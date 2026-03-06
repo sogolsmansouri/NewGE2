@@ -25,6 +25,8 @@ torch::Tensor apply_score_filter(torch::Tensor scores, torch::Tensor filter);
  */
 class NegativeSampler {
    public:
+    using SampleResult = std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>;
+
     virtual ~NegativeSampler() {}
 
     /**
@@ -41,11 +43,13 @@ class NegativeSampler {
                                                              torch::Tensor src_embeddings_g, torch::Tensor dst_embeddings_g, torch::Tensor dst_neg_embeddings_g, torch::Tensor src_neg_embeddings_g,
                                                              int batch_num, int embedding_size, int chunk_num, int num_per_chunk, bool has_relations, bool use_inverse_relations) {
         SPDLOG_INFO("NegativeSampling: compute needs override");
+        return std::forward_as_tuple(torch::Tensor(), torch::Tensor());
     }
 
-    virtual std::tuple<torch::Tensor, torch::Tensor> sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
-                                                             int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) {
+    virtual SampleResult sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
+                                int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) {
         SPDLOG_INFO("NegativeSampling: sample needs override");
+        return std::forward_as_tuple(torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor());
     }
 };
 
@@ -113,9 +117,9 @@ class RNS : public NegativeSamplingBase {
         return std::forward_as_tuple(dst_negs_scores, src_negs_scores);
     }
 
-    std::tuple<torch::Tensor, torch::Tensor> sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
-                                                             int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) override {
-        return std::forward_as_tuple(dst_negs, src_negs);
+    SampleResult sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
+                        int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) override {
+        return std::forward_as_tuple(dst_negs, src_negs, torch::Tensor(), torch::Tensor());
     }
 
 };
@@ -152,26 +156,22 @@ class DNS : public NegativeSamplingBase {
         return std::forward_as_tuple(dst_negs_scores, src_negs_scores);
     }
 
-    std::tuple<torch::Tensor, torch::Tensor> sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
-                                                             int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) override {
-        torch::Tensor selected_dst_negs;
-        torch::Tensor selected_src_negs;
+    SampleResult sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
+                        int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) override {
+        torch::Tensor dst_results_indices;
+        torch::Tensor src_results_indices;
 
-        auto dst_results = dst_negs_scores.topk(selected_negatives_num, 2);
-        torch::Tensor dst_results_scores = std::get<0>(dst_results);
-        torch::Tensor dst_results_indices = std::get<1>(dst_results);  // chunk_num x num_per_chunk x  selected_negatives_num
+        auto dst_results = dst_negs_scores.topk(selected_negatives_num, 2, true, false);
+        dst_results_indices = std::get<1>(dst_results);  // chunk_num x num_per_chunk x  selected_negatives_num
         dst_results_indices = dst_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
-        selected_dst_negs = dst_negs.gather(1, dst_results_indices);
 
         if (has_relations && use_inverse_relations) {
-            auto src_results = src_negs_scores.topk(selected_negatives_num, 2);
-            torch::Tensor src_results_scores = std::get<0>(src_results);
-            torch::Tensor src_results_indices = std::get<1>(src_results);
+            auto src_results = src_negs_scores.topk(selected_negatives_num, 2, true, false);
+            src_results_indices = std::get<1>(src_results);
             src_results_indices = src_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
-            selected_src_negs = dst_negs.gather(1, src_results_indices);
         }
 
-        return std::forward_as_tuple(selected_dst_negs, selected_src_negs);
+        return std::forward_as_tuple(torch::Tensor(), torch::Tensor(), dst_results_indices, src_results_indices);
     }
 };
 
@@ -207,25 +207,21 @@ class KBGAN : public NegativeSamplingBase {
         return std::forward_as_tuple(dst_negs_scores, src_negs_scores);
     }
 
-    std::tuple<torch::Tensor, torch::Tensor> sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
-                                                             int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) override {
-        torch::Tensor selected_dst_negs;
-        torch::Tensor selected_src_negs;
+    SampleResult sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
+                        int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) override {
+        torch::Tensor dst_results_indices;
+        torch::Tensor src_results_indices;
 
-        auto dst_results = dst_negs_scores.topk(selected_negatives_num, 2);
-        torch::Tensor dst_results_scores = std::get<0>(dst_results);
-        torch::Tensor dst_results_indices = std::get<1>(dst_results);  // chunk_num x num_per_chunk x  selected_negatives_num
+        auto dst_results = dst_negs_scores.topk(selected_negatives_num, 2, true, false);
+        dst_results_indices = std::get<1>(dst_results);  // chunk_num x num_per_chunk x  selected_negatives_num
         dst_results_indices = dst_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
-        selected_dst_negs = dst_negs.gather(1, dst_results_indices);
 
         if (has_relations && use_inverse_relations) {
-            auto src_results = src_negs_scores.topk(selected_negatives_num, 2);
-            torch::Tensor src_results_scores = std::get<0>(src_results);
-            torch::Tensor src_results_indices = std::get<1>(src_results);
+            auto src_results = src_negs_scores.topk(selected_negatives_num, 2, true, false);
+            src_results_indices = std::get<1>(src_results);
             src_results_indices = src_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
-            selected_src_negs = dst_negs.gather(1, src_results_indices);
         }
 
-        return std::forward_as_tuple(selected_dst_negs, selected_src_negs);
+        return std::forward_as_tuple(torch::Tensor(), torch::Tensor(), dst_results_indices, src_results_indices);
     }
 };

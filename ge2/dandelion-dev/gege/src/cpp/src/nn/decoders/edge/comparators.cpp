@@ -66,10 +66,14 @@ torch::Tensor DotCompare::operator()(torch::Tensor src, torch::Tensor dst) {
         src = pad_and_reshape(src, dst.size(0));
         return src.bmm(dst.transpose(-1, -2)).flatten(0, 1);
     } else if (src.dim() == 2 && dst.dim() == 4) {
-        // src: batch_num x embedding_size -> chunk_num x num_per_chunk x 1 x embedding_size
-        src = pad_and_reshape(src, dst.size(0)).unsqueeze(2);
-        // dst: chunk_num x num_per_chunk x selected_negatives_num x embedding_size
-        dst = dst.transpose(-1, -2);
-        return torch::einsum("abij,abjk->abik", {src, dst}).reshape({src.size(0) * src.size(1), -1});
+        int64_t chunk_num = dst.size(0);
+        int64_t num_per_chunk = dst.size(1);
+        int64_t selected_negatives_num = dst.size(2);
+        int64_t embedding_dim = dst.size(3);
+        torch::Tensor src_view = pad_and_reshape(src, chunk_num).reshape({chunk_num * num_per_chunk, embedding_dim, 1});
+        torch::Tensor dst_view = dst.reshape({chunk_num * num_per_chunk, selected_negatives_num, embedding_dim});
+        return torch::bmm(dst_view, src_view).reshape({chunk_num * num_per_chunk, selected_negatives_num});
     }
+
+    throw TensorSizeMismatchException(dst, "DotCompare expects dst rank 2, 3, or 4 when src rank is 2");
 }

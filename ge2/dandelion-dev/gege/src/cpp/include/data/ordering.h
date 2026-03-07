@@ -34,3 +34,5 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getSequentialNodePartit
                                                                                             int buffer_capacity);
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomNodePartitionOrdering();
+
+std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states, int active_devices);

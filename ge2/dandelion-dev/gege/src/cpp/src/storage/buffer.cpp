@@ -1,16 +1,171 @@
 #include "storage/buffer.h"
 
 #include <common/util.h>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <fcntl.h>
 #include <unistd.h>
+#include <cstdlib>
 #include <iostream>
+#include <string>
 
 #include <functional>
 #include <future>
 #include <shared_mutex>
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#include "pytorch_scatter/segment_sum.h"
+#endif
 
 #include "configuration/constants.h"
 #include "reporting/logger.h"
+
+#if defined(GEGE_CUDA)
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define GEGE_HAS_NVTX 1
+#elif __has_include(<nvToolsExt.h>)
+#include <nvToolsExt.h>
+#define GEGE_HAS_NVTX 1
+#else
+#define GEGE_HAS_NVTX 0
+#endif
+#else
+#define GEGE_HAS_NVTX 0
+#endif
+
+namespace {
+
+bool parse_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+
+    return default_value;
+}
+
+bool csr_update_enabled() {
+    static bool enabled = parse_env_flag("GEGE_CSR_UPDATE", true);
+    return enabled;
+}
+
+bool csr_update_reduce_enabled() {
+    static bool enabled = parse_env_flag("GEGE_CSR_UPDATE_REDUCE", false);
+    return enabled;
+}
+
+bool csr_nvtx_enabled() {
+    static bool enabled = parse_env_flag("GEGE_CSR_NVTX", false);
+    return enabled;
+}
+
+int64_t parse_env_int(const char *name, int64_t default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    try {
+        return std::stoll(std::string(raw));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+bool stage_debug_enabled() {
+    static bool enabled = parse_env_flag("GEGE_STAGE_DEBUG", false);
+    return enabled;
+}
+
+int64_t stage_debug_max_updates() {
+    static int64_t max_updates = parse_env_int("GEGE_STAGE_DEBUG_MAX_UPDATES", 40);
+    return std::max<int64_t>(max_updates, 0);
+}
+
+std::atomic<int64_t> &stage_debug_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_run_stage_debug(int64_t &debug_update_id) {
+    if (!stage_debug_enabled()) {
+        return false;
+    }
+    debug_update_id = stage_debug_counter().fetch_add(1);
+    return debug_update_id < stage_debug_max_updates();
+}
+
+double elapsed_ms(std::chrono::high_resolution_clock::time_point start, std::chrono::high_resolution_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+class ScopedNvtxRange {
+   public:
+    explicit ScopedNvtxRange(const char *name) {
+        active_ = false;
+#if GEGE_HAS_NVTX
+        if (csr_nvtx_enabled()) {
+            nvtxRangePushA(name);
+            active_ = true;
+        }
+#endif
+    }
+
+    ~ScopedNvtxRange() {
+#if GEGE_HAS_NVTX
+        if (active_) {
+            nvtxRangePop();
+        }
+#endif
+    }
+
+   private:
+    bool active_;
+};
+
+#ifdef GEGE_CUDA
+std::tuple<torch::Tensor, torch::Tensor> reduce_updates_with_csr(torch::Tensor indices, torch::Tensor values) {
+    ScopedNvtxRange nvtx_scope("buffer.reduce_updates_with_csr");
+
+    if (!indices.defined() || !values.defined() || indices.numel() == 0 || values.numel() == 0) {
+        return std::forward_as_tuple(indices, values);
+    }
+
+    torch::Tensor indices64 = indices.to(torch::kInt64);
+    torch::Tensor permutation = torch::argsort(indices64);
+    torch::Tensor sorted_indices = indices64.index_select(0, permutation);
+
+    auto unique_tup = torch::unique_consecutive(sorted_indices, false, true);
+    torch::Tensor unique_indices = std::get<0>(unique_tup);
+    torch::Tensor counts = std::get<2>(unique_tup).to(torch::kInt64);
+
+    if (unique_indices.numel() == sorted_indices.numel()) {
+        return std::forward_as_tuple(indices64, values);
+    }
+
+    torch::Tensor sorted_values = values.index_select(0, permutation);
+    auto indptr_opts = torch::TensorOptions().dtype(torch::kInt64).device(indices.device());
+    torch::Tensor indptr = torch::zeros({unique_indices.numel() + 1}, indptr_opts);
+    if (counts.numel() > 0) {
+        indptr.narrow(0, 1, counts.numel()).copy_(counts.cumsum(0));
+    }
+
+    torch::Tensor reduced_values = segment_sum_csr(sorted_values, indptr, torch::nullopt);
+    return std::forward_as_tuple(unique_indices, reduced_values);
+}
+#endif
+}  // namespace
 
 Partition::Partition(int partition_id, int64_t partition_size, int embedding_size, torch::Dtype dtype, int64_t idx_offset, int64_t file_offset) {
     lock_ = new std::mutex();
@@ -780,9 +935,47 @@ void MemPartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
         // TODO: throw invalid input to func exception
         throw std::runtime_error("");
     }
+    int64_t debug_update_id = -1;
+    bool run_stage_debug = should_run_stage_debug(debug_update_id);
+    auto index_add_start = std::chrono::high_resolution_clock::now();
+    auto step_start = index_add_start;
     
     if (values.device().is_cuda()) {
+#ifdef GEGE_CUDA
+        if (csr_update_enabled()) {
+            static bool logged = false;
+            if (!logged) {
+                SPDLOG_INFO("MemPartitionBuffer::indexAdd using direct CSR update path");
+                logged = true;
+            }
+            torch::Tensor update_indices = indices;
+            torch::Tensor update_values = values;
+            if (csr_update_reduce_enabled()) {
+                std::tie(update_indices, update_values) = reduce_updates_with_csr(indices, values);
+                if (run_stage_debug) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    SPDLOG_INFO("[stage-debug][buffer.indexAdd][update {}][step 1] csr_reduce ms={:.3f} in_rows={} out_rows={}",
+                                debug_update_id, elapsed_ms(step_start, now), indices.numel(), update_indices.numel());
+                    step_start = now;
+                }
+            }
+            buffer_tensor_gpu_view_.index_add_(0, update_indices, update_values);
+            if (run_stage_debug) {
+                auto now = std::chrono::high_resolution_clock::now();
+                SPDLOG_INFO("[stage-debug][buffer.indexAdd][update {}][step 2] index_add_cuda ms={:.3f} rows={} dim={}",
+                            debug_update_id, elapsed_ms(step_start, now), update_indices.numel(), update_values.size(1));
+            }
+        } else {
+            buffer_tensor_gpu_view_.index_add_(0, indices, values);
+            if (run_stage_debug) {
+                auto now = std::chrono::high_resolution_clock::now();
+                SPDLOG_INFO("[stage-debug][buffer.indexAdd][update {}][step 1] index_add_cuda ms={:.3f} rows={} dim={} csr_update={}",
+                            debug_update_id, elapsed_ms(step_start, now), indices.numel(), values.size(1), false);
+            }
+        }
+#else
         buffer_tensor_gpu_view_.index_add_(0, indices, values);
+#endif
     } else {
         // assumes this operation is only used on float valued data.
         auto data_accessor = buffer_tensor_view_.accessor<float, 2>();
@@ -797,6 +990,17 @@ void MemPartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
                 data_accessor[ids_accessor[i]][j] += values_accessor[i][j];
             }
         }
+        if (run_stage_debug) {
+            auto now = std::chrono::high_resolution_clock::now();
+            SPDLOG_INFO("[stage-debug][buffer.indexAdd][update {}][step 1] index_add_cpu ms={:.3f} rows={} dim={}",
+                        debug_update_id, elapsed_ms(step_start, now), size, d);
+        }
+    }
+
+    if (run_stage_debug) {
+        auto now = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO("[stage-debug][buffer.indexAdd][update {}][step 9] total_ms={:.3f} device={}",
+                    debug_update_id, elapsed_ms(index_add_start, now), values.device().str());
     }
 }
 
@@ -811,7 +1015,9 @@ void MemPartitionBuffer::performNextSwap() {
     unload(true);
     auto t2 = std::chrono::high_resolution_clock::now();
     // SPDLOG_INFO("Eviction time: {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+#ifdef GEGE_CUDA
     c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
     
     buffer_state_ = *buffer_state_iterator_;
 
@@ -825,7 +1031,9 @@ void MemPartitionBuffer::performNextSwap() {
     load(data_storage_);
     t2 = std::chrono::high_resolution_clock::now();
     // SPDLOG_INFO("Admission time: {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+#ifdef GEGE_CUDA
     c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
 
     int64_t num_nodes = 0;
 
@@ -943,4 +1151,3 @@ torch::Tensor MemPartitionBuffer::indexRead(torch::Tensor indices) {
     
     return buffer_tensor_gpu_view_.index_select(0, indices);
 }
-

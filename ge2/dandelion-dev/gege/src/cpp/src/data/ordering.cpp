@@ -2,9 +2,112 @@
 #include "data/ordering.h"
 #include "reporting/logger.h"
 
+#include <algorithm>
+#include <numeric>
+
 #ifdef GEGE_OMP
 #include "omp.h"
 #endif
+
+namespace {
+
+std::vector<int64_t> tensor_to_partitions(torch::Tensor tensor) {
+    tensor = tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto *data = tensor.data_ptr<int64_t>();
+    return std::vector<int64_t>(data, data + tensor.numel());
+}
+
+bool states_disjoint(const std::vector<int64_t> &lhs, const std::vector<int64_t> &rhs) {
+    for (auto left_part : lhs) {
+        for (auto right_part : rhs) {
+            if (left_part == right_part) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool search_disjoint_groups(const std::vector<std::vector<bool>> &compatible, const std::vector<int64_t> &remaining, int active_devices,
+                            std::vector<std::vector<int64_t>> &groups);
+
+bool search_group_members(const std::vector<std::vector<bool>> &compatible, const std::vector<int64_t> &remaining, const int active_devices,
+                          const int target_group_size, const std::vector<int64_t> &candidates, std::vector<int64_t> &current_group,
+                          std::vector<std::vector<int64_t>> &groups) {
+    if (current_group.size() == static_cast<std::size_t>(target_group_size)) {
+        std::vector<int64_t> next_remaining;
+        next_remaining.reserve(remaining.size() - current_group.size());
+        for (auto state_idx : remaining) {
+            if (std::find(current_group.begin(), current_group.end(), state_idx) == current_group.end()) {
+                next_remaining.emplace_back(state_idx);
+            }
+        }
+        groups.emplace_back(current_group);
+        if (search_disjoint_groups(compatible, next_remaining, active_devices, groups)) {
+            return true;
+        }
+        groups.pop_back();
+        return false;
+    }
+
+    if (current_group.size() + candidates.size() < static_cast<std::size_t>(target_group_size)) {
+        return false;
+    }
+
+    for (std::size_t i = 0; i < candidates.size(); i++) {
+        int64_t candidate = candidates[i];
+        std::vector<int64_t> next_candidates;
+        next_candidates.reserve(candidates.size() - i - 1);
+        for (std::size_t j = i + 1; j < candidates.size(); j++) {
+            if (compatible[candidate][candidates[j]]) {
+                next_candidates.emplace_back(candidates[j]);
+            }
+        }
+        current_group.emplace_back(candidate);
+        if (search_group_members(compatible, remaining, active_devices, target_group_size, next_candidates, current_group, groups)) {
+            return true;
+        }
+        current_group.pop_back();
+    }
+
+    return false;
+}
+
+bool search_disjoint_groups(const std::vector<std::vector<bool>> &compatible, const std::vector<int64_t> &remaining, int active_devices,
+                            std::vector<std::vector<int64_t>> &groups) {
+    if (remaining.empty()) {
+        return true;
+    }
+
+    int target_group_size = std::min<int>(active_devices, remaining.size());
+    if (target_group_size <= 1) {
+        groups.emplace_back(remaining);
+        return true;
+    }
+
+    auto anchor_it = std::min_element(remaining.begin(), remaining.end(), [&](int64_t lhs, int64_t rhs) {
+        int lhs_degree = 0;
+        int rhs_degree = 0;
+        for (auto state_idx : remaining) {
+            lhs_degree += compatible[lhs][state_idx] ? 1 : 0;
+            rhs_degree += compatible[rhs][state_idx] ? 1 : 0;
+        }
+        return lhs_degree < rhs_degree;
+    });
+    int64_t anchor = *anchor_it;
+
+    std::vector<int64_t> candidates;
+    for (auto state_idx : remaining) {
+        if (state_idx != anchor && compatible[anchor][state_idx]) {
+            candidates.emplace_back(state_idx);
+        }
+    }
+
+    std::vector<int64_t> current_group = {anchor};
+    return search_group_members(compatible, remaining, active_devices, target_group_size, candidates, current_group, groups);
+}
+
+}  // namespace
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(EdgeBucketOrdering edge_bucket_ordering, int num_partitions, int buffer_capacity,
                                                                                int fine_to_coarse_ratio, int num_cache_partitions,
@@ -411,6 +514,55 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomNodePartitionO
     SPDLOG_ERROR("Not implemented");
     std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> ret;
     return ret;
+}
+
+std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states, int active_devices) {
+    if (active_devices <= 1 || buffer_states.size() <= 1) {
+        std::vector<int64_t> identity(buffer_states.size());
+        std::iota(identity.begin(), identity.end(), 0);
+        return identity;
+    }
+
+    std::vector<std::vector<int64_t>> state_partitions;
+    state_partitions.reserve(buffer_states.size());
+    for (auto &state : buffer_states) {
+        state_partitions.emplace_back(tensor_to_partitions(state));
+    }
+
+    std::vector<std::vector<bool>> compatible(buffer_states.size(), std::vector<bool>(buffer_states.size(), false));
+    for (std::size_t i = 0; i < buffer_states.size(); i++) {
+        compatible[i][i] = true;
+        for (std::size_t j = i + 1; j < buffer_states.size(); j++) {
+            bool disjoint = states_disjoint(state_partitions[i], state_partitions[j]);
+            compatible[i][j] = disjoint;
+            compatible[j][i] = disjoint;
+        }
+    }
+
+    std::vector<int64_t> remaining(buffer_states.size());
+    std::iota(remaining.begin(), remaining.end(), 0);
+    std::vector<std::vector<int64_t>> groups;
+    if (!search_disjoint_groups(compatible, remaining, active_devices, groups)) {
+        std::vector<int64_t> identity(buffer_states.size());
+        std::iota(identity.begin(), identity.end(), 0);
+        return identity;
+    }
+
+    std::vector<int64_t> permutation;
+    permutation.reserve(buffer_states.size());
+    for (auto &group : groups) {
+        for (auto state_idx : group) {
+            permutation.emplace_back(state_idx);
+        }
+    }
+
+    if (permutation.size() != buffer_states.size()) {
+        std::vector<int64_t> identity(buffer_states.size());
+        std::iota(identity.begin(), identity.end(), 0);
+        return identity;
+    }
+
+    return permutation;
 }
 
 int32_t pow(int32_t a, int32_t x)

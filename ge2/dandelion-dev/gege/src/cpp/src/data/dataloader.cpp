@@ -2,6 +2,88 @@
 
 #include "common/util.h"
 #include "data/ordering.h"
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <string>
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
+
+namespace {
+
+bool parse_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+    return default_value;
+}
+
+int64_t parse_env_int(const char *name, int64_t default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    try {
+        return std::stoll(std::string(raw));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+bool stage_debug_enabled() {
+    static bool enabled = parse_env_flag("GEGE_STAGE_DEBUG", false);
+    return enabled;
+}
+
+bool fast_map_tensors_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FAST_MAP_TENSORS", true);
+    return enabled;
+}
+
+bool verify_node_mapping_enabled() {
+    static bool enabled = parse_env_flag("GEGE_VERIFY_NODE_MAPPING", false);
+    return enabled;
+}
+
+int64_t stage_debug_max_batches() {
+    static int64_t max_batches = parse_env_int("GEGE_STAGE_DEBUG_MAX_BATCHES", 20);
+    return std::max<int64_t>(max_batches, 0);
+}
+
+std::atomic<int64_t> &stage_debug_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_run_stage_debug(int64_t &debug_batch_id) {
+    if (!stage_debug_enabled()) {
+        return false;
+    }
+    debug_batch_id = stage_debug_counter().fetch_add(1);
+    return debug_batch_id < stage_debug_max_batches();
+}
+
+double elapsed_ms(std::chrono::high_resolution_clock::time_point start, std::chrono::high_resolution_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+int64_t elapsed_ns(std::chrono::high_resolution_clock::time_point start, std::chrono::high_resolution_clock::time_point end) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
+}
+
+}  // namespace
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
                        shared_ptr<EvaluationConfig> evaluation_config, shared_ptr<EncoderConfig> encoder_config, vector<torch::Device> devices,
@@ -37,17 +119,23 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
             training_negative_sampler_ = std::make_shared<RNS>(
                 training_config_->negative_sampling->num_chunks, training_config_->negative_sampling->negatives_per_positive,
                 training_config_->negative_sampling->degree_fraction, training_config_->negative_sampling->filtered,
-                training_config_->negative_sampling->local_filter_mode);
+                training_config_->negative_sampling->local_filter_mode, training_config_->negative_sampling->tournament_selection,
+                training_config_->negative_sampling->tiled_tournament_scores,
+                training_config_->negative_sampling->tiled_tournament_groups_per_tile);
         } else if (negative_sampling_method_ == NegativeSamplingMethod::DNS) {
             training_negative_sampler_ = std::make_shared<DNS>(
                 training_config_->negative_sampling->num_chunks, training_config_->negative_sampling->negatives_per_positive,
                 training_config_->negative_sampling->degree_fraction, training_config_->negative_sampling->filtered,
-                training_config_->negative_sampling->local_filter_mode);
+                training_config_->negative_sampling->local_filter_mode, training_config_->negative_sampling->tournament_selection,
+                training_config_->negative_sampling->tiled_tournament_scores,
+                training_config_->negative_sampling->tiled_tournament_groups_per_tile);
         } else if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {
             training_negative_sampler_ = std::make_shared<KBGAN>(
                 training_config_->negative_sampling->num_chunks, training_config_->negative_sampling->negatives_per_positive,
                 training_config_->negative_sampling->degree_fraction, training_config_->negative_sampling->filtered,
-                training_config_->negative_sampling->local_filter_mode);
+                training_config_->negative_sampling->local_filter_mode, training_config_->negative_sampling->tournament_selection,
+                training_config_->negative_sampling->tiled_tournament_scores,
+                training_config_->negative_sampling->tiled_tournament_groups_per_tile);
         } else {
             SPDLOG_INFO("NegativeSampling: not supported");
         }
@@ -119,6 +207,24 @@ DataLoader::~DataLoader() {
     delete batch_cv_;
 }
 
+void DataLoader::resetPerfStats() {
+    swap_barrier_wait_ns_.store(0);
+    swap_update_ns_.store(0);
+    swap_rebuild_ns_.store(0);
+    swap_sync_wait_ns_.store(0);
+    swap_count_.store(0);
+}
+
+DataLoaderPerfStats DataLoader::getPerfStats() const {
+    DataLoaderPerfStats stats;
+    stats.swap_barrier_wait_ns = swap_barrier_wait_ns_.load();
+    stats.swap_update_ns = swap_update_ns_.load();
+    stats.swap_rebuild_ns = swap_rebuild_ns_.load();
+    stats.swap_sync_wait_ns = swap_sync_wait_ns_.load();
+    stats.swap_count = swap_count_.load();
+    return stats;
+}
+
 void DataLoader::nextEpoch() {
     batch_id_offset_ = 0;
     total_batches_processed_ = 0;
@@ -131,6 +237,7 @@ void DataLoader::nextEpoch() {
 
 void DataLoader::setActiveEdges(int32_t device_idx) {
     EdgeList active_edges;
+    torch::Tensor edge_bucket_sizes;
 
     if (graph_storage_->useInMemorySubGraph()) {
         torch::Tensor edge_bucket_ids = *edge_buckets_per_buffer_iterators_[device_idx];
@@ -143,7 +250,7 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
         int num_partitions = graph_storage_->getNumPartitions();
         edge_bucket_ids = edge_bucket_ids.select(1, 0) * num_partitions + edge_bucket_ids.select(1, 1);
         torch::Tensor in_memory_edge_bucket_idx = torch::empty({edge_bucket_ids.size(0)}, edge_bucket_ids.options());
-        torch::Tensor edge_bucket_sizes = torch::empty({edge_bucket_ids.size(0)}, edge_bucket_ids.options());
+        edge_bucket_sizes = torch::empty({edge_bucket_ids.size(0)}, edge_bucket_ids.options());
 
         auto edge_bucket_ids_accessor = edge_bucket_ids.accessor<int64_t, 1>();
         auto in_memory_edge_bucket_idx_accessor = in_memory_edge_bucket_idx.accessor<int64_t, 1>();
@@ -193,8 +300,7 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     auto opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
     auto perm = torch::randperm(active_edges.size(0), opts);
     perm = perm.to(active_edges.device());
-    active_edges = (active_edges.index_select(0, perm));
-    perm = torch::Tensor();
+    active_edges = active_edges.index_select(0, perm);
     graph_storage_->setActiveEdges(active_edges, device_idx);
 }
 
@@ -259,6 +365,38 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
 }
 
 void DataLoader::setBufferOrdering() {
+    auto reorder_buffer_ordering = [&](std::vector<torch::Tensor> &buffer_states, std::vector<torch::Tensor> &edge_buckets_per_buffer) {
+        if (devices_.size() <= 1 || buffer_states.size() <= 1 || edge_buckets_per_buffer.size() != buffer_states.size()) {
+            return;
+        }
+
+        auto permutation = getDisjointBufferStatePermutation(buffer_states, devices_.size());
+        bool changed = false;
+        for (std::size_t i = 0; i < permutation.size(); i++) {
+            if (permutation[i] != static_cast<int64_t>(i)) {
+                changed = true;
+                break;
+            }
+        }
+
+        if (!changed) {
+            return;
+        }
+
+        std::vector<torch::Tensor> reordered_states;
+        std::vector<torch::Tensor> reordered_buckets;
+        reordered_states.reserve(buffer_states.size());
+        reordered_buckets.reserve(edge_buckets_per_buffer.size());
+        for (auto idx : permutation) {
+            reordered_states.emplace_back(buffer_states[idx]);
+            reordered_buckets.emplace_back(edge_buckets_per_buffer[idx]);
+        }
+        buffer_states = std::move(reordered_states);
+        edge_buckets_per_buffer = std::move(reordered_buckets);
+
+        SPDLOG_INFO("Reordered {} buffer states into disjoint multi-GPU supersteps for {} devices", buffer_states.size(), devices_.size());
+    };
+
     shared_ptr<PartitionBufferOptions> options;
     if (instance_of<Storage, PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)) {
         options = std::dynamic_pointer_cast<PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)->options_;
@@ -273,8 +411,9 @@ void DataLoader::setBufferOrdering() {
             auto tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity, options->fine_to_coarse_ratio,
                                              options->num_cache_partitions, options->randomly_assign_edge_buckets);
             buffer_states_ = std::get<0>(tup);
-            SPDLOG_INFO("buffer_states_ sizes() {}", buffer_states_.size());
             edge_buckets_per_buffer_ = std::get<1>(tup);
+            reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
+            SPDLOG_INFO("buffer_states_ sizes() {}", buffer_states_.size());
             auto edge_buckets_per_buffer_iterator = edge_buckets_per_buffer_.begin();
             edge_buckets_per_buffer_iterators_.resize(devices_.size());
             for (int i = 0; i < devices_.size(); i ++) {
@@ -333,31 +472,45 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 if (swap_tasks_completed == all_batches_.size()) {
                     swap_tasks_completed = 0;
                 }
+                auto swap_barrier_start = std::chrono::high_resolution_clock::now();
                 // batch_cv_->wait(batch_lock, [this, device_idx] { 
                 //     return async_barrier.load() % all_batches_.size() == 0; });
                 // batch_lock.unlock();
                 while(async_barrier.load() % all_batches_.size() != 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
+                swap_barrier_wait_ns_.fetch_add(elapsed_ns(swap_barrier_start, std::chrono::high_resolution_clock::now()));
 
+#ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
                 // SPDLOG_INFO("Swapping subgraph for device {}", device_idx);
                 // auto t1 = std::chrono::high_resolution_clock::now();
+                auto update_start = std::chrono::high_resolution_clock::now();
                 graph_storage_->updateInMemorySubGraph(device_idx);
+                swap_update_ns_.fetch_add(elapsed_ns(update_start, std::chrono::high_resolution_clock::now()));
                 // SPDLOG_INFO("graph_storage_->updateInMemorySubGraph");
-
+#ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
                 // auto t11 = std::chrono::high_resolution_clock::now();
                 // SPDLOG_INFO("Time to updateInMemorySubGraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t11 - t1).count());
+                auto rebuild_start = std::chrono::high_resolution_clock::now();
                 initializeBatches(false, device_idx);
+                swap_rebuild_ns_.fetch_add(elapsed_ns(rebuild_start, std::chrono::high_resolution_clock::now()));
+#ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
 
                 swap_tasks_completed ++;
                 activate_devices_ ++;
+                swap_count_.fetch_add(1);
 
+                auto swap_sync_start = std::chrono::high_resolution_clock::now();
                 while(swap_tasks_completed.load() != all_batches_.size()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
+                swap_sync_wait_ns_.fetch_add(elapsed_ns(swap_sync_start, std::chrono::high_resolution_clock::now()));
                 // auto t2 = std::chrono::high_resolution_clock::now();
                 // SPDLOG_INFO("Finished swapping subgraph for device {}", device_idx);
                 // SPDLOG_INFO("Time to swap subgraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
@@ -444,13 +597,31 @@ shared_ptr<Batch> DataLoader::getBatch(at::optional<torch::Device> device, bool 
 }
 
 void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
+    int64_t debug_batch_id = -1;
+    bool run_stage_debug = should_run_stage_debug(debug_batch_id);
+    auto edge_sample_start = std::chrono::high_resolution_clock::now();
+    auto step_start = edge_sample_start;
 
     if (!batch->edges_.defined()) {
         batch->edges_ = edge_sampler_->getEdges(batch, device_idx);
     }
+    if (run_stage_debug) {
+        auto now = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 1] getEdges ms={:.3f} edges={}x{}",
+                    debug_batch_id, elapsed_ms(step_start, now), batch->edges_.size(0), batch->edges_.size(1));
+        step_start = now;
+    }
 
     if (negative_sampler_ != nullptr) {
         negativeSample(batch);
+    }
+    if (run_stage_debug) {
+        auto now = std::chrono::high_resolution_clock::now();
+        int64_t src_neg_numel = batch->src_neg_indices_.defined() ? batch->src_neg_indices_.numel() : 0;
+        int64_t dst_neg_numel = batch->dst_neg_indices_.defined() ? batch->dst_neg_indices_.numel() : 0;
+        SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 2] negativeSample ms={:.3f} src_neg_numel={} dst_neg_numel={}",
+                    debug_batch_id, elapsed_ms(step_start, now), src_neg_numel, dst_neg_numel);
+        step_start = now;
     }
     // std::cout << batch->src_neg_indices_ << std::endl;
     // std::cout << batch->edges_.sizes() << " " <<  batch->src_neg_indices_.sizes() << " " << batch->dst_neg_indices_.sizes() << std::endl;
@@ -473,6 +644,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     // }
     // SPDLOG_INFO("false_negative_edges_src: {}", false_negative_edges_src);
     // SPDLOG_INFO("false_negative_edges_dst: {}", false_negative_edges_dst);
+    auto map_collect_start = std::chrono::high_resolution_clock::now();
     std::vector<torch::Tensor> all_ids = {batch->edges_.select(1, 0), batch->edges_.select(1, -1)};
 
     if (batch->src_neg_indices_.defined()) {
@@ -482,6 +654,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     if (batch->dst_neg_indices_.defined()) {
         all_ids.emplace_back(batch->dst_neg_indices_.flatten(0, 1));
     }
+    auto map_collect_end = std::chrono::high_resolution_clock::now();
 
     torch::Tensor src_mapping;
     torch::Tensor dst_mapping;
@@ -489,8 +662,14 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     torch::Tensor dst_neg_mapping;
 
     std::vector<torch::Tensor> mapped_tensors;
+    double map_lookup_ms = 0.0;
+    double map_verify_ms = 0.0;
+    double remap_assign_ms = 0.0;
+    MapTensorTiming map_tensor_timing;
+    bool has_map_tensor_timing = false;
 
     if (neighbor_sampler_ != nullptr) {
+        auto map_lookup_start = std::chrono::high_resolution_clock::now();
         // get unique nodes in edges and negatives
         batch->root_node_indices_ = std::get<0>(torch::_unique(torch::cat(all_ids)));
 
@@ -504,9 +683,12 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         torch::Tensor map_to_unsorted = std::get<1>(tup);
 
         mapped_tensors = apply_tensor_map(sorted_map, all_ids);
+        auto map_lookup_end = std::chrono::high_resolution_clock::now();
+        map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
 
         int64_t num_nbrs_sampled = batch->dense_graph_.hop_offsets_[-2].item<int64_t>();
 
+        auto remap_assign_start = std::chrono::high_resolution_clock::now();
         src_mapping = map_to_unsorted.index_select(0, mapped_tensors[0]) - num_nbrs_sampled;
         dst_mapping = map_to_unsorted.index_select(0, mapped_tensors[1]) - num_nbrs_sampled;
 
@@ -517,19 +699,33 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         if (batch->dst_neg_indices_.defined()) {
             dst_neg_mapping = map_to_unsorted.index_select(0, mapped_tensors[3]).reshape(batch->dst_neg_indices_.sizes()) - num_nbrs_sampled;
         }
+        auto remap_assign_end = std::chrono::high_resolution_clock::now();
+        remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
     } else {
         // map edges and negatives to their corresponding index in unique_node_indices_
-        auto tup = map_tensors(all_ids);
+        bool map_sorted = !fast_map_tensors_enabled();
+        auto map_lookup_start = std::chrono::high_resolution_clock::now();
+        auto tup = map_tensors(all_ids, map_sorted, run_stage_debug ? &map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx));
+        auto map_lookup_end = std::chrono::high_resolution_clock::now();
+        map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
+        has_map_tensor_timing = run_stage_debug;
     
 
         batch->unique_node_indices_ = std::get<0>(tup);
 
-        if (batch->unique_node_indices_[0].item<int64_t>() == -1) {
-            SPDLOG_ERROR("Node mapping is broken. Try repartition again.");
-            throw std::runtime_error("");
+        auto map_verify_start = std::chrono::high_resolution_clock::now();
+        if (verify_node_mapping_enabled()) {
+            // Optional expensive guardrail: avoid synchronizing .item() on every batch unless requested.
+            if (torch::any(batch->unique_node_indices_ < 0).item<bool>()) {
+                SPDLOG_ERROR("Node mapping is broken. Try repartition again.");
+                throw std::runtime_error("");
+            }
         }
+        auto map_verify_end = std::chrono::high_resolution_clock::now();
+        map_verify_ms = elapsed_ms(map_verify_start, map_verify_end);
 
 
+        auto remap_assign_start = std::chrono::high_resolution_clock::now();
         mapped_tensors = std::get<1>(tup);
 
         src_mapping = mapped_tensors[0];
@@ -542,6 +738,37 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         if (batch->dst_neg_indices_.defined()) {
             dst_neg_mapping = mapped_tensors[3].reshape(batch->dst_neg_indices_.sizes());
         }
+        auto remap_assign_end = std::chrono::high_resolution_clock::now();
+        remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
+    }
+    if (run_stage_debug) {
+        auto now = std::chrono::high_resolution_clock::now();
+        int64_t input_ids_numel = 0;
+        for (const auto &ids : all_ids) {
+            input_ids_numel += ids.numel();
+        }
+        int64_t unique_numel = batch->unique_node_indices_.defined() ? batch->unique_node_indices_.numel() : 0;
+        int64_t duplicate_count = std::max<int64_t>(input_ids_numel - unique_numel, 0);
+        double duplicate_ratio = input_ids_numel > 0 ? (double)duplicate_count / (double)input_ids_numel : 0.0;
+        SPDLOG_INFO(
+            "[stage-debug][edgeSample][batch {}][step 3] map/remap ms={:.3f} unique_nodes={} input_ids={} duplicates={} duplicate_ratio={:.6f} neighbor_sampler={} fast_map={} verify_map={}",
+            debug_batch_id, elapsed_ms(step_start, now), unique_numel, input_ids_numel, duplicate_count, duplicate_ratio,
+            neighbor_sampler_ != nullptr, fast_map_tensors_enabled(), verify_node_mapping_enabled());
+        SPDLOG_INFO(
+            "[stage-debug][edgeSample][batch {}][step 3 breakdown] collect_ids_ms={:.3f} map_lookup_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f}",
+            debug_batch_id, elapsed_ms(map_collect_start, map_collect_end), map_lookup_ms, map_verify_ms, remap_assign_ms);
+        if (has_map_tensor_timing) {
+            SPDLOG_INFO(
+                "[stage-debug][edgeSample][batch {}][step 3 map_tensors] validate_ms={:.3f} cat_ms={:.3f} unique_ms={:.3f} unique_wall_ms={:.3f} split_ms={:.3f} total_ms={:.3f}",
+                debug_batch_id, map_tensor_timing.validate_ms, map_tensor_timing.cat_ms, map_tensor_timing.unique_ms, map_tensor_timing.unique_wall_ms,
+                map_tensor_timing.split_ms, map_tensor_timing.total_ms);
+            SPDLOG_INFO(
+                "[stage-debug][edgeSample][batch {}][step 3 map_tensors backend] requested_backend={} executed_backend={} fallback={} fallback_backend={} fallback_reason={} total_fallbacks={} cuco_compiled={} capture_file={}",
+                debug_batch_id, map_tensor_timing.unique_requested_backend, map_tensor_timing.unique_executed_backend,
+                map_tensor_timing.unique_used_fallback, map_tensor_timing.unique_fallback_backend, map_tensor_timing.unique_fallback_reason,
+                map_tensor_timing.unique_total_fallbacks, map_tensor_timing.unique_cuco_compiled, map_tensor_timing.capture_path);
+        }
+        step_start = now;
     }
 
     if (batch->edges_.size(1) == 2) {
@@ -554,6 +781,12 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
 
     batch->src_neg_indices_mapping_ = src_neg_mapping;
     batch->dst_neg_indices_mapping_ = dst_neg_mapping;
+
+    if (run_stage_debug) {
+        auto now = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 4] finalize ms={:.3f} total_ms={:.3f}",
+                    debug_batch_id, elapsed_ms(step_start, now), elapsed_ms(edge_sample_start, now));
+    }
 }
 
 void DataLoader::nodeSample(shared_ptr<Batch> batch, int32_t device_idx) {

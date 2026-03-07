@@ -79,6 +79,25 @@ bool instance_of(std::shared_ptr<T1> instance) {
     return (std::dynamic_pointer_cast<T2>(instance) != nullptr);
 }
 
-std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors);
+struct MapTensorTiming {
+    double validate_ms = 0.0;
+    double cat_ms = 0.0;
+    double unique_ms = 0.0;
+    double unique_wall_ms = 0.0;
+    double split_ms = 0.0;
+    double total_ms = 0.0;
+    std::string unique_requested_backend;
+    std::string unique_executed_backend;
+    std::string unique_fallback_backend;
+    std::string unique_fallback_reason;
+    std::string capture_path;
+    int64_t unique_total_calls = 0;
+    int64_t unique_total_fallbacks = 0;
+    bool unique_used_fallback = false;
+    bool unique_cuco_compiled = false;
+};
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted = true,
+                                                                   MapTensorTiming *timing = nullptr, int64_t value_domain_size = -1);
 
 std::vector<torch::Tensor> apply_tensor_map(torch::Tensor map, std::vector<torch::Tensor> unmapped_tensors);

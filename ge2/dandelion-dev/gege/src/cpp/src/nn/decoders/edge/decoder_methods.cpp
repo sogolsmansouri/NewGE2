@@ -82,8 +82,33 @@ bool stage_debug_enabled() {
     return enabled;
 }
 
-bool distmult_selected_cuda_enabled() {
+bool selected_neg_cuda_enabled() {
+    const char *new_name = std::getenv("GEGE_SELECTED_NEG_CUDA");
+    if (new_name != nullptr) {
+        return parse_env_flag("GEGE_SELECTED_NEG_CUDA", true);
+    }
+
     static bool enabled = parse_env_flag("GEGE_DISTMULT_SELECTED_CUDA", true);
+    return enabled;
+}
+
+bool tiled_tournament_scores_validate_enabled() {
+    static bool enabled = parse_env_flag("GEGE_TILED_TOURNAMENT_SCORES_VALIDATE", false);
+    return enabled;
+}
+
+int64_t tiled_tournament_scores_validate_max_batches() {
+    static int64_t max_batches = parse_env_int("GEGE_TILED_TOURNAMENT_SCORES_VALIDATE_MAX_BATCHES", 5);
+    return std::max<int64_t>(max_batches, 0);
+}
+
+std::atomic<int64_t> &tiled_tournament_scores_validate_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool transe_squared_sampling_enabled() {
+    static bool enabled = parse_env_flag("GEGE_TRANSE_SQUARED_SAMPLING", true);
     return enabled;
 }
 
@@ -152,15 +177,190 @@ torch::Tensor gather_selected_negative_ids(torch::Tensor negative_ids, torch::Te
     return negative_ids.gather(1, selected_neg_indices);
 }
 
-bool can_use_distmult_selected_cuda(const shared_ptr<EdgeDecoder> &decoder, bool run_csr_debug, const torch::Tensor &adjusted_embeddings,
-                                    const torch::Tensor &negative_embeddings, const torch::Tensor &selected_neg_indices) {
+SelectedNegScoreKind selected_neg_score_kind(const shared_ptr<EdgeDecoder> &decoder) {
 #ifdef GEGE_CUDA
-    return distmult_selected_cuda_enabled() && !run_csr_debug && instance_of<EdgeDecoder, DistMult>(decoder) && adjusted_embeddings.defined() &&
+    if (instance_of<Comparator, DotCompare>(decoder->comparator_)) {
+        return SelectedNegScoreKind::DOT;
+    }
+    if (instance_of<Comparator, L2Compare>(decoder->comparator_)) {
+        return SelectedNegScoreKind::L2;
+    }
+#else
+    (void)decoder;
+#endif
+    return SelectedNegScoreKind::NONE;
+}
+
+bool sampling_prefers_higher_scores(const shared_ptr<EdgeDecoder> &decoder) {
+#ifdef GEGE_CUDA
+    return !instance_of<Comparator, L2Compare>(decoder->comparator_);
+#else
+    (void)decoder;
+    return true;
+#endif
+}
+
+bool negative_sampler_uses_tournament(const shared_ptr<NegativeSampler> &negative_sampler) {
+    auto sampling_base = std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler);
+    return sampling_base != nullptr && (sampling_base->tournament_selection_ || negative_tournament_env_enabled());
+}
+
+bool tiled_tournament_scores_enabled(const shared_ptr<NegativeSampler> &negative_sampler) {
+    const char *env_override = std::getenv("GEGE_TILED_TOURNAMENT_SCORES");
+    if (env_override != nullptr) {
+        return parse_env_flag("GEGE_TILED_TOURNAMENT_SCORES", false);
+    }
+
+    auto sampling_base = std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler);
+    return sampling_base != nullptr && sampling_base->tiled_tournament_scores_;
+}
+
+int64_t tiled_tournament_groups_per_tile(const shared_ptr<NegativeSampler> &negative_sampler) {
+    const char *env_override = std::getenv("GEGE_TILED_TOURNAMENT_GROUPS_PER_TILE");
+    if (env_override != nullptr) {
+        return std::max<int64_t>(parse_env_int("GEGE_TILED_TOURNAMENT_GROUPS_PER_TILE", 64), 1);
+    }
+
+    auto sampling_base = std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler);
+    if (sampling_base == nullptr) {
+        return 64;
+    }
+    return std::max<int64_t>(sampling_base->tiled_tournament_groups_per_tile_, 1);
+}
+
+bool can_use_tiled_distmult_tournament_scores(const shared_ptr<EdgeDecoder> &decoder,
+                                              const shared_ptr<NegativeSampler> &negative_sampler,
+                                              bool run_csr_debug,
+                                              const torch::Tensor &score_embeddings,
+                                              const torch::Tensor &negative_embeddings,
+                                              int64_t selected_negatives_num) {
+#ifdef GEGE_CUDA
+    return tiled_tournament_scores_enabled(negative_sampler) && !run_csr_debug && std::dynamic_pointer_cast<DistMult>(decoder) != nullptr &&
+           negative_sampler_uses_tournament(negative_sampler) && score_embeddings.defined() && negative_embeddings.defined() &&
+           score_embeddings.is_cuda() && negative_embeddings.is_cuda() && score_embeddings.dim() == 2 && negative_embeddings.dim() == 3 &&
+           selected_negatives_num > 0 && negative_embeddings.size(1) % selected_negatives_num == 0;
+#else
+    (void)decoder;
+    (void)negative_sampler;
+    (void)run_csr_debug;
+    (void)score_embeddings;
+    (void)negative_embeddings;
+    (void)selected_negatives_num;
+    return false;
+#endif
+}
+
+void validate_tiled_tournament_scores_once(const torch::Tensor &selector_chunked_embeddings,
+                                           const torch::Tensor &selector_negative_embeddings,
+                                           const torch::Tensor &score_chunked_embeddings,
+                                           const torch::Tensor &score_negative_embeddings,
+                                           int64_t selected_negatives_num,
+                                           const torch::Tensor &tiled_scores,
+                                           const torch::Tensor &tiled_indices,
+                                           const char *tag) {
+#ifdef GEGE_CUDA
+    if (!tiled_tournament_scores_validate_enabled()) {
+        return;
+    }
+
+    int64_t validate_batch = tiled_tournament_scores_validate_counter().fetch_add(1);
+    if (validate_batch >= tiled_tournament_scores_validate_max_batches()) {
+        return;
+    }
+
+    int64_t chunk_num = selector_chunked_embeddings.size(0);
+    int64_t num_per_chunk = selector_chunked_embeddings.size(1);
+    torch::NoGradGuard no_grad;
+    torch::Tensor selector_scores = selector_chunked_embeddings.bmm(selector_negative_embeddings.transpose(1, 2));
+    torch::Tensor reference_indices = tournament_select_indices(selector_scores, selected_negatives_num, true).view({chunk_num, num_per_chunk * selected_negatives_num});
+    torch::Tensor reference_scores =
+        selected_neg_scores(score_chunked_embeddings, score_negative_embeddings, reference_indices, SelectedNegScoreKind::DOT);
+
+    if (!torch::equal(reference_indices, tiled_indices)) {
+        SPDLOG_ERROR("[tiled-tournament-scores] index validation failed for {} on validation batch {}", tag, validate_batch);
+        throw GegeRuntimeException("Tiled tournament indices mismatch reference");
+    }
+
+    if (!torch::allclose(reference_scores, tiled_scores, 1e-5, 1e-5)) {
+        SPDLOG_ERROR("[tiled-tournament-scores] score validation failed for {} on validation batch {}", tag, validate_batch);
+        throw GegeRuntimeException("Tiled tournament scores mismatch reference");
+    }
+
+    SPDLOG_INFO("[tiled-tournament-scores] validation passed for {} on validation batch {}", tag, validate_batch);
+#else
+    (void)selector_chunked_embeddings;
+    (void)selector_negative_embeddings;
+    (void)score_chunked_embeddings;
+    (void)score_negative_embeddings;
+    (void)selected_negatives_num;
+    (void)tiled_scores;
+    (void)tiled_indices;
+    (void)tag;
+#endif
+}
+
+torch::Tensor reshape_sampling_scores(torch::Tensor scores, int64_t chunk_num, int64_t num_per_chunk, int64_t negatives_num) {
+    if (!scores.defined()) {
+        return scores;
+    }
+
+    return scores.reshape({chunk_num, num_per_chunk, negatives_num});
+}
+
+torch::Tensor l2_candidate_sampling_scores(torch::Tensor adjusted_embeddings, torch::Tensor negative_embeddings, int64_t chunk_num, int64_t num_per_chunk) {
+    torch::Tensor padded_embeddings = adjusted_embeddings;
+    if (num_per_chunk != adjusted_embeddings.size(0) / chunk_num) {
+        int64_t new_size = num_per_chunk * chunk_num;
+        torch::nn::functional::PadFuncOptions options({0, 0, 0, new_size - adjusted_embeddings.size(0)});
+        padded_embeddings = torch::nn::functional::pad(adjusted_embeddings, options);
+    }
+
+    torch::Tensor src = padded_embeddings.view({chunk_num, num_per_chunk, adjusted_embeddings.size(1)});
+    torch::Tensor x2 = src.pow(2).sum(2).unsqueeze(2);
+    torch::Tensor y2 = negative_embeddings.pow(2).sum(2).unsqueeze(1);
+    torch::Tensor xy = torch::matmul(src, negative_embeddings.transpose(1, 2));
+    torch::Tensor distance2 = torch::clamp_min(x2 + y2 - 2 * xy, 1e-8);
+    return -distance2;
+}
+
+torch::Tensor candidate_sampling_scores(const shared_ptr<EdgeDecoder> &decoder,
+                                        torch::Tensor adjusted_embeddings,
+                                        torch::Tensor negative_embeddings,
+                                        int64_t chunk_num,
+                                        int64_t num_per_chunk) {
+    torch::Tensor scores;
+
+    if (instance_of<Comparator, L2Compare>(decoder->comparator_)) {
+        if (transe_squared_sampling_enabled()) {
+            return l2_candidate_sampling_scores(adjusted_embeddings, negative_embeddings, chunk_num, num_per_chunk);
+        }
+        scores = reshape_sampling_scores(decoder->compute_scores(adjusted_embeddings, negative_embeddings), chunk_num, num_per_chunk, negative_embeddings.size(1));
+        return -scores;
+    }
+
+    scores = reshape_sampling_scores(decoder->compute_scores(adjusted_embeddings, negative_embeddings), chunk_num, num_per_chunk, negative_embeddings.size(1));
+
+    if (!sampling_prefers_higher_scores(decoder)) {
+        scores = -scores;
+    }
+
+    return scores;
+}
+
+bool can_use_selected_neg_cuda(const shared_ptr<EdgeDecoder> &decoder, bool run_csr_debug, const torch::Tensor &adjusted_embeddings,
+                               const torch::Tensor &negative_embeddings, const torch::Tensor &selected_neg_indices) {
+#ifdef GEGE_CUDA
+    return selected_neg_cuda_enabled() && !run_csr_debug && selected_neg_score_kind(decoder) != SelectedNegScoreKind::NONE && adjusted_embeddings.defined() &&
            negative_embeddings.defined() && selected_neg_indices.defined() && adjusted_embeddings.is_cuda() && negative_embeddings.is_cuda() &&
            selected_neg_indices.is_cuda() && adjusted_embeddings.dim() == 2 && negative_embeddings.dim() == 3 &&
            selected_neg_indices.dim() == 2 && adjusted_embeddings.scalar_type() == negative_embeddings.scalar_type() &&
            selected_neg_indices.scalar_type() == torch::kInt64;
 #else
+    (void)decoder;
+    (void)run_csr_debug;
+    (void)adjusted_embeddings;
+    (void)negative_embeddings;
+    (void)selected_neg_indices;
     return false;
 #endif
 }
@@ -573,6 +773,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     torch::Tensor selected_src_neg_indices;
     torch::Tensor dst_neg_candidates = dst_negs;
     torch::Tensor src_neg_candidates = src_negs;
+    torch::Tensor selector_dst_chunked_embeddings;
+    torch::Tensor selector_src_chunked_embeddings;
+    torch::Tensor selector_dst_neg_embeddings;
+    torch::Tensor selector_src_neg_embeddings;
+    bool use_tiled_tournament_scores = false;
 
     auto all_pos_embeddings = prepare_pos_embeddings(decoder, positive_edges, src_embeddings, dst_embeddings, has_relations);
 
@@ -601,66 +806,113 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
         step_start = now;
     }
 
+    int64_t csr_debug_batch_id = -1;
+    bool run_csr_debug = should_run_csr_debug(csr_debug_batch_id);
+
     {
         torch::NoGradGuard no_grad;
 
-        torch::Tensor src_embeddings_g;
-        torch::Tensor dst_embeddings_g;
+        torch::Tensor adjusted_src_embeddings_g;
+        torch::Tensor adjusted_dst_embeddings_g;
         torch::Tensor dst_neg_embeddings_g;
         torch::Tensor src_neg_embeddings_g;
+        torch::Tensor dst_negs_scores;
+        torch::Tensor src_negs_scores;
 
-        if (negative_sampling_method == NegativeSamplingMethod::GAN) {
-            auto src_dst_g = gather_positive_embeddings(node_embeddings_g, src_ids, dst_ids, use_csr_gather, &positive_gather_plan);
-            src_embeddings_g = std::get<0>(src_dst_g);
-            dst_embeddings_g = std::get<1>(src_dst_g);
-            if (has_relations) {
+        if (negative_sampling_method == NegativeSamplingMethod::DNS || negative_sampling_method == NegativeSamplingMethod::GAN) {
+            if (negative_sampling_method == NegativeSamplingMethod::GAN) {
+                auto src_dst_g = gather_positive_embeddings(node_embeddings_g, src_ids, dst_ids, use_csr_gather, &positive_gather_plan);
+                auto all_pos_embeddings_g = prepare_pos_embeddings(decoder, positive_edges, std::get<0>(src_dst_g), std::get<1>(src_dst_g), has_relations);
+                adjusted_src_embeddings_g = std::get<0>(all_pos_embeddings_g);
+                adjusted_dst_embeddings_g = std::get<1>(all_pos_embeddings_g);
                 dst_neg_embeddings_g = gather_negative_embeddings(node_embeddings_g, dst_negs, use_csr_gather, &dst_neg_gather_plan);
-                if (decoder->use_inverse_relations_) {
+                if (has_relations && decoder->use_inverse_relations_) {
                     src_neg_embeddings_g = gather_negative_embeddings(node_embeddings_g, src_negs, use_csr_gather, &src_neg_gather_plan);
                 }
-            } else {
-                dst_neg_embeddings_g = gather_negative_embeddings(node_embeddings_g, dst_negs, use_csr_gather, &dst_neg_gather_plan);
             }
-        }
 
-        auto all_negs_scores = negative_sampler->compute(adjusted_src_embeddings, adjusted_dst_embeddings, dst_neg_embeddings, src_neg_embeddings,
-                                                         src_embeddings_g, dst_embeddings_g, dst_neg_embeddings_g, src_neg_embeddings_g,
-                                                         batch_num, embedding_size, chunk_num, num_per_chunk, has_relations, decoder->use_inverse_relations_);
+            if (negative_sampling_method == NegativeSamplingMethod::GAN) {
+                selector_dst_chunked_embeddings = pad_and_reshape(adjusted_src_embeddings_g.detach(), chunk_num);
+                selector_dst_neg_embeddings = dst_neg_embeddings_g.detach();
+                if (has_relations && decoder->use_inverse_relations_) {
+                    selector_src_chunked_embeddings = pad_and_reshape(adjusted_dst_embeddings_g.detach(), chunk_num);
+                    selector_src_neg_embeddings = src_neg_embeddings_g.detach();
+                }
+            } else {
+                selector_dst_chunked_embeddings = pad_and_reshape(adjusted_src_embeddings.detach(), chunk_num);
+                selector_dst_neg_embeddings = dst_neg_embeddings.detach();
+                if (has_relations && decoder->use_inverse_relations_) {
+                    selector_src_chunked_embeddings = pad_and_reshape(adjusted_dst_embeddings.detach(), chunk_num);
+                    selector_src_neg_embeddings = src_neg_embeddings.detach();
+                }
+            }
 
-        torch::Tensor dst_negs_scores = std::get<0>(all_negs_scores);
-        torch::Tensor src_negs_scores = std::get<1>(all_negs_scores);
+            use_tiled_tournament_scores =
+                can_use_tiled_distmult_tournament_scores(decoder, negative_sampler, run_csr_debug, adjusted_src_embeddings, dst_neg_embeddings,
+                                                         selected_negatives_num) &&
+                (!has_relations || !decoder->use_inverse_relations_ ||
+                 can_use_tiled_distmult_tournament_scores(decoder, negative_sampler, run_csr_debug, adjusted_dst_embeddings, src_neg_embeddings,
+                                                         selected_negatives_num));
 
-        auto all_selected_negs = negative_sampler->sample(dst_negs, src_negs, dst_negs_scores, src_negs_scores, chunk_num, num_per_chunk, selected_negatives_num,
-                                                          has_relations, decoder->use_inverse_relations_);
+            if (!use_tiled_tournament_scores) {
+                if (negative_sampling_method == NegativeSamplingMethod::GAN) {
+                    dst_negs_scores = candidate_sampling_scores(decoder, adjusted_src_embeddings_g, dst_neg_embeddings_g, chunk_num, num_per_chunk);
+                    if (has_relations && decoder->use_inverse_relations_) {
+                        src_negs_scores = candidate_sampling_scores(decoder, adjusted_dst_embeddings_g, src_neg_embeddings_g, chunk_num, num_per_chunk);
+                    }
+                } else {
+                    dst_negs_scores = candidate_sampling_scores(decoder, adjusted_src_embeddings, dst_neg_embeddings, chunk_num, num_per_chunk);
+                    if (has_relations && decoder->use_inverse_relations_) {
+                        src_negs_scores = candidate_sampling_scores(decoder, adjusted_dst_embeddings, src_neg_embeddings, chunk_num, num_per_chunk);
+                    }
+                }
 
-        torch::Tensor sampled_dst_negs = std::get<0>(all_selected_negs);
-        torch::Tensor sampled_src_negs = std::get<1>(all_selected_negs);
-        selected_dst_neg_indices = std::get<2>(all_selected_negs);
-        selected_src_neg_indices = std::get<3>(all_selected_negs);
+                auto all_selected_negs = negative_sampler->sample(dst_negs, src_negs, dst_negs_scores, src_negs_scores, chunk_num, num_per_chunk,
+                                                                  selected_negatives_num, has_relations, decoder->use_inverse_relations_);
 
-        if (sampled_dst_negs.defined()) {
-            dst_negs = sampled_dst_negs;
-        }
-        if (sampled_src_negs.defined()) {
-            src_negs = sampled_src_negs;
+                torch::Tensor sampled_dst_negs = std::get<0>(all_selected_negs);
+                torch::Tensor sampled_src_negs = std::get<1>(all_selected_negs);
+                selected_dst_neg_indices = std::get<2>(all_selected_negs);
+                selected_src_neg_indices = std::get<3>(all_selected_negs);
+
+                if (sampled_dst_negs.defined()) {
+                    dst_negs = sampled_dst_negs;
+                }
+                if (sampled_src_negs.defined()) {
+                    src_negs = sampled_src_negs;
+                }
+            }
         }
     }
     if (run_stage_debug) {
         auto now = std::chrono::high_resolution_clock::now();
-        int64_t selected_dst = selected_dst_neg_indices.defined() ? selected_dst_neg_indices.numel() : dst_negs.numel();
-        int64_t selected_src = selected_src_neg_indices.defined() ? selected_src_neg_indices.numel() : src_negs.numel();
+        int64_t tiled_selected_count = static_cast<int64_t>(chunk_num) * num_per_chunk * selected_negatives_num;
+        int64_t selected_dst = selected_dst_neg_indices.defined() ? selected_dst_neg_indices.numel() : (use_tiled_tournament_scores ? tiled_selected_count : dst_negs.numel());
+        int64_t selected_src = selected_src_neg_indices.defined() ? selected_src_neg_indices.numel() : (use_tiled_tournament_scores ? tiled_selected_count : src_negs.numel());
         SPDLOG_INFO("[stage-debug][decoder][batch {}][step 3] neg_sampler ms={:.3f} method={} selected_dst={} selected_src={}",
                     stage_debug_batch_id, elapsed_ms(step_start, now), (int)negative_sampling_method, selected_dst, selected_src);
         step_start = now;
+    }
+
+    torch::Tensor score_dst_chunked_embeddings;
+    torch::Tensor score_src_chunked_embeddings;
+    if (use_tiled_tournament_scores) {
+        score_dst_chunked_embeddings = pad_and_reshape(adjusted_src_embeddings, chunk_num);
+        if (has_relations && decoder->use_inverse_relations_) {
+            score_src_chunked_embeddings = pad_and_reshape(adjusted_dst_embeddings, chunk_num);
+        }
+        if (negative_sampling_method == NegativeSamplingMethod::DNS) {
+            selector_dst_chunked_embeddings = score_dst_chunked_embeddings.detach();
+            if (has_relations && decoder->use_inverse_relations_) {
+                selector_src_chunked_embeddings = score_src_chunked_embeddings.detach();
+            }
+        }
     }
 
     torch::Tensor pos_scores;
     torch::Tensor inv_pos_scores;
     torch::Tensor neg_scores;
     torch::Tensor inv_neg_scores;
-    int64_t csr_debug_batch_id = -1;
-    bool run_csr_debug = should_run_csr_debug(csr_debug_batch_id);
-
     if (run_csr_debug) {
         SPDLOG_INFO("[csr-debug][batch {}] csr_gather_enabled={} use_csr_gather={}", csr_debug_batch_id, csr_gather_enabled(), use_csr_gather);
     }
@@ -685,11 +937,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
         }
         case NegativeSamplingMethod::DNS :
         case NegativeSamplingMethod::GAN : {
-            bool use_fused_dst_scores = can_use_distmult_selected_cuda(decoder, run_csr_debug, adjusted_src_embeddings, dst_neg_embeddings, selected_dst_neg_indices);
+            SelectedNegScoreKind score_kind = selected_neg_score_kind(decoder);
+            bool use_fused_dst_scores = !use_tiled_tournament_scores &&
+                                        can_use_selected_neg_cuda(decoder, run_csr_debug, adjusted_src_embeddings, dst_neg_embeddings, selected_dst_neg_indices);
             torch::Tensor selected_dst_negs_embeddings;
             if (!use_fused_dst_scores) {
-                selected_dst_negs_embeddings =
-                    materialize_selected_negative_embeddings(dst_neg_embeddings, selected_dst_neg_indices, chunk_num, num_per_chunk, selected_negatives_num);
+                if (!use_tiled_tournament_scores) {
+                    selected_dst_negs_embeddings =
+                        materialize_selected_negative_embeddings(dst_neg_embeddings, selected_dst_neg_indices, chunk_num, num_per_chunk, selected_negatives_num);
+                }
                 // SPDLOG_INFO("selected_dst_negs_embeddings dim: {}", selected_dst_negs_embeddings.dim());
                 // SPDLOG_INFO("selected_dst_negs_embeddings size[0]: {}", selected_dst_negs_embeddings.sizes()[0]);  // chunk num
                 // SPDLOG_INFO("selected_dst_negs_embeddings size[1]: {}", selected_dst_negs_embeddings.sizes()[1]);  // num_per_chunk
@@ -697,7 +953,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
                 // SPDLOG_INFO("selected_dst_negs_embeddings size[3]: {}", selected_dst_negs_embeddings.sizes()[3]);  // embedding size
 
 #ifdef GEGE_CUDA
-                if (run_csr_debug && node_embeddings.device().is_cuda()) {
+                if (!use_tiled_tournament_scores && run_csr_debug && node_embeddings.device().is_cuda()) {
                     SPDLOG_INFO("[csr-debug][batch {}][step -1] DNS/GAN branch: start dst reduce validation", csr_debug_batch_id);
                     torch::NoGradGuard no_grad;
                     torch::Tensor dst_selected_ids = gather_selected_negative_ids(dst_neg_candidates, selected_dst_neg_indices);
@@ -711,22 +967,42 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
             if (has_relations) {
                 pos_scores = decoder->compute_scores(adjusted_src_embeddings, dst_embeddings);
 
-                if (use_fused_dst_scores) {
+                if (use_tiled_tournament_scores) {
 #ifdef GEGE_CUDA
-                    neg_scores = distmult_selected_neg_scores(pad_and_reshape(adjusted_src_embeddings, chunk_num), dst_neg_embeddings, selected_dst_neg_indices);
+                    std::tie(neg_scores, selected_dst_neg_indices) = distmult_tiled_tournament_selected_scores(
+                        selector_dst_chunked_embeddings,
+                        selector_dst_neg_embeddings,
+                        score_dst_chunked_embeddings,
+                        dst_neg_embeddings,
+                        selected_negatives_num,
+                        tiled_tournament_groups_per_tile(negative_sampler));
+                    validate_tiled_tournament_scores_once(selector_dst_chunked_embeddings,
+                                                          selector_dst_neg_embeddings,
+                                                          score_dst_chunked_embeddings,
+                                                          dst_neg_embeddings,
+                                                          selected_negatives_num,
+                                                          neg_scores,
+                                                          selected_dst_neg_indices,
+                                                          "dst");
+#endif
+                } else if (use_fused_dst_scores) {
+#ifdef GEGE_CUDA
+                    neg_scores = selected_neg_scores(pad_and_reshape(adjusted_src_embeddings, chunk_num), dst_neg_embeddings, selected_dst_neg_indices, score_kind);
 #endif
                 } else {
                     neg_scores = decoder->compute_scores(adjusted_src_embeddings, selected_dst_negs_embeddings);
                 }
                 if (decoder->use_inverse_relations_) {
                     torch::Tensor selected_src_negs_embeddings;
-                    bool use_fused_src_scores =
-                        can_use_distmult_selected_cuda(decoder, run_csr_debug, adjusted_dst_embeddings, src_neg_embeddings, selected_src_neg_indices);
+                    bool use_fused_src_scores = !use_tiled_tournament_scores &&
+                                                can_use_selected_neg_cuda(decoder, run_csr_debug, adjusted_dst_embeddings, src_neg_embeddings, selected_src_neg_indices);
                     if (!use_fused_src_scores) {
-                        selected_src_negs_embeddings =
-                            materialize_selected_negative_embeddings(src_neg_embeddings, selected_src_neg_indices, chunk_num, num_per_chunk, selected_negatives_num);
+                        if (!use_tiled_tournament_scores) {
+                            selected_src_negs_embeddings =
+                                materialize_selected_negative_embeddings(src_neg_embeddings, selected_src_neg_indices, chunk_num, num_per_chunk, selected_negatives_num);
+                        }
 #ifdef GEGE_CUDA
-                        if (run_csr_debug && node_embeddings.device().is_cuda()) {
+                        if (!use_tiled_tournament_scores && run_csr_debug && node_embeddings.device().is_cuda()) {
                             SPDLOG_INFO("[csr-debug][batch {}][step -1] DNS/GAN branch: start src reduce validation", csr_debug_batch_id);
                             torch::NoGradGuard no_grad;
                             torch::Tensor src_selected_ids = gather_selected_negative_ids(src_neg_candidates, selected_src_neg_indices);
@@ -738,10 +1014,28 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
                     }
                     inv_pos_scores = decoder->compute_scores(adjusted_dst_embeddings, src_embeddings);
 
-                    if (use_fused_src_scores) {
+                    if (use_tiled_tournament_scores) {
 #ifdef GEGE_CUDA
-                        inv_neg_scores =
-                            distmult_selected_neg_scores(pad_and_reshape(adjusted_dst_embeddings, chunk_num), src_neg_embeddings, selected_src_neg_indices);
+                        std::tie(inv_neg_scores, selected_src_neg_indices) = distmult_tiled_tournament_selected_scores(
+                            selector_src_chunked_embeddings,
+                            selector_src_neg_embeddings,
+                            score_src_chunked_embeddings,
+                            src_neg_embeddings,
+                            selected_negatives_num,
+                            tiled_tournament_groups_per_tile(negative_sampler));
+                        validate_tiled_tournament_scores_once(selector_src_chunked_embeddings,
+                                                              selector_src_neg_embeddings,
+                                                              score_src_chunked_embeddings,
+                                                              src_neg_embeddings,
+                                                              selected_negatives_num,
+                                                              inv_neg_scores,
+                                                              selected_src_neg_indices,
+                                                              "src");
+#endif
+                    } else if (use_fused_src_scores) {
+#ifdef GEGE_CUDA
+                        inv_neg_scores = selected_neg_scores(
+                            pad_and_reshape(adjusted_dst_embeddings, chunk_num), src_neg_embeddings, selected_src_neg_indices, score_kind);
 #endif
                     } else {
                         inv_neg_scores = decoder->compute_scores(adjusted_dst_embeddings, selected_src_negs_embeddings);
@@ -750,9 +1044,27 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
             } else {
                 pos_scores = decoder->compute_scores(adjusted_src_embeddings, dst_embeddings);
 
-                if (use_fused_dst_scores) {
+                if (use_tiled_tournament_scores) {
 #ifdef GEGE_CUDA
-                    neg_scores = distmult_selected_neg_scores(pad_and_reshape(adjusted_src_embeddings, chunk_num), dst_neg_embeddings, selected_dst_neg_indices);
+                    std::tie(neg_scores, selected_dst_neg_indices) = distmult_tiled_tournament_selected_scores(
+                        selector_dst_chunked_embeddings,
+                        selector_dst_neg_embeddings,
+                        score_dst_chunked_embeddings,
+                        dst_neg_embeddings,
+                        selected_negatives_num,
+                        tiled_tournament_groups_per_tile(negative_sampler));
+                    validate_tiled_tournament_scores_once(selector_dst_chunked_embeddings,
+                                                          selector_dst_neg_embeddings,
+                                                          score_dst_chunked_embeddings,
+                                                          dst_neg_embeddings,
+                                                          selected_negatives_num,
+                                                          neg_scores,
+                                                          selected_dst_neg_indices,
+                                                          "dst");
+#endif
+                } else if (use_fused_dst_scores) {
+#ifdef GEGE_CUDA
+                    neg_scores = selected_neg_scores(pad_and_reshape(adjusted_src_embeddings, chunk_num), dst_neg_embeddings, selected_dst_neg_indices, score_kind);
 #endif
                 } else {
                     neg_scores = decoder->compute_scores(adjusted_src_embeddings, selected_dst_negs_embeddings);

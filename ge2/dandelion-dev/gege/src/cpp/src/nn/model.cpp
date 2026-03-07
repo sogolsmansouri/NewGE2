@@ -171,7 +171,7 @@ void Model::all_reduce_rel() {
 
 }
 
-void Model::all_reduce() {
+void Model::all_reduce(const std::vector<int64_t> &grad_scales) {
     torch::NoGradGuard no_grad;
     int num_gpus = device_models_.size();
     for (int i = 0; i < named_parameters().keys().size(); i++) {
@@ -185,7 +185,11 @@ void Model::all_reduce() {
                 device_models_[j]->named_parameters()[key].mutable_grad() = torch::zeros_like(device_models_[j]->named_parameters()[key]);
             }
             input_gradients[j] = (device_models_[j]->named_parameters()[key].mutable_grad());
-            input_gradients[j].copy_(input_gradients[j].divide(num_gpus));
+            double grad_scale = static_cast<double>(num_gpus);
+            if (!grad_scales.empty() && j < grad_scales.size()) {
+                grad_scale *= std::max<int64_t>(grad_scales[j], 1);
+            }
+            input_gradients[j].copy_(input_gradients[j].divide(grad_scale));
 
         }
 

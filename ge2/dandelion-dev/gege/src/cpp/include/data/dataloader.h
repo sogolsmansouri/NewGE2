@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <tuple>
@@ -13,6 +14,14 @@
 #include "data/samplers/neighbor.h"
 #include "storage/graph_storage.h"
 #include "storage/storage.h"
+
+struct DataLoaderPerfStats {
+    int64_t swap_barrier_wait_ns = 0;
+    int64_t swap_update_ns = 0;
+    int64_t swap_rebuild_ns = 0;
+    int64_t swap_sync_wait_ns = 0;
+    int64_t swap_count = 0;
+};
 
 class DataLoader {
    public:
@@ -73,6 +82,11 @@ class DataLoader {
     shared_ptr<TrainingConfig> training_config_;
     shared_ptr<EvaluationConfig> evaluation_config_;
     bool only_root_features_;
+    std::atomic<int64_t> swap_barrier_wait_ns_{0};
+    std::atomic<int64_t> swap_update_ns_{0};
+    std::atomic<int64_t> swap_rebuild_ns_{0};
+    std::atomic<int64_t> swap_sync_wait_ns_{0};
+    std::atomic<int64_t> swap_count_{0};
 
     LearningTask learning_task_;
 
@@ -168,6 +182,10 @@ class DataLoader {
      * Notify that the epoch has been completed. Prepares dataset for a new epoch.
      */
     void nextEpoch();
+
+    void resetPerfStats();
+
+    DataLoaderPerfStats getPerfStats() const;
 
     /**
      * Load graph from storage.

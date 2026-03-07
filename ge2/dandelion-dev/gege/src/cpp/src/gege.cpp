@@ -125,11 +125,15 @@ void gege_train(shared_ptr<GegeConfig> gege_config) {
     
     std::vector<torch::Device> devices = devices_from_config(gege_config->storage);
 
-    if (devices.size() == 1) {
+    if (devices.size() == 1 && gege_config->training->dense_sync_batches <= 1) {
         trainer = std::make_shared<SynchronousTrainer>(dataloader, model, gege_config->training->logs_per_epoch);
     } else {
-        // enable multi-gpu synchronous training by the COVER ordering
-        SPDLOG_INFO("SynchronousMultiGPUTrainer");
+        if (devices.size() == 1) {
+            SPDLOG_INFO("SynchronousMultiGPUTrainer single-GPU superstep simulation");
+        } else {
+            // enable multi-gpu synchronous training by the COVER ordering
+            SPDLOG_INFO("SynchronousMultiGPUTrainer");
+        }
         trainer = std::make_shared<SynchronousMultiGPUTrainer>(dataloader, model, gege_config->training->logs_per_epoch);
     }
 

@@ -2,8 +2,9 @@
 
 #include <algorithm>
 #include <random>
-#include <c10/cuda/CUDAStream.h>
-#include <ATen/cuda/CUDAEvent.h>
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
 
 #include "configuration/util.h"
 #include "data/ordering.h"
@@ -539,7 +540,9 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
 
         mapped_edges          = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
         mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
+#ifdef GEGE_CUDA
         c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
 
         mapped_edges = mapped_edges.to(torch::kInt64);
         mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);
@@ -609,7 +612,9 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         performSwap(device_idx);
         auto t2 = std::chrono::high_resolution_clock::now();
         // SPDLOG_INFO("performSwap time {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+#ifdef GEGE_CUDA
         c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
         // SPDLOG_INFO("updateInMemorySubGraph_");
         t1 = std::chrono::high_resolution_clock::now();
         updateInMemorySubGraph_(current_subgraph_states_[device_idx], current_swap_ids, device_idx);
@@ -851,12 +856,16 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     mapped_edges = mapped_edges.to(devices_[device_idx]);
     subgraph->all_in_memory_mapped_edges_ = mapped_edges;
     subgraph->in_memory_subgraph_ = nullptr;
+#ifdef GEGE_CUDA
     c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
 
     mapped_edges = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
     mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
     
+#ifdef GEGE_CUDA
     c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
 
     mapped_edges = mapped_edges.to(torch::kInt64);
     mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);

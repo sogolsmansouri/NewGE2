@@ -2,11 +2,150 @@
 
 #include <unistd.h>
 
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
+#include <mutex>
+#include <sstream>
 
 #include "reporting/logger.h"
+#ifdef GEGE_CUDA
+#include "common/unique_map_cuda.h"
+#endif
+
+namespace {
+
+struct AllIdsBufferCache {
+    torch::Tensor storage;
+    int64_t capacity = 0;
+};
+
+thread_local AllIdsBufferCache all_ids_buffer_cache;
+
+std::string parse_env_string(const char *name, const std::string &default_value = "") {
+    const char *raw = std::getenv(name);
+    return raw == nullptr ? default_value : std::string(raw);
+}
+
+int64_t parse_env_int(const char *name, int64_t default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    try {
+        return std::stoll(std::string(raw));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+const std::string &unique_capture_dir() {
+    static std::string dir = parse_env_string("GEGE_UNIQUE_CAPTURE_DIR");
+    return dir;
+}
+
+int64_t unique_capture_max_batches() {
+    static int64_t max_batches = std::max<int64_t>(parse_env_int("GEGE_UNIQUE_CAPTURE_MAX_BATCHES", 0), 0);
+    return max_batches;
+}
+
+bool unique_capture_enabled() {
+    return !unique_capture_dir().empty() && unique_capture_max_batches() > 0;
+}
+
+std::atomic<int64_t> &unique_capture_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+std::once_flag &unique_capture_dir_once_flag() {
+    static std::once_flag flag;
+    return flag;
+}
+
+std::string capture_unique_input_batch(const torch::Tensor &all_ids) {
+    if (!unique_capture_enabled()) {
+        return "";
+    }
+
+    int64_t capture_idx = unique_capture_counter().fetch_add(1);
+    if (capture_idx >= unique_capture_max_batches()) {
+        return "";
+    }
+
+    std::call_once(unique_capture_dir_once_flag(), []() { std::filesystem::create_directories(unique_capture_dir()); });
+
+    auto cpu_ids = all_ids.detach().to(torch::kCPU).contiguous();
+    std::ostringstream path_builder;
+    path_builder << unique_capture_dir() << "/batch_" << std::setw(6) << std::setfill('0') << capture_idx << "_n" << cpu_ids.numel() << ".pt";
+    std::string capture_path = path_builder.str();
+    torch::save(cpu_ids, capture_path);
+    return capture_path;
+}
+
+void maybe_log_unique_backend_banner(const UniqueMapCudaDebugInfo &debug_info) {
+    static std::once_flag flag;
+    std::call_once(flag, [&debug_info]() {
+        SPDLOG_INFO("[unique-map] requested_backend={} initial_backend={} cuco_compiled={} capture_dir={} capture_max_batches={}",
+                    debug_info.requested_backend, debug_info.executed_backend, debug_info.cuco_compiled, unique_capture_dir(),
+                    unique_capture_max_batches());
+    });
+}
+
+torch::Tensor pack_ids_into_cached_buffer(const std::vector<torch::Tensor> &unmapped_tensors) {
+    if (unmapped_tensors.empty()) {
+        throw GegeRuntimeException("Input tensors must not be empty");
+    }
+
+    auto options = unmapped_tensors.front().options();
+    auto dtype = unmapped_tensors.front().scalar_type();
+    auto device = unmapped_tensors.front().device();
+
+    int64_t total_numel = 0;
+    for (const auto &tensor : unmapped_tensors) {
+        if (tensor.scalar_type() != dtype || tensor.device() != device) {
+            throw GegeRuntimeException("Input tensors must share dtype and device");
+        }
+        total_numel += tensor.numel();
+    }
+
+    if (total_numel == 0) {
+        return torch::empty({0}, options);
+    }
+
+    bool need_new_storage = !all_ids_buffer_cache.storage.defined() || all_ids_buffer_cache.storage.scalar_type() != dtype ||
+                            all_ids_buffer_cache.storage.device() != device || all_ids_buffer_cache.capacity < total_numel;
+    if (need_new_storage) {
+        int64_t next_capacity = total_numel;
+        if (all_ids_buffer_cache.capacity > 0 && all_ids_buffer_cache.storage.defined() &&
+            all_ids_buffer_cache.storage.scalar_type() == dtype && all_ids_buffer_cache.storage.device() == device) {
+            next_capacity = std::max(total_numel, all_ids_buffer_cache.capacity * 2);
+        }
+
+        all_ids_buffer_cache.storage = torch::empty({next_capacity}, options);
+        all_ids_buffer_cache.capacity = next_capacity;
+    }
+
+    torch::Tensor all_ids = all_ids_buffer_cache.storage.narrow(0, 0, total_numel);
+    int64_t offset = 0;
+    for (const auto &tensor : unmapped_tensors) {
+        TORCH_CHECK(tensor.dim() == 1, "Input tensors must be 1D");
+        int64_t tensor_numel = tensor.numel();
+        auto t1d = tensor.is_contiguous() ? tensor : tensor.contiguous();
+        all_ids.narrow(0, offset, tensor_numel).copy_(t1d,true);
+        //all_ids.narrow(0, offset, tensor_numel).copy_(tensor.reshape({tensor_numel}));
+        offset += tensor_numel;
+    }
+
+    return all_ids;
+}
+
+}  // namespace
 
 void assert_no_nans(torch::Tensor values) {
     if (torch::isnan(values).any().item<bool>()) {
@@ -21,8 +160,8 @@ void assert_no_neg(torch::Tensor values) {
 }
 
 void assert_in_range(torch::Tensor values, int64_t start, int64_t end) {
-    if ((values.ge(start) & values.le(end)).any().item<bool>()) {
-        throw GegeRuntimeException("Tensor contains is not in range: " + std::to_string(start) + "-" + std::to_string(end));
+    if ((values.lt(start) | values.gt(end)).any().item<bool>()) {
+        throw GegeRuntimeException("Tensor contains value out of range: ...");
     }
 }
 
@@ -156,28 +295,79 @@ std::string get_directory(std::string filename) {
     return directory;
 }
 
-std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors) {
-    for (auto tensor : unmapped_tensors) {
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted, MapTensorTiming *timing,
+                                                                  int64_t value_domain_size) {
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto step_start = total_start;
+
+    for (const auto &tensor : unmapped_tensors) {
         if (tensor.sizes().size() > 1) {
             throw GegeRuntimeException("Input tensors must be 1D");
         }
     }
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->validate_ms = std::chrono::duration<double, std::milli>(now - step_start).count();
+        step_start = now;
+    }
 
-    torch::Tensor all_ids = torch::cat(unmapped_tensors);
+    torch::Tensor all_ids = pack_ids_into_cached_buffer(unmapped_tensors);
+    std::string capture_path = capture_unique_input_batch(all_ids);
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->cat_ms = std::chrono::duration<double, std::milli>(now - step_start).count();
+        step_start = now;
+    }
 
-    auto unique_tup = torch::_unique2(all_ids, true, true, false);
-
-    torch::Tensor map = std::get<0>(unique_tup);
-    torch::Tensor mapped_all_ids = std::get<1>(unique_tup);
+    torch::Tensor map;
+    torch::Tensor mapped_all_ids;
+    UniqueMapCudaDebugInfo unique_debug_info;
+    unique_debug_info.measure_device_timing = timing != nullptr;
+#ifdef GEGE_CUDA
+    if (all_ids.is_cuda() && all_ids.scalar_type() == torch::kInt64) {
+        auto unique_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &unique_debug_info, value_domain_size);
+        map = std::get<0>(unique_tup);
+        mapped_all_ids = std::get<1>(unique_tup);
+        maybe_log_unique_backend_banner(unique_debug_info);
+    } else {
+        auto unique_tup = torch::_unique2(all_ids, sorted, true, false);
+        map = std::get<0>(unique_tup);
+        mapped_all_ids = std::get<1>(unique_tup);
+    }
+#else
+    auto unique_tup = torch::_unique2(all_ids, sorted, true, false);
+    map = std::get<0>(unique_tup);
+    mapped_all_ids = std::get<1>(unique_tup);
+#endif
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->unique_wall_ms = std::chrono::duration<double, std::milli>(now - step_start).count();
+        timing->unique_ms = unique_debug_info.device_unique_timing_valid ? unique_debug_info.device_unique_ms : timing->unique_wall_ms;
+        timing->unique_requested_backend = unique_debug_info.requested_backend;
+        timing->unique_executed_backend = unique_debug_info.executed_backend;
+        timing->unique_fallback_backend = unique_debug_info.fallback_backend;
+        timing->unique_fallback_reason = unique_debug_info.fallback_reason;
+        timing->capture_path = capture_path;
+        timing->unique_total_calls = unique_debug_info.total_calls;
+        timing->unique_total_fallbacks = unique_debug_info.total_fallbacks;
+        timing->unique_used_fallback = unique_debug_info.used_fallback;
+        timing->unique_cuco_compiled = unique_debug_info.cuco_compiled;
+        step_start = now;
+    }
 
     std::vector<torch::Tensor> mapped_tensors;
 
     int64_t offset = 0;
     int64_t size;
-    for (auto tensor : unmapped_tensors) {
+    for (const auto &tensor : unmapped_tensors) {
         size = tensor.size(0);
         mapped_tensors.emplace_back(mapped_all_ids.narrow(0, offset, size));
         offset += size;
+    }
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->split_ms = std::chrono::duration<double, std::milli>(now - step_start).count();
+        timing->total_ms = std::chrono::duration<double, std::milli>(now - total_start).count();
     }
 
     return std::forward_as_tuple(map, mapped_tensors);

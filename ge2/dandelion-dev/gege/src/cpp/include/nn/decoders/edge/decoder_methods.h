@@ -22,7 +22,8 @@ std::tuple<torch::Tensor, torch::Tensor> prepare_pos_embeddings(shared_ptr<EdgeD
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_corrupt_forward(NegativeSamplingMethod negative_sampling_method, float negative_sampling_selected_ratio,
                                                                                                 shared_ptr<NegativeSampler> negative_sampler, shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
-                                                                                                torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor node_embeddings_g);
+                                                                                                torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
+                                                                                                torch::Tensor node_embeddings_g);
 
 std::tuple<torch::Tensor, torch::Tensor> get_rewards(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs);
 

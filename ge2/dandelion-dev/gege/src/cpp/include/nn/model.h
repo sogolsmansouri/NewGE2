@@ -56,7 +56,7 @@ class Model : public torch::nn::Module {
 
     void broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig> model_config);
 
-    void all_reduce();
+    void all_reduce(const std::vector<int64_t> &grad_scales = {});
 
     void all_reduce_rel();
 

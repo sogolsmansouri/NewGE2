@@ -82,6 +82,9 @@ struct NegativeSamplingConfig {
     float degree_fraction;
     bool filtered;
     LocalFilterMode local_filter_mode;
+    bool tournament_selection;
+    bool tiled_tournament_scores;
+    int tiled_tournament_groups_per_tile;
 };
 
 struct CheckpointConfig {
@@ -121,6 +124,7 @@ struct TrainingConfig {
     int batch_size;
     NegativeSamplingMethod negative_sampling_method;
     float negative_sampling_selected_ratio;
+    int dense_sync_batches;
     shared_ptr<NegativeSamplingConfig> negative_sampling = nullptr;
     int num_epochs;
     int epochs_per_shuffle;

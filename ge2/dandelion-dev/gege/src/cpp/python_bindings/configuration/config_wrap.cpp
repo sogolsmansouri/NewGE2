@@ -72,7 +72,10 @@ void init_config(py::module &m) {
         .def_readwrite("num_chunks", &NegativeSamplingConfig::num_chunks)
         .def_readwrite("negatives_per_positive", &NegativeSamplingConfig::negatives_per_positive)
         .def_readwrite("degree_fraction", &NegativeSamplingConfig::degree_fraction)
-        .def_readwrite("filtered", &NegativeSamplingConfig::filtered);
+        .def_readwrite("filtered", &NegativeSamplingConfig::filtered)
+        .def_readwrite("tournament_selection", &NegativeSamplingConfig::tournament_selection)
+        .def_readwrite("tiled_tournament_scores", &NegativeSamplingConfig::tiled_tournament_scores)
+        .def_readwrite("tiled_tournament_groups_per_tile", &NegativeSamplingConfig::tiled_tournament_groups_per_tile);
 
     py::class_<CheckpointConfig, std::shared_ptr<CheckpointConfig>>(m, "CheckpointConfig")
         .def(py::init<>())
@@ -110,6 +113,7 @@ void init_config(py::module &m) {
         .def_readwrite("batch_size", &TrainingConfig::batch_size)
         .def_readwrite("negative_sampling_method", &TrainingConfig::negative_sampling_method)
         .def_readwrite("negative_sampling_selected_ratio", &TrainingConfig::negative_sampling_selected_ratio)
+        .def_readwrite("dense_sync_batches", &TrainingConfig::dense_sync_batches)
         .def_readwrite("negative_sampling", &TrainingConfig::negative_sampling)
         .def_readwrite("num_epochs", &TrainingConfig::num_epochs)
         .def_readwrite("epochs_per_shuffle", &TrainingConfig::epochs_per_shuffle)

@@ -607,6 +607,9 @@ class NegativeSamplingConfig:
     degree_fraction: float = 0
     filtered: bool = False
     local_filter_mode: str = "DEG"
+    tournament_selection: bool = False
+    tiled_tournament_scores: bool = False
+    tiled_tournament_groups_per_tile: int = 64
 
     def __post_init__(self):
         # for filtered mrr, the sampling class members should be ignored
@@ -616,6 +619,8 @@ class NegativeSamplingConfig:
             raise ValueError("negatives_per_positive must be positive or -1 if using all nodes")
         if self.degree_fraction < 0:
             raise ValueError("degree_fraction must not be negative")
+        if self.tiled_tournament_groups_per_tile <= 0:
+            raise ValueError("tiled_tournament_groups_per_tile must be positive")
 
     def merge(self, input_config: DictConfig):
         """
@@ -638,6 +643,15 @@ class NegativeSamplingConfig:
 
         if "local_filter_mode" in input_config.keys():
             self.local_filter_mode = input_config.local_filter_mode
+
+        if "tournament_selection" in input_config.keys():
+            self.tournament_selection = input_config.tournament_selection
+
+        if "tiled_tournament_scores" in input_config.keys():
+            self.tiled_tournament_scores = input_config.tiled_tournament_scores
+
+        if "tiled_tournament_groups_per_tile" in input_config.keys():
+            self.tiled_tournament_groups_per_tile = input_config.tiled_tournament_groups_per_tile
 
         self.__post_init__()
 
@@ -670,6 +684,7 @@ class TrainingConfig:
     batch_size: int = 1000
     negative_sampling_method: str = "RNS"
     negative_sampling_selected_ratio: float = 1
+    dense_sync_batches: int = 1
     negative_sampling: NegativeSamplingConfig = MISSING
     num_epochs: int = 10
     epochs_per_shuffle: int = 1
@@ -682,6 +697,8 @@ class TrainingConfig:
     def __post_init__(self):
         if self.batch_size <= 0:
             raise ValueError("batch_size must be positive")
+        if self.dense_sync_batches <= 0:
+            raise ValueError("dense_sync_batches must be positive")
         if self.num_epochs <= 0:
             raise ValueError("num_epochs must be positive")
         if self.epochs_per_shuffle <= 0:

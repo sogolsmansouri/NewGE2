@@ -364,11 +364,17 @@ shared_ptr<NegativeSamplingConfig> initNegativeSamplingConfig(pyobj python_confi
         ret_config->num_chunks = cast_helper<int>(python_config.attr("num_chunks"));
         ret_config->degree_fraction = cast_helper<float>(python_config.attr("degree_fraction"));
         ret_config->local_filter_mode = getLocalFilterMode(cast_helper<std::string>(python_config.attr("local_filter_mode")));
+        ret_config->tournament_selection = cast_helper<bool>(python_config.attr("tournament_selection"));
+        ret_config->tiled_tournament_scores = cast_helper<bool>(python_config.attr("tiled_tournament_scores"));
+        ret_config->tiled_tournament_groups_per_tile = cast_helper<int>(python_config.attr("tiled_tournament_groups_per_tile"));
     } else {
         ret_config->num_chunks = 1;
         ret_config->degree_fraction = 0.0;
         ret_config->negatives_per_positive = -1;  // This is set to the proper value by the graph_batcher
         ret_config->local_filter_mode = LocalFilterMode::DEG;
+        ret_config->tournament_selection = false;
+        ret_config->tiled_tournament_scores = false;
+        ret_config->tiled_tournament_groups_per_tile = 64;
     }
 
     return ret_config;
@@ -440,6 +446,7 @@ shared_ptr<TrainingConfig> initTrainingConfig(pyobj python_config) {
     ret_config->batch_size = cast_helper<int>(python_config.attr("batch_size"));
     ret_config->negative_sampling_method = getNegativeSamplingMethod(cast_helper<std::string>(python_config.attr("negative_sampling_method")));
     ret_config->negative_sampling_selected_ratio = cast_helper<float>(python_config.attr("negative_sampling_selected_ratio"));
+    ret_config->dense_sync_batches = cast_helper<int>(python_config.attr("dense_sync_batches"));
     ret_config->negative_sampling = initNegativeSamplingConfig(python_config.attr("negative_sampling"));
     ret_config->logs_per_epoch = cast_helper<int>(python_config.attr("logs_per_epoch"));
     ret_config->num_epochs = cast_helper<int>(python_config.attr("num_epochs"));

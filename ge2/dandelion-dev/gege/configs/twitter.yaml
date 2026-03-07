@@ -37,7 +37,10 @@ training:
     negatives_per_positive: 1000
     degree_fraction: 0.0
     filtered: false
-  num_epochs: 25
+    tournament_selection: false
+    tiled_tournament_scores: false
+    tiled_tournament_groups_per_tile: 64
+  num_epochs: 2
   epochs_per_shuffle: 1
 evaluation:
   batch_size: 1000

@@ -368,12 +368,16 @@ std::tuple<torch::Tensor, torch::Tensor> CorruptNodeNegativeSampler::getNegative
     return std::forward_as_tuple(output_ids, score_filter);
 }
 
-NegativeSamplingBase::NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered, LocalFilterMode local_filter_mode) {
+NegativeSamplingBase::NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered, LocalFilterMode local_filter_mode,
+                                           bool tournament_selection, bool tiled_tournament_scores, int tiled_tournament_groups_per_tile) {
     num_chunks_ = num_chunks;
     num_negatives_ = num_negatives;
     degree_fraction_ = degree_fraction;
     filtered_ = filtered;
     local_filter_mode_ = local_filter_mode;
+    tournament_selection_ = tournament_selection;
+    tiled_tournament_scores_ = tiled_tournament_scores;
+    tiled_tournament_groups_per_tile_ = tiled_tournament_groups_per_tile;
 
     if (filtered_) {
         num_chunks_ = 1;

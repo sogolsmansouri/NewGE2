@@ -1,6 +1,53 @@
 #pragma once
 
+#include <cstdlib>
+#include <limits>
+#include <string>
+
 #include "storage/graph_storage.h"
+
+inline bool parse_negative_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+    return default_value;
+}
+
+inline bool negative_tournament_env_enabled() {
+    static bool enabled = parse_negative_env_flag("GEGE_NEGATIVE_TOURNAMENT", false);
+    return enabled;
+}
+
+inline torch::Tensor tournament_select_indices(torch::Tensor scores, int selected_negatives_num, bool use_tournament_selection) {
+    if (!scores.defined()) {
+        return torch::Tensor();
+    }
+
+    int64_t negatives_num = scores.size(2);
+    bool enabled = use_tournament_selection || negative_tournament_env_enabled();
+    if (!enabled || selected_negatives_num <= 0 || selected_negatives_num >= negatives_num ||
+        negatives_num % selected_negatives_num != 0) {
+        auto results = scores.topk(selected_negatives_num, 2, true, false);
+        return std::get<1>(results);
+    }
+
+    int64_t tournament_size = negatives_num / selected_negatives_num;
+    torch::Tensor grouped_scores = scores.reshape({scores.size(0), scores.size(1), selected_negatives_num, tournament_size});
+    auto grouped_results = grouped_scores.max(3);
+    torch::Tensor local_indices = std::get<1>(grouped_results).to(torch::kInt64);
+    auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(scores.device());
+    torch::Tensor offsets = torch::arange(selected_negatives_num, idx_opts).view({1, 1, selected_negatives_num}) * tournament_size;
+    return local_indices + offsets;
+}
 
 std::tuple<torch::Tensor, torch::Tensor> batch_sample(torch::Tensor edges, int num_negatives, bool inverse = false);
 
@@ -51,6 +98,7 @@ class NegativeSampler {
         SPDLOG_INFO("NegativeSampling: sample needs override");
         return std::forward_as_tuple(torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor());
     }
+
 };
 
 class CorruptNodeNegativeSampler : public NegativeSampler {
@@ -96,16 +144,24 @@ class NegativeSamplingBase : public NegativeSampler {
     float degree_fraction_;
     bool filtered_;
     LocalFilterMode local_filter_mode_;
+    bool tournament_selection_;
+    bool tiled_tournament_scores_;
+    int tiled_tournament_groups_per_tile_;
 
-    NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG);
+    NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false,
+                         LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false,
+                         bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64);
 
     std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(), bool inverse = false) override;
 };
 
 class RNS : public NegativeSamplingBase {
    public:
-    RNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG)
-       : NegativeSamplingBase(num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode) {
+    RNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG,
+        bool tournament_selection = false, bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64)
+       : NegativeSamplingBase(
+             num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode, tournament_selection, tiled_tournament_scores,
+             tiled_tournament_groups_per_tile) {
            SPDLOG_INFO("NegativeSampling: Used RNS");
     }
 
@@ -126,8 +182,11 @@ class RNS : public NegativeSamplingBase {
 
 class DNS : public NegativeSamplingBase {
    public:
-    DNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG)
-       : NegativeSamplingBase(num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode) {
+    DNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG,
+        bool tournament_selection = false, bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64)
+       : NegativeSamplingBase(
+             num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode, tournament_selection, tiled_tournament_scores,
+             tiled_tournament_groups_per_tile) {
            SPDLOG_INFO("NegativeSampling: Used DNS");
     }
 
@@ -161,13 +220,11 @@ class DNS : public NegativeSamplingBase {
         torch::Tensor dst_results_indices;
         torch::Tensor src_results_indices;
 
-        auto dst_results = dst_negs_scores.topk(selected_negatives_num, 2, true, false);
-        dst_results_indices = std::get<1>(dst_results);  // chunk_num x num_per_chunk x  selected_negatives_num
+        dst_results_indices = tournament_select_indices(dst_negs_scores, selected_negatives_num, tournament_selection_);
         dst_results_indices = dst_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
 
         if (has_relations && use_inverse_relations) {
-            auto src_results = src_negs_scores.topk(selected_negatives_num, 2, true, false);
-            src_results_indices = std::get<1>(src_results);
+            src_results_indices = tournament_select_indices(src_negs_scores, selected_negatives_num, tournament_selection_);
             src_results_indices = src_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
         }
 
@@ -177,8 +234,11 @@ class DNS : public NegativeSamplingBase {
 
 class KBGAN : public NegativeSamplingBase {
    public:
-    KBGAN(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG)
-       : NegativeSamplingBase(num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode) {
+    KBGAN(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG,
+          bool tournament_selection = false, bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64)
+       : NegativeSamplingBase(
+             num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode, tournament_selection, tiled_tournament_scores,
+             tiled_tournament_groups_per_tile) {
            SPDLOG_INFO("NegativeSampling: Used KBGAN");
     }
 
@@ -212,13 +272,11 @@ class KBGAN : public NegativeSamplingBase {
         torch::Tensor dst_results_indices;
         torch::Tensor src_results_indices;
 
-        auto dst_results = dst_negs_scores.topk(selected_negatives_num, 2, true, false);
-        dst_results_indices = std::get<1>(dst_results);  // chunk_num x num_per_chunk x  selected_negatives_num
+        dst_results_indices = tournament_select_indices(dst_negs_scores, selected_negatives_num, tournament_selection_);
         dst_results_indices = dst_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
 
         if (has_relations && use_inverse_relations) {
-            auto src_results = src_negs_scores.topk(selected_negatives_num, 2, true, false);
-            src_results_indices = std::get<1>(src_results);
+            src_results_indices = tournament_select_indices(src_negs_scores, selected_negatives_num, tournament_selection_);
             src_results_indices = src_results_indices.view({chunk_num, num_per_chunk * selected_negatives_num});
         }
 

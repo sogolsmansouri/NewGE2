@@ -1,5 +1,20 @@
 #include "data/samplers/negative.h"
 
+namespace {
+
+std::string planned_uniform_cache_key(const torch::Device &device, int64_t num_nodes, int num_chunks, int num_uniform) {
+    std::string key = device.str();
+    key += "|";
+    key += std::to_string(num_nodes);
+    key += "|";
+    key += std::to_string(num_chunks);
+    key += "|";
+    key += std::to_string(num_uniform);
+    return key;
+}
+
+}  // namespace
+
 std::tuple<torch::Tensor, torch::Tensor> batch_sample(torch::Tensor edges, int num_negatives, bool inverse, int64_t idx) {
     auto device = edges.device();
     int64_t batch_size = edges.size(0);
@@ -368,11 +383,13 @@ std::tuple<torch::Tensor, torch::Tensor> CorruptNodeNegativeSampler::getNegative
     return std::forward_as_tuple(output_ids, score_filter);
 }
 
-NegativeSamplingBase::NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered, LocalFilterMode local_filter_mode,
-                                           bool tournament_selection, bool tiled_tournament_scores, int tiled_tournament_groups_per_tile) {
+NegativeSamplingBase::NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered,
+                                           int superbatch_negative_plan_batches, LocalFilterMode local_filter_mode, bool tournament_selection,
+                                           bool tiled_tournament_scores, int tiled_tournament_groups_per_tile) {
     num_chunks_ = num_chunks;
     num_negatives_ = num_negatives;
     degree_fraction_ = degree_fraction;
+    superbatch_negative_plan_batches_ = superbatch_negative_plan_batches;
     filtered_ = filtered;
     local_filter_mode_ = local_filter_mode;
     tournament_selection_ = tournament_selection;
@@ -386,6 +403,12 @@ NegativeSamplingBase::NegativeSamplingBase(int num_chunks, int num_negatives, fl
     }
 }
 
+void NegativeSamplingBase::resetPlanCache() {
+    std::lock_guard<std::mutex> lock(plan_mutex_);
+    planned_uniform_negatives_[0].clear();
+    planned_uniform_negatives_[1].clear();
+}
+
 std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges, bool inverse) {
     vector<Indices> ret_indices(num_chunks_);
     vector<Indices> deg_sample_indices_vec(num_chunks_);
@@ -395,11 +418,25 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
     int num_batch = (int)(num_negatives_ * degree_fraction_);
     int num_uni = num_negatives_ - num_batch;
     torch::TensorOptions ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
+    torch::Tensor planned_uniform_ids;
+    if (num_negatives_ != -1 && num_uni > 0 && superbatch_negative_plan_batches_ > 0) {
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        auto &queue = planned_uniform_negatives_[inverse ? 1 : 0][planned_uniform_cache_key(edges.device(), num_nodes, num_chunks_, num_uni)];
+        while ((int)queue.size() < superbatch_negative_plan_batches_) {
+            queue.emplace_back(torch::randint(num_nodes, {num_chunks_, num_uni}, ind_opts));
+        }
+        planned_uniform_ids = queue.front();
+        queue.pop_front();
+    }
 
     // sample uniform nodes
     for (int j = 0; j < num_chunks_; j++) {
         if (num_negatives_ != -1) {
-            ret_indices[j] = torch::randint(num_nodes, {num_uni}, ind_opts);
+            if (planned_uniform_ids.defined()) {
+                ret_indices[j] = planned_uniform_ids[j];
+            } else {
+                ret_indices[j] = torch::randint(num_nodes, {num_uni}, ind_opts);
+            }
 
             if (degree_fraction_ > 0) {
                 auto tup = batch_sample(edges, num_batch, inverse, j);

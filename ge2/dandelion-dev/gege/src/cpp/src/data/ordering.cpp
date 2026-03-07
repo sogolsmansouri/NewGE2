@@ -3,13 +3,21 @@
 #include "reporting/logger.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <limits>
 #include <numeric>
+#include <unordered_map>
 
 #ifdef GEGE_OMP
 #include "omp.h"
 #endif
 
 namespace {
+
+struct StateAccessSummary {
+    std::vector<int64_t> partitions;
+    std::unordered_map<int64_t, int64_t> incident_bucket_counts;
+};
 
 std::vector<int64_t> tensor_to_partitions(torch::Tensor tensor) {
     tensor = tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
@@ -105,6 +113,413 @@ bool search_disjoint_groups(const std::vector<std::vector<bool>> &compatible, co
 
     std::vector<int64_t> current_group = {anchor};
     return search_group_members(compatible, remaining, active_devices, target_group_size, candidates, current_group, groups);
+}
+
+std::vector<std::vector<int64_t>> build_disjoint_groups(const vector<torch::Tensor> &buffer_states, int active_devices) {
+    std::vector<std::vector<int64_t>> groups;
+    if (active_devices <= 1 || buffer_states.size() <= 1) {
+        groups.reserve(buffer_states.size());
+        for (std::size_t i = 0; i < buffer_states.size(); i++) {
+            groups.push_back({static_cast<int64_t>(i)});
+        }
+        return groups;
+    }
+
+    std::vector<std::vector<int64_t>> state_partitions;
+    state_partitions.reserve(buffer_states.size());
+    for (auto &state : buffer_states) {
+        state_partitions.emplace_back(tensor_to_partitions(state));
+    }
+
+    std::vector<std::vector<bool>> compatible(buffer_states.size(), std::vector<bool>(buffer_states.size(), false));
+    for (std::size_t i = 0; i < buffer_states.size(); i++) {
+        compatible[i][i] = true;
+        for (std::size_t j = i + 1; j < buffer_states.size(); j++) {
+            bool disjoint = states_disjoint(state_partitions[i], state_partitions[j]);
+            compatible[i][j] = disjoint;
+            compatible[j][i] = disjoint;
+        }
+    }
+
+    std::vector<int64_t> remaining(buffer_states.size());
+    std::iota(remaining.begin(), remaining.end(), 0);
+    if (!search_disjoint_groups(compatible, remaining, active_devices, groups)) {
+        groups.clear();
+        groups.reserve(buffer_states.size());
+        for (std::size_t i = 0; i < buffer_states.size(); i++) {
+            groups.push_back({static_cast<int64_t>(i)});
+        }
+    }
+
+    return groups;
+}
+
+std::vector<StateAccessSummary> build_state_access_summaries(const vector<torch::Tensor> &buffer_states,
+                                                             const vector<torch::Tensor> &edge_buckets_per_buffer) {
+    std::vector<StateAccessSummary> summaries(buffer_states.size());
+    for (std::size_t i = 0; i < buffer_states.size(); i++) {
+        auto partitions = tensor_to_partitions(buffer_states[i]);
+        std::sort(partitions.begin(), partitions.end());
+        summaries[i].partitions = std::move(partitions);
+
+        if (i >= edge_buckets_per_buffer.size()) {
+            continue;
+        }
+
+        auto edge_buckets = edge_buckets_per_buffer[i].to(torch::kCPU).to(torch::kInt64).contiguous();
+        if (!edge_buckets.defined() || edge_buckets.numel() == 0) {
+            continue;
+        }
+        auto accessor = edge_buckets.accessor<int64_t, 2>();
+        for (int64_t row = 0; row < edge_buckets.size(0); row++) {
+            summaries[i].incident_bucket_counts[accessor[row][0]]++;
+            summaries[i].incident_bucket_counts[accessor[row][1]]++;
+        }
+    }
+    return summaries;
+}
+
+int64_t state_access_overlap_score(const StateAccessSummary &lhs, const StateAccessSummary &rhs) {
+    std::size_t i = 0;
+    std::size_t j = 0;
+    int64_t score = 0;
+    while (i < lhs.partitions.size() && j < rhs.partitions.size()) {
+        if (lhs.partitions[i] == rhs.partitions[j]) {
+            int64_t partition_id = lhs.partitions[i];
+            auto lhs_it = lhs.incident_bucket_counts.find(partition_id);
+            auto rhs_it = rhs.incident_bucket_counts.find(partition_id);
+            int64_t lhs_incident = lhs_it == lhs.incident_bucket_counts.end() ? 0 : lhs_it->second;
+            int64_t rhs_incident = rhs_it == rhs.incident_bucket_counts.end() ? 0 : rhs_it->second;
+            score += 1000 + std::min(lhs_incident, rhs_incident);
+            i++;
+            j++;
+        } else if (lhs.partitions[i] < rhs.partitions[j]) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    return score;
+}
+
+struct GroupAlignmentResult {
+    int64_t score = std::numeric_limits<int64_t>::min();
+    std::vector<int64_t> ordered_group;
+};
+
+void search_best_group_alignment(const std::vector<int64_t> &prev_group,
+                                 const std::vector<int64_t> &candidate_group,
+                                 const std::vector<StateAccessSummary> &summaries,
+                                 std::vector<bool> &used,
+                                 std::vector<int64_t> &current,
+                                 std::size_t slot,
+                                 int64_t current_score,
+                                 GroupAlignmentResult &best) {
+    std::size_t target = std::min(prev_group.size(), candidate_group.size());
+    if (slot == target) {
+        std::vector<int64_t> ordered = current;
+        for (auto candidate_state : candidate_group) {
+            if (std::find(ordered.begin(), ordered.end(), candidate_state) == ordered.end()) {
+                ordered.emplace_back(candidate_state);
+            }
+        }
+        if (current_score > best.score || (current_score == best.score && ordered < best.ordered_group)) {
+            best.score = current_score;
+            best.ordered_group = std::move(ordered);
+        }
+        return;
+    }
+
+    for (std::size_t i = 0; i < candidate_group.size(); i++) {
+        if (used[i]) {
+            continue;
+        }
+        used[i] = true;
+        int64_t candidate_state = candidate_group[i];
+        current.emplace_back(candidate_state);
+        int64_t step_score = state_access_overlap_score(summaries[prev_group[slot]], summaries[candidate_state]);
+        search_best_group_alignment(prev_group, candidate_group, summaries, used, current, slot + 1, current_score + step_score, best);
+        current.pop_back();
+        used[i] = false;
+    }
+}
+
+GroupAlignmentResult get_best_group_alignment(const std::vector<int64_t> &prev_group,
+                                              const std::vector<int64_t> &candidate_group,
+                                              const std::vector<StateAccessSummary> &summaries) {
+    GroupAlignmentResult result;
+    if (candidate_group.empty()) {
+        result.score = 0;
+        return result;
+    }
+    if (prev_group.empty()) {
+        result.score = 0;
+        result.ordered_group = candidate_group;
+        return result;
+    }
+
+    std::vector<bool> used(candidate_group.size(), false);
+    std::vector<int64_t> current;
+    current.reserve(candidate_group.size());
+    search_best_group_alignment(prev_group, candidate_group, summaries, used, current, 0, 0, result);
+    if (result.score == std::numeric_limits<int64_t>::min()) {
+        result.score = 0;
+        result.ordered_group = candidate_group;
+    }
+    return result;
+}
+
+struct GroupSearchResult {
+    int64_t score = std::numeric_limits<int64_t>::min();
+    std::vector<int64_t> ordered_group;
+    std::vector<int64_t> chosen_states;
+};
+
+void search_best_disjoint_group(const std::vector<std::vector<bool>> &compatible,
+                                const std::vector<int64_t> &remaining,
+                                const std::vector<int64_t> &prev_group,
+                                const std::vector<StateAccessSummary> &summaries,
+                                int target_group_size,
+                                std::size_t start_idx,
+                                std::vector<int64_t> &current_group,
+                                GroupSearchResult &best) {
+    if (current_group.size() == static_cast<std::size_t>(target_group_size)) {
+        GroupSearchResult candidate;
+        candidate.chosen_states = current_group;
+        if (prev_group.empty()) {
+            int64_t score = 0;
+            for (auto remaining_state : remaining) {
+                if (std::find(current_group.begin(), current_group.end(), remaining_state) != current_group.end()) {
+                    continue;
+                }
+                int64_t best_overlap = 0;
+                for (auto group_state : current_group) {
+                    best_overlap = std::max(best_overlap, state_access_overlap_score(summaries[group_state], summaries[remaining_state]));
+                }
+                score += best_overlap;
+            }
+            candidate.score = score;
+            candidate.ordered_group = current_group;
+        } else {
+            auto alignment = get_best_group_alignment(prev_group, current_group, summaries);
+            candidate.score = alignment.score;
+            candidate.ordered_group = std::move(alignment.ordered_group);
+        }
+
+        if (candidate.score > best.score || (candidate.score == best.score && candidate.ordered_group < best.ordered_group)) {
+            best = std::move(candidate);
+        }
+        return;
+    }
+
+    for (std::size_t i = start_idx; i < remaining.size(); i++) {
+        int64_t candidate_state = remaining[i];
+        bool valid = true;
+        for (auto chosen_state : current_group) {
+            if (!compatible[candidate_state][chosen_state]) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            continue;
+        }
+        current_group.emplace_back(candidate_state);
+        search_best_disjoint_group(compatible, remaining, prev_group, summaries, target_group_size, i + 1, current_group, best);
+        current_group.pop_back();
+    }
+}
+
+struct AccessAwareGeneratedState {
+    std::vector<int> partitions;
+    std::vector<std::pair<int, int>> newly_covered_buckets;
+};
+
+struct AccessAwareGroupSearch {
+    int64_t score = std::numeric_limits<int64_t>::min();
+    std::vector<AccessAwareGeneratedState> states;
+};
+
+int64_t partition_overlap_count(const std::vector<int> &lhs, const std::vector<int> &rhs) {
+    int64_t overlap = 0;
+    for (auto left_part : lhs) {
+        for (auto right_part : rhs) {
+            if (left_part == right_part) {
+                overlap++;
+            }
+        }
+    }
+    return overlap;
+}
+
+std::vector<int> sorted_partitions_from_mask(uint64_t mask, int num_partitions) {
+    std::vector<int> partitions;
+    for (int part = 0; part < num_partitions; part++) {
+        if (((mask >> part) & 1ULL) != 0ULL) {
+            partitions.emplace_back(part);
+        }
+    }
+    return partitions;
+}
+
+AccessAwareGeneratedState build_generated_state(uint64_t mask, const std::vector<bool> &uncovered, int num_partitions) {
+    AccessAwareGeneratedState state;
+    state.partitions = sorted_partitions_from_mask(mask, num_partitions);
+    for (auto src_part : state.partitions) {
+        for (auto dst_part : state.partitions) {
+            int bucket_idx = src_part * num_partitions + dst_part;
+            if (uncovered[bucket_idx]) {
+                state.newly_covered_buckets.emplace_back(src_part, dst_part);
+            }
+        }
+    }
+    return state;
+}
+
+int64_t state_new_bucket_gain(uint64_t mask, const std::vector<bool> &uncovered, int num_partitions) {
+    int64_t gain = 0;
+    for (int src_part = 0; src_part < num_partitions; src_part++) {
+        if (((mask >> src_part) & 1ULL) == 0ULL) {
+            continue;
+        }
+        for (int dst_part = 0; dst_part < num_partitions; dst_part++) {
+            if (((mask >> dst_part) & 1ULL) == 0ULL) {
+                continue;
+            }
+            gain += uncovered[src_part * num_partitions + dst_part] ? 1 : 0;
+        }
+    }
+    return gain;
+}
+
+int64_t group_new_bucket_gain(const std::vector<uint64_t> &group_masks, const std::vector<bool> &uncovered, int num_partitions) {
+    int64_t gain = 0;
+    for (auto mask : group_masks) {
+        gain += state_new_bucket_gain(mask, uncovered, num_partitions);
+    }
+    return gain;
+}
+
+void search_access_aware_groups(uint64_t available_mask, int num_partitions, int buffer_capacity,
+                                const std::vector<bool> &uncovered, const std::vector<std::vector<int>> &prev_group,
+                                std::vector<uint64_t> &current_group, AccessAwareGroupSearch &best) {
+    int remaining_partitions = static_cast<int>(__builtin_popcountll(available_mask));
+    if (remaining_partitions == 0) {
+        AccessAwareGroupSearch candidate;
+        std::vector<std::vector<int>> current_partitions;
+        current_partitions.reserve(current_group.size());
+        for (auto mask : current_group) {
+            current_partitions.emplace_back(sorted_partitions_from_mask(mask, num_partitions));
+        }
+
+        int64_t coverage_gain = group_new_bucket_gain(current_group, uncovered, num_partitions);
+        int64_t overlap_gain = 0;
+        if (!prev_group.empty() && prev_group.size() == current_partitions.size()) {
+            for (std::size_t lane = 0; lane < current_partitions.size(); lane++) {
+                overlap_gain += partition_overlap_count(prev_group[lane], current_partitions[lane]);
+            }
+        }
+
+        // Coverage dominates; overlap breaks ties toward better locality.
+        candidate.score = coverage_gain * 100 + overlap_gain * 7;
+        for (auto mask : current_group) {
+            candidate.states.emplace_back(build_generated_state(mask, uncovered, num_partitions));
+        }
+        if (candidate.score > best.score) {
+            best = std::move(candidate);
+        }
+        return;
+    }
+
+    if (remaining_partitions < buffer_capacity) {
+        return;
+    }
+
+    int anchor = 0;
+    while (((available_mask >> anchor) & 1ULL) == 0ULL) {
+        anchor++;
+    }
+
+    std::vector<int> rest;
+    rest.reserve(remaining_partitions - 1);
+    for (int part = anchor + 1; part < num_partitions; part++) {
+        if (((available_mask >> part) & 1ULL) != 0ULL) {
+            rest.emplace_back(part);
+        }
+    }
+
+    for (std::size_t i = 0; i < rest.size(); i++) {
+        for (std::size_t j = i + 1; j < rest.size(); j++) {
+            for (std::size_t k = j + 1; k < rest.size(); k++) {
+                uint64_t state_mask = (1ULL << anchor) | (1ULL << rest[i]) | (1ULL << rest[j]) | (1ULL << rest[k]);
+                current_group.emplace_back(state_mask);
+                search_access_aware_groups(available_mask & ~state_mask, num_partitions, buffer_capacity, uncovered, prev_group, current_group, best);
+                current_group.pop_back();
+            }
+        }
+    }
+}
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> generate_access_aware_states(int num_partitions, int buffer_capacity, int active_devices) {
+    if (buffer_capacity != 4 || active_devices <= 1 || active_devices * buffer_capacity != num_partitions || num_partitions > 63) {
+        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+    }
+
+    const int total_buckets = num_partitions * num_partitions;
+    std::vector<bool> uncovered(total_buckets, true);
+    int uncovered_count = total_buckets;
+
+    std::vector<std::vector<int>> prev_group;
+    std::vector<std::vector<int>> buffer_states;
+    std::vector<std::vector<std::pair<int, int>>> edge_buckets_per_buffer;
+
+    int superstep = 0;
+    const int max_supersteps = total_buckets;
+    while (uncovered_count > 0 && superstep < max_supersteps) {
+        AccessAwareGroupSearch best_group;
+        std::vector<uint64_t> current_group;
+        current_group.reserve(active_devices);
+        const uint64_t all_partitions_mask = (1ULL << num_partitions) - 1ULL;
+        search_access_aware_groups(all_partitions_mask, num_partitions, buffer_capacity, uncovered, prev_group, current_group, best_group);
+
+        if (best_group.states.empty()) {
+            break;
+        }
+
+        int64_t covered_this_step = 0;
+        std::vector<std::vector<int>> current_partitions;
+        current_partitions.reserve(best_group.states.size());
+        for (auto &state : best_group.states) {
+            current_partitions.emplace_back(state.partitions.begin(), state.partitions.end());
+            buffer_states.emplace_back(state.partitions.begin(), state.partitions.end());
+            edge_buckets_per_buffer.emplace_back();
+            auto &assigned = edge_buckets_per_buffer.back();
+            assigned.reserve(state.newly_covered_buckets.size());
+            for (auto &bucket : state.newly_covered_buckets) {
+                int bucket_idx = bucket.first * num_partitions + bucket.second;
+                if (!uncovered[bucket_idx]) {
+                    continue;
+                }
+                uncovered[bucket_idx] = false;
+                uncovered_count--;
+                covered_this_step++;
+                assigned.emplace_back(bucket);
+            }
+        }
+
+        if (covered_this_step == 0) {
+            break;
+        }
+
+        prev_group = std::move(current_partitions);
+        superstep++;
+    }
+
+    if (uncovered_count > 0 || buffer_states.empty()) {
+        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+    }
+
+    return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
 }
 
 }  // namespace
@@ -516,11 +931,41 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomNodePartitionO
     return ret;
 }
 
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getAccessAwareCustomEdgeBucketOrdering(int num_partitions, int buffer_capacity, int active_devices) {
+    SPDLOG_INFO("Generating access-aware CUSTOM Ordering");
+    return generate_access_aware_states(num_partitions, buffer_capacity, active_devices);
+}
+
 std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states, int active_devices) {
-    if (active_devices <= 1 || buffer_states.size() <= 1) {
+    auto groups = build_disjoint_groups(buffer_states, active_devices);
+    if (groups.empty()) {
         std::vector<int64_t> identity(buffer_states.size());
         std::iota(identity.begin(), identity.end(), 0);
         return identity;
+    }
+
+    std::vector<int64_t> permutation;
+    permutation.reserve(buffer_states.size());
+    for (auto &group : groups) {
+        for (auto state_idx : group) {
+            permutation.emplace_back(state_idx);
+        }
+    }
+
+    if (permutation.size() != buffer_states.size()) {
+        std::vector<int64_t> identity(buffer_states.size());
+        std::iota(identity.begin(), identity.end(), 0);
+        return identity;
+    }
+
+    return permutation;
+}
+
+std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states,
+                                                                  const vector<torch::Tensor>& edge_buckets_per_buffer,
+                                                                  int active_devices) {
+    if (active_devices <= 1 || buffer_states.size() <= 1 || edge_buckets_per_buffer.size() != buffer_states.size()) {
+        return getDisjointBufferStatePermutation(buffer_states, active_devices);
     }
 
     std::vector<std::vector<int64_t>> state_partitions;
@@ -539,21 +984,38 @@ std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tenso
         }
     }
 
+    auto summaries = build_state_access_summaries(buffer_states, edge_buckets_per_buffer);
+
     std::vector<int64_t> remaining(buffer_states.size());
     std::iota(remaining.begin(), remaining.end(), 0);
-    std::vector<std::vector<int64_t>> groups;
-    if (!search_disjoint_groups(compatible, remaining, active_devices, groups)) {
-        std::vector<int64_t> identity(buffer_states.size());
-        std::iota(identity.begin(), identity.end(), 0);
-        return identity;
-    }
-
     std::vector<int64_t> permutation;
     permutation.reserve(buffer_states.size());
-    for (auto &group : groups) {
-        for (auto state_idx : group) {
+
+    std::vector<int64_t> previous_group;
+    while (!remaining.empty()) {
+        int target_group_size = std::min<int>(active_devices, remaining.size());
+        GroupSearchResult best_group;
+        std::vector<int64_t> current_group;
+        current_group.reserve(target_group_size);
+        search_best_disjoint_group(compatible, remaining, previous_group, summaries, target_group_size, 0, current_group, best_group);
+
+        if (best_group.chosen_states.empty()) {
+            return getDisjointBufferStatePermutation(buffer_states, active_devices);
+        }
+
+        for (auto state_idx : best_group.ordered_group) {
             permutation.emplace_back(state_idx);
         }
+
+        previous_group = best_group.ordered_group;
+        std::vector<int64_t> next_remaining;
+        next_remaining.reserve(remaining.size() - best_group.chosen_states.size());
+        for (auto state_idx : remaining) {
+            if (std::find(best_group.chosen_states.begin(), best_group.chosen_states.end(), state_idx) == best_group.chosen_states.end()) {
+                next_remaining.emplace_back(state_idx);
+            }
+        }
+        remaining = std::move(next_remaining);
     }
 
     if (permutation.size() != buffer_states.size()) {

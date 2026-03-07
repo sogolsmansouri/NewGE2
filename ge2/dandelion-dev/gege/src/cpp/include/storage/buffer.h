@@ -172,6 +172,8 @@ class PartitionBuffer {
 
     torch::Tensor getGlobalToLocalMap(bool get_current);
 
+    torch::Tensor getPartitionToBufferSlotMap();
+
     void indexAdd(torch::Tensor indices, torch::Tensor values);
 
     void setBufferOrdering(std::vector<torch::Tensor> buffer_states);
@@ -183,10 +185,13 @@ class PartitionBuffer {
     void sync();
 
     int64_t getNumInMemory() { return buffer_tensor_view_.size(0); }
+
+    int64_t getPartitionSize() const { return partition_size_; }
 };
 
 
 class MemPartitionBuffer : public PartitionBuffer {
+    friend class MemPartitionBufferStorage;
 
    public:
     MemPartitionBuffer(int capacity, int num_partitions, int fine_to_coarse_ratio, int64_t partition_size, int embedding_size, int64_t total_embeddings,

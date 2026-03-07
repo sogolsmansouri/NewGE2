@@ -5,6 +5,9 @@
 #include <tuple>
 #include <vector>
 #include <iostream>
+#include <condition_variable>
+#include <memory>
+#include <mutex>
 
 #include "common/datatypes.h"
 #include "data/batch.h"
@@ -81,6 +84,32 @@ class Storage {
     vector<int64_t> getEdgeBucketSizes() { return edge_bucket_sizes_; }
 };
 
+class ReusableBarrier {
+   public:
+    explicit ReusableBarrier(int parties) : parties_(parties), arrived_(0), generation_(0) {}
+
+    void arrive_and_wait() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        int generation = generation_;
+        arrived_++;
+        if (arrived_ == parties_) {
+            arrived_ = 0;
+            generation_++;
+            lock.unlock();
+            cv_.notify_all();
+            return;
+        }
+        cv_.wait(lock, [&] { return generation_ != generation; });
+    }
+
+   private:
+    int parties_;
+    int arrived_;
+    int generation_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+};
+
 
 class MemPartitionBufferStorage : public Storage {
    public:
@@ -129,11 +158,11 @@ class MemPartitionBufferStorage : public Storage {
 
     bool hasSwap(int32_t device_idx = 0) { return buffers_[device_idx]->hasSwap(); }
 
-    void performNextSwap(int32_t device_idx) { 
-        buffers_[device_idx]->performNextSwap(); 
-    }
+    void performNextSwap(int32_t device_idx);
 
     torch::Tensor getGlobalToLocalMap(bool get_current, int32_t device_idx = 0) { return buffers_[device_idx]->getGlobalToLocalMap(get_current); }
+
+    torch::Tensor getPartitionToBufferSlotMap(int32_t device_idx = 0) { return buffers_[device_idx]->getPartitionToBufferSlotMap(); }
 
     void sync(int device_idx = 0) { buffers_[device_idx]->sync(); }
 
@@ -154,8 +183,18 @@ class MemPartitionBufferStorage : public Storage {
     std::vector<int> getNextEvict(int32_t device_idx = 0) { return buffers_[device_idx]->getNextEvict(); }
 
     int64_t getNumInMemory(int32_t device_idx = 0) { return buffers_[device_idx]->getNumInMemory(); }
+
+    int64_t getPartitionSize(int32_t device_idx = 0) { return buffers_[device_idx]->getPartitionSize(); }
    private:
     int fd_;
+    bool peer_relay_runtime_enabled_;
+    std::once_flag peer_relay_init_once_;
+    std::unique_ptr<ReusableBarrier> peer_relay_ready_barrier_;
+    std::unique_ptr<ReusableBarrier> peer_relay_build_barrier_;
+    std::vector<torch::Tensor> peer_relay_next_states_;
+    std::vector<torch::Tensor> peer_relay_staged_views_;
+    void initializePeerRelay_();
+    bool peerRelayEnabled_();
 
 };
 
@@ -208,6 +247,8 @@ class PartitionBufferStorage : public Storage {
 
     torch::Tensor getGlobalToLocalMap(bool get_current) { return buffer_->getGlobalToLocalMap(get_current); }
 
+    torch::Tensor getPartitionToBufferSlotMap() { return buffer_->getPartitionToBufferSlotMap(); }
+
     void sync() { buffer_->sync(); }
 
     void setBufferOrdering(vector<torch::Tensor> buffer_states) { buffer_->setBufferOrdering(buffer_states); }
@@ -217,6 +258,8 @@ class PartitionBufferStorage : public Storage {
     std::vector<int> getNextEvict() { return buffer_->getNextEvict(); }
 
     int64_t getNumInMemory() { return buffer_->getNumInMemory(); }
+
+    int64_t getPartitionSize() { return buffer_->getPartitionSize(); }
 };
 
 /** Flat File storage used for data that only requires sequential access. Can be used to store and access large amounts of edges. */

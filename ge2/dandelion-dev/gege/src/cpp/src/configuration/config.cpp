@@ -363,6 +363,7 @@ shared_ptr<NegativeSamplingConfig> initNegativeSamplingConfig(pyobj python_confi
         ret_config->negatives_per_positive = cast_helper<int>(python_config.attr("negatives_per_positive"));
         ret_config->num_chunks = cast_helper<int>(python_config.attr("num_chunks"));
         ret_config->degree_fraction = cast_helper<float>(python_config.attr("degree_fraction"));
+        ret_config->superbatch_negative_plan_batches = cast_helper<int>(python_config.attr("superbatch_negative_plan_batches"));
         ret_config->local_filter_mode = getLocalFilterMode(cast_helper<std::string>(python_config.attr("local_filter_mode")));
         ret_config->tournament_selection = cast_helper<bool>(python_config.attr("tournament_selection"));
         ret_config->tiled_tournament_scores = cast_helper<bool>(python_config.attr("tiled_tournament_scores"));
@@ -370,6 +371,7 @@ shared_ptr<NegativeSamplingConfig> initNegativeSamplingConfig(pyobj python_confi
     } else {
         ret_config->num_chunks = 1;
         ret_config->degree_fraction = 0.0;
+        ret_config->superbatch_negative_plan_batches = 0;
         ret_config->negatives_per_positive = -1;  // This is set to the proper value by the graph_batcher
         ret_config->local_filter_mode = LocalFilterMode::DEG;
         ret_config->tournament_selection = false;
@@ -447,6 +449,11 @@ shared_ptr<TrainingConfig> initTrainingConfig(pyobj python_config) {
     ret_config->negative_sampling_method = getNegativeSamplingMethod(cast_helper<std::string>(python_config.attr("negative_sampling_method")));
     ret_config->negative_sampling_selected_ratio = cast_helper<float>(python_config.attr("negative_sampling_selected_ratio"));
     ret_config->dense_sync_batches = cast_helper<int>(python_config.attr("dense_sync_batches"));
+    if (pybind11::hasattr(python_config, "logical_active_devices")) {
+        ret_config->logical_active_devices = cast_helper<int>(python_config.attr("logical_active_devices"));
+    } else {
+        ret_config->logical_active_devices = 0;
+    }
     ret_config->negative_sampling = initNegativeSamplingConfig(python_config.attr("negative_sampling"));
     ret_config->logs_per_epoch = cast_helper<int>(python_config.attr("logs_per_epoch"));
     ret_config->num_epochs = cast_helper<int>(python_config.attr("num_epochs"));

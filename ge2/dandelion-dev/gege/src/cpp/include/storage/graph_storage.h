@@ -41,8 +41,22 @@ class GraphModelStorage {
 
     void _unload(shared_ptr<Storage> storage, bool write);
 
+    bool shouldUsePartitionBufferLPFastPath_();
+
+    torch::Tensor getPartitionToBufferSlotMap_(int32_t device_idx = 0);
+
+    int64_t getPartitionSize_(int32_t device_idx = 0);
+
+    torch::Tensor getGlobalToLocalMapForValidation_(bool get_current, int32_t device_idx = 0);
+
+    torch::Tensor mapEdgesWithDenseMap_(torch::Tensor edges, torch::Tensor global_to_local_index_map, torch::Device device);
+
+    torch::Tensor mapEdgesWithPartitionSlots_(torch::Tensor edges, torch::Tensor partition_to_buffer_slot, int64_t partition_size,
+                                              torch::Device device);
+
     int64_t num_nodes_;
     int64_t num_edges_;
+    bool partition_buffer_lp_fast_path_enabled_;
 
    protected:
     bool train_;
@@ -190,6 +204,10 @@ class GraphModelStorage {
 
         return (embeddings_buffered || features_buffered) && (train_ || (!full_graph_evaluation_));
     }
+
+    void setPartitionBufferLPFastPathEnabled(bool enabled) { partition_buffer_lp_fast_path_enabled_ = enabled; }
+
+    bool partitionBufferLPFastPathEnabled() { return shouldUsePartitionBufferLPFastPath_(); }
 
     bool hasSwap(int32_t device_idx = 0) {
         if (storage_ptrs_.node_embeddings != nullptr) {

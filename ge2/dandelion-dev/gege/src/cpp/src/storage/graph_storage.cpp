@@ -1,7 +1,11 @@
 #include "storage/graph_storage.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <random>
+#include <string>
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDACachingAllocator.h>
 #endif
@@ -10,10 +14,99 @@
 #include "data/ordering.h"
 #include "reporting/logger.h"
 
+namespace {
+
+bool parse_graph_storage_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+
+    return default_value;
+}
+
+int64_t parse_graph_storage_env_int(const char *name, int64_t default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    try {
+        return std::stoll(std::string(raw));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+bool partition_buffer_lp_fast_path_validate_enabled() {
+    static bool enabled = parse_graph_storage_env_flag("GEGE_PARTITION_BUFFER_LP_FAST_PATH_VALIDATE", false);
+    return enabled;
+}
+
+int64_t partition_buffer_lp_fast_path_validate_max() {
+    static int64_t max_validations = std::max<int64_t>(parse_graph_storage_env_int("GEGE_PARTITION_BUFFER_LP_FAST_PATH_VALIDATE_MAX", 4), 0);
+    return max_validations;
+}
+
+std::atomic<int64_t> &partition_buffer_lp_fast_path_validate_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_validate_partition_buffer_lp_fast_path(int64_t &validation_id) {
+    if (!partition_buffer_lp_fast_path_validate_enabled()) {
+        return false;
+    }
+
+    validation_id = partition_buffer_lp_fast_path_validate_counter().fetch_add(1);
+    return validation_id < partition_buffer_lp_fast_path_validate_max();
+}
+
+bool partition_buffer_pipeline_timing_enabled() {
+    static bool enabled = parse_graph_storage_env_flag("GEGE_PARTITION_BUFFER_PIPELINE_TIMING", false);
+    return enabled;
+}
+
+int64_t partition_buffer_pipeline_timing_max() {
+    static int64_t max_timings = std::max<int64_t>(parse_graph_storage_env_int("GEGE_PARTITION_BUFFER_PIPELINE_TIMING_MAX", 8), 0);
+    return max_timings;
+}
+
+std::atomic<int64_t> &partition_buffer_pipeline_timing_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_log_partition_buffer_pipeline_timing(int64_t &timing_id) {
+    if (!partition_buffer_pipeline_timing_enabled()) {
+        return false;
+    }
+
+    timing_id = partition_buffer_pipeline_timing_counter().fetch_add(1);
+    return timing_id < partition_buffer_pipeline_timing_max();
+}
+
+double elapsed_graph_storage_ms(std::chrono::high_resolution_clock::time_point start,
+                                std::chrono::high_resolution_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+}  // namespace
+
 GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, shared_ptr<StorageConfig> storage_config) {
     storage_ptrs_ = storage_ptrs;
     train_ = true;
     full_graph_evaluation_ = storage_config->full_graph_evaluation;
+    partition_buffer_lp_fast_path_enabled_ = false;
 
     prefetch_ = storage_config->prefetch;
     prefetch_complete_ = false;
@@ -59,6 +152,7 @@ GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, bool pr
     storage_ptrs_ = storage_ptrs;
     train_ = true;
     full_graph_evaluation_ = false;
+    partition_buffer_lp_fast_path_enabled_ = false;
 
     prefetch_ = prefetch;
     prefetch_complete_ = false;
@@ -86,6 +180,126 @@ GraphModelStorage::~GraphModelStorage() {
     
     delete subgraph_lock_;
     delete subgraph_cv_;
+}
+
+bool GraphModelStorage::shouldUsePartitionBufferLPFastPath_() {
+    return partition_buffer_lp_fast_path_enabled_ && !prefetch_ && useInMemorySubGraph();
+}
+
+torch::Tensor GraphModelStorage::getPartitionToBufferSlotMap_(int32_t device_idx) {
+    if (storage_ptrs_.node_embeddings != nullptr) {
+        if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->getPartitionToBufferSlotMap();
+        }
+        if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getPartitionToBufferSlotMap(device_idx);
+        }
+    }
+
+    if (storage_ptrs_.node_features != nullptr) {
+        if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_features)) {
+            return std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_features)->getPartitionToBufferSlotMap();
+        }
+    }
+
+    throw GegeRuntimeException("Partition-to-buffer slot map unavailable for current storage backend");
+}
+
+int64_t GraphModelStorage::getPartitionSize_(int32_t device_idx) {
+    if (storage_ptrs_.node_embeddings != nullptr) {
+        if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->getPartitionSize();
+        }
+        if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getPartitionSize(device_idx);
+        }
+    }
+
+    if (storage_ptrs_.node_features != nullptr) {
+        if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_features)) {
+            return std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_features)->getPartitionSize();
+        }
+    }
+
+    throw GegeRuntimeException("Partition size unavailable for current storage backend");
+}
+
+torch::Tensor GraphModelStorage::getGlobalToLocalMapForValidation_(bool get_current, int32_t device_idx) {
+    if (storage_ptrs_.node_embeddings != nullptr) {
+        if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(get_current);
+        }
+        if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(get_current, device_idx);
+        }
+    } else if (storage_ptrs_.node_features != nullptr) {
+        if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_features)) {
+            return std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(get_current);
+        }
+        if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_features)) {
+            return std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(get_current, device_idx);
+        }
+    }
+
+    throw GegeRuntimeException("Dense global-to-local map unavailable for current storage backend");
+}
+
+torch::Tensor GraphModelStorage::mapEdgesWithDenseMap_(torch::Tensor edges, torch::Tensor global_to_local_index_map, torch::Device device) {
+    if (!edges.defined()) {
+        return torch::Tensor();
+    }
+
+    torch::Tensor mapped_edges;
+    if (storage_ptrs_.edges->dim1_size_ == 3) {
+        mapped_edges = torch::stack({global_to_local_index_map.index_select(0, edges.select(1, 0)),
+                                     edges.select(1, 1),
+                                     global_to_local_index_map.index_select(0, edges.select(1, -1))})
+                           .transpose(0, 1);
+    } else if (storage_ptrs_.edges->dim1_size_ == 2) {
+        mapped_edges = torch::stack({global_to_local_index_map.index_select(0, edges.select(1, 0)),
+                                     global_to_local_index_map.index_select(0, edges.select(1, -1))})
+                           .transpose(0, 1);
+    } else {
+        SPDLOG_ERROR("Unexpected number of edge columns");
+        throw GegeRuntimeException("Unexpected number of edge columns");
+    }
+
+    return mapped_edges.to(device);
+}
+
+torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges, torch::Tensor partition_to_buffer_slot, int64_t partition_size,
+                                                             torch::Device device) {
+    if (!edges.defined()) {
+        return torch::Tensor();
+    }
+
+    torch::Tensor src = edges.select(1, 0);
+    torch::Tensor dst = edges.select(1, -1);
+    torch::Tensor src_partitions = torch::div(src, partition_size, "trunc");
+    torch::Tensor dst_partitions = torch::div(dst, partition_size, "trunc");
+    torch::Tensor src_slots = partition_to_buffer_slot.index_select(0, src_partitions);
+    torch::Tensor dst_slots = partition_to_buffer_slot.index_select(0, dst_partitions);
+
+    if (torch::lt(src_slots, 0).any().item<bool>() || torch::lt(dst_slots, 0).any().item<bool>()) {
+        throw GegeRuntimeException("Encountered edge endpoint outside current partition buffer state during arithmetic remap");
+    }
+
+    torch::Tensor src_local =
+        src_slots * partition_size + (src - src_partitions * partition_size);
+    torch::Tensor dst_local =
+        dst_slots * partition_size + (dst - dst_partitions * partition_size);
+
+    torch::Tensor mapped_edges;
+    if (storage_ptrs_.edges->dim1_size_ == 3) {
+        mapped_edges = torch::stack({src_local, edges.select(1, 1), dst_local}).transpose(0, 1);
+    } else if (storage_ptrs_.edges->dim1_size_ == 2) {
+        mapped_edges = torch::stack({src_local, dst_local}).transpose(0, 1);
+    } else {
+        SPDLOG_ERROR("Unexpected number of edge columns");
+        throw GegeRuntimeException("Unexpected number of edge columns");
+    }
+
+    return mapped_edges.to(device);
 }
 
 void GraphModelStorage::_load(shared_ptr<Storage> storage) {
@@ -431,6 +645,15 @@ bool GraphModelStorage::embeddingsOffDeviceG() {
 
 void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, torch::Device device, int32_t device_idx) {
     if (useInMemorySubGraph()) {
+        int64_t timing_id = -1;
+        bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
+        auto total_start = std::chrono::high_resolution_clock::now();
+        auto phase_start = total_start;
+        double bucket_meta_ms = 0.0;
+        double edge_materialize_ms = 0.0;
+        double remap_ms = 0.0;
+        double graph_build_ms = 0.0;
+
         current_subgraph_states_[device_idx] = nullptr;
         current_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
 
@@ -473,6 +696,12 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
             }
         }
 
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            bucket_meta_ms = elapsed_graph_storage_ms(phase_start, now);
+            phase_start = now;
+        }
+
         torch::Tensor in_mem_edge_bucket_starts = in_mem_edge_bucket_sizes.cumsum(0);
         int64_t total_size = in_mem_edge_bucket_starts[-1].item<int64_t>();
         in_mem_edge_bucket_starts = in_mem_edge_bucket_starts - in_mem_edge_bucket_sizes;
@@ -489,73 +718,128 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
                 storage_ptrs_.edges->range(edge_bucket_start, edge_bucket_size);
         }
 
-
-        if (storage_ptrs_.node_embeddings != nullptr) {
-            if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
-                current_subgraph_state_->global_to_local_index_map_ =
-                    std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(true);
-            }
-            else if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
-                current_subgraph_state_->global_to_local_index_map_ =
-                    std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(true, device_idx);
-            }
-            else {
-                SPDLOG_ERROR("Backend type not available for embeddings.");
-                throw std::runtime_error("");
-            }
-        } else if (storage_ptrs_.node_features != nullptr) {
-            if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_features)) {
-                current_subgraph_state_->global_to_local_index_map_ =
-                    std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(true);
-            }
-            else if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_features)) {
-                current_subgraph_state_->global_to_local_index_map_ =
-                    std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(true);
-            }
-            else {
-                SPDLOG_ERROR("Backend type not available for features.");
-                throw std::runtime_error("");
-            }
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            edge_materialize_ms = elapsed_graph_storage_ms(phase_start, now);
+            phase_start = now;
         }
-        
+
         torch::Tensor mapped_edges;
-        torch::Tensor mapped_edges_dst_sort;
-        if (storage_ptrs_.edges->dim1_size_ == 3) {
-            mapped_edges =
-                torch::stack({current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 0)),
-                              current_subgraph_state_->all_in_memory_edges_.select(1, 1),
-                              current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, -1))})
-                    .transpose(0, 1);
-        } else if (storage_ptrs_.edges->dim1_size_ == 2) {
-            mapped_edges =
-                torch::stack({current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 0)),
-                              current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, -1))})
-                    .transpose(0, 1);
-        } else {
-            SPDLOG_ERROR("Unexpected number of edge columns");
-            std::runtime_error("Unexpected number of edge columns");
-        }
-        mapped_edges = mapped_edges.to(device);
-        current_subgraph_state_->all_in_memory_mapped_edges_ = mapped_edges;
+        current_subgraph_state_->global_to_local_index_map_ = torch::Tensor();
 
-        mapped_edges          = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
-        mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
+        if (shouldUsePartitionBufferLPFastPath_()) {
+            torch::Tensor partition_to_buffer_slot = getPartitionToBufferSlotMap_(device_idx);
+            int64_t partition_size = getPartitionSize_(device_idx);
+            mapped_edges = mapEdgesWithPartitionSlots_(current_subgraph_state_->all_in_memory_edges_, partition_to_buffer_slot, partition_size, device);
+            if (log_timing) {
+                auto now = std::chrono::high_resolution_clock::now();
+                remap_ms = elapsed_graph_storage_ms(phase_start, now);
+                phase_start = now;
+            }
+            int64_t validation_id = -1;
+            if (should_validate_partition_buffer_lp_fast_path(validation_id)) {
+                torch::Tensor dense_map = getGlobalToLocalMapForValidation_(true, device_idx);
+                torch::Tensor dense_mapped_edges = mapEdgesWithDenseMap_(current_subgraph_state_->all_in_memory_edges_, dense_map, device);
+                if (!mapped_edges.equal(dense_mapped_edges)) {
+                    throw GegeRuntimeException(fmt::format("Partition-buffer LP fast path remap mismatch during initializeInMemorySubGraph (validation #{})",
+                                                           validation_id));
+                }
+                SPDLOG_INFO("Partition-buffer LP fast path validation passed during initializeInMemorySubGraph (validation #{})", validation_id);
+            }
+            if (current_subgraph_state_->in_memory_subgraph_ != nullptr) {
+                current_subgraph_state_->in_memory_subgraph_ = nullptr;
+            }
+            current_subgraph_state_->in_memory_subgraph_ = std::make_shared<GegeGraph>();
+            current_subgraph_state_->in_memory_subgraph_->num_nodes_in_memory_ = getNumNodesInMemory(device_idx);
+            if (log_timing) {
+                auto now = std::chrono::high_resolution_clock::now();
+                graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
+            }
+        } else {
+            if (storage_ptrs_.node_embeddings != nullptr) {
+                if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+                    current_subgraph_state_->global_to_local_index_map_ =
+                        std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(true);
+                }
+                else if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+                    current_subgraph_state_->global_to_local_index_map_ =
+                        std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(true, device_idx);
+                }
+                else {
+                    SPDLOG_ERROR("Backend type not available for embeddings.");
+                    throw std::runtime_error("");
+                }
+            } else if (storage_ptrs_.node_features != nullptr) {
+                if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_features)) {
+                    current_subgraph_state_->global_to_local_index_map_ =
+                        std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(true);
+                }
+                else if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_features)) {
+                    current_subgraph_state_->global_to_local_index_map_ =
+                        std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(true);
+                }
+                else {
+                    SPDLOG_ERROR("Backend type not available for features.");
+                    throw std::runtime_error("");
+                }
+            }
+
+            if (storage_ptrs_.edges->dim1_size_ == 3) {
+                mapped_edges =
+                    torch::stack({current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 0)),
+                                  current_subgraph_state_->all_in_memory_edges_.select(1, 1),
+                                  current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, -1))})
+                        .transpose(0, 1);
+            } else if (storage_ptrs_.edges->dim1_size_ == 2) {
+                mapped_edges =
+                    torch::stack({current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 0)),
+                                  current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, -1))})
+                        .transpose(0, 1);
+            } else {
+                SPDLOG_ERROR("Unexpected number of edge columns");
+                std::runtime_error("Unexpected number of edge columns");
+            }
+            mapped_edges = mapped_edges.to(device);
+
+            if (log_timing) {
+                auto now = std::chrono::high_resolution_clock::now();
+                remap_ms = elapsed_graph_storage_ms(phase_start, now);
+                phase_start = now;
+            }
+
+            torch::Tensor mapped_edges_dst_sort;
+            mapped_edges = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
+            mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
 #ifdef GEGE_CUDA
-        c10::cuda::CUDACachingAllocator::emptyCache();
+            c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
 
-        mapped_edges = mapped_edges.to(torch::kInt64);
-        mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);
+            mapped_edges = mapped_edges.to(torch::kInt64);
+            mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);
 
-        if (current_subgraph_state_->in_memory_subgraph_ != nullptr) {
-            current_subgraph_state_->in_memory_subgraph_ = nullptr;
+            if (current_subgraph_state_->in_memory_subgraph_ != nullptr) {
+                current_subgraph_state_->in_memory_subgraph_ = nullptr;
+            }
+
+            current_subgraph_state_->in_memory_subgraph_ = std::make_shared<GegeGraph>(mapped_edges, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
+            if (log_timing) {
+                auto now = std::chrono::high_resolution_clock::now();
+                graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
+            }
         }
-
-        current_subgraph_state_->in_memory_subgraph_ = std::make_shared<GegeGraph>(mapped_edges, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
+        current_subgraph_state_->all_in_memory_mapped_edges_ = mapped_edges;
         current_subgraph_state_->in_memory_partition_ids_ = new_in_mem_partition_ids;
         current_subgraph_state_->in_memory_edge_bucket_ids_ = in_mem_edge_bucket_ids;
         current_subgraph_state_->in_memory_edge_bucket_sizes_ = in_mem_edge_bucket_sizes;
         current_subgraph_state_->in_memory_edge_bucket_starts_ = in_mem_edge_bucket_starts;
+
+        if (log_timing) {
+            auto total_end = std::chrono::high_resolution_clock::now();
+            SPDLOG_INFO(
+                "[partition-buffer-pipeline][init {}] device={} partitions={} buffer_size={} buckets={} edges={} bucket_meta_ms={:.3f} edge_materialize_ms={:.3f} remap_ms={:.3f} graph_build_ms={:.3f} total_ms={:.3f}",
+                timing_id, device_idx, num_partitions, buffer_size, num_edge_buckets_in_mem, total_size, bucket_meta_ms, edge_materialize_ms,
+                remap_ms, graph_build_ms, elapsed_graph_storage_ms(total_start, total_end));
+        }
         if (prefetch_) {
             if (hasSwap()) {
                 // update next_subgraph_state_ in background
@@ -655,6 +939,15 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     if (prefetch_) {
         subgraph_lock_->lock();
     }
+
+    int64_t timing_id = -1;
+    bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto phase_start = total_start;
+    double state_prepare_ms = 0.0;
+    double edge_materialize_ms = 0.0;
+    double remap_ms = 0.0;
+    double graph_build_ms = 0.0;
 
     std::vector<int> evict_partition_ids = std::get<0>(swap_ids);
     std::vector<int> admit_partition_ids = std::get<1>(swap_ids);
@@ -801,6 +1094,12 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     auto in_mem_mask_accessor = in_mem_mask.accessor<bool, 1>();
     auto in_mem_edge_bucket_starts_accessor = in_mem_edge_bucket_starts.accessor<int64_t, 1>();
 
+    if (log_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        state_prepare_ms = elapsed_graph_storage_ms(phase_start, now);
+        phase_start = now;
+    }
+
     torch::Tensor new_all_in_memory_edges = torch::empty({total_size, storage_ptrs_.edges->dim1_size_}, torch::kInt64);
 
 // get the edges
@@ -821,66 +1120,117 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
 
     subgraph->all_in_memory_edges_ = new_all_in_memory_edges;
 
-    if (storage_ptrs_.node_embeddings != nullptr) {
-        if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
-            subgraph->global_to_local_index_map_ =
-                std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(!prefetch_);
-        }
-        else if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
-            subgraph->global_to_local_index_map_ =
-                std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(!prefetch_, device_idx);
-        }
-    } else if (storage_ptrs_.node_features != nullptr) {
-        subgraph->global_to_local_index_map_ = std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(!prefetch_);
+    if (log_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        edge_materialize_ms = elapsed_graph_storage_ms(phase_start, now);
+        phase_start = now;
     }
 
     torch::Tensor mapped_edges;
-    torch::Tensor mapped_edges_dst_sort;
-    if (storage_ptrs_.edges->dim1_size_ == 3) {
-        mapped_edges = torch::stack({subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 0)),
-                                     subgraph->all_in_memory_edges_.select(1, 1),
-                                     subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, -1))})
-                           .transpose(0, 1);
-        // mapped_edges = mapped_edges.to(devices_[device_idx]);
-    } else if (storage_ptrs_.edges->dim1_size_ == 2) {
-        mapped_edges = torch::stack({subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 0)),
-                                     subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, -1))})
-                           .transpose(0, 1);
-        // mapped_edges = mapped_edges.to(devices_[device_idx]);
+    subgraph->global_to_local_index_map_ = torch::Tensor();
+    if (shouldUsePartitionBufferLPFastPath_()) {
+        torch::Tensor partition_to_buffer_slot = getPartitionToBufferSlotMap_(device_idx);
+        int64_t partition_size = getPartitionSize_(device_idx);
+        mapped_edges = mapEdgesWithPartitionSlots_(subgraph->all_in_memory_edges_, partition_to_buffer_slot, partition_size, devices_[device_idx]);
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            remap_ms = elapsed_graph_storage_ms(phase_start, now);
+            phase_start = now;
+        }
+        int64_t validation_id = -1;
+        if (should_validate_partition_buffer_lp_fast_path(validation_id)) {
+            torch::Tensor dense_map = getGlobalToLocalMapForValidation_(!prefetch_, device_idx);
+            torch::Tensor dense_mapped_edges = mapEdgesWithDenseMap_(subgraph->all_in_memory_edges_, dense_map, devices_[device_idx]);
+            if (!mapped_edges.equal(dense_mapped_edges)) {
+                throw GegeRuntimeException(fmt::format("Partition-buffer LP fast path remap mismatch during updateInMemorySubGraph_ (validation #{})",
+                                                       validation_id));
+            }
+            SPDLOG_INFO("Partition-buffer LP fast path validation passed during updateInMemorySubGraph_ (validation #{})", validation_id);
+        }
+        if (subgraph->in_memory_subgraph_ != nullptr) {
+            subgraph->in_memory_subgraph_ = nullptr;
+        }
+        subgraph->in_memory_subgraph_ = std::make_shared<GegeGraph>();
+        subgraph->in_memory_subgraph_->num_nodes_in_memory_ = getNumNodesInMemory(device_idx);
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
+        }
     } else {
-        // TODO use a function for logging errors and throwing expections
-        SPDLOG_ERROR("Unexpected number of edge columns");
-        std::runtime_error("Unexpected number of edge columns");
-    }
-
-    mapped_edges = mapped_edges.to(devices_[device_idx]);
-    subgraph->all_in_memory_mapped_edges_ = mapped_edges;
-    subgraph->in_memory_subgraph_ = nullptr;
-#ifdef GEGE_CUDA
-    c10::cuda::CUDACachingAllocator::emptyCache();
-#endif
-
-    mapped_edges = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
-    mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
-    
-#ifdef GEGE_CUDA
-    c10::cuda::CUDACachingAllocator::emptyCache();
-#endif
-
-    mapped_edges = mapped_edges.to(torch::kInt64);
-    mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);
-
-    if (subgraph->in_memory_subgraph_ != nullptr) {
         subgraph->in_memory_subgraph_ = nullptr;
-    }
+        if (storage_ptrs_.node_embeddings != nullptr) {
+            if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+                subgraph->global_to_local_index_map_ =
+                    std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(!prefetch_);
+            }
+            else if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+                subgraph->global_to_local_index_map_ =
+                    std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getGlobalToLocalMap(!prefetch_, device_idx);
+            }
+        } else if (storage_ptrs_.node_features != nullptr) {
+            subgraph->global_to_local_index_map_ = std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_features)->getGlobalToLocalMap(!prefetch_);
+        }
 
-    subgraph->in_memory_subgraph_ = std::make_shared<GegeGraph>(mapped_edges, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
+        torch::Tensor mapped_edges_dst_sort;
+        if (storage_ptrs_.edges->dim1_size_ == 3) {
+            mapped_edges = torch::stack({subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 0)),
+                                         subgraph->all_in_memory_edges_.select(1, 1),
+                                         subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, -1))})
+                               .transpose(0, 1);
+        } else if (storage_ptrs_.edges->dim1_size_ == 2) {
+            mapped_edges = torch::stack({subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 0)),
+                                         subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, -1))})
+                               .transpose(0, 1);
+        } else {
+            SPDLOG_ERROR("Unexpected number of edge columns");
+            std::runtime_error("Unexpected number of edge columns");
+        }
+
+        mapped_edges = mapped_edges.to(devices_[device_idx]);
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            remap_ms = elapsed_graph_storage_ms(phase_start, now);
+            phase_start = now;
+        }
+#ifdef GEGE_CUDA
+        c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
+
+        mapped_edges = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
+        mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
+        
+#ifdef GEGE_CUDA
+        c10::cuda::CUDACachingAllocator::emptyCache();
+#endif
+
+        mapped_edges = mapped_edges.to(torch::kInt64);
+        mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);
+
+        if (subgraph->in_memory_subgraph_ != nullptr) {
+            subgraph->in_memory_subgraph_ = nullptr;
+        }
+
+        subgraph->in_memory_subgraph_ = std::make_shared<GegeGraph>(mapped_edges, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
+        }
+    }
+    subgraph->all_in_memory_mapped_edges_ = mapped_edges;
 
     // update state
     subgraph->in_memory_partition_ids_ = new_in_mem_partition_ids;
     subgraph->in_memory_edge_bucket_ids_ = in_mem_edge_bucket_ids;
     subgraph->in_memory_edge_bucket_sizes_ = in_mem_edge_bucket_sizes;
     subgraph->in_memory_edge_bucket_starts_ = in_mem_edge_bucket_starts;
+
+    if (log_timing) {
+        auto total_end = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO(
+            "[partition-buffer-pipeline][update {}] device={} evict={} admit={} buckets={} edges={} state_prepare_ms={:.3f} edge_materialize_ms={:.3f} remap_ms={:.3f} graph_build_ms={:.3f} total_ms={:.3f}",
+            timing_id, device_idx, evict_partition_ids.size(), admit_partition_ids.size(), num_edge_buckets_in_mem, total_size, state_prepare_ms,
+            edge_materialize_ms, remap_ms, graph_build_ms, elapsed_graph_storage_ms(total_start, total_end));
+    }
 
     if (prefetch_) {
         prefetch_complete_ = true;

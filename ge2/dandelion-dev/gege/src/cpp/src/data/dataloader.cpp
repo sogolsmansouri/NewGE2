@@ -57,6 +57,50 @@ bool verify_node_mapping_enabled() {
     return enabled;
 }
 
+bool partition_buffer_lp_fast_path_env_enabled(bool default_value) {
+    return parse_env_flag("GEGE_PARTITION_BUFFER_LP_FAST_PATH", default_value);
+}
+
+bool partition_buffer_pipeline_timing_enabled() {
+    static bool enabled = parse_env_flag("GEGE_PARTITION_BUFFER_PIPELINE_TIMING", false);
+    return enabled;
+}
+
+int64_t partition_buffer_pipeline_timing_max() {
+    static int64_t max_timings = std::max<int64_t>(parse_env_int("GEGE_PARTITION_BUFFER_PIPELINE_TIMING_MAX", 8), 0);
+    return max_timings;
+}
+
+std::atomic<int64_t> &partition_buffer_pipeline_timing_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_log_partition_buffer_pipeline_timing(int64_t &timing_id) {
+    if (!partition_buffer_pipeline_timing_enabled()) {
+        return false;
+    }
+
+    timing_id = partition_buffer_pipeline_timing_counter().fetch_add(1);
+    return timing_id < partition_buffer_pipeline_timing_max();
+}
+
+bool negative_sampler_filtered(const shared_ptr<NegativeSampler> &negative_sampler) {
+    if (negative_sampler == nullptr) {
+        return false;
+    }
+
+    if (instance_of<NegativeSampler, NegativeSamplingBase>(negative_sampler)) {
+        return std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler)->filtered_;
+    }
+
+    if (instance_of<NegativeSampler, CorruptNodeNegativeSampler>(negative_sampler)) {
+        return std::dynamic_pointer_cast<CorruptNodeNegativeSampler>(negative_sampler)->filtered_;
+    }
+
+    return true;
+}
+
 int64_t stage_debug_max_batches() {
     static int64_t max_batches = parse_env_int("GEGE_STAGE_DEBUG_MAX_BATCHES", 20);
     return std::max<int64_t>(max_batches, 0);
@@ -119,21 +163,24 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
             training_negative_sampler_ = std::make_shared<RNS>(
                 training_config_->negative_sampling->num_chunks, training_config_->negative_sampling->negatives_per_positive,
                 training_config_->negative_sampling->degree_fraction, training_config_->negative_sampling->filtered,
-                training_config_->negative_sampling->local_filter_mode, training_config_->negative_sampling->tournament_selection,
+                training_config_->negative_sampling->superbatch_negative_plan_batches, training_config_->negative_sampling->local_filter_mode,
+                training_config_->negative_sampling->tournament_selection,
                 training_config_->negative_sampling->tiled_tournament_scores,
                 training_config_->negative_sampling->tiled_tournament_groups_per_tile);
         } else if (negative_sampling_method_ == NegativeSamplingMethod::DNS) {
             training_negative_sampler_ = std::make_shared<DNS>(
                 training_config_->negative_sampling->num_chunks, training_config_->negative_sampling->negatives_per_positive,
                 training_config_->negative_sampling->degree_fraction, training_config_->negative_sampling->filtered,
-                training_config_->negative_sampling->local_filter_mode, training_config_->negative_sampling->tournament_selection,
+                training_config_->negative_sampling->superbatch_negative_plan_batches, training_config_->negative_sampling->local_filter_mode,
+                training_config_->negative_sampling->tournament_selection,
                 training_config_->negative_sampling->tiled_tournament_scores,
                 training_config_->negative_sampling->tiled_tournament_groups_per_tile);
         } else if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {
             training_negative_sampler_ = std::make_shared<KBGAN>(
                 training_config_->negative_sampling->num_chunks, training_config_->negative_sampling->negatives_per_positive,
                 training_config_->negative_sampling->degree_fraction, training_config_->negative_sampling->filtered,
-                training_config_->negative_sampling->local_filter_mode, training_config_->negative_sampling->tournament_selection,
+                training_config_->negative_sampling->superbatch_negative_plan_batches, training_config_->negative_sampling->local_filter_mode,
+                training_config_->negative_sampling->tournament_selection,
                 training_config_->negative_sampling->tiled_tournament_scores,
                 training_config_->negative_sampling->tiled_tournament_groups_per_tile);
         } else {
@@ -166,6 +213,10 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
         training_neighbor_sampler_ = nullptr;
         evaluation_neighbor_sampler_ = nullptr;
     }
+
+    negative_sampler_ = training_negative_sampler_;
+    neighbor_sampler_ = training_neighbor_sampler_;
+    refreshGraphStorageMode();
 }
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, int batch_size, shared_ptr<NegativeSampler> negative_sampler,
@@ -198,6 +249,8 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     training_neighbor_sampler_ = nullptr;
     evaluation_neighbor_sampler_ = nullptr;
 
+    refreshGraphStorageMode();
+
     loadStorage();
 }
 
@@ -205,6 +258,19 @@ DataLoader::~DataLoader() {
     delete sampler_lock_;
     delete batch_lock_;
     delete batch_cv_;
+}
+
+void DataLoader::refreshGraphStorageMode() {
+    bool enable_fast_path = false;
+    if (graph_storage_ != nullptr && learning_task_ == LearningTask::LINK_PREDICTION && train_ && graph_storage_->useInMemorySubGraph() &&
+        neighbor_sampler_ == nullptr && !negative_sampler_filtered(negative_sampler_)) {
+        enable_fast_path = partition_buffer_lp_fast_path_env_enabled(false);
+    }
+    graph_storage_->setPartitionBufferLPFastPathEnabled(enable_fast_path);
+
+    if (enable_fast_path) {
+        SPDLOG_INFO("Using partition-buffer LP fast path (arithmetic remap, no in-memory graph build)");
+    }
 }
 
 void DataLoader::resetPerfStats() {
@@ -229,6 +295,9 @@ void DataLoader::nextEpoch() {
     batch_id_offset_ = 0;
     total_batches_processed_ = 0;
     epochs_processed_++;
+    if (negative_sampler_ != nullptr) {
+        negative_sampler_->resetPlanCache();
+    }
     buffer_states_.clear();
     if (graph_storage_->useInMemorySubGraph()) {
         unloadStorage();
@@ -238,6 +307,14 @@ void DataLoader::nextEpoch() {
 void DataLoader::setActiveEdges(int32_t device_idx) {
     EdgeList active_edges;
     torch::Tensor edge_bucket_sizes;
+    int64_t timing_id = -1;
+    bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto phase_start = total_start;
+    double bucket_lookup_ms = 0.0;
+    double gather_ms = 0.0;
+    double shuffle_ms = 0.0;
+    int64_t num_active_buckets = 0;
 
     if (graph_storage_->useInMemorySubGraph()) {
         torch::Tensor edge_bucket_ids = *edge_buckets_per_buffer_iterators_[device_idx];
@@ -248,6 +325,7 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
         }
 
         int num_partitions = graph_storage_->getNumPartitions();
+        num_active_buckets = edge_bucket_ids.size(0);
         edge_bucket_ids = edge_bucket_ids.select(1, 0) * num_partitions + edge_bucket_ids.select(1, 1);
         torch::Tensor in_memory_edge_bucket_idx = torch::empty({edge_bucket_ids.size(0)}, edge_bucket_ids.options());
         edge_bucket_sizes = torch::empty({edge_bucket_ids.size(0)}, edge_bucket_ids.options());
@@ -274,6 +352,12 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
             edge_bucket_sizes_accessor[i] = edge_bucket_size;
         }
 
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            bucket_lookup_ms = elapsed_ms(phase_start, now);
+            phase_start = now;
+        }
+
         torch::Tensor local_offsets = edge_bucket_sizes.cumsum(0);
         int64_t total_size = local_offsets[-1].item<int64_t>();
         local_offsets = local_offsets - edge_bucket_sizes;
@@ -294,6 +378,12 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
                 graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.narrow(0, edge_bucket_start, edge_bucket_size);
         }
 
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            gather_ms = elapsed_ms(phase_start, now);
+            phase_start = now;
+        }
+
     } else {
         active_edges = graph_storage_->storage_ptrs_.edges->range(0, graph_storage_->storage_ptrs_.edges->getDim0());
     }
@@ -301,6 +391,13 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     auto perm = torch::randperm(active_edges.size(0), opts);
     perm = perm.to(active_edges.device());
     active_edges = active_edges.index_select(0, perm);
+    if (log_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        shuffle_ms = elapsed_ms(phase_start, now);
+        SPDLOG_INFO(
+            "[partition-buffer-pipeline][setActiveEdges {}] device={} buckets={} edges={} bucket_lookup_ms={:.3f} gather_ms={:.3f} shuffle_ms={:.3f} total_ms={:.3f}",
+            timing_id, device_idx, num_active_buckets, active_edges.size(0), bucket_lookup_ms, gather_ms, shuffle_ms, elapsed_ms(total_start, now));
+    }
     graph_storage_->setActiveEdges(active_edges, device_idx);
 }
 
@@ -365,12 +462,39 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
 }
 
 void DataLoader::setBufferOrdering() {
+    int physical_devices = std::max<int>(devices_.size(), 1);
+    int requested_active_devices = physical_devices;
+    if (training_config_ != nullptr && training_config_->logical_active_devices > 0) {
+        requested_active_devices = training_config_->logical_active_devices;
+    } else {
+        const char *logical_devices_env = std::getenv("GEGE_LOGICAL_ACTIVE_DEVICES");
+        if (logical_devices_env != nullptr && logical_devices_env[0] != '\0') {
+            try {
+                requested_active_devices = std::max(0, std::stoi(logical_devices_env));
+            } catch (const std::exception &) {
+                SPDLOG_WARN("Ignoring invalid GEGE_LOGICAL_ACTIVE_DEVICES={}", logical_devices_env);
+            }
+        }
+    }
+
     auto reorder_buffer_ordering = [&](std::vector<torch::Tensor> &buffer_states, std::vector<torch::Tensor> &edge_buckets_per_buffer) {
-        if (devices_.size() <= 1 || buffer_states.size() <= 1 || edge_buckets_per_buffer.size() != buffer_states.size()) {
+        if (requested_active_devices <= 1 || buffer_states.size() <= 1 || edge_buckets_per_buffer.size() != buffer_states.size()) {
             return;
         }
 
-        auto permutation = getDisjointBufferStatePermutation(buffer_states, devices_.size());
+        if (requested_active_devices != physical_devices) {
+            SPDLOG_INFO("Using logical_active_devices={} for buffer ordering on {} physical device(s)", requested_active_devices, physical_devices);
+        }
+
+        bool access_aware_scheduler = false;
+        const char *access_aware_env = std::getenv("GEGE_ACCESS_AWARE_SCHEDULER");
+        if (access_aware_env != nullptr && access_aware_env[0] != '\0' && std::string(access_aware_env) != "0") {
+            access_aware_scheduler = true;
+        }
+
+        auto permutation = access_aware_scheduler
+            ? getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, requested_active_devices)
+            : getDisjointBufferStatePermutation(buffer_states, requested_active_devices);
         bool changed = false;
         for (std::size_t i = 0; i < permutation.size(); i++) {
             if (permutation[i] != static_cast<int64_t>(i)) {
@@ -394,7 +518,13 @@ void DataLoader::setBufferOrdering() {
         buffer_states = std::move(reordered_states);
         edge_buckets_per_buffer = std::move(reordered_buckets);
 
-        SPDLOG_INFO("Reordered {} buffer states into disjoint multi-GPU supersteps for {} devices", buffer_states.size(), devices_.size());
+        if (access_aware_scheduler) {
+            SPDLOG_INFO("Reordered {} buffer states into access-aware disjoint multi-GPU supersteps for {} logical device(s) on {} physical device(s)",
+                        buffer_states.size(), requested_active_devices, physical_devices);
+        } else {
+            SPDLOG_INFO("Reordered {} buffer states into disjoint multi-GPU supersteps for {} logical device(s) on {} physical device(s)",
+                        buffer_states.size(), requested_active_devices, physical_devices);
+        }
     };
 
     shared_ptr<PartitionBufferOptions> options;
@@ -408,11 +538,26 @@ void DataLoader::setBufferOrdering() {
 
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         if (graph_storage_->useInMemorySubGraph()) {
-            auto tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity, options->fine_to_coarse_ratio,
-                                             options->num_cache_partitions, options->randomly_assign_edge_buckets);
+            bool access_aware_state_generation = false;
+            const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
+            if (access_aware_state_generation_env != nullptr && access_aware_state_generation_env[0] != '\0' &&
+                std::string(access_aware_state_generation_env) != "0") {
+                access_aware_state_generation = true;
+            }
+
+            std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> tup;
+            if (access_aware_state_generation && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM) {
+                tup = getAccessAwareCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices);
+                SPDLOG_INFO("Using access-aware state generation for CUSTOM ordering with {} logical device(s)", requested_active_devices);
+            } else {
+                tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity, options->fine_to_coarse_ratio,
+                                            options->num_cache_partitions, options->randomly_assign_edge_buckets);
+            }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
-            reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
+            if (!access_aware_state_generation) {
+                reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
+            }
             SPDLOG_INFO("buffer_states_ sizes() {}", buffer_states_.size());
             auto edge_buckets_per_buffer_iterator = edge_buckets_per_buffer_.begin();
             edge_buckets_per_buffer_iterators_.resize(devices_.size());
@@ -908,6 +1053,9 @@ void DataLoader::updateEmbeddingsG(shared_ptr<Batch> batch, bool gpu, int32_t de
 }
 
 void DataLoader::loadStorage() {
+    if (negative_sampler_ != nullptr) {
+        negative_sampler_->resetPlanCache();
+    }
     setBufferOrdering();
     graph_storage_->load();
     if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {

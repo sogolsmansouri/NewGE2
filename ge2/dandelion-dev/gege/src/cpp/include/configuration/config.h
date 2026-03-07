@@ -80,6 +80,7 @@ struct NegativeSamplingConfig {
     int num_chunks;
     int negatives_per_positive;
     float degree_fraction;
+    int superbatch_negative_plan_batches;
     bool filtered;
     LocalFilterMode local_filter_mode;
     bool tournament_selection;
@@ -125,6 +126,7 @@ struct TrainingConfig {
     NegativeSamplingMethod negative_sampling_method;
     float negative_sampling_selected_ratio;
     int dense_sync_batches;
+    int logical_active_devices;
     shared_ptr<NegativeSamplingConfig> negative_sampling = nullptr;
     int num_epochs;
     int epochs_per_shuffle;

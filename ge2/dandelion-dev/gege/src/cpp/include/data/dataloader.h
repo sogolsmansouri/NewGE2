@@ -109,6 +109,8 @@ class DataLoader {
 
     void initializeBatches(bool prepare_encode = false, int32_t device_idx = 0);
 
+    void refreshGraphStorageMode();
+
     void clearBatches();
 
     /**
@@ -226,6 +228,7 @@ class DataLoader {
             graph_storage_->setTrainSet();
             negative_sampler_ = training_negative_sampler_;
             neighbor_sampler_ = training_neighbor_sampler_;
+            refreshGraphStorageMode();
             loadStorage();
         }
     }
@@ -242,6 +245,7 @@ class DataLoader {
             graph_storage_->setValidationSet();
             negative_sampler_ = evaluation_negative_sampler_;
             neighbor_sampler_ = evaluation_neighbor_sampler_;
+            refreshGraphStorageMode();
             loadStorage();
         }
     }
@@ -255,6 +259,7 @@ class DataLoader {
             graph_storage_->setTestSet();
             negative_sampler_ = evaluation_negative_sampler_;
             neighbor_sampler_ = evaluation_neighbor_sampler_;
+            refreshGraphStorageMode();
             loadStorage();
         }
     }
@@ -268,6 +273,8 @@ class DataLoader {
             train_ = false;
             graph_storage_->setTrainSet();
             neighbor_sampler_ = evaluation_neighbor_sampler_;
+            negative_sampler_ = nullptr;
+            refreshGraphStorageMode();
             loadStorage();
             initializeBatches(true);
         }

@@ -22,6 +22,8 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getTwoLevelBetaOrdering
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomEdgeBucketOrdering(int num_partitions = 4, int buffer_capacity = 1, bool randomly_assign_edge_buckets = false);
 
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getAccessAwareCustomEdgeBucketOrdering(int num_partitions, int buffer_capacity, int active_devices);
+
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getNodePartitionOrdering(NodePartitionOrdering node_partition_ordering, Indices train_nodes,
                                                                                   int64_t total_num_nodes, int num_partitions, int buffer_capacity,
                                                                                   int fine_to_coarse_ratio, int num_cache_partitions);
@@ -36,3 +38,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getSequentialNodePartit
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomNodePartitionOrdering();
 
 std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states, int active_devices);
+
+std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states,
+                                                                  const vector<torch::Tensor>& edge_buckets_per_buffer,
+                                                                  int active_devices);

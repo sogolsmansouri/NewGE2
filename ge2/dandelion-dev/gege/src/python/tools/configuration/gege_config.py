@@ -605,6 +605,7 @@ class NegativeSamplingConfig:
     num_chunks: int = 1
     negatives_per_positive: int = 1000
     degree_fraction: float = 0
+    superbatch_negative_plan_batches: int = 0
     filtered: bool = False
     local_filter_mode: str = "DEG"
     tournament_selection: bool = False
@@ -619,6 +620,8 @@ class NegativeSamplingConfig:
             raise ValueError("negatives_per_positive must be positive or -1 if using all nodes")
         if self.degree_fraction < 0:
             raise ValueError("degree_fraction must not be negative")
+        if self.superbatch_negative_plan_batches < 0:
+            raise ValueError("superbatch_negative_plan_batches must not be negative")
         if self.tiled_tournament_groups_per_tile <= 0:
             raise ValueError("tiled_tournament_groups_per_tile must be positive")
 
@@ -637,6 +640,9 @@ class NegativeSamplingConfig:
 
         if "degree_fraction" in input_config.keys():
             self.degree_fraction = input_config.degree_fraction
+
+        if "superbatch_negative_plan_batches" in input_config.keys():
+            self.superbatch_negative_plan_batches = input_config.superbatch_negative_plan_batches
 
         if "filtered" in input_config.keys():
             self.filtered = input_config.filtered
@@ -685,6 +691,7 @@ class TrainingConfig:
     negative_sampling_method: str = "RNS"
     negative_sampling_selected_ratio: float = 1
     dense_sync_batches: int = 1
+    logical_active_devices: int = 0
     negative_sampling: NegativeSamplingConfig = MISSING
     num_epochs: int = 10
     epochs_per_shuffle: int = 1
@@ -699,6 +706,8 @@ class TrainingConfig:
             raise ValueError("batch_size must be positive")
         if self.dense_sync_batches <= 0:
             raise ValueError("dense_sync_batches must be positive")
+        if self.logical_active_devices < 0:
+            raise ValueError("logical_active_devices must not be negative")
         if self.num_epochs <= 0:
             raise ValueError("num_epochs must be positive")
         if self.epochs_per_shuffle <= 0:

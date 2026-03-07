@@ -70,6 +70,31 @@ bool csr_nvtx_enabled() {
     return enabled;
 }
 
+int64_t parse_env_int(const char *name, int64_t default_value);
+
+bool partition_buffer_swap_timing_enabled() {
+    static bool enabled = parse_env_flag("GEGE_PARTITION_BUFFER_SWAP_TIMING", false);
+    return enabled;
+}
+
+int64_t partition_buffer_swap_timing_max() {
+    static int64_t max_swaps = std::max<int64_t>(parse_env_int("GEGE_PARTITION_BUFFER_SWAP_TIMING_MAX", 128), 0);
+    return max_swaps;
+}
+
+std::atomic<int64_t> &partition_buffer_swap_timing_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_log_partition_buffer_swap_timing(int64_t &timing_id) {
+    if (!partition_buffer_swap_timing_enabled()) {
+        return false;
+    }
+    timing_id = partition_buffer_swap_timing_counter().fetch_add(1);
+    return timing_id < partition_buffer_swap_timing_max();
+}
+
 int64_t parse_env_int(const char *name, int64_t default_value) {
     const char *raw = std::getenv(name);
     if (raw == nullptr) {
@@ -771,6 +796,21 @@ torch::Tensor PartitionBuffer::getGlobalToLocalMap(bool get_current) {
     return buffer_index_map;
 }
 
+torch::Tensor PartitionBuffer::getPartitionToBufferSlotMap() {
+    torch::Tensor partition_to_buffer_slot = -torch::ones({num_partitions_}, torch::kInt64);
+    auto slot_accessor = partition_to_buffer_slot.accessor<int64_t, 1>();
+
+#pragma omp parallel for
+    for (int partition_id = 0; partition_id < num_partitions_; partition_id++) {
+        Partition *partition = partition_table_[partition_id];
+        if (partition->present_) {
+            slot_accessor[partition_id] = partition->buffer_idx_;
+        }
+    }
+
+    return partition_to_buffer_slot;
+}
+
 void PartitionBuffer::evict(std::vector<Partition *> evict_partitions) {
     if (prefetching_) {
         async_write_block_->async_write(evict_partitions);
@@ -1009,12 +1049,18 @@ void MemPartitionBuffer::performNextSwap() {
     if (!buffer_state_.defined() || buffer_state_iterator_ == buffer_states_.end()) {
         return;
     }
-    
+
+    int64_t timing_id = -1;
+    bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto t1 = total_start;
+    double unload_ms = 0.0;
+    double load_ms = 0.0;
+
     // evict partition
-    auto t1 = std::chrono::high_resolution_clock::now();
     unload(true);
     auto t2 = std::chrono::high_resolution_clock::now();
-    // SPDLOG_INFO("Eviction time: {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+    unload_ms = elapsed_ms(t1, t2);
 #ifdef GEGE_CUDA
     c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
@@ -1030,7 +1076,7 @@ void MemPartitionBuffer::performNextSwap() {
     t1 = std::chrono::high_resolution_clock::now();
     load(data_storage_);
     t2 = std::chrono::high_resolution_clock::now();
-    // SPDLOG_INFO("Admission time: {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+    load_ms = elapsed_ms(t1, t2);
 #ifdef GEGE_CUDA
     c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
@@ -1042,9 +1088,18 @@ void MemPartitionBuffer::performNextSwap() {
         partition_id = buffer_state_[i].item<int>();
         num_nodes += partition_table_[partition_id]->partition_size_;
     }
+
+    if (log_timing) {
+        auto total_end = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO(
+            "[partition-buffer-swap][swap {}] this={} device={} active_parts={} nodes={} unload_ms={:.3f} load_ms={:.3f} total_ms={:.3f}",
+            timing_id, fmt::ptr(this), device_.str(), buffer_state_.size(0), num_nodes, unload_ms, load_ms, elapsed_ms(total_start, total_end));
+    }
 }
 
 void MemPartitionBuffer::sync() {
+    int64_t timing_id = -1;
+    bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
     auto t1 = std::chrono::high_resolution_clock::now();
     void* tensor_mem_ = data_storage_.data_ptr();
 #pragma omp parallel for
@@ -1067,7 +1122,11 @@ void MemPartitionBuffer::sync() {
         partition->present_ = false;
     }
     auto t2 = std::chrono::high_resolution_clock::now();
-    // SPDLOG_INFO("Sync time: {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+    if (log_timing) {
+        SPDLOG_INFO("[partition-buffer-swap][sync {}] this={} device={} parts={} sync_ms={:.3f}",
+                    timing_id, fmt::ptr(this), device_.str(), buffer_state_.defined() ? buffer_state_.size(0) : 0,
+                    elapsed_ms(t1, t2));
+    }
 }
 
 
@@ -1089,16 +1148,32 @@ void MemPartitionBuffer::setBufferOrdering(std::vector<torch::Tensor> buffer_sta
 void MemPartitionBuffer::unload(bool write) {
 
     if (loaded_) {
+        int64_t timing_id = -1;
+        bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
+        auto total_start = std::chrono::high_resolution_clock::now();
+        auto phase_start = total_start;
+        double gpu_to_cpu_ms = 0.0;
         if (buffer_tensor_gpu_view_.device().is_cuda()) {
-            auto t1 = std::chrono::high_resolution_clock::now();
             buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
-            auto t2 = std::chrono::high_resolution_clock::now();
-            // SPDLOG_INFO("CPU copy time: {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+            if (log_timing) {
+                auto now = std::chrono::high_resolution_clock::now();
+                gpu_to_cpu_ms = elapsed_ms(phase_start, now);
+                phase_start = now;
+            }
             buff_mem_unload_ = buffer_tensor_view_.data_ptr();
 
         }
         
         sync();
+        double sync_ms = 0.0;
+        if (log_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            sync_ms = elapsed_ms(phase_start, now);
+            SPDLOG_INFO(
+                "[partition-buffer-swap][unload {}] this={} device={} loaded_parts={} gpu_to_cpu_ms={:.3f} sync_ms={:.3f} total_ms={:.3f}",
+                timing_id, fmt::ptr(this), device_.str(), buffer_state_.defined() ? buffer_state_.size(0) : 0, gpu_to_cpu_ms, sync_ms,
+                elapsed_ms(total_start, now));
+        }
         // buffer_tensor_view_ = torch::Tensor();
         // buff_mem_unload_ = nullptr;
 

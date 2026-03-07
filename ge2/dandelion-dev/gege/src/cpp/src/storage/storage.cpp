@@ -16,6 +16,9 @@
 
 #if defined(GEGE_CUDA)
 #include "pytorch_scatter/segment_sum.h"
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime_api.h>
 #if __has_include(<nvtx3/nvToolsExt.h>)
 #include <nvtx3/nvToolsExt.h>
 #define GEGE_HAS_NVTX 1
@@ -64,6 +67,11 @@ bool csr_update_reduce_enabled() {
 
 bool csr_nvtx_enabled() {
     static bool enabled = parse_env_flag("GEGE_CSR_NVTX", false);
+    return enabled;
+}
+
+bool partition_buffer_peer_relay_enabled() {
+    static bool enabled = parse_env_flag("GEGE_PARTITION_BUFFER_PEER_RELAY", false);
     return enabled;
 }
 
@@ -356,6 +364,7 @@ MemPartitionBufferStorage::MemPartitionBufferStorage(string filename, int64_t di
     dtype_ = options_->dtype;
     initialized_ = true;
     loaded_ = false;
+    peer_relay_runtime_enabled_ = false;
     int64_t partition_size = ceil((double)dim0_size_ / options_->num_partitions);
     device_ = torch::kCUDA;
     devices_ = devices;
@@ -364,6 +373,75 @@ MemPartitionBufferStorage::MemPartitionBufferStorage(string filename, int64_t di
                                   dtype_, filename_, options_->prefetching, devices_[i], devices_.size());
         buffers_.emplace_back(buffer);
     }
+}
+
+void MemPartitionBufferStorage::initializePeerRelay_() {
+    peer_relay_runtime_enabled_ = false;
+
+    if (!partition_buffer_peer_relay_enabled()) {
+        return;
+    }
+
+#if !defined(GEGE_CUDA)
+    SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY requested but GEGE_CUDA is not enabled; falling back to CPU-backed swaps");
+    return;
+#else
+    if (devices_.size() <= 1) {
+        SPDLOG_INFO("GEGE_PARTITION_BUFFER_PEER_RELAY requested but only {} physical CUDA device is active; falling back to CPU-backed swaps", devices_.size());
+        return;
+    }
+
+    if (options_ != nullptr && options_->prefetching) {
+        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY does not support partition prefetching; falling back to CPU-backed swaps");
+        return;
+    }
+
+    for (std::size_t src = 0; src < devices_.size(); src++) {
+        if (!devices_[src].is_cuda()) {
+            SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY requires CUDA devices only; falling back to CPU-backed swaps");
+            return;
+        }
+        for (std::size_t dst = 0; dst < devices_.size(); dst++) {
+            if (src == dst) {
+                continue;
+            }
+            int can_access = 0;
+            cudaError_t status = cudaDeviceCanAccessPeer(&can_access, devices_[src].index(), devices_[dst].index());
+            if (status != cudaSuccess || can_access == 0) {
+                SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: CUDA peer access unavailable between device {} and {}",
+                            devices_[src].index(), devices_[dst].index());
+                return;
+            }
+        }
+    }
+
+    for (std::size_t src = 0; src < devices_.size(); src++) {
+        c10::cuda::CUDAGuard device_guard(devices_[src]);
+        for (std::size_t dst = 0; dst < devices_.size(); dst++) {
+            if (src == dst) {
+                continue;
+            }
+            cudaError_t status = cudaDeviceEnablePeerAccess(devices_[dst].index(), 0);
+            if (status != cudaSuccess && status != cudaErrorPeerAccessAlreadyEnabled) {
+                SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: failed to enable peer access from device {} to {} ({})",
+                            devices_[src].index(), devices_[dst].index(), cudaGetErrorString(status));
+                return;
+            }
+        }
+    }
+
+    peer_relay_ready_barrier_ = std::make_unique<ReusableBarrier>(static_cast<int>(devices_.size()));
+    peer_relay_build_barrier_ = std::make_unique<ReusableBarrier>(static_cast<int>(devices_.size()));
+    peer_relay_next_states_.resize(devices_.size());
+    peer_relay_staged_views_.resize(devices_.size());
+    peer_relay_runtime_enabled_ = true;
+    SPDLOG_INFO("Enabled GEGE_PARTITION_BUFFER_PEER_RELAY for {} CUDA devices; CPU backing store will be synchronized at unload/eval boundaries", devices_.size());
+#endif
+}
+
+bool MemPartitionBufferStorage::peerRelayEnabled_() {
+    std::call_once(peer_relay_init_once_, [this]() { initializePeerRelay_(); });
+    return peer_relay_runtime_enabled_;
 }
 
 
@@ -482,6 +560,119 @@ void MemPartitionBufferStorage::unload(bool perform_write, int32_t device_idx) {
             loaded_ = false;
         }
     }
+}
+
+void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
+    if (!peerRelayEnabled_()) {
+        buffers_[device_idx]->performNextSwap();
+        return;
+    }
+
+#if !defined(GEGE_CUDA)
+    buffers_[device_idx]->performNextSwap();
+#else
+    auto *buffer = buffers_[device_idx];
+    if (!buffer->buffer_state_.defined() || buffer->buffer_state_iterator_ == buffer->buffer_states_.end()) {
+        return;
+    }
+
+    {
+        c10::cuda::CUDAGuard device_guard(buffer->device_);
+        cudaDeviceSynchronize();
+    }
+
+    peer_relay_next_states_[device_idx] = (*buffer->buffer_state_iterator_).clone();
+    peer_relay_staged_views_[device_idx] = torch::Tensor();
+    peer_relay_ready_barrier_->arrive_and_wait();
+
+    std::vector<int> current_owner(options_->num_partitions, -1);
+    for (int src_dev = 0; src_dev < static_cast<int>(buffers_.size()); src_dev++) {
+        auto *src_buffer = buffers_[src_dev];
+        auto current_state = src_buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+        auto *state_ptr = current_state.data_ptr<int64_t>();
+        for (int64_t i = 0; i < current_state.numel(); i++) {
+            current_owner[state_ptr[i]] = src_dev;
+        }
+    }
+
+    auto next_state = peer_relay_next_states_[device_idx].to(torch::kCPU).to(torch::kInt64).contiguous();
+    torch::Tensor staged_view = torch::zeros_like(buffer->buffer_tensor_gpu_view_);
+    {
+        c10::cuda::CUDAGuard device_guard(buffer->device_);
+        auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
+        c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
+
+        auto *next_state_ptr = next_state.data_ptr<int64_t>();
+        for (int64_t slot = 0; slot < next_state.numel(); slot++) {
+            int partition_id = static_cast<int>(next_state_ptr[slot]);
+            int src_dev = current_owner[partition_id];
+            if (src_dev < 0) {
+                throw GegeRuntimeException(fmt::format("Peer relay could not find current owner for partition {}", partition_id));
+            }
+
+            auto *src_buffer = buffers_[src_dev];
+            Partition *src_partition = src_buffer->partition_table_[partition_id];
+            Partition *dst_partition = buffer->partition_table_[partition_id];
+            int64_t src_slot = src_partition->buffer_idx_;
+            int64_t rows = dst_partition->partition_size_;
+            int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
+
+            void *dst_ptr = static_cast<char *>(staged_view.data_ptr()) + (slot * buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
+            void *src_ptr = static_cast<char *>(src_buffer->buffer_tensor_gpu_view_.data_ptr()) +
+                            (src_slot * src_buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
+
+            cudaError_t status;
+            if (src_dev == device_idx) {
+                status = cudaMemcpyAsync(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice, comm_stream.stream());
+            } else {
+                status = cudaMemcpyPeerAsync(dst_ptr, buffer->device_.index(), src_ptr, src_buffer->device_.index(), bytes, comm_stream.stream());
+            }
+
+            if (status != cudaSuccess) {
+                throw GegeRuntimeException(fmt::format("Peer relay copy failed for partition {} from device {} to {}: {}",
+                                                      partition_id, src_buffer->device_.index(), buffer->device_.index(),
+                                                      cudaGetErrorString(status)));
+            }
+        }
+
+        cudaStreamSynchronize(comm_stream.stream());
+    }
+
+    peer_relay_staged_views_[device_idx] = staged_view;
+    peer_relay_build_barrier_->arrive_and_wait();
+
+    auto previous_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
+    for (int64_t i = 0; i < previous_state.numel(); i++) {
+        int partition_id = static_cast<int>(previous_state_ptr[i]);
+        Partition *partition = buffer->partition_table_[partition_id];
+        partition->present_ = false;
+        partition->buffer_idx_ = -1;
+        partition->data_ptr_ = nullptr;
+    }
+
+    buffer->buffer_tensor_gpu_view_ = peer_relay_staged_views_[device_idx];
+    buffer->buffer_state_ = *buffer->buffer_state_iterator_;
+    for (int i = 0; i < buffer->buffer_sizes_; i++) {
+        if (buffer->buffer_state_iterator_ != buffer->buffer_states_.end()) {
+            buffer->buffer_state_iterator_++;
+        }
+    }
+
+    int64_t num_rows = 0;
+    auto current_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto *current_state_ptr = current_state.data_ptr<int64_t>();
+    for (int64_t slot = 0; slot < current_state.numel(); slot++) {
+        int partition_id = static_cast<int>(current_state_ptr[slot]);
+        Partition *partition = buffer->partition_table_[partition_id];
+        partition->present_ = true;
+        partition->buffer_idx_ = slot;
+        partition->data_ptr_ = nullptr;
+        num_rows += partition->partition_size_;
+    }
+    buffer->size_.store(num_rows);
+    buffer->loaded_ = true;
+#endif
 }
 
 torch::Tensor MemPartitionBufferStorage::indexRead(Indices indices) { 

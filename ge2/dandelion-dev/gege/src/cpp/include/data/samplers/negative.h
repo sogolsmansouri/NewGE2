@@ -1,7 +1,10 @@
 #pragma once
 
 #include <cstdlib>
+#include <deque>
 #include <limits>
+#include <map>
+#include <mutex>
 #include <string>
 
 #include "storage/graph_storage.h"
@@ -84,6 +87,7 @@ class NegativeSampler {
      */
     virtual std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
                                                                   bool inverse = false) = 0;
+    virtual void resetPlanCache() {}
     // serve as `select` function.
 
     virtual std::tuple<torch::Tensor, torch::Tensor> compute(torch::Tensor src_embeddings, torch::Tensor dst_embeddings, torch::Tensor dst_neg_embeddings, torch::Tensor src_neg_embeddings,
@@ -142,25 +146,31 @@ class NegativeSamplingBase : public NegativeSampler {
     int num_chunks_;
     int num_negatives_;
     float degree_fraction_;
+    int superbatch_negative_plan_batches_;
     bool filtered_;
     LocalFilterMode local_filter_mode_;
     bool tournament_selection_;
     bool tiled_tournament_scores_;
     int tiled_tournament_groups_per_tile_;
+    std::mutex plan_mutex_;
+    std::map<std::string, std::deque<torch::Tensor>> planned_uniform_negatives_[2];
 
     NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false,
-                         LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false,
+                         int superbatch_negative_plan_batches = 0, LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false,
                          bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64);
 
     std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(), bool inverse = false) override;
+    void resetPlanCache() override;
 };
 
 class RNS : public NegativeSamplingBase {
    public:
-    RNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG,
-        bool tournament_selection = false, bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64)
+    RNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, int superbatch_negative_plan_batches = 0,
+        LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false, bool tiled_tournament_scores = false,
+        int tiled_tournament_groups_per_tile = 64)
        : NegativeSamplingBase(
-             num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode, tournament_selection, tiled_tournament_scores,
+             num_chunks, num_negatives, degree_fraction, filtered, superbatch_negative_plan_batches, local_filter_mode, tournament_selection,
+             tiled_tournament_scores,
              tiled_tournament_groups_per_tile) {
            SPDLOG_INFO("NegativeSampling: Used RNS");
     }
@@ -182,10 +192,12 @@ class RNS : public NegativeSamplingBase {
 
 class DNS : public NegativeSamplingBase {
    public:
-    DNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG,
-        bool tournament_selection = false, bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64)
+    DNS(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, int superbatch_negative_plan_batches = 0,
+        LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false, bool tiled_tournament_scores = false,
+        int tiled_tournament_groups_per_tile = 64)
        : NegativeSamplingBase(
-             num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode, tournament_selection, tiled_tournament_scores,
+             num_chunks, num_negatives, degree_fraction, filtered, superbatch_negative_plan_batches, local_filter_mode, tournament_selection,
+             tiled_tournament_scores,
              tiled_tournament_groups_per_tile) {
            SPDLOG_INFO("NegativeSampling: Used DNS");
     }
@@ -234,10 +246,12 @@ class DNS : public NegativeSamplingBase {
 
 class KBGAN : public NegativeSamplingBase {
    public:
-    KBGAN(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, LocalFilterMode local_filter_mode = LocalFilterMode::DEG,
-          bool tournament_selection = false, bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64)
+    KBGAN(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false, int superbatch_negative_plan_batches = 0,
+          LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false, bool tiled_tournament_scores = false,
+          int tiled_tournament_groups_per_tile = 64)
        : NegativeSamplingBase(
-             num_chunks, num_negatives, degree_fraction, filtered, local_filter_mode, tournament_selection, tiled_tournament_scores,
+             num_chunks, num_negatives, degree_fraction, filtered, superbatch_negative_plan_batches, local_filter_mode, tournament_selection,
+             tiled_tournament_scores,
              tiled_tournament_groups_per_tile) {
            SPDLOG_INFO("NegativeSampling: Used KBGAN");
     }

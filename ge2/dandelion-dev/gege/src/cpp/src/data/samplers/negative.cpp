@@ -47,7 +47,8 @@ torch::Tensor deg_negative_local_filter(torch::Tensor deg_sample_indices, torch:
     int64_t chunk_size = ceil((double)edges.size(0) / num_chunks);
     int64_t num_deg_negs = deg_sample_indices.size(1);
 
-    torch::Tensor chunk_ids = deg_sample_indices.div(chunk_size, "trunc");
+    torch::Tensor chunk_ids =
+        torch::floor(deg_sample_indices.to(torch::kFloat64).div(static_cast<double>(chunk_size))).to(torch::kInt64);
     torch::Tensor inv_mask = chunk_ids - torch::arange(0, num_chunks, deg_sample_indices.device()).view({num_chunks, -1});
     torch::Tensor mask = (inv_mask == 0);
     torch::Tensor temp_idx = torch::nonzero(mask);

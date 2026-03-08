@@ -363,9 +363,9 @@ class InMemory : public Storage {
                                       .div(static_cast<double>(partition_size)))
                                   .to(torch::kInt64);
 
-        auto tup = torch::sort(dst_partitions, true, -1, false);
+        auto tup = torch::sort(dst_partitions, -1, true);
         torch::Tensor dst_args = std::get<1>(tup);
-        tup = torch::sort(src_partitions.index_select(0, dst_args), true, -1, false);
+        tup = torch::sort(src_partitions.index_select(0, dst_args), -1, true);
         torch::Tensor src_args = std::get<1>(tup);
         data_.copy_(data_.index_select(0, dst_args.index_select(0, src_args)));
 

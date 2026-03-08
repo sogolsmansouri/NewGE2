@@ -352,8 +352,16 @@ class InMemory : public Storage {
     void rePartition(torch::Tensor permutation, int64_t num_nodes, int64_t num_partitions) {
         int64_t partition_size = ceil((double)num_nodes / num_partitions);
  
-        auto src_partitions = torch::div(permutation.index_select(0, data_.select(1, 0).squeeze()), partition_size, "trunc");
-        auto dst_partitions = torch::div(permutation.index_select(0, data_.select(1, -1).squeeze()), partition_size, "trunc");
+        auto src_partitions = torch::floor(
+                                  permutation.index_select(0, data_.select(1, 0).squeeze())
+                                      .to(torch::kFloat64)
+                                      .div(static_cast<double>(partition_size)))
+                                  .to(torch::kInt64);
+        auto dst_partitions = torch::floor(
+                                  permutation.index_select(0, data_.select(1, -1).squeeze())
+                                      .to(torch::kFloat64)
+                                      .div(static_cast<double>(partition_size)))
+                                  .to(torch::kInt64);
 
         auto tup = torch::sort(dst_partitions, true, -1, false);
         torch::Tensor dst_args = std::get<1>(tup);
@@ -361,8 +369,16 @@ class InMemory : public Storage {
         torch::Tensor src_args = std::get<1>(tup);
         data_.copy_(data_.index_select(0, dst_args.index_select(0, src_args)));
 
-        auto edge_bucket_ids_src = torch::div(permutation.index_select(0, data_.select(1, 0).squeeze()), partition_size, "trunc");
-        auto edge_bucket_ids_dst = torch::div(permutation.index_select(0, data_.select(1, -1).squeeze()), partition_size, "trunc");
+        auto edge_bucket_ids_src = torch::floor(
+                                       permutation.index_select(0, data_.select(1, 0).squeeze())
+                                           .to(torch::kFloat64)
+                                           .div(static_cast<double>(partition_size)))
+                                       .to(torch::kInt64);
+        auto edge_bucket_ids_dst = torch::floor(
+                                       permutation.index_select(0, data_.select(1, -1).squeeze())
+                                           .to(torch::kFloat64)
+                                           .div(static_cast<double>(partition_size)))
+                                       .to(torch::kInt64);
 
 
         torch::Tensor offsets = torch::zeros({num_partitions, num_partitions}, torch::kInt64);

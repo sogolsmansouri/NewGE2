@@ -275,8 +275,8 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
 
     torch::Tensor src = edges.select(1, 0);
     torch::Tensor dst = edges.select(1, -1);
-    torch::Tensor src_partitions = torch::div(src, partition_size, "trunc");
-    torch::Tensor dst_partitions = torch::div(dst, partition_size, "trunc");
+    torch::Tensor src_partitions = torch::floor(src.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
+    torch::Tensor dst_partitions = torch::floor(dst.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
     torch::Tensor src_slots = partition_to_buffer_slot.index_select(0, src_partitions);
     torch::Tensor dst_slots = partition_to_buffer_slot.index_select(0, dst_partitions);
 

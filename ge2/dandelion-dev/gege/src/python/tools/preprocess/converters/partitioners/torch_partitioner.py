@@ -12,34 +12,21 @@ def dataframe_to_tensor(input_dataframe):
 def partition_edges(edges, num_nodes, num_partitions):
     partition_size = int(np.ceil(num_nodes / num_partitions))
 
-    src_partitions = torch.div(edges[:, 0], partition_size, rounding_mode="trunc")
-    dst_partitions = torch.div(edges[:, -1], partition_size, rounding_mode="trunc")
+    # All node ids are non-negative, so floor division is equivalent to truncation
+    # and works across older Torch versions that do not support rounding_mode.
+    src_partitions = edges[:, 0] // partition_size
+    dst_partitions = edges[:, -1] // partition_size
 
-    _, dst_args = torch.sort(dst_partitions, stable=True)
-    _, src_args = torch.sort(src_partitions[dst_args], stable=True)
+    # Sort by a single flat bucket id instead of relying on stable multi-pass sort.
+    edge_bucket_ids = src_partitions * num_partitions + dst_partitions
+    edge_bucket_ids, sort_args = torch.sort(edge_bucket_ids)
+    edges = edges.index_select(0, sort_args)
 
-    edges = edges[dst_args[src_args]]
-    edge_bucket_ids = torch.div(edges, partition_size, rounding_mode="trunc")
+    offsets = np.zeros(num_partitions * num_partitions, dtype=int)
 
-    offsets = np.zeros([num_partitions, num_partitions], dtype=int)
-
-    unique_src, num_source = torch.unique_consecutive(edge_bucket_ids[:, 0], return_counts=True)
-
-    num_source_offsets = torch.cumsum(num_source, 0) - num_source
-
-    curr_src_unique = 0
-    for i in range(num_partitions):
-        if curr_src_unique < unique_src.size(0) and unique_src[curr_src_unique] == i:
-            offset = num_source_offsets[curr_src_unique]
-            num_edges = num_source[curr_src_unique]
-            dst_ids = edge_bucket_ids[offset : offset + num_edges, -1]
-
-            unique_dst, num_dst = torch.unique_consecutive(dst_ids, return_counts=True)
-
-            offsets[i][unique_dst] = num_dst
-            curr_src_unique += 1
-
-    offsets = list(offsets.flatten())
+    unique_buckets, bucket_counts = torch.unique_consecutive(edge_bucket_ids, return_counts=True)
+    offsets[unique_buckets.cpu().numpy()] = bucket_counts.cpu().numpy()
+    offsets = list(offsets)
 
     return edges, offsets
 

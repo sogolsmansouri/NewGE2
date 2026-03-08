@@ -8,7 +8,6 @@
 #include "reporting/logger.h"
 
 #ifdef GEGE_CUDA
-#include <ATen/ops/_unique2.h>
 #include "pytorch_scatter/segment_sum.h"
 #endif
 
@@ -65,6 +64,19 @@ int64_t parse_env_int(const char *name, int64_t default_value) {
     } catch (...) {
         return default_value;
     }
+}
+
+std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tensor ids) {
+    torch::Tensor ids64 = ids.to(torch::kInt64);
+    auto sort_tup = torch::sort(ids64, 0, false);
+    torch::Tensor sorted_ids = std::get<0>(sort_tup);
+    torch::Tensor perm = std::get<1>(sort_tup).to(torch::kInt64);
+    auto unique_tup = torch::unique_consecutive(sorted_ids, false, true);
+    torch::Tensor unique_ids = std::get<0>(unique_tup);
+    torch::Tensor inverse_sorted = std::get<1>(unique_tup).to(torch::kInt64);
+    torch::Tensor inverse = torch::empty_like(inverse_sorted);
+    inverse.scatter_(0, perm, inverse_sorted);
+    return std::forward_as_tuple(unique_ids, inverse);
 }
 
 bool csr_debug_enabled() {
@@ -390,7 +402,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> build_csr_from_local_ids
 
 torch::Tensor gather_negative_embeddings_csr(torch::Tensor node_embeddings, torch::Tensor negative_ids) {
     torch::Tensor flat_ids = negative_ids.flatten(0, 1).to(torch::kInt64);
-    auto unique_tup = at::_unique2(flat_ids, false, true, false);
+    auto unique_tup = unique_with_inverse_compat(flat_ids);
     torch::Tensor unique_ids = std::get<0>(unique_tup);
     torch::Tensor inverse = std::get<1>(unique_tup).to(torch::kInt64);
     torch::Tensor unique_embeddings = node_embeddings.index_select(0, unique_ids);
@@ -448,7 +460,7 @@ PositiveGatherPlan build_positive_gather_plan(torch::Tensor src_ids, torch::Tens
 #ifdef GEGE_CUDA
     if (use_csr_gather && src_ids.device().is_cuda()) {
         torch::Tensor flat_ids = torch::cat({src_ids, dst_ids}, 0).to(torch::kInt64);
-        auto unique_tup = at::_unique2(flat_ids, false, true, false);
+        auto unique_tup = unique_with_inverse_compat(flat_ids);
         torch::Tensor inverse = std::get<1>(unique_tup).to(torch::kInt64);
 
         int64_t src_count = src_ids.numel();
@@ -468,7 +480,7 @@ NegativeGatherPlan build_negative_gather_plan(torch::Tensor negative_ids, bool u
 #ifdef GEGE_CUDA
     if (use_csr_gather && negative_ids.device().is_cuda()) {
         torch::Tensor flat_ids = negative_ids.flatten(0, 1).to(torch::kInt64);
-        auto unique_tup = at::_unique2(flat_ids, false, true, false);
+        auto unique_tup = unique_with_inverse_compat(flat_ids);
         plan.use_csr = true;
         plan.unique_ids = std::get<0>(unique_tup);
         plan.inverse = std::get<1>(unique_tup).to(torch::kInt64);

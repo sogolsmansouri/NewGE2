@@ -97,6 +97,19 @@ void maybe_log_unique_backend_banner(const UniqueMapCudaDebugInfo &debug_info) {
     });
 }
 
+std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tensor ids) {
+    torch::Tensor ids64 = ids.to(torch::kInt64);
+    auto sort_tup = torch::sort(ids64, 0, false);
+    torch::Tensor sorted_ids = std::get<0>(sort_tup);
+    torch::Tensor perm = std::get<1>(sort_tup).to(torch::kInt64);
+    auto unique_tup = torch::unique_consecutive(sorted_ids, false, true);
+    torch::Tensor unique_ids = std::get<0>(unique_tup);
+    torch::Tensor inverse_sorted = std::get<1>(unique_tup).to(torch::kInt64);
+    torch::Tensor inverse = torch::empty_like(inverse_sorted);
+    inverse.scatter_(0, perm, inverse_sorted);
+    return std::forward_as_tuple(unique_ids, inverse);
+}
+
 torch::Tensor pack_ids_into_cached_buffer(const std::vector<torch::Tensor> &unmapped_tensors) {
     if (unmapped_tensors.empty()) {
         throw GegeRuntimeException("Input tensors must not be empty");
@@ -330,12 +343,12 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
         mapped_all_ids = std::get<1>(unique_tup);
         maybe_log_unique_backend_banner(unique_debug_info);
     } else {
-        auto unique_tup = torch::_unique2(all_ids, sorted, true, false);
+        auto unique_tup = unique_with_inverse_compat(all_ids);
         map = std::get<0>(unique_tup);
         mapped_all_ids = std::get<1>(unique_tup);
     }
 #else
-    auto unique_tup = torch::_unique2(all_ids, sorted, true, false);
+    auto unique_tup = unique_with_inverse_compat(all_ids);
     map = std::get<0>(unique_tup);
     mapped_all_ids = std::get<1>(unique_tup);
 #endif

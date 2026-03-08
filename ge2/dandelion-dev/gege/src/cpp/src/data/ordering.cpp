@@ -14,6 +14,13 @@
 
 namespace {
 
+std::tuple<torch::Tensor, torch::Tensor> unique_with_counts_sorted(torch::Tensor values) {
+    auto sort_tup = torch::sort(values.to(torch::kInt64), 0, false);
+    torch::Tensor sorted_values = std::get<0>(sort_tup);
+    auto unique_tup = torch::unique_consecutive(sorted_values, false, false, true);
+    return std::forward_as_tuple(std::get<0>(unique_tup), std::get<2>(unique_tup));
+}
+
 struct StateAccessSummary {
     std::vector<int64_t> partitions;
     std::unordered_map<int64_t, int64_t> incident_bucket_counts;
@@ -599,9 +606,9 @@ vector<vector<int>> getBetaOrderingHelper(int num_partitions, int buffer_capacit
     Indices in_buffer = all_partitions.index_select(0, torch::arange(buffer_capacity));
 
     Indices combined = torch::cat({all_partitions, in_buffer});
-    auto uniques = torch::_unique2(combined, true, false, true);
+    auto uniques = unique_with_counts_sorted(combined);
     auto vals = std::get<0>(uniques);
-    auto counts = std::get<2>(uniques);
+    auto counts = std::get<1>(uniques);
     Indices on_disk = vals.masked_select(counts == 1);
 
     int *data_ptr_ = (int *)in_buffer.data_ptr();

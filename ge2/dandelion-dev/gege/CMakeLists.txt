@@ -166,7 +166,9 @@ set_target_properties(${PROJECT_NAME} PROPERTIES PUBLIC_HEADER "${project_HEADER
 set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 if(${USE_CUDA})
-    set(NVCC_FLAGS "{NVCC_FLAGS} --expt-relaxed-constexpr")
+    target_compile_options(${PROJECT_NAME} PRIVATE
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>
+            $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda>)
 endif()
 
 if(${USE_OMP})

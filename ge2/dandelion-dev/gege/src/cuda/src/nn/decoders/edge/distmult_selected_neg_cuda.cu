@@ -270,7 +270,7 @@ torch::Tensor selected_neg_scores_cuda_forward(torch::Tensor chunked_adjusted_em
         }
     });
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
     return output;
 }
 
@@ -357,6 +357,6 @@ std::tuple<torch::Tensor, torch::Tensor> selected_neg_scores_cuda_backward(torch
         }
     });
 
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
     return std::forward_as_tuple(grad_chunked, grad_negatives);
 }

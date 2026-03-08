@@ -39,6 +39,13 @@
 
 namespace cuco {
 namespace detail {
+struct identity_fn {
+  template <typename T>
+  __host__ __device__ constexpr T operator()(T const& x) const noexcept
+  {
+    return x;
+  }
+};
 /**
  * @brief An open addressing impl class.
  *
@@ -282,7 +289,7 @@ class open_addressing_impl {
     auto const always_true = thrust::constant_iterator<bool>{true};
     detail::insert_if_n<cg_size, cuco::detail::default_block_size()>
       <<<grid_size, cuco::detail::default_block_size(), 0, stream>>>(
-        first, num_keys, always_true, thrust::identity{}, counter.data(), container_ref);
+        first, num_keys, always_true, identity_fn{}, counter.data(), container_ref);
 
     return counter.load_to_host(stream);
   }
@@ -311,7 +318,7 @@ class open_addressing_impl {
     auto const always_true = thrust::constant_iterator<bool>{true};
     detail::insert_if_n<cg_size, cuco::detail::default_block_size()>
       <<<grid_size, cuco::detail::default_block_size(), 0, stream>>>(
-        first, num_keys, always_true, thrust::identity{}, container_ref);
+        first, num_keys, always_true, identity_fn{}, container_ref);
   }
 
   /**
@@ -473,7 +480,7 @@ class open_addressing_impl {
     auto const always_true = thrust::constant_iterator<bool>{true};
     detail::contains_if_n<cg_size, cuco::detail::default_block_size()>
       <<<grid_size, cuco::detail::default_block_size(), 0, stream>>>(
-        first, num_keys, always_true, thrust::identity{}, output_begin, container_ref);
+        first, num_keys, always_true, identity_fn{}, output_begin, container_ref);
   }
 
   /**

@@ -324,7 +324,7 @@ torch::Tensor compute_filter_corruption_gpu(shared_ptr<GegeGraph> graph, torch::
 }
 
 torch::Tensor apply_score_filter(torch::Tensor scores, torch::Tensor filter) {
-    if (filter.defined()) {
+    if (filter.defined() && filter.size(0) > 0) {
         scores.index_put_({filter.select(1, 0), filter.select(1, 1)}, -1e9);
     }
     return scores;

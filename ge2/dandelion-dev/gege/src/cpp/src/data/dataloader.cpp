@@ -264,7 +264,7 @@ void DataLoader::refreshGraphStorageMode() {
     bool enable_fast_path = false;
     if (graph_storage_ != nullptr && learning_task_ == LearningTask::LINK_PREDICTION && train_ && graph_storage_->useInMemorySubGraph() &&
         neighbor_sampler_ == nullptr && !negative_sampler_filtered(negative_sampler_)) {
-        enable_fast_path = partition_buffer_lp_fast_path_env_enabled(false);
+        enable_fast_path = partition_buffer_lp_fast_path_env_enabled(true);
     }
     graph_storage_->setPartitionBufferLPFastPathEnabled(enable_fast_path);
 

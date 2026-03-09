@@ -607,7 +607,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
     }
 
     auto next_state = peer_relay_next_states_[device_idx].to(torch::kCPU).to(torch::kInt64).contiguous();
-    torch::Tensor staged_view = torch::zeros_like(buffer->buffer_tensor_gpu_view_);
+    // Every slot in the next buffer state is fully overwritten by relay copies,
+    // so zero-filling the staging tensor just burns swap time.
+    torch::Tensor staged_view = torch::empty_like(buffer->buffer_tensor_gpu_view_);
     {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
         auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());

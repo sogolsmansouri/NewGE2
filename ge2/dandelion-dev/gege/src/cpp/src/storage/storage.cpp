@@ -422,13 +422,24 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
                 continue;
             }
             cudaError_t status = cudaDeviceEnablePeerAccess(devices_[dst].index(), 0);
-            if (status != cudaSuccess && status != cudaErrorPeerAccessAlreadyEnabled) {
+            if (status == cudaErrorPeerAccessAlreadyEnabled) {
+                // cudaDeviceEnablePeerAccess may leave a sticky runtime error even
+                // though repeated enable attempts are semantically harmless.
+                // Clear it here so later kernel launch checks do not trip on this
+                // stale status.
+                cudaGetLastError();
+                continue;
+            }
+            if (status != cudaSuccess) {
                 SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: failed to enable peer access from device {} to {} ({})",
                             devices_[src].index(), devices_[dst].index(), cudaGetErrorString(status));
                 return;
             }
         }
     }
+
+    // Ensure no sticky peer-access status leaks into unrelated CUDA work.
+    cudaGetLastError();
 
     peer_relay_ready_barrier_ = std::make_unique<ReusableBarrier>(static_cast<int>(devices_.size()));
     peer_relay_build_barrier_ = std::make_unique<ReusableBarrier>(static_cast<int>(devices_.size()));

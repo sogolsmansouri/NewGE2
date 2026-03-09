@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <future>
 #include <map>
 #include <string>
 #include <tuple>
@@ -26,6 +27,11 @@ struct DataLoaderPerfStats {
     std::vector<int64_t> device_swap_rebuild_ns;
     std::vector<int64_t> device_swap_sync_wait_ns;
     std::vector<int64_t> device_swap_count;
+};
+
+struct PreparedSuperstep {
+    shared_ptr<InMemorySubgraphState> subgraph_state;
+    std::vector<shared_ptr<Batch>> batches;
 };
 
 class DataLoader {
@@ -100,6 +106,7 @@ class DataLoader {
     std::vector<int64_t> device_swap_rebuild_ns_;
     std::vector<int64_t> device_swap_sync_wait_ns_;
     std::vector<int64_t> device_swap_count_;
+    std::vector<std::future<PreparedSuperstep>> prepared_supersteps_;
 
     LearningTask learning_task_;
 
@@ -123,6 +130,10 @@ class DataLoader {
     void initializeBatches(bool prepare_encode = false, int32_t device_idx = 0);
 
     void refreshGraphStorageMode();
+
+    void maybePrepareNextSuperstep(int32_t device_idx = 0);
+
+    void advanceEdgeBucketIterator_(int32_t device_idx);
 
     void clearBatches();
 

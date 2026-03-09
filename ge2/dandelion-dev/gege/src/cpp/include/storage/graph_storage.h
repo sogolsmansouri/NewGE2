@@ -101,6 +101,8 @@ class GraphModelStorage {
 
     void updateInMemorySubGraph(int32_t device_idx = 0);
 
+    shared_ptr<InMemorySubgraphState> prepareNextInMemorySubGraph(std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx = 0);
+
     void getNextSubGraph();
 
     EdgeList merge_sorted_edge_buckets(EdgeList edges, torch::Tensor starts, int buffer_size, bool src);

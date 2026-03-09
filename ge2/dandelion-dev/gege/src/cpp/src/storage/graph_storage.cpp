@@ -302,6 +302,16 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
     return mapped_edges.to(device);
 }
 
+torch::Tensor build_partition_to_buffer_slot_map(torch::Tensor in_memory_partition_ids, int64_t num_partitions) {
+    torch::Tensor partition_to_buffer_slot = -torch::ones({num_partitions}, torch::kInt64);
+    auto slot_accessor = partition_to_buffer_slot.accessor<int64_t, 1>();
+    auto partition_accessor = in_memory_partition_ids.accessor<int64_t, 1>();
+    for (int64_t slot = 0; slot < in_memory_partition_ids.size(0); slot++) {
+        slot_accessor[partition_accessor[slot]] = slot;
+    }
+    return partition_to_buffer_slot;
+}
+
 void GraphModelStorage::_load(shared_ptr<Storage> storage) {
     if (storage != nullptr) {
         storage->load();
@@ -963,6 +973,17 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
     }
 }
 
+shared_ptr<InMemorySubgraphState> GraphModelStorage::prepareNextInMemorySubGraph(std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx) {
+    if (!shouldUsePartitionBufferLPFastPath_()) {
+        throw GegeRuntimeException("prepareNextInMemorySubGraph currently requires the partition-buffer LP fast path");
+    }
+
+    auto next_subgraph_state = std::make_shared<InMemorySubgraphState>();
+    next_subgraph_state->in_memory_subgraph_ = nullptr;
+    updateInMemorySubGraph_(next_subgraph_state, swap_ids, device_idx);
+    return next_subgraph_state;
+}
+
 void GraphModelStorage::getNextSubGraph() {
     std::pair<std::vector<int>, std::vector<int>> next_swap_ids = getNextSwapIds();
     next_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
@@ -1164,7 +1185,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     torch::Tensor mapped_edges;
     subgraph->global_to_local_index_map_ = torch::Tensor();
     if (shouldUsePartitionBufferLPFastPath_()) {
-        torch::Tensor partition_to_buffer_slot = getPartitionToBufferSlotMap_(device_idx);
+        torch::Tensor partition_to_buffer_slot = build_partition_to_buffer_slot_map(new_in_mem_partition_ids, num_partitions);
         int64_t partition_size = getPartitionSize_(device_idx);
         mapped_edges = mapEdgesWithPartitionSlots_(subgraph->all_in_memory_edges_, partition_to_buffer_slot, partition_size, devices_[device_idx]);
         if (log_timing) {

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <string>
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -533,10 +534,8 @@ void DataLoader::advanceEdgeBucketIterator_(int32_t device_idx) {
         return;
     }
 
-    for (int i = 0; i < devices_.size(); i++) {
-        if (edge_buckets_per_buffer_iterators_[device_idx] != edge_buckets_per_buffer_.end()) {
-            edge_buckets_per_buffer_iterators_[device_idx]++;
-        }
+    if (edge_buckets_per_buffer_iterators_[device_idx] != edge_buckets_per_buffer_.end()) {
+        edge_buckets_per_buffer_iterators_[device_idx]++;
     }
 }
 
@@ -649,6 +648,12 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
 
     ActiveEdgePlan plan;
     if (graph_storage_->useInMemorySubGraph()) {
+        if (device_idx < 0 || device_idx >= edge_buckets_per_buffer_iterators_.size()) {
+            throw std::runtime_error("setActiveEdges received invalid device index for edge bucket iterator");
+        }
+        if (edge_buckets_per_buffer_iterators_[device_idx] == edge_buckets_per_buffer_.end()) {
+            throw std::runtime_error("setActiveEdges reached end of edge bucket iterator before active state consumption completed");
+        }
         torch::Tensor edge_bucket_ids = *edge_buckets_per_buffer_iterators_[device_idx];
         advanceEdgeBucketIterator_(device_idx);
         plan = build_active_edge_plan(graph_storage_.get(), graph_storage_->current_subgraph_states_[device_idx], edge_bucket_ids, batch_size_, train_,
@@ -970,7 +975,6 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                     all_batches_[device_idx] = std::move(prepared_superstep.batches);
                     batches_left_[device_idx] = all_batches_[device_idx].size();
                     batch_iterators_[device_idx] = all_batches_[device_idx].begin();
-                    advanceEdgeBucketIterator_(device_idx);
                 } else {
                     initializeBatches(false, device_idx);
                 }

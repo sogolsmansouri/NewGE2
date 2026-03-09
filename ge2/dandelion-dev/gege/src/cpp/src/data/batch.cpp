@@ -368,4 +368,6 @@ void Batch::clear() {
 
     src_neg_filter_ = torch::Tensor();
     dst_neg_filter_ = torch::Tensor();
+    edge_block_starts_ = torch::Tensor();
+    edge_block_sizes_ = torch::Tensor();
 }

@@ -406,6 +406,41 @@ EdgeList GraphModelStorage::getEdgesRange(int64_t start, int64_t size, int devic
     }
 }
 
+EdgeList GraphModelStorage::getEdgesFromBlocks(torch::Tensor starts, torch::Tensor sizes, int32_t device_idx) {
+    if (!starts.defined() || !sizes.defined() || starts.numel() == 0) {
+        return torch::empty({0, storage_ptrs_.edges->dim1_size_},
+                            torch::TensorOptions().dtype(torch::kInt64).device(storage_ptrs_.edges->device_));
+    }
+
+    if (!useInMemorySubGraph() || !current_subgraph_states_[device_idx] ||
+        !current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.defined()) {
+        throw GegeRuntimeException("Block edge access requires an active in-memory subgraph");
+    }
+
+    torch::Tensor starts_cpu = starts.to(torch::kCPU, torch::kInt64);
+    torch::Tensor sizes_cpu = sizes.to(torch::kCPU, torch::kInt64);
+    auto starts_accessor = starts_cpu.accessor<int64_t, 1>();
+    auto sizes_accessor = sizes_cpu.accessor<int64_t, 1>();
+
+    int64_t total_size = 0;
+    for (int64_t i = 0; i < sizes_cpu.size(0); i++) {
+        total_size += sizes_accessor[i];
+    }
+
+    auto &source = current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_;
+    EdgeList gathered = torch::empty({total_size, source.size(1)}, source.options());
+
+    int64_t dst_start = 0;
+    for (int64_t i = 0; i < starts_cpu.size(0); i++) {
+        int64_t src_start = starts_accessor[i];
+        int64_t block_size = sizes_accessor[i];
+        gathered.narrow(0, dst_start, block_size).copy_(source.narrow(0, src_start, block_size));
+        dst_start += block_size;
+    }
+
+    return gathered;
+}
+
 void GraphModelStorage::shuffleEdges() { storage_ptrs_.edges->shuffle(); }
 
 Indices GraphModelStorage::getRandomNodeIds(int64_t size) {

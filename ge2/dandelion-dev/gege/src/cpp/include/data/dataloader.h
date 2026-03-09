@@ -21,6 +21,11 @@ struct DataLoaderPerfStats {
     int64_t swap_rebuild_ns = 0;
     int64_t swap_sync_wait_ns = 0;
     int64_t swap_count = 0;
+    std::vector<int64_t> device_swap_barrier_wait_ns;
+    std::vector<int64_t> device_swap_update_ns;
+    std::vector<int64_t> device_swap_rebuild_ns;
+    std::vector<int64_t> device_swap_sync_wait_ns;
+    std::vector<int64_t> device_swap_count;
 };
 
 class DataLoader {
@@ -60,6 +65,9 @@ class DataLoader {
     // Link prediction
     vector<torch::Tensor> edge_buckets_per_buffer_;
     vector<vector<torch::Tensor>::iterator> edge_buckets_per_buffer_iterators_;
+    vector<torch::Tensor> active_edge_block_starts_;
+    vector<torch::Tensor> active_edge_block_sizes_;
+    vector<int64_t> active_edge_block_total_sizes_;
 
     // Node classification
     vector<torch::Tensor> node_ids_per_buffer_;
@@ -87,6 +95,11 @@ class DataLoader {
     std::atomic<int64_t> swap_rebuild_ns_{0};
     std::atomic<int64_t> swap_sync_wait_ns_{0};
     std::atomic<int64_t> swap_count_{0};
+    std::vector<int64_t> device_swap_barrier_wait_ns_;
+    std::vector<int64_t> device_swap_update_ns_;
+    std::vector<int64_t> device_swap_rebuild_ns_;
+    std::vector<int64_t> device_swap_sync_wait_ns_;
+    std::vector<int64_t> device_swap_count_;
 
     LearningTask learning_task_;
 

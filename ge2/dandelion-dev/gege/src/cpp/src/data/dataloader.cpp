@@ -6,6 +6,8 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <numeric>
+#include <random>
 #include <string>
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -64,6 +66,20 @@ bool partition_buffer_lp_fast_path_env_enabled(bool default_value) {
 bool partition_buffer_pipeline_timing_enabled() {
     static bool enabled = parse_env_flag("GEGE_PARTITION_BUFFER_PIPELINE_TIMING", false);
     return enabled;
+}
+
+bool partition_buffer_block_shuffle_enabled() {
+    static bool enabled = parse_env_flag("GEGE_PARTITION_BUFFER_BLOCK_SHUFFLE", false);
+    return enabled;
+}
+
+bool partition_buffer_bucket_batch_env_enabled(bool default_value) {
+    return parse_env_flag("GEGE_PARTITION_BUFFER_BUCKET_BATCHES", default_value);
+}
+
+int64_t partition_buffer_block_shuffle_block_size() {
+    static int64_t block_size = parse_env_int("GEGE_PARTITION_BUFFER_BLOCK_SIZE", 0);
+    return block_size;
 }
 
 int64_t partition_buffer_pipeline_timing_max() {
@@ -155,6 +171,14 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
 
     devices_ = devices;
     activate_devices_ = 0;
+    active_edge_block_starts_.resize(devices_.size());
+    active_edge_block_sizes_.resize(devices_.size());
+    active_edge_block_total_sizes_.assign(devices_.size(), 0);
+    device_swap_barrier_wait_ns_.assign(devices_.size(), 0);
+    device_swap_update_ns_.assign(devices_.size(), 0);
+    device_swap_rebuild_ns_.assign(devices_.size(), 0);
+    device_swap_sync_wait_ns_.assign(devices_.size(), 0);
+    device_swap_count_.assign(devices_.size(), 0);
 
     negative_sampling_method_ = nsm;
 
@@ -240,6 +264,16 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     only_root_features_ = false;
 
     edge_sampler_ = std::make_shared<RandomEdgeSampler>(graph_storage_);
+    devices_ = {graph_storage_->storage_ptrs_.edges->device_};
+    activate_devices_ = 0;
+    active_edge_block_starts_.resize(devices_.size());
+    active_edge_block_sizes_.resize(devices_.size());
+    active_edge_block_total_sizes_.assign(devices_.size(), 0);
+    device_swap_barrier_wait_ns_.assign(devices_.size(), 0);
+    device_swap_update_ns_.assign(devices_.size(), 0);
+    device_swap_rebuild_ns_.assign(devices_.size(), 0);
+    device_swap_sync_wait_ns_.assign(devices_.size(), 0);
+    device_swap_count_.assign(devices_.size(), 0);
     negative_sampler_ = negative_sampler;
     neighbor_sampler_ = neighbor_sampler;
 
@@ -270,6 +304,9 @@ void DataLoader::refreshGraphStorageMode() {
 
     if (enable_fast_path) {
         SPDLOG_INFO("Using partition-buffer LP fast path (arithmetic remap, no in-memory graph build)");
+        if (partition_buffer_bucket_batch_env_enabled(true)) {
+            SPDLOG_INFO("Using partition-buffer bucket-batch execution (descriptor batching, no full active edge tensor)");
+        }
     }
 }
 
@@ -279,6 +316,11 @@ void DataLoader::resetPerfStats() {
     swap_rebuild_ns_.store(0);
     swap_sync_wait_ns_.store(0);
     swap_count_.store(0);
+    std::fill(device_swap_barrier_wait_ns_.begin(), device_swap_barrier_wait_ns_.end(), 0);
+    std::fill(device_swap_update_ns_.begin(), device_swap_update_ns_.end(), 0);
+    std::fill(device_swap_rebuild_ns_.begin(), device_swap_rebuild_ns_.end(), 0);
+    std::fill(device_swap_sync_wait_ns_.begin(), device_swap_sync_wait_ns_.end(), 0);
+    std::fill(device_swap_count_.begin(), device_swap_count_.end(), 0);
 }
 
 DataLoaderPerfStats DataLoader::getPerfStats() const {
@@ -288,6 +330,11 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.swap_rebuild_ns = swap_rebuild_ns_.load();
     stats.swap_sync_wait_ns = swap_sync_wait_ns_.load();
     stats.swap_count = swap_count_.load();
+    stats.device_swap_barrier_wait_ns = device_swap_barrier_wait_ns_;
+    stats.device_swap_update_ns = device_swap_update_ns_;
+    stats.device_swap_rebuild_ns = device_swap_rebuild_ns_;
+    stats.device_swap_sync_wait_ns = device_swap_sync_wait_ns_;
+    stats.device_swap_count = device_swap_count_;
     return stats;
 }
 
@@ -298,6 +345,11 @@ void DataLoader::nextEpoch() {
     if (negative_sampler_ != nullptr) {
         negative_sampler_->resetPlanCache();
     }
+    for (int device_idx = 0; device_idx < active_edge_block_starts_.size(); device_idx++) {
+        active_edge_block_starts_[device_idx] = torch::Tensor();
+        active_edge_block_sizes_[device_idx] = torch::Tensor();
+        active_edge_block_total_sizes_[device_idx] = 0;
+    }
     buffer_states_.clear();
     if (graph_storage_->useInMemorySubGraph()) {
         unloadStorage();
@@ -305,6 +357,12 @@ void DataLoader::nextEpoch() {
 }
 
 void DataLoader::setActiveEdges(int32_t device_idx) {
+    struct BlockDescriptor {
+        int64_t src_start;
+        int64_t size;
+        int64_t dst_start;
+    };
+
     EdgeList active_edges;
     torch::Tensor edge_bucket_sizes;
     int64_t timing_id = -1;
@@ -315,6 +373,12 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     double gather_ms = 0.0;
     double shuffle_ms = 0.0;
     int64_t num_active_buckets = 0;
+    std::string shuffle_mode = "global_randperm";
+    std::vector<BlockDescriptor> blocks;
+    bool use_bucket_batches = false;
+    active_edge_block_starts_[device_idx] = torch::Tensor();
+    active_edge_block_sizes_[device_idx] = torch::Tensor();
+    active_edge_block_total_sizes_[device_idx] = 0;
 
     if (graph_storage_->useInMemorySubGraph()) {
         torch::Tensor edge_bucket_ids = *edge_buckets_per_buffer_iterators_[device_idx];
@@ -364,18 +428,85 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
 
         auto local_offsets_accessor = local_offsets.accessor<int64_t, 1>();
 
-        active_edges = torch::empty({total_size, graph_storage_->storage_ptrs_.edges->dim1_size_},
-                                    graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.options());
+        bool use_block_shuffle = partition_buffer_block_shuffle_enabled() && total_size > 0;
+        bool default_bucket_batches = train_ && learning_task_ == LearningTask::LINK_PREDICTION &&
+                                     graph_storage_->partitionBufferLPFastPathEnabled();
+        use_bucket_batches = partition_buffer_bucket_batch_env_enabled(default_bucket_batches) && total_size > 0;
+        int64_t configured_block_size = partition_buffer_block_shuffle_block_size();
+        int64_t block_size = configured_block_size > 0 ? configured_block_size : std::max<int64_t>(batch_size_, 1024);
 
+        if (use_block_shuffle || use_bucket_batches) {
+            std::vector<int64_t> bucket_order(static_cast<std::size_t>(in_memory_edge_bucket_idx.size(0)));
+            std::iota(bucket_order.begin(), bucket_order.end(), 0);
+
+            const uint64_t seed = static_cast<uint64_t>(epochs_processed_ + 1) * 1315423911ULL ^
+                                  static_cast<uint64_t>(device_idx + 1) * 2654435761ULL ^
+                                  static_cast<uint64_t>(loaded_subgraphs + 1) * 2246822519ULL ^
+                                  static_cast<uint64_t>(num_active_buckets);
+            std::mt19937_64 gen(seed);
+            std::shuffle(bucket_order.begin(), bucket_order.end(), gen);
+
+            blocks.reserve(static_cast<std::size_t>(std::max<int64_t>(num_active_buckets, 1)));
+            for (int64_t order_idx : bucket_order) {
+                int64_t idx = in_memory_edge_bucket_idx_accessor[order_idx];
+                int64_t edge_bucket_size = edge_bucket_sizes_accessor[order_idx];
+                int64_t edge_bucket_start = all_edge_bucket_starts_accessor[idx];
+                for (int64_t offset = 0; offset < edge_bucket_size; offset += block_size) {
+                    blocks.push_back(BlockDescriptor{edge_bucket_start + offset, std::min<int64_t>(block_size, edge_bucket_size - offset), 0});
+                }
+            }
+
+            if (use_block_shuffle) {
+                std::shuffle(blocks.begin(), blocks.end(), gen);
+                shuffle_mode = fmt::format("bucket_block(block_size={})", block_size);
+            } else {
+                shuffle_mode = fmt::format("bucket_batch(block_size={})", block_size);
+            }
+
+            int64_t running_dst = 0;
+            for (auto &block : blocks) {
+                block.dst_start = running_dst;
+                running_dst += block.size;
+            }
+        }
+
+        if (use_bucket_batches) {
+            auto opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+            torch::Tensor block_starts = torch::empty({static_cast<int64_t>(blocks.size())}, opts);
+            torch::Tensor block_sizes = torch::empty({static_cast<int64_t>(blocks.size())}, opts);
+            auto starts_accessor = block_starts.accessor<int64_t, 1>();
+            auto sizes_accessor = block_sizes.accessor<int64_t, 1>();
+            for (int64_t i = 0; i < static_cast<int64_t>(blocks.size()); i++) {
+                starts_accessor[i] = blocks[static_cast<std::size_t>(i)].src_start;
+                sizes_accessor[i] = blocks[static_cast<std::size_t>(i)].size;
+            }
+            active_edge_block_starts_[device_idx] = block_starts;
+            active_edge_block_sizes_[device_idx] = block_sizes;
+            active_edge_block_total_sizes_[device_idx] = total_size;
+            active_edges = torch::Tensor();
+        } else {
+            active_edges = torch::empty({total_size, graph_storage_->storage_ptrs_.edges->dim1_size_},
+                                        graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.options());
+
+            if (use_block_shuffle) {
 #pragma omp parallel for
-        for (int i = 0; i < in_memory_edge_bucket_idx.size(0); i++) {
-            int64_t idx = in_memory_edge_bucket_idx_accessor[i];
-            int64_t edge_bucket_size = edge_bucket_sizes_accessor[i];
-            int64_t edge_bucket_start = all_edge_bucket_starts_accessor[idx];
-            int64_t local_offset = local_offsets_accessor[i];
+                for (int64_t i = 0; i < static_cast<int64_t>(blocks.size()); i++) {
+                    auto &block = blocks[static_cast<std::size_t>(i)];
+                    active_edges.narrow(0, block.dst_start, block.size) =
+                        graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.narrow(0, block.src_start, block.size);
+                }
+            } else {
+#pragma omp parallel for
+                for (int i = 0; i < in_memory_edge_bucket_idx.size(0); i++) {
+                    int64_t idx = in_memory_edge_bucket_idx_accessor[i];
+                    int64_t edge_bucket_size = edge_bucket_sizes_accessor[i];
+                    int64_t edge_bucket_start = all_edge_bucket_starts_accessor[idx];
+                    int64_t local_offset = local_offsets_accessor[i];
 
-            active_edges.narrow(0, local_offset, edge_bucket_size) =
-                graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.narrow(0, edge_bucket_start, edge_bucket_size);
+                    active_edges.narrow(0, local_offset, edge_bucket_size) =
+                        graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.narrow(0, edge_bucket_start, edge_bucket_size);
+                }
+            }
         }
 
         if (log_timing) {
@@ -387,16 +518,20 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     } else {
         active_edges = graph_storage_->storage_ptrs_.edges->range(0, graph_storage_->storage_ptrs_.edges->getDim0());
     }
-    auto opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
-    auto perm = torch::randperm(active_edges.size(0), opts);
-    perm = perm.to(active_edges.device());
-    active_edges = active_edges.index_select(0, perm);
+    if (!use_bucket_batches && (!graph_storage_->useInMemorySubGraph() || !partition_buffer_block_shuffle_enabled())) {
+        auto opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+        auto perm = torch::randperm(active_edges.size(0), opts);
+        perm = perm.to(active_edges.device());
+        active_edges = active_edges.index_select(0, perm);
+    }
     if (log_timing) {
         auto now = std::chrono::high_resolution_clock::now();
         shuffle_ms = elapsed_ms(phase_start, now);
         SPDLOG_INFO(
-            "[partition-buffer-pipeline][setActiveEdges {}] device={} buckets={} edges={} bucket_lookup_ms={:.3f} gather_ms={:.3f} shuffle_ms={:.3f} total_ms={:.3f}",
-            timing_id, device_idx, num_active_buckets, active_edges.size(0), bucket_lookup_ms, gather_ms, shuffle_ms, elapsed_ms(total_start, now));
+            "[partition-buffer-pipeline][setActiveEdges {}] device={} buckets={} edges={} shuffle_mode={} bucket_lookup_ms={:.3f} gather_ms={:.3f} shuffle_ms={:.3f} total_ms={:.3f}",
+            timing_id, device_idx, num_active_buckets, use_bucket_batches ? active_edge_block_total_sizes_[device_idx] : active_edges.size(0), shuffle_mode,
+            bucket_lookup_ms, gather_ms, shuffle_ms,
+            elapsed_ms(total_start, now));
     }
     graph_storage_->setActiveEdges(active_edges, device_idx);
 }
@@ -421,6 +556,7 @@ void DataLoader::setActiveNodes() {
 void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
     int64_t batch_id = 0;
     int64_t start_idx = 0;
+    bool use_bucket_batches = false;
 
     int64_t num_items;
     if (prepare_encode) {
@@ -428,7 +564,8 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
     } else {
         if (learning_task_ == LearningTask::LINK_PREDICTION) {
             setActiveEdges(device_idx);
-            num_items = graph_storage_->getNumActiveEdges(device_idx);
+            use_bucket_batches = active_edge_block_starts_[device_idx].defined() && active_edge_block_starts_[device_idx].numel() > 0;
+            num_items = use_bucket_batches ? active_edge_block_total_sizes_[device_idx] : graph_storage_->getNumActiveEdges(device_idx);
         } else {
             setActiveNodes();
             num_items = graph_storage_->getNumActiveNodes();
@@ -437,24 +574,61 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
 
     int64_t batch_size = batch_size_;
     vector<shared_ptr<Batch>> batches;
-    while (start_idx < num_items) {
-        if (num_items - (start_idx + batch_size) < 0) {
-            batch_size = num_items - start_idx;
-        }
-        shared_ptr<Batch> curr_batch = std::make_shared<Batch>(train_);
-        curr_batch->batch_id_ = batch_id + batch_id_offset_;
-        curr_batch->start_idx_ = start_idx;
-        curr_batch->batch_size_ = batch_size;
+    if (use_bucket_batches) {
+        torch::Tensor block_starts = active_edge_block_starts_[device_idx];
+        torch::Tensor block_sizes = active_edge_block_sizes_[device_idx];
+        auto starts_accessor = block_starts.accessor<int64_t, 1>();
+        auto sizes_accessor = block_sizes.accessor<int64_t, 1>();
 
-        if (prepare_encode) {
-            curr_batch->task_ = LearningTask::ENCODE;
-        } else {
-            curr_batch->task_ = learning_task_;
-        }
+        int64_t block_begin = 0;
+        while (block_begin < block_starts.size(0)) {
+            int64_t block_end = block_begin;
+            int64_t accumulated_size = 0;
+            while (block_end < block_starts.size(0)) {
+                int64_t next_size = sizes_accessor[block_end];
+                if (accumulated_size > 0 && accumulated_size + next_size > batch_size_) {
+                    break;
+                }
+                accumulated_size += next_size;
+                block_end++;
+                if (accumulated_size >= batch_size_) {
+                    break;
+                }
+            }
 
-        batches.emplace_back(curr_batch);
-        batch_id++;
-        start_idx += batch_size;
+            shared_ptr<Batch> curr_batch = std::make_shared<Batch>(train_);
+            curr_batch->batch_id_ = batch_id + batch_id_offset_;
+            curr_batch->start_idx_ = start_idx;
+            curr_batch->batch_size_ = accumulated_size;
+            curr_batch->task_ = prepare_encode ? LearningTask::ENCODE : learning_task_;
+            curr_batch->edge_block_starts_ = block_starts.narrow(0, block_begin, block_end - block_begin);
+            curr_batch->edge_block_sizes_ = block_sizes.narrow(0, block_begin, block_end - block_begin);
+
+            batches.emplace_back(curr_batch);
+            batch_id++;
+            start_idx += accumulated_size;
+            block_begin = block_end;
+        }
+    } else {
+        while (start_idx < num_items) {
+            if (num_items - (start_idx + batch_size) < 0) {
+                batch_size = num_items - start_idx;
+            }
+            shared_ptr<Batch> curr_batch = std::make_shared<Batch>(train_);
+            curr_batch->batch_id_ = batch_id + batch_id_offset_;
+            curr_batch->start_idx_ = start_idx;
+            curr_batch->batch_size_ = batch_size;
+
+            if (prepare_encode) {
+                curr_batch->task_ = LearningTask::ENCODE;
+            } else {
+                curr_batch->task_ = learning_task_;
+            }
+
+            batches.emplace_back(curr_batch);
+            batch_id++;
+            start_idx += batch_size;
+        }
     }
     all_batches_[device_idx] = batches;
     batches_left_[device_idx] = batches.size();
@@ -624,7 +798,9 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 while(async_barrier.load() % all_batches_.size() != 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
-                swap_barrier_wait_ns_.fetch_add(elapsed_ns(swap_barrier_start, std::chrono::high_resolution_clock::now()));
+                auto swap_barrier_elapsed = elapsed_ns(swap_barrier_start, std::chrono::high_resolution_clock::now());
+                swap_barrier_wait_ns_.fetch_add(swap_barrier_elapsed);
+                device_swap_barrier_wait_ns_[device_idx] += swap_barrier_elapsed;
 
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
@@ -633,7 +809,9 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 // auto t1 = std::chrono::high_resolution_clock::now();
                 auto update_start = std::chrono::high_resolution_clock::now();
                 graph_storage_->updateInMemorySubGraph(device_idx);
-                swap_update_ns_.fetch_add(elapsed_ns(update_start, std::chrono::high_resolution_clock::now()));
+                auto swap_update_elapsed = elapsed_ns(update_start, std::chrono::high_resolution_clock::now());
+                swap_update_ns_.fetch_add(swap_update_elapsed);
+                device_swap_update_ns_[device_idx] += swap_update_elapsed;
                 // SPDLOG_INFO("graph_storage_->updateInMemorySubGraph");
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
@@ -642,7 +820,9 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 // SPDLOG_INFO("Time to updateInMemorySubGraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t11 - t1).count());
                 auto rebuild_start = std::chrono::high_resolution_clock::now();
                 initializeBatches(false, device_idx);
-                swap_rebuild_ns_.fetch_add(elapsed_ns(rebuild_start, std::chrono::high_resolution_clock::now()));
+                auto swap_rebuild_elapsed = elapsed_ns(rebuild_start, std::chrono::high_resolution_clock::now());
+                swap_rebuild_ns_.fetch_add(swap_rebuild_elapsed);
+                device_swap_rebuild_ns_[device_idx] += swap_rebuild_elapsed;
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
@@ -650,12 +830,15 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 swap_tasks_completed ++;
                 activate_devices_ ++;
                 swap_count_.fetch_add(1);
+                device_swap_count_[device_idx] += 1;
 
                 auto swap_sync_start = std::chrono::high_resolution_clock::now();
                 while(swap_tasks_completed.load() != all_batches_.size()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
-                swap_sync_wait_ns_.fetch_add(elapsed_ns(swap_sync_start, std::chrono::high_resolution_clock::now()));
+                auto swap_sync_elapsed = elapsed_ns(swap_sync_start, std::chrono::high_resolution_clock::now());
+                swap_sync_wait_ns_.fetch_add(swap_sync_elapsed);
+                device_swap_sync_wait_ns_[device_idx] += swap_sync_elapsed;
                 // auto t2 = std::chrono::high_resolution_clock::now();
                 // SPDLOG_INFO("Finished swapping subgraph for device {}", device_idx);
                 // SPDLOG_INFO("Time to swap subgraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
@@ -1069,9 +1252,14 @@ void DataLoader::loadStorage() {
     batches_left_ = std::vector<int32_t>(devices_.size());
     batch_iterators_ = std::vector<std::vector<shared_ptr<Batch>>::iterator>(devices_.size());
     all_reads_ = std::vector<bool>(devices_.size());
+    active_edge_block_starts_.resize(devices_.size());
+    active_edge_block_sizes_.resize(devices_.size());
+    active_edge_block_total_sizes_.assign(devices_.size(), 0);
 
     for (int device_idx = 0; device_idx < devices_.size(); device_idx ++) {
         all_reads_[device_idx] = false;
+        active_edge_block_starts_[device_idx] = torch::Tensor();
+        active_edge_block_sizes_[device_idx] = torch::Tensor();
     }
 
     if (!buffer_states_.empty()) {

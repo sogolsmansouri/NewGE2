@@ -1,6 +1,9 @@
 #include "engine/trainer.h"
 
+#include <algorithm>
 #include <chrono>
+#include <iomanip>
+#include <sstream>
 
 #include "configuration/options.h"
 #include "reporting/logger.h"
@@ -19,6 +22,37 @@ int64_t elapsed_ns(std::chrono::high_resolution_clock::time_point start, std::ch
 
 double ns_to_ms(int64_t ns) {
     return static_cast<double>(ns) / 1.0e6;
+}
+
+std::string format_vector(const std::vector<int64_t> &values) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << values[i];
+    }
+    return oss.str();
+}
+
+std::string format_ms_vector(const std::vector<int64_t> &values) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3);
+    for (size_t i = 0; i < values.size(); ++i) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << ns_to_ms(values[i]);
+    }
+    return oss.str();
+}
+
+double spread_ms(const std::vector<int64_t> &values) {
+    if (values.empty()) {
+        return 0.0;
+    }
+    auto minmax = std::minmax_element(values.begin(), values.end());
+    return ns_to_ms(*minmax.second - *minmax.first);
 }
 
 }
@@ -133,6 +167,23 @@ void SynchronousTrainer::train(int num_epochs) {
                 "[perf][epoch {}] swap_count={} swap_barrier_wait_ms={:.3f} swap_update_ms={:.3f} swap_rebuild_ms={:.3f} swap_sync_wait_ms={:.3f}",
                 dataloader_->getEpochsProcessed(), perf_stats.swap_count, ns_to_ms(perf_stats.swap_barrier_wait_ns),
                 ns_to_ms(perf_stats.swap_update_ns), ns_to_ms(perf_stats.swap_rebuild_ns), ns_to_ms(perf_stats.swap_sync_wait_ns));
+            if (!perf_stats.device_swap_count.empty()) {
+                SPDLOG_INFO("[perf][epoch {}][device] swap_count={}", dataloader_->getEpochsProcessed(),
+                            format_vector(perf_stats.device_swap_count));
+                SPDLOG_INFO("[perf][epoch {}][device] swap_barrier_wait_ms={}", dataloader_->getEpochsProcessed(),
+                            format_ms_vector(perf_stats.device_swap_barrier_wait_ns));
+                SPDLOG_INFO("[perf][epoch {}][device] swap_update_ms={}", dataloader_->getEpochsProcessed(),
+                            format_ms_vector(perf_stats.device_swap_update_ns));
+                SPDLOG_INFO("[perf][epoch {}][device] swap_rebuild_ms={}", dataloader_->getEpochsProcessed(),
+                            format_ms_vector(perf_stats.device_swap_rebuild_ns));
+                SPDLOG_INFO("[perf][epoch {}][device] swap_sync_wait_ms={}", dataloader_->getEpochsProcessed(),
+                            format_ms_vector(perf_stats.device_swap_sync_wait_ns));
+                SPDLOG_INFO(
+                    "[perf][epoch {}][spread] swap_barrier_wait_ms={:.3f} swap_update_ms={:.3f} swap_rebuild_ms={:.3f} swap_sync_wait_ms={:.3f}",
+                    dataloader_->getEpochsProcessed(), spread_ms(perf_stats.device_swap_barrier_wait_ns),
+                    spread_ms(perf_stats.device_swap_update_ns), spread_ms(perf_stats.device_swap_rebuild_ns),
+                    spread_ms(perf_stats.device_swap_sync_wait_ns));
+            }
         }
     }
 }
@@ -314,5 +365,22 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             dataloader_->getEpochsProcessed(), dense_sync_batches, all_reduce_calls.load(), ns_to_ms(sync_wait_ns.load()), ns_to_ms(all_reduce_ns.load()),
             perf_stats.swap_count, ns_to_ms(perf_stats.swap_barrier_wait_ns), ns_to_ms(perf_stats.swap_update_ns), ns_to_ms(perf_stats.swap_rebuild_ns),
             ns_to_ms(perf_stats.swap_sync_wait_ns));
+        if (!perf_stats.device_swap_count.empty()) {
+            SPDLOG_INFO("[perf][epoch {}][device] swap_count={}", dataloader_->getEpochsProcessed(),
+                        format_vector(perf_stats.device_swap_count));
+            SPDLOG_INFO("[perf][epoch {}][device] swap_barrier_wait_ms={}", dataloader_->getEpochsProcessed(),
+                        format_ms_vector(perf_stats.device_swap_barrier_wait_ns));
+            SPDLOG_INFO("[perf][epoch {}][device] swap_update_ms={}", dataloader_->getEpochsProcessed(),
+                        format_ms_vector(perf_stats.device_swap_update_ns));
+            SPDLOG_INFO("[perf][epoch {}][device] swap_rebuild_ms={}", dataloader_->getEpochsProcessed(),
+                        format_ms_vector(perf_stats.device_swap_rebuild_ns));
+            SPDLOG_INFO("[perf][epoch {}][device] swap_sync_wait_ms={}", dataloader_->getEpochsProcessed(),
+                        format_ms_vector(perf_stats.device_swap_sync_wait_ns));
+            SPDLOG_INFO(
+                "[perf][epoch {}][spread] swap_barrier_wait_ms={:.3f} swap_update_ms={:.3f} swap_rebuild_ms={:.3f} swap_sync_wait_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), spread_ms(perf_stats.device_swap_barrier_wait_ns),
+                spread_ms(perf_stats.device_swap_update_ns), spread_ms(perf_stats.device_swap_rebuild_ns),
+                spread_ms(perf_stats.device_swap_sync_wait_ns));
+        }
     }
 }

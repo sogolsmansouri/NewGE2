@@ -113,6 +113,8 @@ class GraphModelStorage {
 
     EdgeList getEdgesRange(int64_t start, int64_t size, int32_t device_idx = 0);
 
+    EdgeList getEdgesFromBlocks(torch::Tensor starts, torch::Tensor sizes, int32_t device_idx = 0);
+
     Indices getRandomNodeIds(int64_t size);
 
     Indices getNodeIdsRange(int64_t start, int64_t size);

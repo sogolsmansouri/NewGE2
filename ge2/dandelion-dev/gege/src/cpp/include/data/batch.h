@@ -59,6 +59,9 @@ class Batch {
     torch::Tensor src_neg_filter_; /**< Used to filter out false negatives for source corrupted negatives */
     torch::Tensor dst_neg_filter_; /**< Used to filter out false negatives for destination corrupted negatives */
 
+    torch::Tensor edge_block_starts_; /**< Source offsets into the current in-memory mapped edge tensor for bucket-block batches */
+    torch::Tensor edge_block_sizes_;  /**< Block sizes paired with edge_block_starts_ */
+
     Batch(bool train); /**< Constructor */
 
     ~Batch(); /**< Destructor */

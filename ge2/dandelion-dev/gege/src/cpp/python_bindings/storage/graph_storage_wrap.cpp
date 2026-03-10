@@ -34,7 +34,6 @@ void init_graph_storage(py::module &m) {
         .def_readwrite("storage_ptrs", &GraphModelStorage::storage_ptrs_)
         .def_readwrite("full_graph_evaluation", &GraphModelStorage::full_graph_evaluation_)
         .def_readwrite("current_subgraph_state", &GraphModelStorage::current_subgraph_state_)
-        .def_readwrite("next_subgraph_state", &GraphModelStorage::next_subgraph_state_)
 
         .def(py::init<GraphModelStoragePtrs, shared_ptr<StorageConfig>>(), py::arg("storage_ptrs"), py::arg("storage_config"))
         .def(py::init([](shared_ptr<Storage> edges, shared_ptr<Storage> nodes, shared_ptr<Storage> node_features, shared_ptr<Storage> node_embeddings,

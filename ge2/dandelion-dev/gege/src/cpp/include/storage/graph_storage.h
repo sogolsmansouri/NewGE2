@@ -1,5 +1,7 @@
 #pragma once
 
+#include <future>
+
 #include "configuration/constants.h"
 #include "storage/storage.h"
 
@@ -76,9 +78,8 @@ class GraphModelStorage {
     std::condition_variable *subgraph_cv_;
     shared_ptr<InMemorySubgraphState> current_subgraph_state_;
     std::vector<shared_ptr<InMemorySubgraphState>> current_subgraph_states_;
-    shared_ptr<InMemorySubgraphState> next_subgraph_state_;
+    std::vector<std::future<shared_ptr<InMemorySubgraphState>>> next_subgraph_futures_;
     bool prefetch_;
-    bool prefetch_complete_;
 
     GraphModelStoragePtrs storage_ptrs_;
     bool full_graph_evaluation_;
@@ -103,7 +104,7 @@ class GraphModelStorage {
 
     shared_ptr<InMemorySubgraphState> prepareNextInMemorySubGraph(std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx = 0);
 
-    void getNextSubGraph();
+    void getNextSubGraph(int32_t device_idx = 0);
 
     EdgeList merge_sorted_edge_buckets(EdgeList edges, torch::Tensor starts, int buffer_size, bool src);
 

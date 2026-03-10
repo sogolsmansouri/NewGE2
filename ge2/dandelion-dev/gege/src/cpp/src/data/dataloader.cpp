@@ -959,6 +959,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                     if (device_idx == 0) {
                         graph_storage_->current_subgraph_state_ = prepared_superstep.subgraph_state;
                     }
+                    advanceEdgeBucketIterator_(device_idx);
                     graph_storage_->setActiveEdges(torch::Tensor(), device_idx);
                 } else {
                     graph_storage_->updateInMemorySubGraph(device_idx);

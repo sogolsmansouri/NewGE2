@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <sstream>
 #include <string>
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -148,6 +149,27 @@ void add_perf_sample(std::vector<std::vector<int64_t>> &per_device, int32_t devi
     }
 }
 
+std::string format_tensor_values(torch::Tensor values) {
+    if (!values.defined()) {
+        return "-";
+    }
+
+    values = values.reshape({-1}).to(torch::kCPU).to(torch::kInt64).contiguous();
+    if (values.numel() == 0) {
+        return "-";
+    }
+
+    auto accessor = values.accessor<int64_t, 1>();
+    std::ostringstream oss;
+    for (int64_t i = 0; i < values.size(0); i++) {
+        if (i > 0) {
+            oss << ",";
+        }
+        oss << accessor[i];
+    }
+    return oss.str();
+}
+
 }  // namespace
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
@@ -199,6 +221,12 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     initialize_perf_samples(device_swap_active_edge_samples_, devices_.size());
     initialize_perf_samples(device_swap_batch_count_samples_, devices_.size());
     initialize_perf_samples(device_swap_rebuild_samples_ns_, devices_.size());
+    initialize_perf_vector(device_current_state_index_, devices_.size());
+    std::fill(device_current_state_index_.begin(), device_current_state_index_.end(), -1);
+    initialize_perf_vector(device_current_active_bucket_count_, devices_.size());
+    initialize_perf_vector(device_current_active_edge_count_, devices_.size());
+    device_current_state_partitions_.assign(devices_.size(), std::string("-"));
+    initialize_perf_vector(device_state_build_sequence_, devices_.size());
 
     negative_sampling_method_ = nsm;
 
@@ -442,6 +470,7 @@ void DataLoader::nextEpoch() {
     batch_id_offset_ = 0;
     total_batches_processed_ = 0;
     epochs_processed_++;
+    std::fill(device_state_build_sequence_.begin(), device_state_build_sequence_.end(), 0);
     if (negative_sampler_ != nullptr) {
         negative_sampler_->resetPlanCache();
     }
@@ -462,8 +491,14 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     double gather_ms = 0.0;
     double shuffle_ms = 0.0;
     int64_t num_active_buckets = 0;
+    int64_t state_idx = -1;
+    std::string resident_partitions = "-";
 
     if (graph_storage_->useInMemorySubGraph()) {
+        state_idx = std::distance(edge_buckets_per_buffer_.begin(), edge_buckets_per_buffer_iterators_[device_idx]);
+        if (state_idx >= 0 && static_cast<std::size_t>(state_idx) < buffer_states_.size()) {
+            resident_partitions = format_tensor_values(buffer_states_[state_idx]);
+        }
         torch::Tensor edge_bucket_ids = *edge_buckets_per_buffer_iterators_[device_idx];
         for (int i = 0; i < devices_.size(); i++) {
             if (edge_buckets_per_buffer_iterators_[device_idx] != edge_buckets_per_buffer_.end()) {
@@ -547,6 +582,12 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     }
     add_perf_sample(device_swap_active_bucket_samples_, device_idx, num_active_buckets);
     add_perf_sample(device_swap_active_edge_samples_, device_idx, active_edges.size(0));
+    if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_current_state_index_.size()) {
+        device_current_state_index_[device_idx] = state_idx;
+        device_current_active_bucket_count_[device_idx] = num_active_buckets;
+        device_current_active_edge_count_[device_idx] = active_edges.size(0);
+        device_current_state_partitions_[device_idx] = resident_partitions;
+    }
     graph_storage_->setActiveEdges(active_edges, device_idx);
 }
 
@@ -609,6 +650,19 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
     batches_left_[device_idx] = batches.size();
     batch_iterators_[device_idx] = all_batches_[device_idx].begin();
     add_perf_sample(device_swap_batch_count_samples_, device_idx, static_cast<int64_t>(batches.size()));
+    if (!prepare_encode && learning_task_ == LearningTask::LINK_PREDICTION && graph_storage_->useInMemorySubGraph() &&
+        device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_current_state_index_.size() &&
+        device_current_state_index_[device_idx] >= 0) {
+        int64_t state_sequence = 0;
+        if (static_cast<std::size_t>(device_idx) < device_state_build_sequence_.size()) {
+            state_sequence = device_state_build_sequence_[device_idx]++;
+        }
+        SPDLOG_INFO(
+            "[perf][epoch {}][gpu {}][state {}] phase={} state_idx={} resident_partitions={} active_buckets={} active_edges={} batches={}",
+            epochs_processed_ + 1, device_idx, state_sequence, state_sequence == 0 ? "init" : "swap",
+            device_current_state_index_[device_idx], device_current_state_partitions_[device_idx],
+            device_current_active_bucket_count_[device_idx], device_current_active_edge_count_[device_idx], batches.size());
+    }
 }
 
 void DataLoader::setBufferOrdering() {

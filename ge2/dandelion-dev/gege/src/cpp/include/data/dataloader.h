@@ -162,6 +162,11 @@ class DataLoader {
     std::vector<std::vector<int64_t>> device_swap_active_edge_samples_;
     std::vector<std::vector<int64_t>> device_swap_batch_count_samples_;
     std::vector<std::vector<int64_t>> device_swap_rebuild_samples_ns_;
+    std::vector<int64_t> device_current_state_index_;
+    std::vector<int64_t> device_current_active_bucket_count_;
+    std::vector<int64_t> device_current_active_edge_count_;
+    std::vector<std::string> device_current_state_partitions_;
+    std::vector<int64_t> device_state_build_sequence_;
 
     LearningTask learning_task_;
 

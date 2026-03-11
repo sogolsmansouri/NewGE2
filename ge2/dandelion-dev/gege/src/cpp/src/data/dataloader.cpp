@@ -127,6 +127,10 @@ int64_t elapsed_ns(std::chrono::high_resolution_clock::time_point start, std::ch
     return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 }
 
+void initialize_perf_vector(std::vector<int64_t> &values, std::size_t size) {
+    values.assign(size, 0);
+}
+
 }  // namespace
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
@@ -155,6 +159,11 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
 
     devices_ = devices;
     activate_devices_ = 0;
+    initialize_perf_vector(device_swap_barrier_wait_ns_, devices_.size());
+    initialize_perf_vector(device_swap_update_ns_, devices_.size());
+    initialize_perf_vector(device_swap_rebuild_ns_, devices_.size());
+    initialize_perf_vector(device_swap_sync_wait_ns_, devices_.size());
+    initialize_perf_vector(device_swap_count_, devices_.size());
 
     negative_sampling_method_ = nsm;
 
@@ -279,6 +288,11 @@ void DataLoader::resetPerfStats() {
     swap_rebuild_ns_.store(0);
     swap_sync_wait_ns_.store(0);
     swap_count_.store(0);
+    std::fill(device_swap_barrier_wait_ns_.begin(), device_swap_barrier_wait_ns_.end(), 0);
+    std::fill(device_swap_update_ns_.begin(), device_swap_update_ns_.end(), 0);
+    std::fill(device_swap_rebuild_ns_.begin(), device_swap_rebuild_ns_.end(), 0);
+    std::fill(device_swap_sync_wait_ns_.begin(), device_swap_sync_wait_ns_.end(), 0);
+    std::fill(device_swap_count_.begin(), device_swap_count_.end(), 0);
 }
 
 DataLoaderPerfStats DataLoader::getPerfStats() const {
@@ -288,6 +302,11 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.swap_rebuild_ns = swap_rebuild_ns_.load();
     stats.swap_sync_wait_ns = swap_sync_wait_ns_.load();
     stats.swap_count = swap_count_.load();
+    stats.device_swap_barrier_wait_ns = device_swap_barrier_wait_ns_;
+    stats.device_swap_update_ns = device_swap_update_ns_;
+    stats.device_swap_rebuild_ns = device_swap_rebuild_ns_;
+    stats.device_swap_sync_wait_ns = device_swap_sync_wait_ns_;
+    stats.device_swap_count = device_swap_count_;
     return stats;
 }
 
@@ -624,7 +643,11 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 while(async_barrier.load() % all_batches_.size() != 0) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
-                swap_barrier_wait_ns_.fetch_add(elapsed_ns(swap_barrier_start, std::chrono::high_resolution_clock::now()));
+                int64_t swap_barrier_elapsed = elapsed_ns(swap_barrier_start, std::chrono::high_resolution_clock::now());
+                swap_barrier_wait_ns_.fetch_add(swap_barrier_elapsed);
+                if (device_idx < device_swap_barrier_wait_ns_.size()) {
+                    device_swap_barrier_wait_ns_[device_idx] += swap_barrier_elapsed;
+                }
 
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
@@ -633,7 +656,11 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 // auto t1 = std::chrono::high_resolution_clock::now();
                 auto update_start = std::chrono::high_resolution_clock::now();
                 graph_storage_->updateInMemorySubGraph(device_idx);
-                swap_update_ns_.fetch_add(elapsed_ns(update_start, std::chrono::high_resolution_clock::now()));
+                int64_t swap_update_elapsed = elapsed_ns(update_start, std::chrono::high_resolution_clock::now());
+                swap_update_ns_.fetch_add(swap_update_elapsed);
+                if (device_idx < device_swap_update_ns_.size()) {
+                    device_swap_update_ns_[device_idx] += swap_update_elapsed;
+                }
                 // SPDLOG_INFO("graph_storage_->updateInMemorySubGraph");
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
@@ -642,7 +669,11 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 // SPDLOG_INFO("Time to updateInMemorySubGraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t11 - t1).count());
                 auto rebuild_start = std::chrono::high_resolution_clock::now();
                 initializeBatches(false, device_idx);
-                swap_rebuild_ns_.fetch_add(elapsed_ns(rebuild_start, std::chrono::high_resolution_clock::now()));
+                int64_t swap_rebuild_elapsed = elapsed_ns(rebuild_start, std::chrono::high_resolution_clock::now());
+                swap_rebuild_ns_.fetch_add(swap_rebuild_elapsed);
+                if (device_idx < device_swap_rebuild_ns_.size()) {
+                    device_swap_rebuild_ns_[device_idx] += swap_rebuild_elapsed;
+                }
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
@@ -650,12 +681,19 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 swap_tasks_completed ++;
                 activate_devices_ ++;
                 swap_count_.fetch_add(1);
+                if (device_idx < device_swap_count_.size()) {
+                    device_swap_count_[device_idx] += 1;
+                }
 
                 auto swap_sync_start = std::chrono::high_resolution_clock::now();
                 while(swap_tasks_completed.load() != all_batches_.size()) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(10));
                 }
-                swap_sync_wait_ns_.fetch_add(elapsed_ns(swap_sync_start, std::chrono::high_resolution_clock::now()));
+                int64_t swap_sync_elapsed = elapsed_ns(swap_sync_start, std::chrono::high_resolution_clock::now());
+                swap_sync_wait_ns_.fetch_add(swap_sync_elapsed);
+                if (device_idx < device_swap_sync_wait_ns_.size()) {
+                    device_swap_sync_wait_ns_[device_idx] += swap_sync_elapsed;
+                }
                 // auto t2 = std::chrono::high_resolution_clock::now();
                 // SPDLOG_INFO("Finished swapping subgraph for device {}", device_idx);
                 // SPDLOG_INFO("Time to swap subgraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());

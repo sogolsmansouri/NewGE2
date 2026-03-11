@@ -131,6 +131,13 @@ void initialize_perf_vector(std::vector<int64_t> &values, std::size_t size) {
     values.assign(size, 0);
 }
 
+void add_perf_stat(std::atomic<int64_t> &aggregate, std::vector<int64_t> &per_device, int32_t device_idx, int64_t elapsed_ns) {
+    aggregate.fetch_add(elapsed_ns);
+    if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < per_device.size()) {
+        per_device[device_idx] += elapsed_ns;
+    }
+}
+
 }  // namespace
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
@@ -164,6 +171,20 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     initialize_perf_vector(device_swap_rebuild_ns_, devices_.size());
     initialize_perf_vector(device_swap_sync_wait_ns_, devices_.size());
     initialize_perf_vector(device_swap_count_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_ns_, devices_.size());
+    initialize_perf_vector(device_edge_sample_ns_, devices_.size());
+    initialize_perf_vector(device_edge_get_edges_ns_, devices_.size());
+    initialize_perf_vector(device_edge_negative_sample_ns_, devices_.size());
+    initialize_perf_vector(device_edge_map_collect_ids_ns_, devices_.size());
+    initialize_perf_vector(device_edge_map_lookup_ns_, devices_.size());
+    initialize_perf_vector(device_edge_map_verify_ns_, devices_.size());
+    initialize_perf_vector(device_edge_remap_assign_ns_, devices_.size());
+    initialize_perf_vector(device_edge_finalize_ns_, devices_.size());
+    initialize_perf_vector(device_node_sample_ns_, devices_.size());
+    initialize_perf_vector(device_load_cpu_parameters_ns_, devices_.size());
+    initialize_perf_vector(device_get_batch_device_prepare_ns_, devices_.size());
+    initialize_perf_vector(device_get_batch_perform_map_ns_, devices_.size());
+    initialize_perf_vector(device_get_batch_overhead_ns_, devices_.size());
 
     negative_sampling_method_ = nsm;
 
@@ -288,11 +309,39 @@ void DataLoader::resetPerfStats() {
     swap_rebuild_ns_.store(0);
     swap_sync_wait_ns_.store(0);
     swap_count_.store(0);
+    get_next_batch_ns_.store(0);
+    edge_sample_ns_.store(0);
+    edge_get_edges_ns_.store(0);
+    edge_negative_sample_ns_.store(0);
+    edge_map_collect_ids_ns_.store(0);
+    edge_map_lookup_ns_.store(0);
+    edge_map_verify_ns_.store(0);
+    edge_remap_assign_ns_.store(0);
+    edge_finalize_ns_.store(0);
+    node_sample_ns_.store(0);
+    load_cpu_parameters_ns_.store(0);
+    get_batch_device_prepare_ns_.store(0);
+    get_batch_perform_map_ns_.store(0);
+    get_batch_overhead_ns_.store(0);
     std::fill(device_swap_barrier_wait_ns_.begin(), device_swap_barrier_wait_ns_.end(), 0);
     std::fill(device_swap_update_ns_.begin(), device_swap_update_ns_.end(), 0);
     std::fill(device_swap_rebuild_ns_.begin(), device_swap_rebuild_ns_.end(), 0);
     std::fill(device_swap_sync_wait_ns_.begin(), device_swap_sync_wait_ns_.end(), 0);
     std::fill(device_swap_count_.begin(), device_swap_count_.end(), 0);
+    std::fill(device_get_next_batch_ns_.begin(), device_get_next_batch_ns_.end(), 0);
+    std::fill(device_edge_sample_ns_.begin(), device_edge_sample_ns_.end(), 0);
+    std::fill(device_edge_get_edges_ns_.begin(), device_edge_get_edges_ns_.end(), 0);
+    std::fill(device_edge_negative_sample_ns_.begin(), device_edge_negative_sample_ns_.end(), 0);
+    std::fill(device_edge_map_collect_ids_ns_.begin(), device_edge_map_collect_ids_ns_.end(), 0);
+    std::fill(device_edge_map_lookup_ns_.begin(), device_edge_map_lookup_ns_.end(), 0);
+    std::fill(device_edge_map_verify_ns_.begin(), device_edge_map_verify_ns_.end(), 0);
+    std::fill(device_edge_remap_assign_ns_.begin(), device_edge_remap_assign_ns_.end(), 0);
+    std::fill(device_edge_finalize_ns_.begin(), device_edge_finalize_ns_.end(), 0);
+    std::fill(device_node_sample_ns_.begin(), device_node_sample_ns_.end(), 0);
+    std::fill(device_load_cpu_parameters_ns_.begin(), device_load_cpu_parameters_ns_.end(), 0);
+    std::fill(device_get_batch_device_prepare_ns_.begin(), device_get_batch_device_prepare_ns_.end(), 0);
+    std::fill(device_get_batch_perform_map_ns_.begin(), device_get_batch_perform_map_ns_.end(), 0);
+    std::fill(device_get_batch_overhead_ns_.begin(), device_get_batch_overhead_ns_.end(), 0);
 }
 
 DataLoaderPerfStats DataLoader::getPerfStats() const {
@@ -302,11 +351,39 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.swap_rebuild_ns = swap_rebuild_ns_.load();
     stats.swap_sync_wait_ns = swap_sync_wait_ns_.load();
     stats.swap_count = swap_count_.load();
+    stats.get_next_batch_ns = get_next_batch_ns_.load();
+    stats.edge_sample_ns = edge_sample_ns_.load();
+    stats.edge_get_edges_ns = edge_get_edges_ns_.load();
+    stats.edge_negative_sample_ns = edge_negative_sample_ns_.load();
+    stats.edge_map_collect_ids_ns = edge_map_collect_ids_ns_.load();
+    stats.edge_map_lookup_ns = edge_map_lookup_ns_.load();
+    stats.edge_map_verify_ns = edge_map_verify_ns_.load();
+    stats.edge_remap_assign_ns = edge_remap_assign_ns_.load();
+    stats.edge_finalize_ns = edge_finalize_ns_.load();
+    stats.node_sample_ns = node_sample_ns_.load();
+    stats.load_cpu_parameters_ns = load_cpu_parameters_ns_.load();
+    stats.get_batch_device_prepare_ns = get_batch_device_prepare_ns_.load();
+    stats.get_batch_perform_map_ns = get_batch_perform_map_ns_.load();
+    stats.get_batch_overhead_ns = get_batch_overhead_ns_.load();
     stats.device_swap_barrier_wait_ns = device_swap_barrier_wait_ns_;
     stats.device_swap_update_ns = device_swap_update_ns_;
     stats.device_swap_rebuild_ns = device_swap_rebuild_ns_;
     stats.device_swap_sync_wait_ns = device_swap_sync_wait_ns_;
     stats.device_swap_count = device_swap_count_;
+    stats.device_get_next_batch_ns = device_get_next_batch_ns_;
+    stats.device_edge_sample_ns = device_edge_sample_ns_;
+    stats.device_edge_get_edges_ns = device_edge_get_edges_ns_;
+    stats.device_edge_negative_sample_ns = device_edge_negative_sample_ns_;
+    stats.device_edge_map_collect_ids_ns = device_edge_map_collect_ids_ns_;
+    stats.device_edge_map_lookup_ns = device_edge_map_lookup_ns_;
+    stats.device_edge_map_verify_ns = device_edge_map_verify_ns_;
+    stats.device_edge_remap_assign_ns = device_edge_remap_assign_ns_;
+    stats.device_edge_finalize_ns = device_edge_finalize_ns_;
+    stats.device_node_sample_ns = device_node_sample_ns_;
+    stats.device_load_cpu_parameters_ns = device_load_cpu_parameters_ns_;
+    stats.device_get_batch_device_prepare_ns = device_get_batch_device_prepare_ns_;
+    stats.device_get_batch_perform_map_ns = device_get_batch_perform_map_ns_;
+    stats.device_get_batch_overhead_ns = device_get_batch_overhead_ns_;
     return stats;
 }
 
@@ -750,31 +827,63 @@ void DataLoader::finishedBatch(int32_t device_idx) {
 }
 
 shared_ptr<Batch> DataLoader::getBatch(at::optional<torch::Device> device, bool perform_map, int32_t device_idx) {
+    auto get_batch_start = std::chrono::high_resolution_clock::now();
+    auto get_next_batch_start = get_batch_start;
     shared_ptr<Batch> batch = getNextBatch(device_idx);
+    int64_t get_next_batch_elapsed = elapsed_ns(get_next_batch_start, std::chrono::high_resolution_clock::now());
+    add_perf_stat(get_next_batch_ns_, device_get_next_batch_ns_, device_idx, get_next_batch_elapsed);
     
     if (batch == nullptr) {
         return batch;
     }
+
+    int64_t edge_sample_elapsed = 0;
+    int64_t node_sample_elapsed = 0;
+    int64_t load_cpu_parameters_elapsed = 0;
+    int64_t device_prepare_elapsed = 0;
+    int64_t perform_map_elapsed = 0;
  
     if (batch->task_ == LearningTask::LINK_PREDICTION) {
+        auto edge_sample_start = std::chrono::high_resolution_clock::now();
         edgeSample(batch, device_idx);
+        edge_sample_elapsed = elapsed_ns(edge_sample_start, std::chrono::high_resolution_clock::now());
+        add_perf_stat(edge_sample_ns_, device_edge_sample_ns_, device_idx, edge_sample_elapsed);
     } else if (batch->task_ == LearningTask::NODE_CLASSIFICATION || batch->task_ == LearningTask::ENCODE) {
+        auto node_sample_start = std::chrono::high_resolution_clock::now();
         nodeSample(batch, device_idx);
+        node_sample_elapsed = elapsed_ns(node_sample_start, std::chrono::high_resolution_clock::now());
+        add_perf_stat(node_sample_ns_, device_node_sample_ns_, device_idx, node_sample_elapsed);
     }
 
+    auto load_cpu_parameters_start = std::chrono::high_resolution_clock::now();
     loadCPUParameters(batch);
+    load_cpu_parameters_elapsed = elapsed_ns(load_cpu_parameters_start, std::chrono::high_resolution_clock::now());
+    add_perf_stat(load_cpu_parameters_ns_, device_load_cpu_parameters_ns_, device_idx, load_cpu_parameters_elapsed);
 
     if (device.has_value()) {
         if (device.value().is_cuda()) {
+            auto device_prepare_start = std::chrono::high_resolution_clock::now();
             batch->to(device.value());
             loadGPUParameters(batch);
             batch->dense_graph_.performMap();
+            device_prepare_elapsed = elapsed_ns(device_prepare_start, std::chrono::high_resolution_clock::now());
+            add_perf_stat(get_batch_device_prepare_ns_, device_get_batch_device_prepare_ns_, device_idx, device_prepare_elapsed);
         }
     }
 
     if (perform_map) {
+        auto perform_map_start = std::chrono::high_resolution_clock::now();
         batch->dense_graph_.performMap();
+        perform_map_elapsed = elapsed_ns(perform_map_start, std::chrono::high_resolution_clock::now());
+        add_perf_stat(get_batch_perform_map_ns_, device_get_batch_perform_map_ns_, device_idx, perform_map_elapsed);
     }
+
+    int64_t get_batch_total_elapsed = elapsed_ns(get_batch_start, std::chrono::high_resolution_clock::now());
+    int64_t get_batch_overhead_elapsed =
+        std::max<int64_t>(get_batch_total_elapsed - get_next_batch_elapsed - edge_sample_elapsed - node_sample_elapsed - load_cpu_parameters_elapsed -
+                              device_prepare_elapsed - perform_map_elapsed,
+                          0LL);
+    add_perf_stat(get_batch_overhead_ns_, device_get_batch_overhead_ns_, device_idx, get_batch_overhead_elapsed);
 
     return batch;
 }
@@ -784,9 +893,18 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     bool run_stage_debug = should_run_stage_debug(debug_batch_id);
     auto edge_sample_start = std::chrono::high_resolution_clock::now();
     auto step_start = edge_sample_start;
+    int64_t get_edges_elapsed = 0;
+    int64_t negative_sample_elapsed = 0;
+    int64_t map_collect_elapsed = 0;
+    int64_t map_lookup_elapsed = 0;
+    int64_t map_verify_elapsed = 0;
+    int64_t remap_assign_elapsed = 0;
+    int64_t finalize_elapsed = 0;
 
     if (!batch->edges_.defined()) {
+        auto get_edges_start = std::chrono::high_resolution_clock::now();
         batch->edges_ = edge_sampler_->getEdges(batch, device_idx);
+        get_edges_elapsed = elapsed_ns(get_edges_start, std::chrono::high_resolution_clock::now());
     }
     if (run_stage_debug) {
         auto now = std::chrono::high_resolution_clock::now();
@@ -796,7 +914,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     }
 
     if (negative_sampler_ != nullptr) {
-        negativeSample(batch);
+        auto negative_sample_start = std::chrono::high_resolution_clock::now();
+        negativeSample(batch, device_idx);
+        negative_sample_elapsed = elapsed_ns(negative_sample_start, std::chrono::high_resolution_clock::now());
     }
     if (run_stage_debug) {
         auto now = std::chrono::high_resolution_clock::now();
@@ -838,6 +958,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         all_ids.emplace_back(batch->dst_neg_indices_.flatten(0, 1));
     }
     auto map_collect_end = std::chrono::high_resolution_clock::now();
+    map_collect_elapsed = elapsed_ns(map_collect_start, map_collect_end);
 
     torch::Tensor src_mapping;
     torch::Tensor dst_mapping;
@@ -868,6 +989,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         mapped_tensors = apply_tensor_map(sorted_map, all_ids);
         auto map_lookup_end = std::chrono::high_resolution_clock::now();
         map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
+        map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
 
         int64_t num_nbrs_sampled = batch->dense_graph_.hop_offsets_[-2].item<int64_t>();
 
@@ -884,6 +1006,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         }
         auto remap_assign_end = std::chrono::high_resolution_clock::now();
         remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
+        remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
     } else {
         // map edges and negatives to their corresponding index in unique_node_indices_
         bool map_sorted = !fast_map_tensors_enabled();
@@ -891,6 +1014,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         auto tup = map_tensors(all_ids, map_sorted, run_stage_debug ? &map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx));
         auto map_lookup_end = std::chrono::high_resolution_clock::now();
         map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
+        map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
         has_map_tensor_timing = run_stage_debug;
     
 
@@ -906,6 +1030,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         }
         auto map_verify_end = std::chrono::high_resolution_clock::now();
         map_verify_ms = elapsed_ms(map_verify_start, map_verify_end);
+        map_verify_elapsed = elapsed_ns(map_verify_start, map_verify_end);
 
 
         auto remap_assign_start = std::chrono::high_resolution_clock::now();
@@ -923,6 +1048,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         }
         auto remap_assign_end = std::chrono::high_resolution_clock::now();
         remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
+        remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
     }
     if (run_stage_debug) {
         auto now = std::chrono::high_resolution_clock::now();
@@ -954,6 +1080,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         step_start = now;
     }
 
+    auto finalize_start = std::chrono::high_resolution_clock::now();
     if (batch->edges_.size(1) == 2) {
         batch->edges_ = torch::stack({src_mapping, dst_mapping}).transpose(0, 1);
     } else if (batch->edges_.size(1) == 3) {
@@ -964,6 +1091,15 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
 
     batch->src_neg_indices_mapping_ = src_neg_mapping;
     batch->dst_neg_indices_mapping_ = dst_neg_mapping;
+    finalize_elapsed = elapsed_ns(finalize_start, std::chrono::high_resolution_clock::now());
+
+    add_perf_stat(edge_get_edges_ns_, device_edge_get_edges_ns_, device_idx, get_edges_elapsed);
+    add_perf_stat(edge_negative_sample_ns_, device_edge_negative_sample_ns_, device_idx, negative_sample_elapsed);
+    add_perf_stat(edge_map_collect_ids_ns_, device_edge_map_collect_ids_ns_, device_idx, map_collect_elapsed);
+    add_perf_stat(edge_map_lookup_ns_, device_edge_map_lookup_ns_, device_idx, map_lookup_elapsed);
+    add_perf_stat(edge_map_verify_ns_, device_edge_map_verify_ns_, device_idx, map_verify_elapsed);
+    add_perf_stat(edge_remap_assign_ns_, device_edge_remap_assign_ns_, device_idx, remap_assign_elapsed);
+    add_perf_stat(edge_finalize_ns_, device_edge_finalize_ns_, device_idx, finalize_elapsed);
 
     if (run_stage_debug) {
         auto now = std::chrono::high_resolution_clock::now();

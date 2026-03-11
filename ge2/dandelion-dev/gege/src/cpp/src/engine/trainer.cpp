@@ -419,11 +419,37 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             perf_stats.device_swap_update_ns.size() == device_timings.size() &&
             perf_stats.device_swap_rebuild_ns.size() == device_timings.size() &&
             perf_stats.device_swap_sync_wait_ns.size() == device_timings.size();
+        bool have_device_batch_fetch_stats =
+            perf_stats.device_get_next_batch_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_sample_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_get_edges_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_negative_sample_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_map_collect_ids_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_map_lookup_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_map_verify_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_remap_assign_ns.size() == device_timings.size() &&
+            perf_stats.device_edge_finalize_ns.size() == device_timings.size() &&
+            perf_stats.device_node_sample_ns.size() == device_timings.size() &&
+            perf_stats.device_load_cpu_parameters_ns.size() == device_timings.size() &&
+            perf_stats.device_get_batch_device_prepare_ns.size() == device_timings.size() &&
+            perf_stats.device_get_batch_perform_map_ns.size() == device_timings.size() &&
+            perf_stats.device_get_batch_overhead_ns.size() == device_timings.size();
         if (!have_device_swap_stats &&
             (!perf_stats.device_swap_count.empty() || !perf_stats.device_swap_barrier_wait_ns.empty() ||
              !perf_stats.device_swap_update_ns.empty() || !perf_stats.device_swap_rebuild_ns.empty() ||
              !perf_stats.device_swap_sync_wait_ns.empty())) {
             SPDLOG_WARN("[perf][epoch {}] device swap stats are unavailable or size-mismatched for {} GPU timing entries",
+                        dataloader_->getEpochsProcessed(), device_timings.size());
+        }
+        if (!have_device_batch_fetch_stats &&
+            (!perf_stats.device_get_next_batch_ns.empty() || !perf_stats.device_edge_sample_ns.empty() ||
+             !perf_stats.device_edge_get_edges_ns.empty() || !perf_stats.device_edge_negative_sample_ns.empty() ||
+             !perf_stats.device_edge_map_collect_ids_ns.empty() || !perf_stats.device_edge_map_lookup_ns.empty() ||
+             !perf_stats.device_edge_map_verify_ns.empty() || !perf_stats.device_edge_remap_assign_ns.empty() ||
+             !perf_stats.device_edge_finalize_ns.empty() || !perf_stats.device_node_sample_ns.empty() ||
+             !perf_stats.device_load_cpu_parameters_ns.empty() || !perf_stats.device_get_batch_device_prepare_ns.empty() ||
+             !perf_stats.device_get_batch_perform_map_ns.empty() || !perf_stats.device_get_batch_overhead_ns.empty())) {
+            SPDLOG_WARN("[perf][epoch {}] device batch-fetch stats are unavailable or size-mismatched for {} GPU timing entries",
                         dataloader_->getEpochsProcessed(), device_timings.size());
         }
         SPDLOG_INFO(
@@ -438,6 +464,17 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             ns_to_ms(sum_member(device_timings, &DeviceEpochTiming::finalize_region_ns)),
             perf_stats.swap_count, ns_to_ms(perf_stats.swap_barrier_wait_ns), ns_to_ms(perf_stats.swap_update_ns), ns_to_ms(perf_stats.swap_rebuild_ns),
             ns_to_ms(perf_stats.swap_sync_wait_ns));
+        SPDLOG_INFO(
+            "[perf][epoch {}][batch_fetch] total_ms={:.3f} get_next_batch_ms={:.3f} edge_sample_ms={:.3f} node_sample_ms={:.3f} load_cpu_parameters_ms={:.3f} device_prepare_ms={:.3f} perform_map_ms={:.3f} overhead_ms={:.3f}",
+            dataloader_->getEpochsProcessed(), ns_to_ms(sum_member(device_timings, &DeviceEpochTiming::batch_fetch_region_ns)),
+            ns_to_ms(perf_stats.get_next_batch_ns), ns_to_ms(perf_stats.edge_sample_ns), ns_to_ms(perf_stats.node_sample_ns),
+            ns_to_ms(perf_stats.load_cpu_parameters_ns), ns_to_ms(perf_stats.get_batch_device_prepare_ns),
+            ns_to_ms(perf_stats.get_batch_perform_map_ns), ns_to_ms(perf_stats.get_batch_overhead_ns));
+        SPDLOG_INFO(
+            "[perf][epoch {}][edge_sample] total_ms={:.3f} get_edges_ms={:.3f} negative_sample_ms={:.3f} collect_ids_ms={:.3f} map_lookup_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f} finalize_ms={:.3f}",
+            dataloader_->getEpochsProcessed(), ns_to_ms(perf_stats.edge_sample_ns), ns_to_ms(perf_stats.edge_get_edges_ns),
+            ns_to_ms(perf_stats.edge_negative_sample_ns), ns_to_ms(perf_stats.edge_map_collect_ids_ns), ns_to_ms(perf_stats.edge_map_lookup_ns),
+            ns_to_ms(perf_stats.edge_map_verify_ns), ns_to_ms(perf_stats.edge_remap_assign_ns), ns_to_ms(perf_stats.edge_finalize_ns));
         for (int32_t device_idx = 0; device_idx < static_cast<int32_t>(device_timings.size()); device_idx++) {
             const auto &timing = device_timings[device_idx];
             int64_t swap_count = have_device_swap_stats ? perf_stats.device_swap_count[device_idx] : 0;
@@ -445,6 +482,20 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             int64_t swap_update = have_device_swap_stats ? perf_stats.device_swap_update_ns[device_idx] : 0;
             int64_t swap_rebuild = have_device_swap_stats ? perf_stats.device_swap_rebuild_ns[device_idx] : 0;
             int64_t swap_sync = have_device_swap_stats ? perf_stats.device_swap_sync_wait_ns[device_idx] : 0;
+            int64_t get_next_batch = have_device_batch_fetch_stats ? perf_stats.device_get_next_batch_ns[device_idx] : 0;
+            int64_t edge_sample = have_device_batch_fetch_stats ? perf_stats.device_edge_sample_ns[device_idx] : 0;
+            int64_t edge_get_edges = have_device_batch_fetch_stats ? perf_stats.device_edge_get_edges_ns[device_idx] : 0;
+            int64_t edge_negative_sample = have_device_batch_fetch_stats ? perf_stats.device_edge_negative_sample_ns[device_idx] : 0;
+            int64_t edge_map_collect_ids = have_device_batch_fetch_stats ? perf_stats.device_edge_map_collect_ids_ns[device_idx] : 0;
+            int64_t edge_map_lookup = have_device_batch_fetch_stats ? perf_stats.device_edge_map_lookup_ns[device_idx] : 0;
+            int64_t edge_map_verify = have_device_batch_fetch_stats ? perf_stats.device_edge_map_verify_ns[device_idx] : 0;
+            int64_t edge_remap_assign = have_device_batch_fetch_stats ? perf_stats.device_edge_remap_assign_ns[device_idx] : 0;
+            int64_t edge_finalize = have_device_batch_fetch_stats ? perf_stats.device_edge_finalize_ns[device_idx] : 0;
+            int64_t node_sample = have_device_batch_fetch_stats ? perf_stats.device_node_sample_ns[device_idx] : 0;
+            int64_t load_cpu_parameters = have_device_batch_fetch_stats ? perf_stats.device_load_cpu_parameters_ns[device_idx] : 0;
+            int64_t device_prepare = have_device_batch_fetch_stats ? perf_stats.device_get_batch_device_prepare_ns[device_idx] : 0;
+            int64_t perform_map = have_device_batch_fetch_stats ? perf_stats.device_get_batch_perform_map_ns[device_idx] : 0;
+            int64_t get_batch_overhead = have_device_batch_fetch_stats ? perf_stats.device_get_batch_overhead_ns[device_idx] : 0;
             SPDLOG_INFO(
                 "[perf][epoch {}][gpu {}] batches={} sync_points={} batch_fetch_region_ms={:.3f} gpu_load_region_ms={:.3f} map_region_ms={:.3f} compute_region_ms={:.3f} embedding_update_region_ms={:.3f} embedding_update_g_region_ms={:.3f} dense_sync_wait_ms={:.3f} dense_sync_wait_excl_all_reduce_ms={:.3f} dense_sync_all_reduce_ms={:.3f} finalize_region_ms={:.3f} swap_count={} swap_barrier_wait_ms={:.3f} swap_update_ms={:.3f} swap_rebuild_ms={:.3f} swap_sync_wait_ms={:.3f}",
                 dataloader_->getEpochsProcessed(), device_idx, timing.batch_count, timing.sync_count, ns_to_ms(timing.batch_fetch_region_ns),
@@ -452,6 +503,14 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                 ns_to_ms(timing.embedding_update_g_region_ns), ns_to_ms(timing.dense_sync_wait_ns), ns_to_ms(timing.dense_sync_wait_excl_all_reduce_ns),
                 ns_to_ms(timing.dense_sync_all_reduce_ns), ns_to_ms(timing.finalize_region_ns), swap_count,
                 ns_to_ms(swap_barrier), ns_to_ms(swap_update), ns_to_ms(swap_rebuild), ns_to_ms(swap_sync));
+            SPDLOG_INFO(
+                "[perf][epoch {}][gpu {}][batch_fetch] total_ms={:.3f} get_next_batch_ms={:.3f} edge_sample_ms={:.3f} node_sample_ms={:.3f} load_cpu_parameters_ms={:.3f} device_prepare_ms={:.3f} perform_map_ms={:.3f} overhead_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), device_idx, ns_to_ms(timing.batch_fetch_region_ns), ns_to_ms(get_next_batch), ns_to_ms(edge_sample),
+                ns_to_ms(node_sample), ns_to_ms(load_cpu_parameters), ns_to_ms(device_prepare), ns_to_ms(perform_map), ns_to_ms(get_batch_overhead));
+            SPDLOG_INFO(
+                "[perf][epoch {}][gpu {}][edge_sample] total_ms={:.3f} get_edges_ms={:.3f} negative_sample_ms={:.3f} collect_ids_ms={:.3f} map_lookup_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f} finalize_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), device_idx, ns_to_ms(edge_sample), ns_to_ms(edge_get_edges), ns_to_ms(edge_negative_sample),
+                ns_to_ms(edge_map_collect_ids), ns_to_ms(edge_map_lookup), ns_to_ms(edge_map_verify), ns_to_ms(edge_remap_assign), ns_to_ms(edge_finalize));
         }
         SPDLOG_INFO(
             "[perf][epoch {}][spread] batch_fetch_region_ms={:.3f} gpu_load_region_ms={:.3f} map_region_ms={:.3f} compute_region_ms={:.3f} embedding_update_region_ms={:.3f} embedding_update_g_region_ms={:.3f} dense_sync_wait_ms={:.3f} dense_sync_wait_excl_all_reduce_ms={:.3f} dense_sync_all_reduce_ms={:.3f} finalize_region_ms={:.3f}",
@@ -465,6 +524,20 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             spread_ms(collect_ns(device_timings, &DeviceEpochTiming::dense_sync_wait_excl_all_reduce_ns)),
             spread_ms(collect_ns(device_timings, &DeviceEpochTiming::dense_sync_all_reduce_ns)),
             spread_ms(collect_ns(device_timings, &DeviceEpochTiming::finalize_region_ns)));
+        if (have_device_batch_fetch_stats) {
+            SPDLOG_INFO(
+                "[perf][epoch {}][spread][batch_fetch] get_next_batch_ms={:.3f} edge_sample_ms={:.3f} node_sample_ms={:.3f} load_cpu_parameters_ms={:.3f} device_prepare_ms={:.3f} perform_map_ms={:.3f} overhead_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), spread_ms(perf_stats.device_get_next_batch_ns), spread_ms(perf_stats.device_edge_sample_ns),
+                spread_ms(perf_stats.device_node_sample_ns), spread_ms(perf_stats.device_load_cpu_parameters_ns),
+                spread_ms(perf_stats.device_get_batch_device_prepare_ns), spread_ms(perf_stats.device_get_batch_perform_map_ns),
+                spread_ms(perf_stats.device_get_batch_overhead_ns));
+            SPDLOG_INFO(
+                "[perf][epoch {}][spread][edge_sample] get_edges_ms={:.3f} negative_sample_ms={:.3f} collect_ids_ms={:.3f} map_lookup_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f} finalize_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), spread_ms(perf_stats.device_edge_get_edges_ns),
+                spread_ms(perf_stats.device_edge_negative_sample_ns), spread_ms(perf_stats.device_edge_map_collect_ids_ns),
+                spread_ms(perf_stats.device_edge_map_lookup_ns), spread_ms(perf_stats.device_edge_map_verify_ns),
+                spread_ms(perf_stats.device_edge_remap_assign_ns), spread_ms(perf_stats.device_edge_finalize_ns));
+        }
         if (have_device_swap_stats) {
             SPDLOG_INFO("[perf][epoch {}][device] swap_count={}", dataloader_->getEpochsProcessed(),
                         format_vector(perf_stats.device_swap_count));

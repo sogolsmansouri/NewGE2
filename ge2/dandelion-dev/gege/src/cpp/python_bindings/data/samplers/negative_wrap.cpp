@@ -5,14 +5,15 @@ class PyNegativeSampler : NegativeSampler {
    public:
     using NegativeSampler::NegativeSampler;
     using ReturnTensorTuple = std::tuple<torch::Tensor, torch::Tensor>;
-    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges, bool inverse) override {
-        PYBIND11_OVERRIDE_PURE_NAME(ReturnTensorTuple, NegativeSampler, "getNegatives", getNegatives, graph, edges, inverse);
+    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges, bool inverse, int32_t device_idx) override {
+        PYBIND11_OVERRIDE_PURE_NAME(ReturnTensorTuple, NegativeSampler, "getNegatives", getNegatives, graph, edges, inverse, device_idx);
     }
 };
 
 void init_neg_samplers(py::module &m) {
     py::class_<NegativeSampler, PyNegativeSampler, std::shared_ptr<NegativeSampler>>(m, "NegativeSampler")
-        .def("getNegatives", &NegativeSampler::getNegatives, py::arg("graph"), py::arg("edges") = torch::Tensor(), py::arg("inverse") = false);
+        .def("getNegatives", &NegativeSampler::getNegatives, py::arg("graph"), py::arg("edges") = torch::Tensor(), py::arg("inverse") = false,
+             py::arg("device_idx") = 0);
 
     py::class_<CorruptNodeNegativeSampler, NegativeSampler, std::shared_ptr<CorruptNodeNegativeSampler>>(m, "CorruptNodeNegativeSampler")
         .def_readwrite("num_chunks", &CorruptNodeNegativeSampler::num_chunks_)

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <limits>
@@ -70,6 +72,19 @@ torch::Tensor compute_filter_corruption(shared_ptr<GegeGraph> graph, torch::Tens
 
 torch::Tensor apply_score_filter(torch::Tensor scores, torch::Tensor filter);
 
+struct NegativeSamplerPerfStats {
+    int64_t get_negatives_total_ns = 0;
+    int64_t get_negatives_call_count = 0;
+    int64_t plan_lock_wait_ns = 0;
+    int64_t plan_lock_wait_count = 0;
+    std::vector<int64_t> device_get_negatives_total_ns;
+    std::vector<int64_t> device_get_negatives_call_count;
+    std::vector<int64_t> device_plan_lock_wait_ns;
+    std::vector<int64_t> device_plan_lock_wait_count;
+    std::vector<std::vector<int64_t>> device_get_negatives_samples_ns;
+    std::vector<std::vector<int64_t>> device_plan_lock_wait_samples_ns;
+};
+
 /**
  * Samples the negative edges from a given batch.
  */
@@ -86,8 +101,11 @@ class NegativeSampler {
      * @return The negative nodes/edges sampled
      */
     virtual std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
-                                                                  bool inverse = false) = 0;
+                                                                  bool inverse = false, int32_t device_idx = 0) = 0;
     virtual void resetPlanCache() {}
+    virtual void resetPerfStats() {}
+    virtual void initializePerfStats(std::size_t num_devices) {}
+    virtual NegativeSamplerPerfStats getPerfStats() const { return NegativeSamplerPerfStats(); }
     // serve as `select` function.
 
     virtual std::tuple<torch::Tensor, torch::Tensor> compute(torch::Tensor src_embeddings, torch::Tensor dst_embeddings, torch::Tensor dst_neg_embeddings, torch::Tensor src_neg_embeddings,
@@ -116,7 +134,8 @@ class CorruptNodeNegativeSampler : public NegativeSampler {
     CorruptNodeNegativeSampler(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false,
                                LocalFilterMode local_filter_mode = LocalFilterMode::DEG);
 
-    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(), bool inverse = false) override;
+    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
+                                                          bool inverse = false, int32_t device_idx = 0) override;
 };
 
 class CorruptRelNegativeSampler : public NegativeSampler {
@@ -127,7 +146,8 @@ class CorruptRelNegativeSampler : public NegativeSampler {
 
     CorruptRelNegativeSampler(int num_chunks, int num_negatives, bool filtered = false);
 
-    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(), bool inverse = false) override;
+    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
+                                                          bool inverse = false, int32_t device_idx = 0) override;
 };
 
 class NegativeEdgeSampler : public NegativeSampler {
@@ -137,7 +157,8 @@ class NegativeEdgeSampler : public NegativeSampler {
 
     NegativeEdgeSampler(int num_chunks, int num_negatives, bool filtered = false);
 
-    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(), bool inverse = false) override;
+    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
+                                                          bool inverse = false, int32_t device_idx = 0) override;
 };
 
 // APIs.
@@ -159,8 +180,24 @@ class NegativeSamplingBase : public NegativeSampler {
                          int superbatch_negative_plan_batches = 0, LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false,
                          bool tiled_tournament_scores = false, int tiled_tournament_groups_per_tile = 64);
 
-    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(), bool inverse = false) override;
+    std::tuple<torch::Tensor, torch::Tensor> getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
+                                                          bool inverse = false, int32_t device_idx = 0) override;
     void resetPlanCache() override;
+    void resetPerfStats() override;
+    void initializePerfStats(std::size_t num_devices) override;
+    NegativeSamplerPerfStats getPerfStats() const override;
+
+   private:
+    std::atomic<int64_t> get_negatives_total_ns_{0};
+    std::atomic<int64_t> get_negatives_call_count_{0};
+    std::atomic<int64_t> plan_lock_wait_ns_{0};
+    std::atomic<int64_t> plan_lock_wait_count_{0};
+    std::vector<int64_t> device_get_negatives_total_ns_;
+    std::vector<int64_t> device_get_negatives_call_count_;
+    std::vector<int64_t> device_plan_lock_wait_ns_;
+    std::vector<int64_t> device_plan_lock_wait_count_;
+    std::vector<std::vector<int64_t>> device_get_negatives_samples_ns_;
+    std::vector<std::vector<int64_t>> device_plan_lock_wait_samples_ns_;
 };
 
 class RNS : public NegativeSamplingBase {

@@ -35,6 +35,7 @@ struct DataLoaderPerfStats {
     int64_t get_batch_device_prepare_ns = 0;
     int64_t get_batch_perform_map_ns = 0;
     int64_t get_batch_overhead_ns = 0;
+    NegativeSamplerPerfStats negative_sampler;
     std::vector<int64_t> device_swap_barrier_wait_ns;
     std::vector<int64_t> device_swap_update_ns;
     std::vector<int64_t> device_swap_rebuild_ns;
@@ -54,6 +55,10 @@ struct DataLoaderPerfStats {
     std::vector<int64_t> device_get_batch_device_prepare_ns;
     std::vector<int64_t> device_get_batch_perform_map_ns;
     std::vector<int64_t> device_get_batch_overhead_ns;
+    std::vector<std::vector<int64_t>> device_swap_active_bucket_samples;
+    std::vector<std::vector<int64_t>> device_swap_active_edge_samples;
+    std::vector<std::vector<int64_t>> device_swap_batch_count_samples;
+    std::vector<std::vector<int64_t>> device_swap_rebuild_samples_ns;
 };
 
 class DataLoader {
@@ -153,6 +158,10 @@ class DataLoader {
     std::vector<int64_t> device_get_batch_device_prepare_ns_;
     std::vector<int64_t> device_get_batch_perform_map_ns_;
     std::vector<int64_t> device_get_batch_overhead_ns_;
+    std::vector<std::vector<int64_t>> device_swap_active_bucket_samples_;
+    std::vector<std::vector<int64_t>> device_swap_active_edge_samples_;
+    std::vector<std::vector<int64_t>> device_swap_batch_count_samples_;
+    std::vector<std::vector<int64_t>> device_swap_rebuild_samples_ns_;
 
     LearningTask learning_task_;
 

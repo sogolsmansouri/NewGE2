@@ -131,10 +131,20 @@ void initialize_perf_vector(std::vector<int64_t> &values, std::size_t size) {
     values.assign(size, 0);
 }
 
+void initialize_perf_samples(std::vector<std::vector<int64_t>> &values, std::size_t size) {
+    values.assign(size, {});
+}
+
 void add_perf_stat(std::atomic<int64_t> &aggregate, std::vector<int64_t> &per_device, int32_t device_idx, int64_t elapsed_ns) {
     aggregate.fetch_add(elapsed_ns);
     if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < per_device.size()) {
         per_device[device_idx] += elapsed_ns;
+    }
+}
+
+void add_perf_sample(std::vector<std::vector<int64_t>> &per_device, int32_t device_idx, int64_t value) {
+    if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < per_device.size()) {
+        per_device[device_idx].push_back(value);
     }
 }
 
@@ -185,6 +195,10 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     initialize_perf_vector(device_get_batch_device_prepare_ns_, devices_.size());
     initialize_perf_vector(device_get_batch_perform_map_ns_, devices_.size());
     initialize_perf_vector(device_get_batch_overhead_ns_, devices_.size());
+    initialize_perf_samples(device_swap_active_bucket_samples_, devices_.size());
+    initialize_perf_samples(device_swap_active_edge_samples_, devices_.size());
+    initialize_perf_samples(device_swap_batch_count_samples_, devices_.size());
+    initialize_perf_samples(device_swap_rebuild_samples_ns_, devices_.size());
 
     negative_sampling_method_ = nsm;
 
@@ -246,6 +260,13 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
 
     negative_sampler_ = training_negative_sampler_;
     neighbor_sampler_ = training_neighbor_sampler_;
+    auto initialize_negative_sampler_perf = [&](const shared_ptr<NegativeSampler> &sampler) {
+        if (instance_of<NegativeSampler, NegativeSamplingBase>(sampler)) {
+            std::dynamic_pointer_cast<NegativeSamplingBase>(sampler)->initializePerfStats(devices_.size());
+        }
+    };
+    initialize_negative_sampler_perf(training_negative_sampler_);
+    initialize_negative_sampler_perf(evaluation_negative_sampler_);
     refreshGraphStorageMode();
 }
 
@@ -272,6 +293,9 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     edge_sampler_ = std::make_shared<RandomEdgeSampler>(graph_storage_);
     negative_sampler_ = negative_sampler;
     neighbor_sampler_ = neighbor_sampler;
+    if (instance_of<NegativeSampler, NegativeSamplingBase>(negative_sampler_)) {
+        std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler_)->initializePerfStats(devices_.size());
+    }
 
     training_negative_sampler_ = nullptr;
     evaluation_negative_sampler_ = nullptr;
@@ -342,6 +366,26 @@ void DataLoader::resetPerfStats() {
     std::fill(device_get_batch_device_prepare_ns_.begin(), device_get_batch_device_prepare_ns_.end(), 0);
     std::fill(device_get_batch_perform_map_ns_.begin(), device_get_batch_perform_map_ns_.end(), 0);
     std::fill(device_get_batch_overhead_ns_.begin(), device_get_batch_overhead_ns_.end(), 0);
+    for (auto &samples : device_swap_active_bucket_samples_) {
+        samples.clear();
+    }
+    for (auto &samples : device_swap_active_edge_samples_) {
+        samples.clear();
+    }
+    for (auto &samples : device_swap_batch_count_samples_) {
+        samples.clear();
+    }
+    for (auto &samples : device_swap_rebuild_samples_ns_) {
+        samples.clear();
+    }
+    auto reset_negative_sampler_perf = [&](const shared_ptr<NegativeSampler> &sampler) {
+        if (instance_of<NegativeSampler, NegativeSamplingBase>(sampler)) {
+            std::dynamic_pointer_cast<NegativeSamplingBase>(sampler)->resetPerfStats();
+        }
+    };
+    reset_negative_sampler_perf(training_negative_sampler_);
+    reset_negative_sampler_perf(evaluation_negative_sampler_);
+    reset_negative_sampler_perf(negative_sampler_);
 }
 
 DataLoaderPerfStats DataLoader::getPerfStats() const {
@@ -384,6 +428,13 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.device_get_batch_device_prepare_ns = device_get_batch_device_prepare_ns_;
     stats.device_get_batch_perform_map_ns = device_get_batch_perform_map_ns_;
     stats.device_get_batch_overhead_ns = device_get_batch_overhead_ns_;
+    stats.device_swap_active_bucket_samples = device_swap_active_bucket_samples_;
+    stats.device_swap_active_edge_samples = device_swap_active_edge_samples_;
+    stats.device_swap_batch_count_samples = device_swap_batch_count_samples_;
+    stats.device_swap_rebuild_samples_ns = device_swap_rebuild_samples_ns_;
+    if (instance_of<NegativeSampler, NegativeSamplingBase>(negative_sampler_)) {
+        stats.negative_sampler = std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler_)->getPerfStats();
+    }
     return stats;
 }
 
@@ -494,6 +545,8 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
             "[partition-buffer-pipeline][setActiveEdges {}] device={} buckets={} edges={} bucket_lookup_ms={:.3f} gather_ms={:.3f} shuffle_ms={:.3f} total_ms={:.3f}",
             timing_id, device_idx, num_active_buckets, active_edges.size(0), bucket_lookup_ms, gather_ms, shuffle_ms, elapsed_ms(total_start, now));
     }
+    add_perf_sample(device_swap_active_bucket_samples_, device_idx, num_active_buckets);
+    add_perf_sample(device_swap_active_edge_samples_, device_idx, active_edges.size(0));
     graph_storage_->setActiveEdges(active_edges, device_idx);
 }
 
@@ -555,6 +608,7 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
     all_batches_[device_idx] = batches;
     batches_left_[device_idx] = batches.size();
     batch_iterators_[device_idx] = all_batches_[device_idx].begin();
+    add_perf_sample(device_swap_batch_count_samples_, device_idx, static_cast<int64_t>(batches.size()));
 }
 
 void DataLoader::setBufferOrdering() {
@@ -751,6 +805,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 if (device_idx < device_swap_rebuild_ns_.size()) {
                     device_swap_rebuild_ns_[device_idx] += swap_rebuild_elapsed;
                 }
+                add_perf_sample(device_swap_rebuild_samples_ns_, device_idx, swap_rebuild_elapsed);
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
@@ -1134,10 +1189,10 @@ void DataLoader::nodeSample(shared_ptr<Batch> batch, int32_t device_idx) {
 
 void DataLoader::negativeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     std::tie(batch->src_neg_indices_, batch->src_neg_filter_) =
-        negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_, true);
+        negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_, true, device_idx);
 
     std::tie(batch->dst_neg_indices_, batch->dst_neg_filter_) =
-        negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_, false);
+        negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_, false, device_idx);
 }
 
 void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {

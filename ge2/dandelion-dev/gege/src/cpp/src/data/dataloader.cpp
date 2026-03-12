@@ -174,7 +174,7 @@ std::string format_tensor_values(torch::Tensor values) {
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
                        shared_ptr<EvaluationConfig> evaluation_config, shared_ptr<EncoderConfig> encoder_config, vector<torch::Device> devices,
-                       NegativeSamplingMethod nsm) {
+                       NegativeSamplingMethod nsm, bool use_inverse_relations) {
     current_edge_ = 0;
     train_ = true;
     epochs_processed_ = 0;
@@ -194,6 +194,7 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     training_config_ = training_config;
     evaluation_config_ = evaluation_config;
     only_root_features_ = false;
+    use_inverse_relations_ = use_inverse_relations;
 
     edge_sampler_ = std::make_shared<RandomEdgeSampler>(graph_storage_);
 
@@ -318,6 +319,7 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
 
     graph_storage_ = graph_storage;
     learning_task_ = learning_task;
+    use_inverse_relations_ = true;
     only_root_features_ = false;
 
     edge_sampler_ = std::make_shared<RandomEdgeSampler>(graph_storage_);
@@ -748,34 +750,9 @@ void DataLoader::setBufferOrdering() {
             access_aware_scheduler = true;
         }
 
-        bool cost_aware_scheduler = false;
-        const char *cost_aware_env = std::getenv("GEGE_COST_AWARE_SCHEDULER");
-        if (cost_aware_env != nullptr && cost_aware_env[0] != '\0' && std::string(cost_aware_env) != "0") {
-            cost_aware_scheduler = true;
-        }
-
-        if (cost_aware_scheduler && requested_active_devices != physical_devices) {
-            SPDLOG_WARN("Disabling cost-aware scheduler because logical_active_devices={} differs from physical device count={}",
-                        requested_active_devices, physical_devices);
-            cost_aware_scheduler = false;
-        }
-
-        std::vector<int64_t> edge_bucket_sizes;
-        if (cost_aware_scheduler && options != nullptr && graph_storage_->storage_ptrs_.edges != nullptr) {
-            edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
-            if (edge_bucket_sizes.size() != static_cast<std::size_t>(options->num_partitions * options->num_partitions)) {
-                SPDLOG_WARN("Disabling cost-aware scheduler due to edge_bucket_sizes size mismatch: got {}, expected {}",
-                            edge_bucket_sizes.size(), options->num_partitions * options->num_partitions);
-                cost_aware_scheduler = false;
-            }
-        }
-
-        auto permutation = cost_aware_scheduler
-            ? getCostAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, edge_bucket_sizes, options->num_partitions,
-                                                         requested_active_devices)
-            : (access_aware_scheduler
-                   ? getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, requested_active_devices)
-                   : getDisjointBufferStatePermutation(buffer_states, requested_active_devices));
+        auto permutation = access_aware_scheduler
+            ? getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, requested_active_devices)
+            : getDisjointBufferStatePermutation(buffer_states, requested_active_devices);
         bool changed = false;
         for (std::size_t i = 0; i < permutation.size(); i++) {
             if (permutation[i] != static_cast<int64_t>(i)) {
@@ -799,10 +776,7 @@ void DataLoader::setBufferOrdering() {
         buffer_states = std::move(reordered_states);
         edge_buckets_per_buffer = std::move(reordered_buckets);
 
-        if (cost_aware_scheduler) {
-            SPDLOG_INFO("Reordered {} buffer states into cost-aware disjoint multi-GPU supersteps for {} logical device(s) on {} physical device(s)",
-                        buffer_states.size(), requested_active_devices, physical_devices);
-        } else if (access_aware_scheduler) {
+        if (access_aware_scheduler) {
             SPDLOG_INFO("Reordered {} buffer states into access-aware disjoint multi-GPU supersteps for {} logical device(s) on {} physical device(s)",
                         buffer_states.size(), requested_active_devices, physical_devices);
         } else {
@@ -1313,11 +1287,10 @@ void DataLoader::nodeSample(shared_ptr<Batch> batch, int32_t device_idx) {
 }
 
 void DataLoader::negativeSample(shared_ptr<Batch> batch, int32_t device_idx) {
-    std::tie(batch->src_neg_indices_, batch->src_neg_filter_) =
-        negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_, true, device_idx);
-
-    std::tie(batch->dst_neg_indices_, batch->dst_neg_filter_) =
-        negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_, false, device_idx);
+    bool need_src_negatives = batch->edges_.size(1) == 3 && use_inverse_relations_;
+    std::tie(batch->src_neg_indices_, batch->src_neg_filter_, batch->dst_neg_indices_, batch->dst_neg_filter_) =
+        negative_sampler_->getNodeCorruptNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_,
+                                                   need_src_negatives, device_idx);
 }
 
 void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {

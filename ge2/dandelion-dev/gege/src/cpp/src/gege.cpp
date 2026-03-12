@@ -85,9 +85,17 @@ std::tuple<shared_ptr<Model>, shared_ptr<GraphModelStorage>, shared_ptr<DataLoad
         epochs_processed = checkpoint_meta.num_epochs;
     }
 
+    bool use_inverse_relations = true;
+    if (gege_config->model->decoder != nullptr && gege_config->model->decoder->type != DecoderType::NODE) {
+        auto decoder_options = std::dynamic_pointer_cast<EdgeDecoderOptions>(gege_config->model->decoder->options);
+        if (decoder_options != nullptr) {
+            use_inverse_relations = decoder_options->inverse_edges;
+        }
+    }
+
     shared_ptr<DataLoader> dataloader = std::make_shared<DataLoader>(graph_model_storage, model->learning_task_, gege_config->training,
                                                                      gege_config->evaluation, gege_config->model->encoder, devices,
-                                                                     gege_config->training->negative_sampling_method);
+                                                                     gege_config->training->negative_sampling_method, use_inverse_relations);
 
     dataloader->epochs_processed_ = epochs_processed;
 

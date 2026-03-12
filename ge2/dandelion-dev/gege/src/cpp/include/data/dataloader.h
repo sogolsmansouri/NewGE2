@@ -120,6 +120,7 @@ class DataLoader {
     shared_ptr<TrainingConfig> training_config_;
     shared_ptr<EvaluationConfig> evaluation_config_;
     bool only_root_features_;
+    bool use_inverse_relations_;
     std::atomic<int64_t> swap_barrier_wait_ns_{0};
     std::atomic<int64_t> swap_update_ns_{0};
     std::atomic<int64_t> swap_rebuild_ns_{0};
@@ -174,7 +175,7 @@ class DataLoader {
 
     DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
                shared_ptr<EvaluationConfig> evaluation_config, shared_ptr<EncoderConfig> encoder_config, vector<torch::Device> devices,
-               NegativeSamplingMethod nsm = NegativeSamplingMethod::OTHER);
+               NegativeSamplingMethod nsm = NegativeSamplingMethod::OTHER, bool use_inverse_relations = true);
 
     DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, int batch_size, shared_ptr<NegativeSampler> negative_sampler = nullptr,
                shared_ptr<NeighborSampler> neighbor_sampler = nullptr, bool train = false);

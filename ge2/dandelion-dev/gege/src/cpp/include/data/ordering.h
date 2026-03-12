@@ -42,9 +42,3 @@ std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tenso
 std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states,
                                                                   const vector<torch::Tensor>& edge_buckets_per_buffer,
                                                                   int active_devices);
-
-std::vector<int64_t> getCostAwareDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states,
-                                                                const vector<torch::Tensor>& edge_buckets_per_buffer,
-                                                                const std::vector<int64_t>& edge_bucket_sizes,
-                                                                int num_partitions,
-                                                                int active_devices);

@@ -931,19 +931,16 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
 
     switch (negative_sampling_method) {
         case NegativeSamplingMethod::RNS : {
-            torch::Tensor dst_neg_embs = gather_negative_embeddings(node_embeddings, dst_negs, use_csr_gather, &dst_neg_gather_plan);
             if (has_relations) {
                 pos_scores = decoder->compute_scores(adjusted_src_embeddings, dst_embeddings);
-                neg_scores = decoder->compute_scores(adjusted_src_embeddings, dst_neg_embs);
+                neg_scores = decoder->compute_scores(adjusted_src_embeddings, dst_neg_embeddings);
                 if (decoder->use_inverse_relations_) {
-                    torch::Tensor src_neg_embs = gather_negative_embeddings(node_embeddings, src_negs, use_csr_gather, &src_neg_gather_plan);
-
                     inv_pos_scores = decoder->compute_scores(adjusted_dst_embeddings, src_embeddings);
-                    inv_neg_scores = decoder->compute_scores(adjusted_dst_embeddings, src_neg_embs);
+                    inv_neg_scores = decoder->compute_scores(adjusted_dst_embeddings, src_neg_embeddings);
                 }
             } else {
                 pos_scores = decoder->compute_scores(adjusted_src_embeddings, dst_embeddings);
-                neg_scores = decoder->compute_scores(adjusted_src_embeddings, dst_neg_embs);
+                neg_scores = decoder->compute_scores(adjusted_src_embeddings, dst_neg_embeddings);
             }
             break;
         }

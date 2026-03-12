@@ -24,6 +24,8 @@ std::tuple<torch::Tensor, torch::Tensor> unique_with_counts_sorted(torch::Tensor
 struct StateAccessSummary {
     std::vector<int64_t> partitions;
     std::unordered_map<int64_t, int64_t> incident_bucket_counts;
+    int64_t edge_weight = 0;
+    int64_t bucket_count = 0;
 };
 
 std::vector<int64_t> tensor_to_partitions(torch::Tensor tensor) {
@@ -162,7 +164,9 @@ std::vector<std::vector<int64_t>> build_disjoint_groups(const vector<torch::Tens
 }
 
 std::vector<StateAccessSummary> build_state_access_summaries(const vector<torch::Tensor> &buffer_states,
-                                                             const vector<torch::Tensor> &edge_buckets_per_buffer) {
+                                                             const vector<torch::Tensor> &edge_buckets_per_buffer,
+                                                             const std::vector<int64_t> &edge_bucket_sizes = {},
+                                                             int num_partitions = 0) {
     std::vector<StateAccessSummary> summaries(buffer_states.size());
     for (std::size_t i = 0; i < buffer_states.size(); i++) {
         auto partitions = tensor_to_partitions(buffer_states[i]);
@@ -173,14 +177,27 @@ std::vector<StateAccessSummary> build_state_access_summaries(const vector<torch:
             continue;
         }
 
+        if (!edge_buckets_per_buffer[i].defined()) {
+            continue;
+        }
+
         auto edge_buckets = edge_buckets_per_buffer[i].to(torch::kCPU).to(torch::kInt64).contiguous();
         if (!edge_buckets.defined() || edge_buckets.numel() == 0) {
             continue;
         }
         auto accessor = edge_buckets.accessor<int64_t, 2>();
         for (int64_t row = 0; row < edge_buckets.size(0); row++) {
-            summaries[i].incident_bucket_counts[accessor[row][0]]++;
-            summaries[i].incident_bucket_counts[accessor[row][1]]++;
+            int64_t src_part = accessor[row][0];
+            int64_t dst_part = accessor[row][1];
+            summaries[i].incident_bucket_counts[src_part]++;
+            summaries[i].incident_bucket_counts[dst_part]++;
+            summaries[i].bucket_count++;
+            if (num_partitions > 0 && !edge_bucket_sizes.empty()) {
+                int64_t bucket_id = src_part * num_partitions + dst_part;
+                if (bucket_id >= 0 && static_cast<std::size_t>(bucket_id) < edge_bucket_sizes.size()) {
+                    summaries[i].edge_weight += edge_bucket_sizes[bucket_id];
+                }
+            }
         }
     }
     return summaries;
@@ -281,6 +298,236 @@ struct GroupSearchResult {
     std::vector<int64_t> ordered_group;
     std::vector<int64_t> chosen_states;
 };
+
+int64_t state_partition_overlap_count(const std::vector<int64_t> &lhs, const std::vector<int64_t> &rhs) {
+    std::size_t i = 0;
+    std::size_t j = 0;
+    int64_t overlap = 0;
+    while (i < lhs.size() && j < rhs.size()) {
+        if (lhs[i] == rhs[j]) {
+            overlap++;
+            i++;
+            j++;
+        } else if (lhs[i] < rhs[j]) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    return overlap;
+}
+
+int64_t state_transition_churn_cost(const StateAccessSummary &prev, const StateAccessSummary &next) {
+    int64_t overlap = state_partition_overlap_count(prev.partitions, next.partitions);
+    int64_t new_partitions = std::max<int64_t>(static_cast<int64_t>(next.partitions.size()) - overlap, 0);
+    if (new_partitions == 0 || next.bucket_count == 0) {
+        return 0;
+    }
+    int64_t avg_bucket_weight = std::max<int64_t>(next.edge_weight / next.bucket_count, 1);
+    return new_partitions * avg_bucket_weight;
+}
+
+int64_t state_predicted_lane_cost(const StateAccessSummary &summary) {
+    return summary.edge_weight;
+}
+
+int64_t state_predicted_lane_cost(const StateAccessSummary &prev, const StateAccessSummary &next) {
+    return next.edge_weight + state_transition_churn_cost(prev, next);
+}
+
+struct CostAwareAlignmentResult {
+    bool valid = false;
+    int64_t max_lane_cost = std::numeric_limits<int64_t>::max();
+    int64_t spread = std::numeric_limits<int64_t>::max();
+    int64_t total_cost = std::numeric_limits<int64_t>::max();
+    int64_t overlap_score = std::numeric_limits<int64_t>::min();
+    std::vector<int64_t> ordered_group;
+};
+
+bool is_better_cost_alignment(const CostAwareAlignmentResult &candidate, const CostAwareAlignmentResult &best) {
+    if (!best.valid) {
+        return candidate.valid;
+    }
+    if (candidate.max_lane_cost != best.max_lane_cost) {
+        return candidate.max_lane_cost < best.max_lane_cost;
+    }
+    if (candidate.spread != best.spread) {
+        return candidate.spread < best.spread;
+    }
+    if (candidate.total_cost != best.total_cost) {
+        return candidate.total_cost < best.total_cost;
+    }
+    if (candidate.overlap_score != best.overlap_score) {
+        return candidate.overlap_score > best.overlap_score;
+    }
+    return candidate.ordered_group < best.ordered_group;
+}
+
+void search_best_cost_alignment(const std::vector<int64_t> &prev_group,
+                                const std::vector<int64_t> &candidate_group,
+                                const std::vector<StateAccessSummary> &summaries,
+                                std::vector<bool> &used,
+                                std::vector<int64_t> &current,
+                                std::vector<int64_t> &lane_costs,
+                                std::size_t slot,
+                                int64_t current_total_cost,
+                                int64_t current_overlap_score,
+                                CostAwareAlignmentResult &best) {
+    std::size_t target = std::min(prev_group.size(), candidate_group.size());
+    if (slot == target) {
+        std::vector<int64_t> ordered = current;
+        for (auto candidate_state : candidate_group) {
+            if (std::find(ordered.begin(), ordered.end(), candidate_state) == ordered.end()) {
+                ordered.emplace_back(candidate_state);
+            }
+        }
+
+        auto minmax = std::minmax_element(lane_costs.begin(), lane_costs.end());
+        CostAwareAlignmentResult candidate;
+        candidate.valid = true;
+        candidate.max_lane_cost = *minmax.second;
+        candidate.spread = *minmax.second - *minmax.first;
+        candidate.total_cost = current_total_cost;
+        candidate.overlap_score = current_overlap_score;
+        candidate.ordered_group = std::move(ordered);
+        if (is_better_cost_alignment(candidate, best)) {
+            best = std::move(candidate);
+        }
+        return;
+    }
+
+    for (std::size_t i = 0; i < candidate_group.size(); i++) {
+        if (used[i]) {
+            continue;
+        }
+        used[i] = true;
+        int64_t candidate_state = candidate_group[i];
+        int64_t lane_cost = state_predicted_lane_cost(summaries[prev_group[slot]], summaries[candidate_state]);
+        current.emplace_back(candidate_state);
+        lane_costs.emplace_back(lane_cost);
+        int64_t overlap_score = state_access_overlap_score(summaries[prev_group[slot]], summaries[candidate_state]);
+        search_best_cost_alignment(prev_group, candidate_group, summaries, used, current, lane_costs, slot + 1,
+                                   current_total_cost + lane_cost, current_overlap_score + overlap_score, best);
+        lane_costs.pop_back();
+        current.pop_back();
+        used[i] = false;
+    }
+}
+
+CostAwareAlignmentResult get_best_cost_alignment(const std::vector<int64_t> &prev_group,
+                                                 const std::vector<int64_t> &candidate_group,
+                                                 const std::vector<StateAccessSummary> &summaries) {
+    CostAwareAlignmentResult result;
+    if (candidate_group.empty()) {
+        result.valid = true;
+        result.max_lane_cost = 0;
+        result.spread = 0;
+        result.total_cost = 0;
+        result.overlap_score = 0;
+        return result;
+    }
+
+    if (prev_group.empty()) {
+        std::vector<int64_t> lane_costs;
+        lane_costs.reserve(candidate_group.size());
+        int64_t total_cost = 0;
+        for (auto state_idx : candidate_group) {
+            int64_t lane_cost = state_predicted_lane_cost(summaries[state_idx]);
+            lane_costs.emplace_back(lane_cost);
+            total_cost += lane_cost;
+        }
+        auto minmax = std::minmax_element(lane_costs.begin(), lane_costs.end());
+        result.valid = true;
+        result.max_lane_cost = *minmax.second;
+        result.spread = *minmax.second - *minmax.first;
+        result.total_cost = total_cost;
+        result.overlap_score = 0;
+        result.ordered_group = candidate_group;
+        return result;
+    }
+
+    std::vector<bool> used(candidate_group.size(), false);
+    std::vector<int64_t> current;
+    std::vector<int64_t> lane_costs;
+    current.reserve(candidate_group.size());
+    lane_costs.reserve(candidate_group.size());
+    search_best_cost_alignment(prev_group, candidate_group, summaries, used, current, lane_costs, 0, 0, 0, result);
+    if (!result.valid) {
+        result = get_best_cost_alignment({}, candidate_group, summaries);
+    }
+    return result;
+}
+
+struct CostAwareGroupSearchResult {
+    bool valid = false;
+    int64_t max_lane_cost = std::numeric_limits<int64_t>::max();
+    int64_t spread = std::numeric_limits<int64_t>::max();
+    int64_t total_cost = std::numeric_limits<int64_t>::max();
+    int64_t overlap_score = std::numeric_limits<int64_t>::min();
+    std::vector<int64_t> ordered_group;
+    std::vector<int64_t> chosen_states;
+};
+
+bool is_better_cost_group(const CostAwareGroupSearchResult &candidate, const CostAwareGroupSearchResult &best) {
+    if (!best.valid) {
+        return candidate.valid;
+    }
+    if (candidate.max_lane_cost != best.max_lane_cost) {
+        return candidate.max_lane_cost < best.max_lane_cost;
+    }
+    if (candidate.spread != best.spread) {
+        return candidate.spread < best.spread;
+    }
+    if (candidate.total_cost != best.total_cost) {
+        return candidate.total_cost < best.total_cost;
+    }
+    if (candidate.overlap_score != best.overlap_score) {
+        return candidate.overlap_score > best.overlap_score;
+    }
+    return candidate.ordered_group < best.ordered_group;
+}
+
+void search_best_cost_aware_disjoint_group(const std::vector<std::vector<bool>> &compatible,
+                                           const std::vector<int64_t> &remaining,
+                                           const std::vector<int64_t> &prev_group,
+                                           const std::vector<StateAccessSummary> &summaries,
+                                           int target_group_size,
+                                           std::size_t start_idx,
+                                           std::vector<int64_t> &current_group,
+                                           CostAwareGroupSearchResult &best) {
+    if (current_group.size() == static_cast<std::size_t>(target_group_size)) {
+        auto alignment = get_best_cost_alignment(prev_group, current_group, summaries);
+        CostAwareGroupSearchResult candidate;
+        candidate.valid = alignment.valid;
+        candidate.max_lane_cost = alignment.max_lane_cost;
+        candidate.spread = alignment.spread;
+        candidate.total_cost = alignment.total_cost;
+        candidate.overlap_score = alignment.overlap_score;
+        candidate.ordered_group = alignment.ordered_group;
+        candidate.chosen_states = current_group;
+        if (is_better_cost_group(candidate, best)) {
+            best = std::move(candidate);
+        }
+        return;
+    }
+
+    for (std::size_t i = start_idx; i < remaining.size(); i++) {
+        int64_t candidate_state = remaining[i];
+        bool valid = true;
+        for (auto chosen_state : current_group) {
+            if (!compatible[candidate_state][chosen_state]) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            continue;
+        }
+        current_group.emplace_back(candidate_state);
+        search_best_cost_aware_disjoint_group(compatible, remaining, prev_group, summaries, target_group_size, i + 1, current_group, best);
+        current_group.pop_back();
+    }
+}
 
 void search_best_disjoint_group(const std::vector<std::vector<bool>> &compatible,
                                 const std::vector<int64_t> &remaining,
@@ -1031,6 +1278,73 @@ std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<t
         std::vector<int64_t> identity(buffer_states.size());
         std::iota(identity.begin(), identity.end(), 0);
         return identity;
+    }
+
+    return permutation;
+}
+
+std::vector<int64_t> getCostAwareDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states,
+                                                                const vector<torch::Tensor>& edge_buckets_per_buffer,
+                                                                const std::vector<int64_t>& edge_bucket_sizes,
+                                                                int num_partitions,
+                                                                int active_devices) {
+    if (active_devices <= 1 || buffer_states.size() <= 1 || edge_buckets_per_buffer.size() != buffer_states.size() ||
+        num_partitions <= 0 || edge_bucket_sizes.size() != static_cast<std::size_t>(num_partitions * num_partitions)) {
+        return getDisjointBufferStatePermutation(buffer_states, active_devices);
+    }
+
+    std::vector<std::vector<int64_t>> state_partitions;
+    state_partitions.reserve(buffer_states.size());
+    for (auto &state : buffer_states) {
+        state_partitions.emplace_back(tensor_to_partitions(state));
+    }
+
+    std::vector<std::vector<bool>> compatible(buffer_states.size(), std::vector<bool>(buffer_states.size(), false));
+    for (std::size_t i = 0; i < buffer_states.size(); i++) {
+        compatible[i][i] = true;
+        for (std::size_t j = i + 1; j < buffer_states.size(); j++) {
+            bool disjoint = states_disjoint(state_partitions[i], state_partitions[j]);
+            compatible[i][j] = disjoint;
+            compatible[j][i] = disjoint;
+        }
+    }
+
+    auto summaries = build_state_access_summaries(buffer_states, edge_buckets_per_buffer, edge_bucket_sizes, num_partitions);
+
+    std::vector<int64_t> remaining(buffer_states.size());
+    std::iota(remaining.begin(), remaining.end(), 0);
+    std::vector<int64_t> permutation;
+    permutation.reserve(buffer_states.size());
+
+    std::vector<int64_t> previous_group;
+    while (!remaining.empty()) {
+        int target_group_size = std::min<int>(active_devices, remaining.size());
+        CostAwareGroupSearchResult best_group;
+        std::vector<int64_t> current_group;
+        current_group.reserve(target_group_size);
+        search_best_cost_aware_disjoint_group(compatible, remaining, previous_group, summaries, target_group_size, 0, current_group, best_group);
+
+        if (!best_group.valid || best_group.chosen_states.empty()) {
+            return getDisjointBufferStatePermutation(buffer_states, active_devices);
+        }
+
+        for (auto state_idx : best_group.ordered_group) {
+            permutation.emplace_back(state_idx);
+        }
+
+        previous_group = best_group.ordered_group;
+        std::vector<int64_t> next_remaining;
+        next_remaining.reserve(remaining.size() - best_group.chosen_states.size());
+        for (auto state_idx : remaining) {
+            if (std::find(best_group.chosen_states.begin(), best_group.chosen_states.end(), state_idx) == best_group.chosen_states.end()) {
+                next_remaining.emplace_back(state_idx);
+            }
+        }
+        remaining = std::move(next_remaining);
+    }
+
+    if (permutation.size() != buffer_states.size()) {
+        return getDisjointBufferStatePermutation(buffer_states, active_devices);
     }
 
     return permutation;

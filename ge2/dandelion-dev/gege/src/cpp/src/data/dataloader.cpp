@@ -179,6 +179,7 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     train_ = true;
     epochs_processed_ = 0;
     batches_processed_ = 0;
+    loaded_subgraphs = 0;
     false_negative_edges = 0;
     swap_tasks_completed = 0;
     sampler_lock_ = new std::mutex();
@@ -303,6 +304,7 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     current_edge_ = 0;
     train_ = train;
     epochs_processed_ = 0;
+    loaded_subgraphs = 0;
     false_negative_edges = 0;
     batches_processed_ = 0;
     sampler_lock_ = new std::mutex();
@@ -319,6 +321,39 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     only_root_features_ = false;
 
     edge_sampler_ = std::make_shared<RandomEdgeSampler>(graph_storage_);
+    if (graph_storage_ != nullptr) {
+        devices_ = graph_storage_->devices_;
+    }
+    activate_devices_ = 0;
+    initialize_perf_vector(device_swap_barrier_wait_ns_, devices_.size());
+    initialize_perf_vector(device_swap_update_ns_, devices_.size());
+    initialize_perf_vector(device_swap_rebuild_ns_, devices_.size());
+    initialize_perf_vector(device_swap_sync_wait_ns_, devices_.size());
+    initialize_perf_vector(device_swap_count_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_ns_, devices_.size());
+    initialize_perf_vector(device_edge_sample_ns_, devices_.size());
+    initialize_perf_vector(device_edge_get_edges_ns_, devices_.size());
+    initialize_perf_vector(device_edge_negative_sample_ns_, devices_.size());
+    initialize_perf_vector(device_edge_map_collect_ids_ns_, devices_.size());
+    initialize_perf_vector(device_edge_map_lookup_ns_, devices_.size());
+    initialize_perf_vector(device_edge_map_verify_ns_, devices_.size());
+    initialize_perf_vector(device_edge_remap_assign_ns_, devices_.size());
+    initialize_perf_vector(device_edge_finalize_ns_, devices_.size());
+    initialize_perf_vector(device_node_sample_ns_, devices_.size());
+    initialize_perf_vector(device_load_cpu_parameters_ns_, devices_.size());
+    initialize_perf_vector(device_get_batch_device_prepare_ns_, devices_.size());
+    initialize_perf_vector(device_get_batch_perform_map_ns_, devices_.size());
+    initialize_perf_vector(device_get_batch_overhead_ns_, devices_.size());
+    initialize_perf_samples(device_swap_active_bucket_samples_, devices_.size());
+    initialize_perf_samples(device_swap_active_edge_samples_, devices_.size());
+    initialize_perf_samples(device_swap_batch_count_samples_, devices_.size());
+    initialize_perf_samples(device_swap_rebuild_samples_ns_, devices_.size());
+    initialize_perf_vector(device_current_state_index_, devices_.size());
+    std::fill(device_current_state_index_.begin(), device_current_state_index_.end(), -1);
+    initialize_perf_vector(device_current_active_bucket_count_, devices_.size());
+    initialize_perf_vector(device_current_active_edge_count_, devices_.size());
+    device_current_state_partitions_.assign(devices_.size(), std::string("-"));
+    initialize_perf_vector(device_state_build_sequence_, devices_.size());
     negative_sampler_ = negative_sampler;
     neighbor_sampler_ = neighbor_sampler;
     if (instance_of<NegativeSampler, NegativeSamplingBase>(negative_sampler_)) {
@@ -343,6 +378,10 @@ DataLoader::~DataLoader() {
 }
 
 void DataLoader::refreshGraphStorageMode() {
+    if (graph_storage_ == nullptr) {
+        return;
+    }
+
     bool enable_fast_path = false;
     if (graph_storage_ != nullptr && learning_task_ == LearningTask::LINK_PREDICTION && train_ && graph_storage_->useInMemorySubGraph() &&
         neighbor_sampler_ == nullptr && !negative_sampler_filtered(negative_sampler_)) {
@@ -681,6 +720,19 @@ void DataLoader::setBufferOrdering() {
         }
     }
 
+    shared_ptr<PartitionBufferOptions> options;
+    if (instance_of<Storage, PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)) {
+        options = std::dynamic_pointer_cast<PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)->options_;
+    } else if (instance_of<Storage, MemPartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)) {
+        options = std::dynamic_pointer_cast<MemPartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)->options_;
+    } else if (instance_of<Storage, PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_features)) {
+        options = std::dynamic_pointer_cast<PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_features)->options_;
+    }
+
+    if (graph_storage_->useInMemorySubGraph() && options == nullptr) {
+        throw std::runtime_error("Partition-buffer ordering requires partition-buffer storage options");
+    }
+
     auto reorder_buffer_ordering = [&](std::vector<torch::Tensor> &buffer_states, std::vector<torch::Tensor> &edge_buckets_per_buffer) {
         if (requested_active_devices <= 1 || buffer_states.size() <= 1 || edge_buckets_per_buffer.size() != buffer_states.size()) {
             return;
@@ -696,9 +748,34 @@ void DataLoader::setBufferOrdering() {
             access_aware_scheduler = true;
         }
 
-        auto permutation = access_aware_scheduler
-            ? getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, requested_active_devices)
-            : getDisjointBufferStatePermutation(buffer_states, requested_active_devices);
+        bool cost_aware_scheduler = false;
+        const char *cost_aware_env = std::getenv("GEGE_COST_AWARE_SCHEDULER");
+        if (cost_aware_env != nullptr && cost_aware_env[0] != '\0' && std::string(cost_aware_env) != "0") {
+            cost_aware_scheduler = true;
+        }
+
+        if (cost_aware_scheduler && requested_active_devices != physical_devices) {
+            SPDLOG_WARN("Disabling cost-aware scheduler because logical_active_devices={} differs from physical device count={}",
+                        requested_active_devices, physical_devices);
+            cost_aware_scheduler = false;
+        }
+
+        std::vector<int64_t> edge_bucket_sizes;
+        if (cost_aware_scheduler && options != nullptr && graph_storage_->storage_ptrs_.edges != nullptr) {
+            edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+            if (edge_bucket_sizes.size() != static_cast<std::size_t>(options->num_partitions * options->num_partitions)) {
+                SPDLOG_WARN("Disabling cost-aware scheduler due to edge_bucket_sizes size mismatch: got {}, expected {}",
+                            edge_bucket_sizes.size(), options->num_partitions * options->num_partitions);
+                cost_aware_scheduler = false;
+            }
+        }
+
+        auto permutation = cost_aware_scheduler
+            ? getCostAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, edge_bucket_sizes, options->num_partitions,
+                                                         requested_active_devices)
+            : (access_aware_scheduler
+                   ? getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, requested_active_devices)
+                   : getDisjointBufferStatePermutation(buffer_states, requested_active_devices));
         bool changed = false;
         for (std::size_t i = 0; i < permutation.size(); i++) {
             if (permutation[i] != static_cast<int64_t>(i)) {
@@ -722,7 +799,10 @@ void DataLoader::setBufferOrdering() {
         buffer_states = std::move(reordered_states);
         edge_buckets_per_buffer = std::move(reordered_buckets);
 
-        if (access_aware_scheduler) {
+        if (cost_aware_scheduler) {
+            SPDLOG_INFO("Reordered {} buffer states into cost-aware disjoint multi-GPU supersteps for {} logical device(s) on {} physical device(s)",
+                        buffer_states.size(), requested_active_devices, physical_devices);
+        } else if (access_aware_scheduler) {
             SPDLOG_INFO("Reordered {} buffer states into access-aware disjoint multi-GPU supersteps for {} logical device(s) on {} physical device(s)",
                         buffer_states.size(), requested_active_devices, physical_devices);
         } else {
@@ -730,15 +810,6 @@ void DataLoader::setBufferOrdering() {
                         buffer_states.size(), requested_active_devices, physical_devices);
         }
     };
-
-    shared_ptr<PartitionBufferOptions> options;
-    if (instance_of<Storage, PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)) {
-        options = std::dynamic_pointer_cast<PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)->options_;
-    } else if (instance_of<Storage, MemPartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)) {
-        options = std::dynamic_pointer_cast<MemPartitionBufferStorage>(graph_storage_->storage_ptrs_.node_embeddings)->options_;
-    } else if (instance_of<Storage, PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_features)) {
-        options = std::dynamic_pointer_cast<PartitionBufferStorage>(graph_storage_->storage_ptrs_.node_features)->options_;
-    }
 
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         if (graph_storage_->useInMemorySubGraph()) {
@@ -1339,6 +1410,7 @@ void DataLoader::loadStorage() {
     if (negative_sampler_ != nullptr) {
         negative_sampler_->resetPlanCache();
     }
+    loaded_subgraphs = 0;
     setBufferOrdering();
     graph_storage_->load();
     if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {

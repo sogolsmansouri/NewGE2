@@ -1148,15 +1148,18 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         int64_t num_nbrs_sampled = batch->dense_graph_.hop_offsets_[-2].item<int64_t>();
 
         auto remap_assign_start = std::chrono::high_resolution_clock::now();
-        src_mapping = map_to_unsorted.index_select(0, mapped_tensors[0]) - num_nbrs_sampled;
-        dst_mapping = map_to_unsorted.index_select(0, mapped_tensors[1]) - num_nbrs_sampled;
+        std::size_t mapped_tensor_idx = 0;
+        src_mapping = map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]) - num_nbrs_sampled;
+        dst_mapping = map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]) - num_nbrs_sampled;
 
         if (batch->src_neg_indices_.defined()) {
-            src_neg_mapping = map_to_unsorted.index_select(0, mapped_tensors[2]).reshape(batch->src_neg_indices_.sizes()) - num_nbrs_sampled;
+            src_neg_mapping =
+                map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]).reshape(batch->src_neg_indices_.sizes()) - num_nbrs_sampled;
         }
 
         if (batch->dst_neg_indices_.defined()) {
-            dst_neg_mapping = map_to_unsorted.index_select(0, mapped_tensors[3]).reshape(batch->dst_neg_indices_.sizes()) - num_nbrs_sampled;
+            dst_neg_mapping =
+                map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]).reshape(batch->dst_neg_indices_.sizes()) - num_nbrs_sampled;
         }
         auto remap_assign_end = std::chrono::high_resolution_clock::now();
         remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
@@ -1190,15 +1193,16 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         auto remap_assign_start = std::chrono::high_resolution_clock::now();
         mapped_tensors = std::get<1>(tup);
 
-        src_mapping = mapped_tensors[0];
-        dst_mapping = mapped_tensors[1];
+        std::size_t mapped_tensor_idx = 0;
+        src_mapping = mapped_tensors[mapped_tensor_idx++];
+        dst_mapping = mapped_tensors[mapped_tensor_idx++];
 
         if (batch->src_neg_indices_.defined()) {
-            src_neg_mapping = mapped_tensors[2].reshape(batch->src_neg_indices_.sizes());
+            src_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->src_neg_indices_.sizes());
         }
 
         if (batch->dst_neg_indices_.defined()) {
-            dst_neg_mapping = mapped_tensors[3].reshape(batch->dst_neg_indices_.sizes());
+            dst_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->dst_neg_indices_.sizes());
         }
         auto remap_assign_end = std::chrono::high_resolution_clock::now();
         remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);

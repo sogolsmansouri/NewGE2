@@ -116,7 +116,7 @@ std::tuple<torch::Tensor, DegNegativeLocalFilterCudaStats> deg_negative_local_fi
     auto match_start = std::chrono::high_resolution_clock::now();
     mark_deg_filter_matches_kernel<<<blocks, threads_per_block, 0, stream>>>(input.data_ptr<int64_t>(), flags.data_ptr<int32_t>(),
                                                                               num_entries, num_deg_negs, chunk_size);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
     stats.match_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - match_start).count();
@@ -124,7 +124,7 @@ std::tuple<torch::Tensor, DegNegativeLocalFilterCudaStats> deg_negative_local_fi
     auto compact_start = std::chrono::high_resolution_clock::now();
     AT_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(temp_storage.data_ptr<uint8_t>(), temp_storage_bytes, flags.data_ptr<int32_t>(),
                                                 offsets.data_ptr<int32_t>(), num_entries, stream));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
 
     int32_t last_flag = 0;
     int32_t last_offset = 0;
@@ -145,7 +145,7 @@ std::tuple<torch::Tensor, DegNegativeLocalFilterCudaStats> deg_negative_local_fi
     scatter_deg_filter_matches_kernel<<<blocks, threads_per_block, 0, stream>>>(
         input.data_ptr<int64_t>(), flags.data_ptr<int32_t>(), offsets.data_ptr<int32_t>(), filter.data_ptr<int64_t>(), num_entries,
         num_deg_negs);
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    AT_CUDA_CHECK(cudaGetLastError());
     AT_CUDA_CHECK(cudaStreamSynchronize(stream));
     stats.scatter_ns =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - scatter_start).count();

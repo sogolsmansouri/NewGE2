@@ -915,6 +915,20 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                     device_swap_rebuild_ns_[device_idx] += swap_rebuild_elapsed;
                 }
                 add_perf_sample(device_swap_rebuild_samples_ns_, device_idx, swap_rebuild_elapsed);
+                if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_current_state_index_.size() &&
+                    device_current_state_index_[device_idx] >= 0) {
+                    int64_t state_sequence = -1;
+                    if (static_cast<std::size_t>(device_idx) < device_state_build_sequence_.size() &&
+                        device_state_build_sequence_[device_idx] > 0) {
+                        state_sequence = device_state_build_sequence_[device_idx] - 1;
+                    }
+                    SPDLOG_INFO(
+                        "[perf][epoch {}][gpu {}][state {}][rebuild] state_idx={} resident_partitions={} active_buckets={} active_edges={} batches={} rebuild_ms={:.3f}",
+                        epochs_processed_ + 1, device_idx, state_sequence, device_current_state_index_[device_idx],
+                        device_current_state_partitions_[device_idx], device_current_active_bucket_count_[device_idx],
+                        device_current_active_edge_count_[device_idx], all_batches_[device_idx].size(),
+                        static_cast<double>(swap_rebuild_elapsed) / 1'000'000.0);
+                }
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
 #endif

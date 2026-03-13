@@ -141,20 +141,18 @@ ChunkNegativePlan build_chunk_negative_plan(torch::Tensor edges,
             torch::Tensor remaining_rows = torch::full({num_chunks}, batch_size, ind_opts) - chunk_starts;
             torch::Tensor chunk_lengths = torch::clamp(remaining_rows, 0, chunk_size);
             torch::Tensor available_counts = batch_size - chunk_lengths;
-            if (available_counts.min().item<int64_t>() > 0) {
-                auto rand_opts = torch::TensorOptions().dtype(torch::kFloat32).device(edges.device());
-                torch::Tensor random_positions = torch::floor(
-                                                    torch::rand({num_chunks, num_degree}, rand_opts) *
-                                                    available_counts.to(torch::kFloat32).view({num_chunks, 1}))
-                                                    .to(torch::kInt64);
-                torch::Tensor chunk_starts_2d = chunk_starts.view({num_chunks, 1});
-                torch::Tensor chunk_lengths_2d = chunk_lengths.view({num_chunks, 1});
-                torch::Tensor shift_mask = (random_positions >= chunk_starts_2d).to(torch::kInt64);
-                plan.sample_edge_ids = random_positions + shift_mask * chunk_lengths_2d;
-                plan.chunk_exclusion_active = true;
-            } else {
-                plan.sample_edge_ids = torch::randint(0, batch_size, {num_chunks, num_degree}, ind_opts);
-            }
+            // `can_exclude_current_chunk` already implies every chunk has at least one
+            // valid row outside its own interval, so avoid a per-batch device->host sync.
+            auto rand_opts = torch::TensorOptions().dtype(torch::kFloat32).device(edges.device());
+            torch::Tensor random_positions = torch::floor(
+                                                torch::rand({num_chunks, num_degree}, rand_opts) *
+                                                available_counts.to(torch::kFloat32).view({num_chunks, 1}))
+                                                .to(torch::kInt64);
+            torch::Tensor chunk_starts_2d = chunk_starts.view({num_chunks, 1});
+            torch::Tensor chunk_lengths_2d = chunk_lengths.view({num_chunks, 1});
+            torch::Tensor shift_mask = (random_positions >= chunk_starts_2d).to(torch::kInt64);
+            plan.sample_edge_ids = random_positions + shift_mask * chunk_lengths_2d;
+            plan.chunk_exclusion_active = true;
         } else {
             plan.sample_edge_ids = torch::randint(0, batch_size, {num_chunks, num_degree}, ind_opts);
         }

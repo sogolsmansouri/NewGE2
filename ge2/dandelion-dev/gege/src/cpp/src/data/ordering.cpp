@@ -3,9 +3,14 @@
 #include "reporting/logger.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <numeric>
+#include <random>
+#include <stdexcept>
+#include <string>
 #include <unordered_map>
 
 #ifdef GEGE_OMP
@@ -30,6 +35,628 @@ std::vector<int64_t> tensor_to_partitions(torch::Tensor tensor) {
     tensor = tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
     auto *data = tensor.data_ptr<int64_t>();
     return std::vector<int64_t>(data, data + tensor.numel());
+}
+
+bool optimized_custom_schedule_enabled() {
+    const char *raw = std::getenv("GEGE_OPTIMIZED_CUSTOM_SCHEDULE");
+    if (raw == nullptr) {
+        return true;
+    }
+
+    std::string value(raw);
+    return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
+}
+
+int64_t optimized_custom_schedule_restarts() {
+    const char *raw = std::getenv("GEGE_CUSTOM_OPTIMIZER_RESTARTS");
+    if (raw == nullptr) {
+        return 8;
+    }
+
+    try {
+        return std::max<int64_t>(std::stoll(std::string(raw)), 1);
+    } catch (...) {
+        return 8;
+    }
+}
+
+int64_t optimized_custom_schedule_seed() {
+    const char *raw = std::getenv("GEGE_CUSTOM_OPTIMIZER_SEED");
+    if (raw == nullptr) {
+        return 12345;
+    }
+
+    try {
+        return std::stoll(std::string(raw));
+    } catch (...) {
+        return 12345;
+    }
+}
+
+struct CustomStateMetrics {
+    std::vector<int> partitions;
+    int64_t weight = 0;
+    int64_t batches = 0;
+    int64_t bucket_count = 0;
+};
+
+struct CustomScheduleScore {
+    int64_t worst_round_spread = 0;
+    int64_t worst_batch_spread = 0;
+    int64_t worst_state_weight = 0;
+    int64_t total_round_spread = 0;
+    int64_t continuity_hotness = 0;
+    int64_t continuity_new_partitions = 0;
+    int64_t total_abs_deviation = 0;
+
+    auto as_tuple() const {
+        return std::make_tuple(worst_round_spread, worst_batch_spread, worst_state_weight, total_round_spread, continuity_hotness,
+                               continuity_new_partitions, total_abs_deviation);
+    }
+};
+
+struct CustomEvaluatedSchedule {
+    std::vector<int> slot_to_partition;
+    std::vector<CustomStateMetrics> states;
+    std::vector<std::vector<int>> rounds;
+    std::vector<std::vector<int>> lane_rounds;
+    CustomScheduleScore score;
+};
+
+bool custom_score_better(const CustomScheduleScore &lhs, const CustomScheduleScore &rhs) {
+    return lhs.as_tuple() < rhs.as_tuple();
+}
+
+int int_pow_local(int a, int x) {
+    int ans = 1;
+    int temp = a;
+    while (x) {
+        if (x & 1) {
+            ans *= temp;
+        }
+        temp *= temp;
+        x >>= 1;
+    }
+    return ans;
+}
+
+std::vector<std::vector<int>> build_custom_template_states(int num_partitions, int buffer_capacity) {
+    assert(buffer_capacity == 4);
+    int32_t sub_chunk_per_perm = num_partitions / buffer_capacity;
+    int32_t log2l = 0;
+
+    while (int_pow_local(2, log2l) < num_partitions) {
+        log2l += 1;
+    }
+
+    assert(int_pow_local(2, log2l) == num_partitions);
+
+    std::vector<std::vector<std::vector<int>>> offset_supergroup = {
+        {{0, 0, 0, 0}, {1, 1, 1, 1}, {2, 2, 2, 2}, {3, 3, 3, 3}},
+        {{0, 1, 2, 3}, {1, 0, 3, 2}, {2, 3, 0, 1}, {3, 2, 1, 0}},
+        {{0, 2, 3, 1}, {1, 3, 2, 0}, {2, 0, 1, 3}, {3, 1, 0, 2}},
+        {{0, 3, 1, 2}, {1, 2, 0, 3}, {2, 1, 3, 0}, {3, 0, 2, 1}},
+    };
+    std::vector<std::vector<std::vector<int>>> p = {{{0, 1, 2, 3}}};
+
+    for (int log4l_pre = 1; log4l_pre < log2l / 2; log4l_pre++) {
+        auto p_pre = p;
+        p = std::vector<std::vector<std::vector<int>>>();
+        for (auto &s : p_pre) {
+            std::vector<std::vector<int>> s_cur;
+            for (int offset = 0; offset < int_pow_local(4, log4l_pre + 1); offset += int_pow_local(4, log4l_pre)) {
+                for (auto &g : s) {
+                    std::vector<int> g_cur;
+                    for (auto &x : g) {
+                        g_cur.emplace_back(x + offset);
+                    }
+                    s_cur.emplace_back(g_cur);
+                }
+            }
+            p.emplace_back(s_cur);
+        }
+        int32_t len = p_pre.size();
+        for (int i = len - int_pow_local(4, log4l_pre - 1); i < len; i++) {
+            auto s = p_pre[i];
+            for (auto &offset_s : offset_supergroup) {
+                std::vector<std::vector<int>> s_cur;
+                for (auto &g : s) {
+                    for (auto &offset_g : offset_s) {
+                        std::vector<int> g_cur;
+                        for (int j = 0; j < 4; j++) {
+                            g_cur.emplace_back(g[j] * 4 + offset_g[j]);
+                        }
+                        s_cur.emplace_back(g_cur);
+                    }
+                }
+                p.emplace_back(s_cur);
+            }
+        }
+    }
+
+    std::vector<std::vector<std::vector<int>>> pairing_chunks = {
+        {{0, 2}, {1, 3}},
+        {{0, 3}, {1, 2}}
+    };
+
+    if (log2l % 2 == 1) {
+        int32_t len_chunk = sub_chunk_per_perm;
+        auto p_pre = p;
+        p = std::vector<std::vector<std::vector<int>>>();
+
+        for (auto &s : p_pre) {
+            std::vector<std::vector<int>> s_cur;
+            for (int i = 0; i < int_pow_local(2, log2l); i += int_pow_local(2, log2l - 1)) {
+                for (auto &g : s) {
+                    std::vector<int> g_cur;
+                    for (auto &x : g) {
+                        g_cur.emplace_back(x + i);
+                    }
+                    s_cur.emplace_back(g_cur);
+                }
+            }
+            p.emplace_back(s_cur);
+        }
+
+        int32_t len = p_pre.size();
+        for (int i = len - int_pow_local(2, log2l - 3); i < len; i++) {
+            std::vector<std::vector<int>> s = p_pre[i];
+            for (auto &pairing_s : pairing_chunks) {
+                std::vector<std::vector<int>> s_cur;
+                for (auto &chunk_index : pairing_s) {
+                    for (auto &g : s) {
+                        std::vector<int> g_cur;
+                        for (auto &x : g) {
+                            g_cur.emplace_back(chunk_index[x / len_chunk] * len_chunk + x % len_chunk);
+                        }
+                        s_cur.emplace_back(g_cur);
+                    }
+                }
+                p.emplace_back(s_cur);
+            }
+        }
+    }
+
+    std::vector<std::vector<int>> buffer_states;
+    for (auto &supergroup : p) {
+        for (auto &state : supergroup) {
+            buffer_states.emplace_back(state);
+        }
+    }
+    return buffer_states;
+}
+
+std::vector<std::vector<int>> build_slot_pair_owners(const std::vector<std::vector<int>> &template_states, int num_slots) {
+    std::vector<std::vector<int>> owners(num_slots, std::vector<int>(num_slots, -1));
+    for (int state_idx = 0; state_idx < template_states.size(); state_idx++) {
+        for (auto src_slot : template_states[state_idx]) {
+            for (auto dst_slot : template_states[state_idx]) {
+                if (owners[src_slot][dst_slot] == -1) {
+                    owners[src_slot][dst_slot] = state_idx;
+                }
+            }
+        }
+    }
+
+    for (int src_slot = 0; src_slot < num_slots; src_slot++) {
+        for (int dst_slot = 0; dst_slot < num_slots; dst_slot++) {
+            if (owners[src_slot][dst_slot] == -1) {
+                throw std::runtime_error("No owner state found for slot pair");
+            }
+        }
+    }
+
+    return owners;
+}
+
+std::vector<int64_t> build_partition_hotness(const std::vector<int64_t> &edge_bucket_sizes, int num_partitions) {
+    std::vector<int64_t> hotness(num_partitions, 0);
+    for (int partition = 0; partition < num_partitions; partition++) {
+        int64_t outgoing = 0;
+        int64_t incoming = 0;
+        for (int other = 0; other < num_partitions; other++) {
+            outgoing += edge_bucket_sizes[partition * num_partitions + other];
+            incoming += edge_bucket_sizes[other * num_partitions + partition];
+        }
+        hotness[partition] = outgoing + incoming - edge_bucket_sizes[partition * num_partitions + partition];
+    }
+    return hotness;
+}
+
+std::vector<int> lite_initial_assignment(const std::vector<std::vector<int>> &template_states,
+                                         const std::vector<int64_t> &edge_bucket_sizes,
+                                         const std::vector<int64_t> &hotness,
+                                         int num_partitions,
+                                         int active_devices) {
+    auto slot_pair_owners = build_slot_pair_owners(template_states, num_partitions);
+    std::vector<int64_t> state_weights(template_states.size(), 0);
+    std::vector<int> slot_to_partition(num_partitions, -1);
+    std::vector<int> assigned_slots;
+    const double total_weight = std::accumulate(edge_bucket_sizes.begin(), edge_bucket_sizes.end(), 0.0);
+    const double target_state_weight = total_weight / static_cast<double>(template_states.size());
+
+    std::vector<int> sorted_partitions(num_partitions);
+    std::iota(sorted_partitions.begin(), sorted_partitions.end(), 0);
+    std::sort(sorted_partitions.begin(), sorted_partitions.end(), [&](int lhs, int rhs) {
+        if (hotness[lhs] != hotness[rhs]) {
+            return hotness[lhs] > hotness[rhs];
+        }
+        return lhs < rhs;
+    });
+
+    for (auto partition : sorted_partitions) {
+        int best_slot = -1;
+        std::tuple<int64_t, int64_t, double, double, int> best_key{std::numeric_limits<int64_t>::max(),
+                                                                    std::numeric_limits<int64_t>::max(),
+                                                                    std::numeric_limits<double>::max(),
+                                                                    std::numeric_limits<double>::max(),
+                                                                    std::numeric_limits<int>::max()};
+
+        for (int slot = 0; slot < num_partitions; slot++) {
+            if (slot_to_partition[slot] != -1) {
+                continue;
+            }
+
+            auto candidate_weights = state_weights;
+            int diagonal_owner = slot_pair_owners[slot][slot];
+            candidate_weights[diagonal_owner] += edge_bucket_sizes[partition * num_partitions + partition];
+
+            for (auto other_slot : assigned_slots) {
+                int other_partition = slot_to_partition[other_slot];
+                int forward_owner = slot_pair_owners[slot][other_slot];
+                int reverse_owner = slot_pair_owners[other_slot][slot];
+                candidate_weights[forward_owner] += edge_bucket_sizes[partition * num_partitions + other_partition];
+                candidate_weights[reverse_owner] += edge_bucket_sizes[other_partition * num_partitions + partition];
+            }
+
+            int64_t max_round_max = 0;
+            int64_t max_round_spread = 0;
+            double total_over_target = 0.0;
+            double total_abs_deviation = 0.0;
+            for (int round_start = 0; round_start < candidate_weights.size(); round_start += active_devices) {
+                auto begin = candidate_weights.begin() + round_start;
+                auto end = begin + std::min<int>(active_devices, candidate_weights.size() - round_start);
+                auto [round_min_it, round_max_it] = std::minmax_element(begin, end);
+                max_round_max = std::max<int64_t>(max_round_max, *round_max_it);
+                max_round_spread = std::max<int64_t>(max_round_spread, *round_max_it - *round_min_it);
+            }
+            for (auto weight : candidate_weights) {
+                total_over_target += std::max<double>(weight - target_state_weight, 0.0);
+                total_abs_deviation += std::abs(weight - target_state_weight);
+            }
+
+            auto candidate_key = std::make_tuple(max_round_max, max_round_spread, total_over_target, total_abs_deviation, slot);
+            if (candidate_key < best_key) {
+                best_key = candidate_key;
+                best_slot = slot;
+            }
+        }
+
+        if (best_slot == -1) {
+            throw std::runtime_error("Failed to construct optimized CUSTOM initial assignment");
+        }
+
+        slot_to_partition[best_slot] = partition;
+        int diagonal_owner = slot_pair_owners[best_slot][best_slot];
+        state_weights[diagonal_owner] += edge_bucket_sizes[partition * num_partitions + partition];
+        for (auto other_slot : assigned_slots) {
+            int other_partition = slot_to_partition[other_slot];
+            int forward_owner = slot_pair_owners[best_slot][other_slot];
+            int reverse_owner = slot_pair_owners[other_slot][best_slot];
+            state_weights[forward_owner] += edge_bucket_sizes[partition * num_partitions + other_partition];
+            state_weights[reverse_owner] += edge_bucket_sizes[other_partition * num_partitions + partition];
+        }
+        assigned_slots.emplace_back(best_slot);
+    }
+
+    return slot_to_partition;
+}
+
+std::pair<int64_t, int64_t> custom_state_transition_cost(const CustomStateMetrics &previous_state,
+                                                         const CustomStateMetrics &next_state,
+                                                         const std::vector<int64_t> &hotness) {
+    int64_t transition_hotness = 0;
+    int64_t transition_new_partitions = 0;
+
+    for (auto partition : next_state.partitions) {
+        if (std::find(previous_state.partitions.begin(), previous_state.partitions.end(), partition) == previous_state.partitions.end()) {
+            transition_hotness += hotness[partition];
+            transition_new_partitions++;
+        }
+    }
+    return std::make_pair(transition_hotness, transition_new_partitions);
+}
+
+std::tuple<std::vector<std::vector<int>>, int64_t, int64_t> optimize_custom_lane_assignment(
+    const std::vector<std::vector<int>> &rounds,
+    const std::vector<CustomStateMetrics> &states,
+    const std::vector<int64_t> &hotness) {
+    if (rounds.empty()) {
+        return std::make_tuple(std::vector<std::vector<int>>(), 0, 0);
+    }
+
+    std::vector<std::vector<std::vector<int>>> all_permutations;
+    all_permutations.reserve(rounds.size());
+    for (auto &round : rounds) {
+        std::vector<int> permutation(round.size());
+        std::iota(permutation.begin(), permutation.end(), 0);
+        std::vector<std::vector<int>> round_permutations;
+        do {
+            round_permutations.emplace_back(permutation);
+        } while (std::next_permutation(permutation.begin(), permutation.end()));
+        all_permutations.emplace_back(std::move(round_permutations));
+    }
+
+    std::vector<std::vector<std::pair<int64_t, int64_t>>> dp(rounds.size());
+    std::vector<std::vector<int>> backpointers(rounds.size());
+    dp[0].assign(all_permutations[0].size(), std::make_pair(0, 0));
+    backpointers[0].assign(all_permutations[0].size(), -1);
+
+    for (int round_idx = 1; round_idx < rounds.size(); round_idx++) {
+        dp[round_idx].assign(all_permutations[round_idx].size(),
+                             std::make_pair(std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::max()));
+        backpointers[round_idx].assign(all_permutations[round_idx].size(), -1);
+
+        for (int permutation_idx = 0; permutation_idx < all_permutations[round_idx].size(); permutation_idx++) {
+            const auto &permutation = all_permutations[round_idx][permutation_idx];
+
+            for (int previous_permutation_idx = 0; previous_permutation_idx < all_permutations[round_idx - 1].size(); previous_permutation_idx++) {
+                const auto &previous_permutation = all_permutations[round_idx - 1][previous_permutation_idx];
+                int64_t transition_hotness = 0;
+                int64_t transition_new_partitions = 0;
+
+                for (int lane_idx = 0; lane_idx < permutation.size(); lane_idx++) {
+                    const auto &previous_state = states[rounds[round_idx - 1][previous_permutation[lane_idx]]];
+                    const auto &next_state = states[rounds[round_idx][permutation[lane_idx]]];
+                    auto [lane_hotness, lane_new_partitions] = custom_state_transition_cost(previous_state, next_state, hotness);
+                    transition_hotness += lane_hotness;
+                    transition_new_partitions += lane_new_partitions;
+                }
+
+                auto candidate_cost =
+                    std::make_pair(dp[round_idx - 1][previous_permutation_idx].first + transition_hotness,
+                                   dp[round_idx - 1][previous_permutation_idx].second + transition_new_partitions);
+                if (candidate_cost < dp[round_idx][permutation_idx]) {
+                    dp[round_idx][permutation_idx] = candidate_cost;
+                    backpointers[round_idx][permutation_idx] = previous_permutation_idx;
+                }
+            }
+        }
+    }
+
+    int best_final_idx = 0;
+    for (int permutation_idx = 1; permutation_idx < dp.back().size(); permutation_idx++) {
+        if (dp.back()[permutation_idx] < dp.back()[best_final_idx]) {
+            best_final_idx = permutation_idx;
+        }
+    }
+
+    std::vector<int> chosen(rounds.size(), -1);
+    chosen.back() = best_final_idx;
+    for (int round_idx = rounds.size() - 1; round_idx > 0; round_idx--) {
+        chosen[round_idx - 1] = backpointers[round_idx][chosen[round_idx]];
+    }
+
+    std::vector<std::vector<int>> lane_rounds;
+    lane_rounds.reserve(rounds.size());
+    for (int round_idx = 0; round_idx < rounds.size(); round_idx++) {
+        std::vector<int> lane_round;
+        lane_round.reserve(rounds[round_idx].size());
+        for (auto local_idx : all_permutations[round_idx][chosen[round_idx]]) {
+            lane_round.emplace_back(rounds[round_idx][local_idx]);
+        }
+        lane_rounds.emplace_back(std::move(lane_round));
+    }
+
+    return std::make_tuple(lane_rounds, dp.back()[best_final_idx].first, dp.back()[best_final_idx].second);
+}
+
+CustomEvaluatedSchedule summarize_custom_schedule(const std::vector<std::vector<int>> &template_states,
+                                                 const std::vector<int> &slot_to_partition,
+                                                 const std::vector<int64_t> &edge_bucket_sizes,
+                                                 const std::vector<int64_t> &hotness,
+                                                 int num_partitions,
+                                                 int active_devices,
+                                                 int batch_size) {
+    std::vector<std::vector<int>> mapped_states = template_states;
+    for (auto &state : mapped_states) {
+        for (auto &slot : state) {
+            slot = slot_to_partition[slot];
+        }
+    }
+
+    auto edge_buckets = greedyAssignEdgeBucketsToBuffers(mapped_states, num_partitions);
+
+    std::vector<CustomStateMetrics> state_metrics;
+    state_metrics.reserve(mapped_states.size());
+    for (int state_idx = 0; state_idx < mapped_states.size(); state_idx++) {
+        int64_t weight = 0;
+        for (auto &[src, dst] : edge_buckets[state_idx]) {
+            weight += edge_bucket_sizes[src * num_partitions + dst];
+        }
+        int64_t batches = (weight + batch_size - 1) / batch_size;
+        state_metrics.push_back({mapped_states[state_idx], weight, batches, static_cast<int64_t>(edge_buckets[state_idx].size())});
+    }
+
+    std::vector<std::vector<int>> rounds;
+    for (int i = 0; i < state_metrics.size(); i += active_devices) {
+        std::vector<int> round;
+        for (int j = i; j < std::min<int>(i + active_devices, state_metrics.size()); j++) {
+            round.emplace_back(j);
+        }
+        rounds.emplace_back(std::move(round));
+    }
+
+    auto [lane_rounds, continuity_hotness, continuity_new_partitions] = optimize_custom_lane_assignment(rounds, state_metrics, hotness);
+
+    int64_t worst_round_spread = 0;
+    int64_t worst_batch_spread = 0;
+    int64_t worst_state_weight = 0;
+    int64_t total_round_spread = 0;
+    double total_abs_deviation = 0.0;
+    for (auto &round : rounds) {
+        int64_t round_min_weight = std::numeric_limits<int64_t>::max();
+        int64_t round_max_weight = 0;
+        int64_t round_min_batches = std::numeric_limits<int64_t>::max();
+        int64_t round_max_batches = 0;
+        double round_mean_weight = 0.0;
+        for (auto state_idx : round) {
+            round_min_weight = std::min<int64_t>(round_min_weight, state_metrics[state_idx].weight);
+            round_max_weight = std::max<int64_t>(round_max_weight, state_metrics[state_idx].weight);
+            round_min_batches = std::min<int64_t>(round_min_batches, state_metrics[state_idx].batches);
+            round_max_batches = std::max<int64_t>(round_max_batches, state_metrics[state_idx].batches);
+            worst_state_weight = std::max<int64_t>(worst_state_weight, state_metrics[state_idx].weight);
+            round_mean_weight += static_cast<double>(state_metrics[state_idx].weight);
+        }
+        round_mean_weight /= static_cast<double>(round.size());
+        for (auto state_idx : round) {
+            total_abs_deviation += std::abs(static_cast<double>(state_metrics[state_idx].weight) - round_mean_weight);
+        }
+        int64_t round_spread = round_max_weight - round_min_weight;
+        int64_t batch_spread = round_max_batches - round_min_batches;
+        worst_round_spread = std::max<int64_t>(worst_round_spread, round_spread);
+        worst_batch_spread = std::max<int64_t>(worst_batch_spread, batch_spread);
+        total_round_spread += round_spread;
+    }
+
+    CustomScheduleScore score = {
+        worst_round_spread,
+        worst_batch_spread,
+        worst_state_weight,
+        total_round_spread,
+        continuity_hotness,
+        continuity_new_partitions,
+        static_cast<int64_t>(total_abs_deviation),
+    };
+
+    return {slot_to_partition, state_metrics, rounds, lane_rounds, score};
+}
+
+CustomEvaluatedSchedule steepest_descent_custom_schedule(const std::vector<std::vector<int>> &template_states,
+                                                         const std::vector<int> &initial_assignment,
+                                                         const std::vector<int64_t> &edge_bucket_sizes,
+                                                         const std::vector<int64_t> &hotness,
+                                                         int num_partitions,
+                                                         int active_devices,
+                                                         int batch_size) {
+    std::vector<int> assignment = initial_assignment;
+    auto current = summarize_custom_schedule(template_states, assignment, edge_bucket_sizes, hotness, num_partitions, active_devices, batch_size);
+
+    bool improved = true;
+    while (improved) {
+        improved = false;
+        auto best_candidate = current;
+        std::pair<int, int> best_swap{-1, -1};
+
+        for (int i = 0; i < assignment.size(); i++) {
+            for (int j = i + 1; j < assignment.size(); j++) {
+                auto candidate_assignment = assignment;
+                std::swap(candidate_assignment[i], candidate_assignment[j]);
+                auto candidate =
+                    summarize_custom_schedule(template_states, candidate_assignment, edge_bucket_sizes, hotness, num_partitions, active_devices, batch_size);
+                if (custom_score_better(candidate.score, best_candidate.score)) {
+                    best_candidate = std::move(candidate);
+                    best_swap = std::make_pair(i, j);
+                }
+            }
+        }
+
+        if (best_swap.first != -1) {
+            std::swap(assignment[best_swap.first], assignment[best_swap.second]);
+            current = std::move(best_candidate);
+            improved = true;
+        }
+    }
+
+    return current;
+}
+
+CustomEvaluatedSchedule optimize_custom_schedule(const std::vector<std::vector<int>> &template_states,
+                                                 const std::vector<int64_t> &edge_bucket_sizes,
+                                                 int num_partitions,
+                                                 int active_devices,
+                                                 int batch_size) {
+    auto hotness = build_partition_hotness(edge_bucket_sizes, num_partitions);
+    std::mt19937 rng(static_cast<uint32_t>(optimized_custom_schedule_seed()));
+    int64_t restarts = optimized_custom_schedule_restarts();
+
+    std::vector<std::vector<int>> initial_assignments;
+    initial_assignments.emplace_back(lite_initial_assignment(template_states, edge_bucket_sizes, hotness, num_partitions, active_devices));
+
+    std::vector<int> identity(num_partitions);
+    std::iota(identity.begin(), identity.end(), 0);
+    initial_assignments.emplace_back(identity);
+
+    for (int64_t restart = 1; restart < restarts; restart++) {
+        auto candidate = identity;
+        std::shuffle(candidate.begin(), candidate.end(), rng);
+        initial_assignments.emplace_back(std::move(candidate));
+    }
+
+    bool has_best = false;
+    CustomEvaluatedSchedule best;
+    for (auto &initial_assignment : initial_assignments) {
+        auto candidate = steepest_descent_custom_schedule(template_states, initial_assignment, edge_bucket_sizes, hotness, num_partitions,
+                                                          active_devices, batch_size);
+        if (!has_best || custom_score_better(candidate.score, best.score)) {
+            best = std::move(candidate);
+            has_best = true;
+        }
+    }
+
+    if (!has_best) {
+        throw std::runtime_error("No optimized CUSTOM schedule candidates were generated");
+    }
+
+    return best;
+}
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> build_optimized_custom_edge_bucket_ordering(int num_partitions,
+                                                                                                      int buffer_capacity,
+                                                                                                      int active_devices,
+                                                                                                      int batch_size,
+                                                                                                      const std::vector<int64_t> &edge_bucket_sizes) {
+    auto template_states = build_custom_template_states(num_partitions, buffer_capacity);
+    auto optimized = optimize_custom_schedule(template_states, edge_bucket_sizes, num_partitions, active_devices, batch_size);
+
+    std::vector<std::vector<int>> mapped_states = template_states;
+    for (auto &state : mapped_states) {
+        for (auto &slot : state) {
+            slot = optimized.slot_to_partition[slot];
+        }
+    }
+
+    auto edge_buckets_per_buffer = greedyAssignEdgeBucketsToBuffers(mapped_states, num_partitions);
+    std::vector<std::vector<int>> ordered_states;
+    std::vector<std::vector<std::pair<int, int>>> ordered_buckets;
+    ordered_states.reserve(mapped_states.size());
+    ordered_buckets.reserve(edge_buckets_per_buffer.size());
+
+    for (const auto &lane_round : optimized.lane_rounds) {
+        for (auto state_idx : lane_round) {
+            ordered_states.emplace_back(mapped_states[state_idx]);
+            ordered_buckets.emplace_back(edge_buckets_per_buffer[state_idx]);
+        }
+    }
+
+    std::ostringstream slot_mapping;
+    for (int idx = 0; idx < optimized.slot_to_partition.size(); idx++) {
+        if (idx > 0) {
+            slot_mapping << ",";
+        }
+        slot_mapping << optimized.slot_to_partition[idx];
+    }
+
+    SPDLOG_INFO(
+        "Using optimized CUSTOM ordering: worst_round_spread={:.3f}M worst_batch_spread={} total_round_spread={:.3f}M continuity_hotness={:.3f}M continuity_new_partitions={}",
+        optimized.score.worst_round_spread / 1000000.0,
+        optimized.score.worst_batch_spread,
+        optimized.score.total_round_spread / 1000000.0,
+        optimized.score.continuity_hotness / 1000000.0,
+        optimized.score.continuity_new_partitions);
+    SPDLOG_INFO("Optimized CUSTOM slot_to_partition=[{}]", slot_mapping.str());
+
+    return convertEdgeBucketOrderToTensors(ordered_states, ordered_buckets);
 }
 
 bool states_disjoint(const std::vector<int64_t> &lhs, const std::vector<int64_t> &rhs) {
@@ -1186,4 +1813,28 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomEdgeBucketOrde
     // }
     return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
 
+}
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getOptimizedCustomEdgeBucketOrdering(int num_partitions,
+                                                                                               int buffer_capacity,
+                                                                                               int active_devices,
+                                                                                               int batch_size,
+                                                                                               const vector<int64_t> &edge_bucket_sizes) {
+    if (!optimized_custom_schedule_enabled()) {
+        SPDLOG_INFO("GEGE_OPTIMIZED_CUSTOM_SCHEDULE disabled; falling back to standard CUSTOM ordering");
+        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+    }
+
+    if (buffer_capacity != 4 || active_devices != 4) {
+        SPDLOG_INFO("Optimized CUSTOM ordering currently supports buffer_capacity=4 and active_devices=4; falling back to standard CUSTOM ordering");
+        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+    }
+
+    if (edge_bucket_sizes.size() != static_cast<size_t>(num_partitions * num_partitions)) {
+        SPDLOG_WARN("Optimized CUSTOM ordering expected {} edge bucket sizes, found {}; falling back to standard CUSTOM ordering",
+                    num_partitions * num_partitions, edge_bucket_sizes.size());
+        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+    }
+
+    return build_optimized_custom_edge_bucket_ordering(num_partitions, buffer_capacity, active_devices, batch_size, edge_bucket_sizes);
 }

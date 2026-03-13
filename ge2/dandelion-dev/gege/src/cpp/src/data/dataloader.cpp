@@ -788,6 +788,7 @@ void DataLoader::setBufferOrdering() {
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         if (graph_storage_->useInMemorySubGraph()) {
             bool access_aware_state_generation = false;
+            bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", true);
             const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
             if (access_aware_state_generation_env != nullptr && access_aware_state_generation_env[0] != '\0' &&
                 std::string(access_aware_state_generation_env) != "0") {
@@ -795,16 +796,25 @@ void DataLoader::setBufferOrdering() {
             }
 
             std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> tup;
+            bool used_optimized_custom_schedule = false;
             if (access_aware_state_generation && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM) {
                 tup = getAccessAwareCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices);
                 SPDLOG_INFO("Using access-aware state generation for CUSTOM ordering with {} logical device(s)", requested_active_devices);
+            } else if (optimized_custom_schedule && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
+                       !options->randomly_assign_edge_buckets && requested_active_devices == physical_devices &&
+                       requested_active_devices == 4 && options->buffer_capacity == 4) {
+                auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+                tup = getOptimizedCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices,
+                                                           batch_size_, edge_bucket_sizes);
+                used_optimized_custom_schedule = true;
+                SPDLOG_INFO("Using optimized CUSTOM ordering for {} active device(s)", requested_active_devices);
             } else {
                 tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity, options->fine_to_coarse_ratio,
                                             options->num_cache_partitions, options->randomly_assign_edge_buckets);
             }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
-            if (!access_aware_state_generation) {
+            if (!access_aware_state_generation && !used_optimized_custom_schedule) {
                 reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
             }
             SPDLOG_INFO("buffer_states_ sizes() {}", buffer_states_.size());

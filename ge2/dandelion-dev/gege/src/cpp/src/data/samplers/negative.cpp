@@ -56,6 +56,7 @@ struct ChunkNegativePlan {
     torch::Tensor sample_edge_ids;
     int64_t uniform_randint_ns = 0;
     int64_t sample_edge_randint_ns = 0;
+    bool chunk_exclusion_active = false;
 };
 
 bool negative_deg_chunk_exclusion_enabled() {
@@ -150,6 +151,7 @@ ChunkNegativePlan build_chunk_negative_plan(torch::Tensor edges,
                 torch::Tensor chunk_lengths_2d = chunk_lengths.view({num_chunks, 1});
                 torch::Tensor shift_mask = (random_positions >= chunk_starts_2d).to(torch::kInt64);
                 plan.sample_edge_ids = random_positions + shift_mask * chunk_lengths_2d;
+                plan.chunk_exclusion_active = true;
             } else {
                 plan.sample_edge_ids = torch::randint(0, batch_size, {num_chunks, num_degree}, ind_opts);
             }
@@ -172,6 +174,7 @@ MaterializedNegativeOutput materialize_negative_output(torch::Tensor edges,
                                                        LocalFilterMode local_filter_mode,
                                                        torch::Tensor uniform_ids,
                                                        torch::Tensor sample_edge_ids,
+                                                       bool chunk_exclusion_active,
                                                        bool inverse,
                                                        const torch::TensorOptions &ind_opts) {
     MaterializedNegativeOutput output;
@@ -191,7 +194,10 @@ MaterializedNegativeOutput materialize_negative_output(torch::Tensor edges,
         output.ids = torch::empty({num_chunks, 0}, ind_opts);
     }
 
-    if (degree_fraction > 0 && local_filter_mode == LocalFilterMode::DEG && sample_edge_ids.defined()) {
+    // Chunk exclusion guarantees the DEG-local filter is empty, so avoid
+    // materializing deg_sample_indices and the resulting empty CUDA nonzero path.
+    if (degree_fraction > 0 && local_filter_mode == LocalFilterMode::DEG && sample_edge_ids.defined() &&
+        !chunk_exclusion_active) {
         output.deg_sample_indices = sample_edge_ids;
     }
 
@@ -628,7 +634,7 @@ std::tuple<torch::Tensor, torch::Tensor> CorruptNodeNegativeSampler::getNegative
                                           exclude_current_chunk_degree_samples);
     auto output =
         materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, plan.uniform_ids,
-                                    plan.sample_edge_ids, inverse, ind_opts);
+                                    plan.sample_edge_ids, plan.chunk_exclusion_active, inverse, ind_opts);
     torch::Tensor score_filter = build_negative_filter(graph, edges, output, inverse, filtered_, local_filter_mode_);
     return std::forward_as_tuple(output.ids, score_filter);
 }
@@ -650,14 +656,14 @@ NegativeSampler::NodeCorruptResult CorruptNodeNegativeSampler::getNodeCorruptNeg
     if (need_src_negatives) {
         auto src_output =
             materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, plan.uniform_ids,
-                                        plan.sample_edge_ids, true, ind_opts);
+                                        plan.sample_edge_ids, plan.chunk_exclusion_active, true, ind_opts);
         src_negatives = src_output.ids;
         src_filter = build_negative_filter(graph, edges, src_output, true, filtered_, local_filter_mode_);
     }
 
     auto dst_output =
         materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, plan.uniform_ids,
-                                    plan.sample_edge_ids, false, ind_opts);
+                                    plan.sample_edge_ids, plan.chunk_exclusion_active, false, ind_opts);
     torch::Tensor dst_filter = build_negative_filter(graph, edges, dst_output, false, filtered_, local_filter_mode_);
     return std::forward_as_tuple(src_negatives, src_filter, dst_output.ids, dst_filter);
 }
@@ -853,6 +859,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
 
     torch::Tensor uniform_ids;
     torch::Tensor sample_edge_ids;
+    bool chunk_exclusion_active = false;
     const int cache_id = inverse ? 1 : 0;
     const bool state_pool_enabled = state_negative_pool_refresh_batches_ > 1 && num_negatives_ != -1 && device_idx >= 0;
 
@@ -867,6 +874,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
             cache_entry.remaining_uses > 0) {
             uniform_ids = cache_entry.uniform_ids;
             sample_edge_ids = cache_entry.sample_edge_ids;
+            chunk_exclusion_active = cache_entry.chunk_exclusion_active;
             cache_entry.remaining_uses--;
             used_state_pool = true;
         }
@@ -911,6 +919,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
         if (need_sample_edge_ids) {
             sample_edge_ids = plan.sample_edge_ids;
         }
+        chunk_exclusion_active = plan.chunk_exclusion_active;
         if (state_pool_enabled) {
             std::lock_guard<std::mutex> lock(plan_mutex_);
             if (static_cast<std::size_t>(device_idx) >= state_negative_pool_plan_cache_[cache_id].size()) {
@@ -921,6 +930,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
             cache_entry.num_nodes = num_nodes;
             cache_entry.batch_size = edges.size(0);
             cache_entry.remaining_uses = state_negative_pool_refresh_batches_ - 1;
+            cache_entry.chunk_exclusion_active = chunk_exclusion_active;
             cache_entry.uniform_ids = uniform_ids;
             cache_entry.sample_edge_ids = sample_edge_ids;
         }
@@ -928,7 +938,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
 
     auto materialize_start = std::chrono::high_resolution_clock::now();
     auto output = materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
-                                              sample_edge_ids, inverse, ind_opts);
+                                              sample_edge_ids, chunk_exclusion_active, inverse, ind_opts);
     materialize_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::high_resolution_clock::now() - materialize_start)
                                .count();
@@ -989,6 +999,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
 
     torch::Tensor uniform_ids;
     torch::Tensor sample_edge_ids;
+    bool chunk_exclusion_active = false;
     const bool state_pool_enabled = state_negative_pool_refresh_batches_ > 1 && num_negatives_ != -1 && device_idx >= 0;
 
     if (state_pool_enabled) {
@@ -1008,6 +1019,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
         if (reuse_dst && reuse_src) {
             uniform_ids = dst_cache_entry.uniform_ids;
             sample_edge_ids = dst_cache_entry.sample_edge_ids;
+            chunk_exclusion_active = dst_cache_entry.chunk_exclusion_active;
             dst_cache_entry.remaining_uses--;
             if (need_src_negatives) {
                 src_cache_entry.remaining_uses--;
@@ -1055,6 +1067,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
         if (need_sample_edge_ids) {
             sample_edge_ids = plan.sample_edge_ids;
         }
+        chunk_exclusion_active = plan.chunk_exclusion_active;
         if (state_pool_enabled) {
             std::lock_guard<std::mutex> lock(plan_mutex_);
             if (static_cast<std::size_t>(device_idx) >= state_negative_pool_plan_cache_[0].size()) {
@@ -1068,6 +1081,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
                 cache_entry.num_nodes = num_nodes;
                 cache_entry.batch_size = edges.size(0);
                 cache_entry.remaining_uses = state_negative_pool_refresh_batches_ - 1;
+                cache_entry.chunk_exclusion_active = chunk_exclusion_active;
                 cache_entry.uniform_ids = uniform_ids;
                 cache_entry.sample_edge_ids = sample_edge_ids;
             }
@@ -1075,7 +1089,8 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     }
 
     torch::Tensor shared_deg_filter;
-    bool can_share_deg_filter = !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && sample_edge_ids.defined();
+    bool can_share_deg_filter =
+        !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && sample_edge_ids.defined() && !chunk_exclusion_active;
     if (can_share_deg_filter) {
         auto filter_start = std::chrono::high_resolution_clock::now();
         ScopedNegativeFilterBreakdownCapture capture(&filter_breakdown);
@@ -1090,7 +1105,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     if (need_src_negatives) {
         auto materialize_start = std::chrono::high_resolution_clock::now();
         auto src_output = materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
-                                                      sample_edge_ids, true, ind_opts);
+                                                      sample_edge_ids, chunk_exclusion_active, true, ind_opts);
         materialize_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::high_resolution_clock::now() - materialize_start)
                                    .count();
@@ -1108,7 +1123,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
 
     auto materialize_start = std::chrono::high_resolution_clock::now();
     auto dst_output = materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
-                                                  sample_edge_ids, false, ind_opts);
+                                                  sample_edge_ids, chunk_exclusion_active, false, ind_opts);
     materialize_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::high_resolution_clock::now() - materialize_start)
                                .count();

@@ -266,6 +266,7 @@ class NegativeSamplingBase : public NegativeSampler {
         int64_t num_nodes = -1;
         int64_t batch_size = -1;
         int remaining_uses = 0;
+        bool chunk_exclusion_active = false;
         torch::Tensor uniform_ids;
         torch::Tensor sample_edge_ids;
     };

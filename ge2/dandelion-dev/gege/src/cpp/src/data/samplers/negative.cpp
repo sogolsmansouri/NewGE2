@@ -979,6 +979,91 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
     return std::forward_as_tuple(output.ids, score_filter);
 }
 
+SplitMapNodeCorruptPlan NegativeSamplingBase::getSplitMapNodeCorruptPlan(shared_ptr<GegeGraph> graph, torch::Tensor edges, int32_t device_idx) {
+    auto get_negatives_start = std::chrono::high_resolution_clock::now();
+    SplitMapNodeCorruptPlan plan;
+    bool used_planned_uniform = false;
+    bool call_on_cuda = edges.is_cuda();
+    int64_t uniform_randint_elapsed = 0;
+    int64_t sample_edge_randint_elapsed = 0;
+    int64_t num_nodes = graph->num_nodes_in_memory_;
+
+    if (filtered_ || local_filter_mode_ != LocalFilterMode::DEG || !edges.defined() || edges.dim() != 2 || edges.size(1) != 2 ||
+        num_negatives_ == -1) {
+        return plan;
+    }
+
+    int num_degree = static_cast<int>(num_negatives_ * degree_fraction_);
+    int num_uniform = num_negatives_ - num_degree;
+    auto ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
+
+    torch::Tensor planned_uniform_ids;
+    if (num_uniform > 0 && superbatch_negative_plan_batches_ > 0) {
+        auto lock_wait_start = std::chrono::high_resolution_clock::now();
+        std::lock_guard<std::mutex> lock(plan_mutex_);
+        int64_t lock_wait_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::high_resolution_clock::now() - lock_wait_start)
+                                        .count();
+        add_negative_perf_stat(plan_lock_wait_ns_, device_plan_lock_wait_ns_, device_idx, lock_wait_elapsed);
+        add_negative_perf_count(plan_lock_wait_count_, device_plan_lock_wait_count_, device_idx);
+        add_negative_perf_sample(device_plan_lock_wait_samples_ns_, device_idx, lock_wait_elapsed);
+
+        auto &queue = planned_uniform_negatives_[0][planned_uniform_cache_key(edges.device(), num_nodes, num_chunks_, num_uniform)];
+        while ((int)queue.size() < superbatch_negative_plan_batches_) {
+            auto uniform_start = std::chrono::high_resolution_clock::now();
+            queue.emplace_back(torch::randint(num_nodes, {num_chunks_, num_uniform}, ind_opts));
+            uniform_randint_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::high_resolution_clock::now() - uniform_start)
+                                           .count();
+        }
+        planned_uniform_ids = queue.front();
+        queue.pop_front();
+        used_planned_uniform = true;
+    }
+
+    if (num_uniform > 0) {
+        if (planned_uniform_ids.defined()) {
+            plan.uniform_ids = planned_uniform_ids;
+        } else {
+            auto uniform_start = std::chrono::high_resolution_clock::now();
+            plan.uniform_ids = torch::randint(num_nodes, {num_chunks_, num_uniform}, ind_opts);
+            uniform_randint_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::high_resolution_clock::now() - uniform_start)
+                                           .count();
+        }
+    }
+
+    if (num_degree > 0) {
+        int64_t endpoint_pool_size = edges.size(0) * 2;
+        if (endpoint_pool_size <= 0) {
+            return plan;
+        }
+        auto degree_start = std::chrono::high_resolution_clock::now();
+        plan.deg_endpoint_positions = torch::randint(endpoint_pool_size, {num_chunks_, num_degree}, ind_opts);
+        sample_edge_randint_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                           std::chrono::high_resolution_clock::now() - degree_start)
+                                           .count();
+    }
+
+    plan.valid = true;
+
+    int64_t get_negatives_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - get_negatives_start).count();
+    record_negative_perf_call(get_negatives_total_ns_, get_negatives_call_count_, device_get_negatives_total_ns_, device_get_negatives_call_count_,
+                              device_get_negatives_samples_ns_, device_idx, get_negatives_elapsed, 1);
+    if (used_planned_uniform) {
+        add_negative_perf_count(planned_uniform_fetch_count_, device_planned_uniform_fetch_count_, device_idx, 1);
+    }
+    if (call_on_cuda) {
+        add_negative_perf_count(cuda_call_count_, device_cuda_call_count_, device_idx, 1);
+    } else {
+        add_negative_perf_count(cpu_call_count_, device_cpu_call_count_, device_idx, 1);
+    }
+    add_negative_perf_stat(uniform_randint_ns_, device_uniform_randint_ns_, device_idx, uniform_randint_elapsed);
+    add_negative_perf_stat(sample_edge_randint_ns_, device_sample_edge_randint_ns_, device_idx, sample_edge_randint_elapsed);
+    return plan;
+}
+
 NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges,
                                                                                  bool need_src_negatives, int32_t device_idx) {
     auto get_negatives_start = std::chrono::high_resolution_clock::now();

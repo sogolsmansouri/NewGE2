@@ -139,6 +139,12 @@ struct NegativeSamplerPerfStats {
     std::vector<std::vector<int64_t>> device_plan_lock_wait_samples_ns;
 };
 
+struct SplitMapNodeCorruptPlan {
+    torch::Tensor uniform_ids;
+    torch::Tensor deg_endpoint_positions;
+    bool valid = false;
+};
+
 /**
  * Samples the negative edges from a given batch.
  */
@@ -255,6 +261,8 @@ class NegativeSamplingBase : public NegativeSampler {
                                                           bool inverse = false, int32_t device_idx = 0) override;
     NodeCorruptResult getNodeCorruptNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
                                               bool need_src_negatives = true, int32_t device_idx = 0) override;
+    SplitMapNodeCorruptPlan getSplitMapNodeCorruptPlan(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
+                                                       int32_t device_idx = 0);
     void resetPlanCache() override;
     void resetPerfStats() override;
     void initializePerfStats(std::size_t num_devices) override;

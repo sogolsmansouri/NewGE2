@@ -1,4 +1,5 @@
 #include "data/samplers/negative.h"
+#include "data/samplers/negative_filter_cuda.h"
 
 #include <algorithm>
 #include <chrono>
@@ -14,6 +15,11 @@ std::string planned_uniform_cache_key(const torch::Device &device, int64_t num_n
     key += "|";
     key += std::to_string(num_uniform);
     return key;
+}
+
+bool negative_deg_filter_cuda_fastpath_enabled() {
+    static bool enabled = parse_negative_env_flag("GEGE_DEG_FILTER_CUDA_FASTPATH", true);
+    return enabled;
 }
 
 void initialize_negative_perf_vector(std::vector<int64_t> &values, std::size_t size) {
@@ -222,6 +228,16 @@ torch::Tensor deg_negative_local_filter(torch::Tensor deg_sample_indices, torch:
     int64_t num_chunks = deg_sample_indices.size(0);
     int64_t chunk_size = ceil((double)edges.size(0) / num_chunks);
     int64_t num_deg_negs = deg_sample_indices.size(1);
+
+    if (deg_sample_indices.is_cuda() && negative_deg_filter_cuda_fastpath_enabled()) {
+        auto [filter, cuda_stats] = deg_negative_local_filter_cuda(deg_sample_indices, chunk_size);
+        if (active_negative_filter_breakdown != nullptr) {
+            active_negative_filter_breakdown->deg_chunk_ids_ns += cuda_stats.match_ns;
+            active_negative_filter_breakdown->deg_nonzero_ns += cuda_stats.compact_ns;
+            active_negative_filter_breakdown->deg_gather_ns += cuda_stats.scatter_ns;
+        }
+        return filter;
+    }
 
     auto chunk_ids_start = std::chrono::high_resolution_clock::now();
     torch::Tensor chunk_ids =

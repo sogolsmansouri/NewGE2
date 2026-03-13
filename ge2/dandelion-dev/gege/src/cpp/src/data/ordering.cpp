@@ -103,6 +103,51 @@ struct CustomEvaluatedSchedule {
     CustomScheduleScore score;
 };
 
+int64_t compute_state_resident_weight(const std::vector<int> &partitions,
+                                      const std::vector<int64_t> &edge_bucket_sizes,
+                                      int num_partitions) {
+    int64_t resident_weight = 0;
+    for (auto src_part : partitions) {
+        for (auto dst_part : partitions) {
+            resident_weight += edge_bucket_sizes[src_part * num_partitions + dst_part];
+        }
+    }
+    return resident_weight;
+}
+
+int select_startup_round(const std::vector<std::vector<int>> &lane_rounds,
+                         const std::vector<int64_t> &resident_state_weights,
+                         const std::vector<CustomStateMetrics> &state_metrics) {
+    int best_round = 0;
+    auto best_key = std::make_tuple(std::numeric_limits<int64_t>::max(),
+                                    std::numeric_limits<int64_t>::max(),
+                                    std::numeric_limits<int64_t>::max(),
+                                    std::numeric_limits<int64_t>::max(),
+                                    std::numeric_limits<int64_t>::max());
+
+    for (int round_idx = 0; round_idx < static_cast<int>(lane_rounds.size()); round_idx++) {
+        int64_t max_resident_weight = 0;
+        int64_t total_resident_weight = 0;
+        int64_t max_assigned_weight = 0;
+        int64_t total_assigned_weight = 0;
+
+        for (auto state_idx : lane_rounds[round_idx]) {
+            max_resident_weight = std::max<int64_t>(max_resident_weight, resident_state_weights[state_idx]);
+            total_resident_weight += resident_state_weights[state_idx];
+            max_assigned_weight = std::max<int64_t>(max_assigned_weight, state_metrics[state_idx].weight);
+            total_assigned_weight += state_metrics[state_idx].weight;
+        }
+
+        auto key = std::make_tuple(max_resident_weight, total_resident_weight, max_assigned_weight, total_assigned_weight, round_idx);
+        if (key < best_key) {
+            best_key = key;
+            best_round = round_idx;
+        }
+    }
+
+    return best_round;
+}
+
 bool custom_score_better(const CustomScheduleScore &lhs, const CustomScheduleScore &rhs) {
     return lhs.as_tuple() < rhs.as_tuple();
 }
@@ -627,12 +672,23 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> build_optimized_custom_
     }
 
     auto edge_buckets_per_buffer = greedyAssignEdgeBucketsToBuffers(mapped_states, num_partitions);
+    std::vector<int64_t> resident_state_weights;
+    resident_state_weights.reserve(mapped_states.size());
+    for (const auto &state : mapped_states) {
+        resident_state_weights.emplace_back(compute_state_resident_weight(state, edge_bucket_sizes, num_partitions));
+    }
     std::vector<std::vector<int>> ordered_states;
     std::vector<std::vector<std::pair<int, int>>> ordered_buckets;
     ordered_states.reserve(mapped_states.size());
     ordered_buckets.reserve(edge_buckets_per_buffer.size());
 
-    for (const auto &lane_round : optimized.lane_rounds) {
+    auto ordered_lane_rounds = optimized.lane_rounds;
+    int startup_round = select_startup_round(ordered_lane_rounds, resident_state_weights, optimized.states);
+    if (startup_round > 0) {
+        std::rotate(ordered_lane_rounds.begin(), ordered_lane_rounds.begin() + startup_round, ordered_lane_rounds.end());
+    }
+
+    for (const auto &lane_round : ordered_lane_rounds) {
         for (auto state_idx : lane_round) {
             ordered_states.emplace_back(mapped_states[state_idx]);
             ordered_buckets.emplace_back(edge_buckets_per_buffer[state_idx]);
@@ -655,6 +711,18 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> build_optimized_custom_
         optimized.score.continuity_hotness / 1000000.0,
         optimized.score.continuity_new_partitions);
     SPDLOG_INFO("Optimized CUSTOM slot_to_partition=[{}]", slot_mapping.str());
+    if (!ordered_lane_rounds.empty()) {
+        int64_t startup_max_resident_weight = 0;
+        int64_t startup_total_resident_weight = 0;
+        for (auto state_idx : ordered_lane_rounds.front()) {
+            startup_max_resident_weight = std::max<int64_t>(startup_max_resident_weight, resident_state_weights[state_idx]);
+            startup_total_resident_weight += resident_state_weights[state_idx];
+        }
+        SPDLOG_INFO("Optimized CUSTOM startup round={} startup_max_resident_edges={:.3f}M startup_total_resident_edges={:.3f}M",
+                    startup_round,
+                    startup_max_resident_weight / 1000000.0,
+                    startup_total_resident_weight / 1000000.0);
+    }
 
     return convertEdgeBucketOrderToTensors(ordered_states, ordered_buckets);
 }

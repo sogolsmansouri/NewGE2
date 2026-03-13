@@ -63,6 +63,35 @@ struct MaterializedNegativeOutput {
     torch::Tensor deg_sample_indices;
 };
 
+struct NegativeFilterBreakdown {
+    int64_t deg_chunk_ids_ns = 0;
+    int64_t deg_mask_ns = 0;
+    int64_t deg_nonzero_ns = 0;
+    int64_t deg_gather_ns = 0;
+    int64_t deg_finalize_ns = 0;
+    int64_t gpu_prepare_ns = 0;
+    int64_t gpu_searchsorted_ns = 0;
+    int64_t gpu_offsets_ns = 0;
+    int64_t gpu_repeat_interleave_ns = 0;
+    int64_t gpu_neighbor_gather_ns = 0;
+    int64_t gpu_relation_filter_ns = 0;
+    int64_t gpu_finalize_ns = 0;
+};
+
+thread_local NegativeFilterBreakdown *active_negative_filter_breakdown = nullptr;
+
+class ScopedNegativeFilterBreakdownCapture {
+   public:
+    explicit ScopedNegativeFilterBreakdownCapture(NegativeFilterBreakdown *target) : previous_(active_negative_filter_breakdown) {
+        active_negative_filter_breakdown = target;
+    }
+
+    ~ScopedNegativeFilterBreakdownCapture() { active_negative_filter_breakdown = previous_; }
+
+   private:
+    NegativeFilterBreakdown *previous_;
+};
+
 torch::Tensor materialize_degree_samples(torch::Tensor edges, torch::Tensor sample_edge_ids, bool inverse) {
     if (!sample_edge_ids.defined() || sample_edge_ids.numel() == 0) {
         return torch::Tensor();
@@ -144,7 +173,9 @@ torch::Tensor build_negative_filter(shared_ptr<GegeGraph> graph,
                                     const MaterializedNegativeOutput &output,
                                     bool inverse,
                                     bool filtered,
-                                    LocalFilterMode local_filter_mode) {
+                                    LocalFilterMode local_filter_mode,
+                                    NegativeFilterBreakdown *breakdown = nullptr) {
+    ScopedNegativeFilterBreakdownCapture capture(breakdown);
     return compute_filter_corruption(graph, edges, output.ids, inverse, filtered, local_filter_mode, output.deg_sample_indices);
 }
 
@@ -192,14 +223,38 @@ torch::Tensor deg_negative_local_filter(torch::Tensor deg_sample_indices, torch:
     int64_t chunk_size = ceil((double)edges.size(0) / num_chunks);
     int64_t num_deg_negs = deg_sample_indices.size(1);
 
+    auto chunk_ids_start = std::chrono::high_resolution_clock::now();
     torch::Tensor chunk_ids =
         torch::floor(deg_sample_indices.to(torch::kFloat64).div(static_cast<double>(chunk_size))).to(torch::kInt64);
+    int64_t chunk_ids_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - chunk_ids_start).count();
+
+    auto mask_start = std::chrono::high_resolution_clock::now();
     torch::Tensor inv_mask = chunk_ids - torch::arange(0, num_chunks, deg_sample_indices.device()).view({num_chunks, -1});
     torch::Tensor mask = (inv_mask == 0);
-    torch::Tensor temp_idx = torch::nonzero(mask);
-    torch::Tensor id_offsets = deg_sample_indices.flatten(0, 1).index_select(0, temp_idx.select(1, 0) * num_deg_negs + temp_idx.select(1, 1));
+    int64_t mask_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - mask_start).count();
 
+    auto nonzero_start = std::chrono::high_resolution_clock::now();
+    torch::Tensor temp_idx = torch::nonzero(mask);
+    int64_t nonzero_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - nonzero_start).count();
+
+    auto gather_start = std::chrono::high_resolution_clock::now();
+    torch::Tensor id_offsets = deg_sample_indices.flatten(0, 1).index_select(0, temp_idx.select(1, 0) * num_deg_negs + temp_idx.select(1, 1));
+    int64_t gather_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - gather_start).count();
+
+    auto finalize_start = std::chrono::high_resolution_clock::now();
     torch::Tensor filter = torch::stack({id_offsets, temp_idx.select(1, 1)}).transpose(0, 1);
+    int64_t finalize_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - finalize_start).count();
+    if (active_negative_filter_breakdown != nullptr) {
+        active_negative_filter_breakdown->deg_chunk_ids_ns += chunk_ids_elapsed;
+        active_negative_filter_breakdown->deg_mask_ns += mask_elapsed;
+        active_negative_filter_breakdown->deg_nonzero_ns += nonzero_elapsed;
+        active_negative_filter_breakdown->deg_gather_ns += gather_elapsed;
+        active_negative_filter_breakdown->deg_finalize_ns += finalize_elapsed;
+    }
     return filter;
 }
 
@@ -393,7 +448,15 @@ torch::Tensor compute_filter_corruption_gpu(shared_ptr<GegeGraph> graph, torch::
     torch::Tensor nodes;
     int tup_id;
     int corrupt_id;
+    int64_t prepare_elapsed = 0;
+    int64_t searchsorted_elapsed = 0;
+    int64_t offsets_elapsed = 0;
+    int64_t repeat_interleave_elapsed = 0;
+    int64_t neighbor_gather_elapsed = 0;
+    int64_t relation_filter_elapsed = 0;
+    int64_t finalize_elapsed = 0;
 
+    auto prepare_start = std::chrono::high_resolution_clock::now();
     if (inverse) {
         if (has_relations) {
             tup_id = 2;
@@ -431,32 +494,55 @@ torch::Tensor compute_filter_corruption_gpu(shared_ptr<GegeGraph> graph, torch::
 
         all_sorted_nodes = all_sorted_edges.select(1, tup_id).contiguous();
     }
+    prepare_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - prepare_start).count();
 
+    auto searchsorted_start = std::chrono::high_resolution_clock::now();
     torch::Tensor starts = torch::searchsorted(all_sorted_nodes, nodes);
     torch::Tensor ends = torch::searchsorted(all_sorted_nodes, nodes + 1);
-    torch::Tensor num_neighbors = ends - starts;
+    searchsorted_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - searchsorted_start).count();
 
+    auto offsets_start = std::chrono::high_resolution_clock::now();
+    torch::Tensor num_neighbors = ends - starts;
     torch::Tensor summed_num_neighbors = num_neighbors.cumsum(0);
     Indices local_offsets = summed_num_neighbors - num_neighbors;
+    offsets_elapsed =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - offsets_start).count();
 
     if (global) {
+        auto repeat_interleave_start = std::chrono::high_resolution_clock::now();
         torch::Tensor repeated_starts = starts.repeat_interleave(num_neighbors);
         torch::Tensor repeated_offsets = local_offsets.repeat_interleave(num_neighbors);
         torch::Tensor arange = torch::arange(repeated_offsets.size(0), edges.options());
         torch::Tensor sorted_list_idx = repeated_starts + arange - repeated_offsets;
-
-        torch::Tensor batch_neighbors = all_sorted_edges.index_select(0, sorted_list_idx);
         torch::Tensor edge_ids = torch::arange(edges.size(0), edges.options()).repeat_interleave(num_neighbors);
+        repeat_interleave_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - repeat_interleave_start).count();
+
+        auto neighbor_gather_start = std::chrono::high_resolution_clock::now();
+        torch::Tensor batch_neighbors = all_sorted_edges.index_select(0, sorted_list_idx);
+        neighbor_gather_elapsed =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - neighbor_gather_start).count();
 
         if (has_relations) {
+            auto relation_filter_start = std::chrono::high_resolution_clock::now();
             torch::Tensor filter_tmp_ids =
                 torch::cat({edge_ids.view({-1, 1}), batch_neighbors.select(1, 1).view({-1, 1}), batch_neighbors.select(1, corrupt_id).view({-1, 1})}, 1);
             torch::Tensor rel_ids = edges.select(1, 1).repeat_interleave(num_neighbors);
             torch::Tensor mask = filter_tmp_ids.select(1, 1) == rel_ids;
             filter_tmp_ids = filter_tmp_ids.index_select(0, torch::arange(filter_tmp_ids.size(0), filter_tmp_ids.options()).masked_select(mask));
+            relation_filter_elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - relation_filter_start).count();
+            auto finalize_start = std::chrono::high_resolution_clock::now();
             filter = torch::cat({filter_tmp_ids.select(1, 0).view({-1, 1}), filter_tmp_ids.select(1, 2).view({-1, 1})}, 1);
+            finalize_elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - finalize_start).count();
         } else {
+            auto finalize_start = std::chrono::high_resolution_clock::now();
             filter = torch::cat({edge_ids.view({-1, 1}), batch_neighbors.select(1, corrupt_id).view({-1, 1})}, 1);
+            finalize_elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - finalize_start).count();
         }
     } else {
         // TODO implement local filtering on the GPU, filter needs to be an int64, shape [*, 2], unit tests for this would be good
@@ -464,6 +550,15 @@ torch::Tensor compute_filter_corruption_gpu(shared_ptr<GegeGraph> graph, torch::
         //        torch::TensorOptions ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
         //        filter = torch::empty({0, 2}, ind_opts);
         throw GegeRuntimeException("Local filtering against all edges in the batch not yet supported on GPU.");
+    }
+    if (active_negative_filter_breakdown != nullptr) {
+        active_negative_filter_breakdown->gpu_prepare_ns += prepare_elapsed;
+        active_negative_filter_breakdown->gpu_searchsorted_ns += searchsorted_elapsed;
+        active_negative_filter_breakdown->gpu_offsets_ns += offsets_elapsed;
+        active_negative_filter_breakdown->gpu_repeat_interleave_ns += repeat_interleave_elapsed;
+        active_negative_filter_breakdown->gpu_neighbor_gather_ns += neighbor_gather_elapsed;
+        active_negative_filter_breakdown->gpu_relation_filter_ns += relation_filter_elapsed;
+        active_negative_filter_breakdown->gpu_finalize_ns += finalize_elapsed;
     }
     return filter;
 }
@@ -574,6 +669,18 @@ void NegativeSamplingBase::initializePerfStats(std::size_t num_devices) {
     initialize_negative_perf_vector(device_sample_edge_randint_ns_, num_devices);
     initialize_negative_perf_vector(device_materialize_ns_, num_devices);
     initialize_negative_perf_vector(device_filter_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_deg_chunk_ids_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_deg_mask_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_deg_nonzero_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_deg_gather_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_deg_finalize_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_gpu_prepare_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_gpu_searchsorted_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_gpu_offsets_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_gpu_repeat_interleave_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_gpu_neighbor_gather_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_gpu_relation_filter_ns_, num_devices);
+    initialize_negative_perf_vector(device_filter_gpu_finalize_ns_, num_devices);
     initialize_negative_perf_samples(device_get_negatives_samples_ns_, num_devices);
     initialize_negative_perf_samples(device_plan_lock_wait_samples_ns_, num_devices);
     state_negative_pool_plan_cache_[0].assign(num_devices, NegativePoolPlanCacheEntry());
@@ -593,6 +700,18 @@ void NegativeSamplingBase::resetPerfStats() {
     sample_edge_randint_ns_.store(0);
     materialize_ns_.store(0);
     filter_ns_.store(0);
+    filter_deg_chunk_ids_ns_.store(0);
+    filter_deg_mask_ns_.store(0);
+    filter_deg_nonzero_ns_.store(0);
+    filter_deg_gather_ns_.store(0);
+    filter_deg_finalize_ns_.store(0);
+    filter_gpu_prepare_ns_.store(0);
+    filter_gpu_searchsorted_ns_.store(0);
+    filter_gpu_offsets_ns_.store(0);
+    filter_gpu_repeat_interleave_ns_.store(0);
+    filter_gpu_neighbor_gather_ns_.store(0);
+    filter_gpu_relation_filter_ns_.store(0);
+    filter_gpu_finalize_ns_.store(0);
     std::fill(device_get_negatives_total_ns_.begin(), device_get_negatives_total_ns_.end(), 0);
     std::fill(device_get_negatives_call_count_.begin(), device_get_negatives_call_count_.end(), 0);
     std::fill(device_plan_lock_wait_ns_.begin(), device_plan_lock_wait_ns_.end(), 0);
@@ -605,6 +724,18 @@ void NegativeSamplingBase::resetPerfStats() {
     std::fill(device_sample_edge_randint_ns_.begin(), device_sample_edge_randint_ns_.end(), 0);
     std::fill(device_materialize_ns_.begin(), device_materialize_ns_.end(), 0);
     std::fill(device_filter_ns_.begin(), device_filter_ns_.end(), 0);
+    std::fill(device_filter_deg_chunk_ids_ns_.begin(), device_filter_deg_chunk_ids_ns_.end(), 0);
+    std::fill(device_filter_deg_mask_ns_.begin(), device_filter_deg_mask_ns_.end(), 0);
+    std::fill(device_filter_deg_nonzero_ns_.begin(), device_filter_deg_nonzero_ns_.end(), 0);
+    std::fill(device_filter_deg_gather_ns_.begin(), device_filter_deg_gather_ns_.end(), 0);
+    std::fill(device_filter_deg_finalize_ns_.begin(), device_filter_deg_finalize_ns_.end(), 0);
+    std::fill(device_filter_gpu_prepare_ns_.begin(), device_filter_gpu_prepare_ns_.end(), 0);
+    std::fill(device_filter_gpu_searchsorted_ns_.begin(), device_filter_gpu_searchsorted_ns_.end(), 0);
+    std::fill(device_filter_gpu_offsets_ns_.begin(), device_filter_gpu_offsets_ns_.end(), 0);
+    std::fill(device_filter_gpu_repeat_interleave_ns_.begin(), device_filter_gpu_repeat_interleave_ns_.end(), 0);
+    std::fill(device_filter_gpu_neighbor_gather_ns_.begin(), device_filter_gpu_neighbor_gather_ns_.end(), 0);
+    std::fill(device_filter_gpu_relation_filter_ns_.begin(), device_filter_gpu_relation_filter_ns_.end(), 0);
+    std::fill(device_filter_gpu_finalize_ns_.begin(), device_filter_gpu_finalize_ns_.end(), 0);
     for (auto &samples : device_get_negatives_samples_ns_) {
         samples.clear();
     }
@@ -627,6 +758,18 @@ NegativeSamplerPerfStats NegativeSamplingBase::getPerfStats() const {
     stats.sample_edge_randint_ns = sample_edge_randint_ns_.load();
     stats.materialize_ns = materialize_ns_.load();
     stats.filter_ns = filter_ns_.load();
+    stats.filter_deg_chunk_ids_ns = filter_deg_chunk_ids_ns_.load();
+    stats.filter_deg_mask_ns = filter_deg_mask_ns_.load();
+    stats.filter_deg_nonzero_ns = filter_deg_nonzero_ns_.load();
+    stats.filter_deg_gather_ns = filter_deg_gather_ns_.load();
+    stats.filter_deg_finalize_ns = filter_deg_finalize_ns_.load();
+    stats.filter_gpu_prepare_ns = filter_gpu_prepare_ns_.load();
+    stats.filter_gpu_searchsorted_ns = filter_gpu_searchsorted_ns_.load();
+    stats.filter_gpu_offsets_ns = filter_gpu_offsets_ns_.load();
+    stats.filter_gpu_repeat_interleave_ns = filter_gpu_repeat_interleave_ns_.load();
+    stats.filter_gpu_neighbor_gather_ns = filter_gpu_neighbor_gather_ns_.load();
+    stats.filter_gpu_relation_filter_ns = filter_gpu_relation_filter_ns_.load();
+    stats.filter_gpu_finalize_ns = filter_gpu_finalize_ns_.load();
     stats.device_get_negatives_total_ns = device_get_negatives_total_ns_;
     stats.device_get_negatives_call_count = device_get_negatives_call_count_;
     stats.device_plan_lock_wait_ns = device_plan_lock_wait_ns_;
@@ -639,6 +782,18 @@ NegativeSamplerPerfStats NegativeSamplingBase::getPerfStats() const {
     stats.device_sample_edge_randint_ns = device_sample_edge_randint_ns_;
     stats.device_materialize_ns = device_materialize_ns_;
     stats.device_filter_ns = device_filter_ns_;
+    stats.device_filter_deg_chunk_ids_ns = device_filter_deg_chunk_ids_ns_;
+    stats.device_filter_deg_mask_ns = device_filter_deg_mask_ns_;
+    stats.device_filter_deg_nonzero_ns = device_filter_deg_nonzero_ns_;
+    stats.device_filter_deg_gather_ns = device_filter_deg_gather_ns_;
+    stats.device_filter_deg_finalize_ns = device_filter_deg_finalize_ns_;
+    stats.device_filter_gpu_prepare_ns = device_filter_gpu_prepare_ns_;
+    stats.device_filter_gpu_searchsorted_ns = device_filter_gpu_searchsorted_ns_;
+    stats.device_filter_gpu_offsets_ns = device_filter_gpu_offsets_ns_;
+    stats.device_filter_gpu_repeat_interleave_ns = device_filter_gpu_repeat_interleave_ns_;
+    stats.device_filter_gpu_neighbor_gather_ns = device_filter_gpu_neighbor_gather_ns_;
+    stats.device_filter_gpu_relation_filter_ns = device_filter_gpu_relation_filter_ns_;
+    stats.device_filter_gpu_finalize_ns = device_filter_gpu_finalize_ns_;
     stats.device_get_negatives_samples_ns = device_get_negatives_samples_ns_;
     stats.device_plan_lock_wait_samples_ns = device_plan_lock_wait_samples_ns_;
     return stats;
@@ -654,6 +809,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
     int64_t sample_edge_randint_elapsed = 0;
     int64_t materialize_elapsed = 0;
     int64_t filter_elapsed = 0;
+    NegativeFilterBreakdown filter_breakdown;
     int64_t num_nodes = graph->num_nodes_in_memory_;
     int num_batch = (int)(num_negatives_ * degree_fraction_);
     int num_uni = num_negatives_ - num_batch;
@@ -737,7 +893,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
                                std::chrono::high_resolution_clock::now() - materialize_start)
                                .count();
     auto filter_start = std::chrono::high_resolution_clock::now();
-    torch::Tensor score_filter = build_negative_filter(graph, edges, output, inverse, filtered_, local_filter_mode_);
+    torch::Tensor score_filter = build_negative_filter(graph, edges, output, inverse, filtered_, local_filter_mode_, &filter_breakdown);
     filter_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                           std::chrono::high_resolution_clock::now() - filter_start)
                           .count();
@@ -760,6 +916,18 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
     add_negative_perf_stat(sample_edge_randint_ns_, device_sample_edge_randint_ns_, device_idx, sample_edge_randint_elapsed);
     add_negative_perf_stat(materialize_ns_, device_materialize_ns_, device_idx, materialize_elapsed);
     add_negative_perf_stat(filter_ns_, device_filter_ns_, device_idx, filter_elapsed);
+    add_negative_perf_stat(filter_deg_chunk_ids_ns_, device_filter_deg_chunk_ids_ns_, device_idx, filter_breakdown.deg_chunk_ids_ns);
+    add_negative_perf_stat(filter_deg_mask_ns_, device_filter_deg_mask_ns_, device_idx, filter_breakdown.deg_mask_ns);
+    add_negative_perf_stat(filter_deg_nonzero_ns_, device_filter_deg_nonzero_ns_, device_idx, filter_breakdown.deg_nonzero_ns);
+    add_negative_perf_stat(filter_deg_gather_ns_, device_filter_deg_gather_ns_, device_idx, filter_breakdown.deg_gather_ns);
+    add_negative_perf_stat(filter_deg_finalize_ns_, device_filter_deg_finalize_ns_, device_idx, filter_breakdown.deg_finalize_ns);
+    add_negative_perf_stat(filter_gpu_prepare_ns_, device_filter_gpu_prepare_ns_, device_idx, filter_breakdown.gpu_prepare_ns);
+    add_negative_perf_stat(filter_gpu_searchsorted_ns_, device_filter_gpu_searchsorted_ns_, device_idx, filter_breakdown.gpu_searchsorted_ns);
+    add_negative_perf_stat(filter_gpu_offsets_ns_, device_filter_gpu_offsets_ns_, device_idx, filter_breakdown.gpu_offsets_ns);
+    add_negative_perf_stat(filter_gpu_repeat_interleave_ns_, device_filter_gpu_repeat_interleave_ns_, device_idx, filter_breakdown.gpu_repeat_interleave_ns);
+    add_negative_perf_stat(filter_gpu_neighbor_gather_ns_, device_filter_gpu_neighbor_gather_ns_, device_idx, filter_breakdown.gpu_neighbor_gather_ns);
+    add_negative_perf_stat(filter_gpu_relation_filter_ns_, device_filter_gpu_relation_filter_ns_, device_idx, filter_breakdown.gpu_relation_filter_ns);
+    add_negative_perf_stat(filter_gpu_finalize_ns_, device_filter_gpu_finalize_ns_, device_idx, filter_breakdown.gpu_finalize_ns);
     return std::forward_as_tuple(output.ids, score_filter);
 }
 
@@ -773,6 +941,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     int64_t sample_edge_randint_elapsed = 0;
     int64_t materialize_elapsed = 0;
     int64_t filter_elapsed = 0;
+    NegativeFilterBreakdown filter_breakdown;
     int64_t num_nodes = graph->num_nodes_in_memory_;
     int num_batch = (int)(num_negatives_ * degree_fraction_);
     int num_uni = num_negatives_ - num_batch;
@@ -865,6 +1034,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     bool can_share_deg_filter = !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && sample_edge_ids.defined();
     if (can_share_deg_filter) {
         auto filter_start = std::chrono::high_resolution_clock::now();
+        ScopedNegativeFilterBreakdownCapture capture(&filter_breakdown);
         shared_deg_filter = deg_negative_local_filter(sample_edge_ids, edges);
         filter_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::high_resolution_clock::now() - filter_start)
@@ -885,7 +1055,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
             src_filter = shared_deg_filter;
         } else {
             auto filter_start = std::chrono::high_resolution_clock::now();
-            src_filter = build_negative_filter(graph, edges, src_output, true, filtered_, local_filter_mode_);
+            src_filter = build_negative_filter(graph, edges, src_output, true, filtered_, local_filter_mode_, &filter_breakdown);
             filter_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                   std::chrono::high_resolution_clock::now() - filter_start)
                                   .count();
@@ -903,7 +1073,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
         dst_filter = shared_deg_filter;
     } else {
         auto filter_start = std::chrono::high_resolution_clock::now();
-        dst_filter = build_negative_filter(graph, edges, dst_output, false, filtered_, local_filter_mode_);
+        dst_filter = build_negative_filter(graph, edges, dst_output, false, filtered_, local_filter_mode_, &filter_breakdown);
         filter_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                               std::chrono::high_resolution_clock::now() - filter_start)
                               .count();
@@ -929,5 +1099,17 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     add_negative_perf_stat(sample_edge_randint_ns_, device_sample_edge_randint_ns_, device_idx, sample_edge_randint_elapsed);
     add_negative_perf_stat(materialize_ns_, device_materialize_ns_, device_idx, materialize_elapsed);
     add_negative_perf_stat(filter_ns_, device_filter_ns_, device_idx, filter_elapsed);
+    add_negative_perf_stat(filter_deg_chunk_ids_ns_, device_filter_deg_chunk_ids_ns_, device_idx, filter_breakdown.deg_chunk_ids_ns);
+    add_negative_perf_stat(filter_deg_mask_ns_, device_filter_deg_mask_ns_, device_idx, filter_breakdown.deg_mask_ns);
+    add_negative_perf_stat(filter_deg_nonzero_ns_, device_filter_deg_nonzero_ns_, device_idx, filter_breakdown.deg_nonzero_ns);
+    add_negative_perf_stat(filter_deg_gather_ns_, device_filter_deg_gather_ns_, device_idx, filter_breakdown.deg_gather_ns);
+    add_negative_perf_stat(filter_deg_finalize_ns_, device_filter_deg_finalize_ns_, device_idx, filter_breakdown.deg_finalize_ns);
+    add_negative_perf_stat(filter_gpu_prepare_ns_, device_filter_gpu_prepare_ns_, device_idx, filter_breakdown.gpu_prepare_ns);
+    add_negative_perf_stat(filter_gpu_searchsorted_ns_, device_filter_gpu_searchsorted_ns_, device_idx, filter_breakdown.gpu_searchsorted_ns);
+    add_negative_perf_stat(filter_gpu_offsets_ns_, device_filter_gpu_offsets_ns_, device_idx, filter_breakdown.gpu_offsets_ns);
+    add_negative_perf_stat(filter_gpu_repeat_interleave_ns_, device_filter_gpu_repeat_interleave_ns_, device_idx, filter_breakdown.gpu_repeat_interleave_ns);
+    add_negative_perf_stat(filter_gpu_neighbor_gather_ns_, device_filter_gpu_neighbor_gather_ns_, device_idx, filter_breakdown.gpu_neighbor_gather_ns);
+    add_negative_perf_stat(filter_gpu_relation_filter_ns_, device_filter_gpu_relation_filter_ns_, device_idx, filter_breakdown.gpu_relation_filter_ns);
+    add_negative_perf_stat(filter_gpu_finalize_ns_, device_filter_gpu_finalize_ns_, device_idx, filter_breakdown.gpu_finalize_ns);
     return std::forward_as_tuple(src_negatives, src_filter, dst_output.ids, dst_filter);
 }

@@ -572,6 +572,17 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             ns_to_ms(perf_stats.negative_sampler.filter_ns), perf_stats.negative_sampler.state_pool_hit_count,
             perf_stats.negative_sampler.planned_uniform_fetch_count, perf_stats.negative_sampler.cuda_call_count,
             perf_stats.negative_sampler.cpu_call_count);
+        SPDLOG_INFO(
+            "[perf][epoch {}][negative_filter_breakdown] deg_chunk_ids_ms={:.3f} deg_mask_ms={:.3f} deg_nonzero_ms={:.3f} deg_gather_ms={:.3f} deg_finalize_ms={:.3f} gpu_prepare_ms={:.3f} gpu_searchsorted_ms={:.3f} gpu_offsets_ms={:.3f} gpu_repeat_interleave_ms={:.3f} gpu_neighbor_gather_ms={:.3f} gpu_relation_filter_ms={:.3f} gpu_finalize_ms={:.3f}",
+            dataloader_->getEpochsProcessed(), ns_to_ms(perf_stats.negative_sampler.filter_deg_chunk_ids_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_deg_mask_ns), ns_to_ms(perf_stats.negative_sampler.filter_deg_nonzero_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_deg_gather_ns), ns_to_ms(perf_stats.negative_sampler.filter_deg_finalize_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_gpu_prepare_ns), ns_to_ms(perf_stats.negative_sampler.filter_gpu_searchsorted_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_gpu_offsets_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_gpu_repeat_interleave_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_gpu_neighbor_gather_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_gpu_relation_filter_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_gpu_finalize_ns));
         for (int32_t device_idx = 0; device_idx < static_cast<int32_t>(device_timings.size()); device_idx++) {
             const auto &timing = device_timings[device_idx];
             int64_t swap_count = have_device_swap_stats ? perf_stats.device_swap_count[device_idx] : 0;
@@ -642,6 +653,21 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     perf_stats.negative_sampler.device_planned_uniform_fetch_count[device_idx],
                     perf_stats.negative_sampler.device_cuda_call_count[device_idx],
                     perf_stats.negative_sampler.device_cpu_call_count[device_idx]);
+                SPDLOG_INFO(
+                    "[perf][epoch {}][gpu {}][negative_filter_breakdown] deg_chunk_ids_ms={:.3f} deg_mask_ms={:.3f} deg_nonzero_ms={:.3f} deg_gather_ms={:.3f} deg_finalize_ms={:.3f} gpu_prepare_ms={:.3f} gpu_searchsorted_ms={:.3f} gpu_offsets_ms={:.3f} gpu_repeat_interleave_ms={:.3f} gpu_neighbor_gather_ms={:.3f} gpu_relation_filter_ms={:.3f} gpu_finalize_ms={:.3f}",
+                    dataloader_->getEpochsProcessed(), device_idx,
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_deg_chunk_ids_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_deg_mask_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_deg_nonzero_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_deg_gather_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_deg_finalize_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_gpu_prepare_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_gpu_searchsorted_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_gpu_offsets_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_gpu_repeat_interleave_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_gpu_neighbor_gather_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_gpu_relation_filter_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_gpu_finalize_ns[device_idx]));
             }
         }
         SPDLOG_INFO(
@@ -677,6 +703,20 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                 spread_ms(perf_stats.negative_sampler.device_sample_edge_randint_ns),
                 spread_ms(perf_stats.negative_sampler.device_materialize_ns),
                 spread_ms(perf_stats.negative_sampler.device_filter_ns));
+            SPDLOG_INFO(
+                "[perf][epoch {}][spread][negative_filter] deg_chunk_ids_ms={:.3f} deg_mask_ms={:.3f} deg_nonzero_ms={:.3f} deg_gather_ms={:.3f} deg_finalize_ms={:.3f} gpu_prepare_ms={:.3f} gpu_searchsorted_ms={:.3f} gpu_offsets_ms={:.3f} gpu_repeat_interleave_ms={:.3f} gpu_neighbor_gather_ms={:.3f} gpu_relation_filter_ms={:.3f} gpu_finalize_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), spread_ms(perf_stats.negative_sampler.device_filter_deg_chunk_ids_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_deg_mask_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_deg_nonzero_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_deg_gather_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_deg_finalize_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_gpu_prepare_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_gpu_searchsorted_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_gpu_offsets_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_gpu_repeat_interleave_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_gpu_neighbor_gather_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_gpu_relation_filter_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_gpu_finalize_ns));
         }
         if (have_device_swap_stats) {
             SPDLOG_INFO("[perf][epoch {}][device] swap_count={}", dataloader_->getEpochsProcessed(),

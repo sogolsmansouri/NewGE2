@@ -91,10 +91,26 @@ struct NegativeSamplerPerfStats {
     int64_t get_negatives_call_count = 0;
     int64_t plan_lock_wait_ns = 0;
     int64_t plan_lock_wait_count = 0;
+    int64_t state_pool_hit_count = 0;
+    int64_t planned_uniform_fetch_count = 0;
+    int64_t cuda_call_count = 0;
+    int64_t cpu_call_count = 0;
+    int64_t uniform_randint_ns = 0;
+    int64_t sample_edge_randint_ns = 0;
+    int64_t materialize_ns = 0;
+    int64_t filter_ns = 0;
     std::vector<int64_t> device_get_negatives_total_ns;
     std::vector<int64_t> device_get_negatives_call_count;
     std::vector<int64_t> device_plan_lock_wait_ns;
     std::vector<int64_t> device_plan_lock_wait_count;
+    std::vector<int64_t> device_state_pool_hit_count;
+    std::vector<int64_t> device_planned_uniform_fetch_count;
+    std::vector<int64_t> device_cuda_call_count;
+    std::vector<int64_t> device_cpu_call_count;
+    std::vector<int64_t> device_uniform_randint_ns;
+    std::vector<int64_t> device_sample_edge_randint_ns;
+    std::vector<int64_t> device_materialize_ns;
+    std::vector<int64_t> device_filter_ns;
     std::vector<std::vector<int64_t>> device_get_negatives_samples_ns;
     std::vector<std::vector<int64_t>> device_plan_lock_wait_samples_ns;
 };
@@ -238,9 +254,26 @@ class NegativeSamplingBase : public NegativeSampler {
     std::vector<int64_t> device_get_negatives_call_count_;
     std::vector<int64_t> device_plan_lock_wait_ns_;
     std::vector<int64_t> device_plan_lock_wait_count_;
+    std::vector<int64_t> device_state_pool_hit_count_;
+    std::vector<int64_t> device_planned_uniform_fetch_count_;
+    std::vector<int64_t> device_cuda_call_count_;
+    std::vector<int64_t> device_cpu_call_count_;
+    std::vector<int64_t> device_uniform_randint_ns_;
+    std::vector<int64_t> device_sample_edge_randint_ns_;
+    std::vector<int64_t> device_materialize_ns_;
+    std::vector<int64_t> device_filter_ns_;
     std::vector<std::vector<int64_t>> device_get_negatives_samples_ns_;
     std::vector<std::vector<int64_t>> device_plan_lock_wait_samples_ns_;
     std::array<std::vector<NegativePoolPlanCacheEntry>, 2> state_negative_pool_plan_cache_;
+
+    std::atomic<int64_t> state_pool_hit_count_{0};
+    std::atomic<int64_t> planned_uniform_fetch_count_{0};
+    std::atomic<int64_t> cuda_call_count_{0};
+    std::atomic<int64_t> cpu_call_count_{0};
+    std::atomic<int64_t> uniform_randint_ns_{0};
+    std::atomic<int64_t> sample_edge_randint_ns_{0};
+    std::atomic<int64_t> materialize_ns_{0};
+    std::atomic<int64_t> filter_ns_{0};
 };
 
 class RNS : public NegativeSamplingBase {

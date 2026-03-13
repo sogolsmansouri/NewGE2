@@ -485,6 +485,14 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             perf_stats.negative_sampler.device_get_negatives_call_count.size() == device_timings.size() &&
             perf_stats.negative_sampler.device_plan_lock_wait_ns.size() == device_timings.size() &&
             perf_stats.negative_sampler.device_plan_lock_wait_count.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_state_pool_hit_count.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_planned_uniform_fetch_count.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_cuda_call_count.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_cpu_call_count.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_uniform_randint_ns.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_sample_edge_randint_ns.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_materialize_ns.size() == device_timings.size() &&
+            perf_stats.negative_sampler.device_filter_ns.size() == device_timings.size() &&
             perf_stats.negative_sampler.device_get_negatives_samples_ns.size() == device_timings.size() &&
             perf_stats.negative_sampler.device_plan_lock_wait_samples_ns.size() == device_timings.size();
         if (!have_device_swap_stats &&
@@ -516,6 +524,14 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
              !perf_stats.negative_sampler.device_get_negatives_call_count.empty() ||
              !perf_stats.negative_sampler.device_plan_lock_wait_ns.empty() ||
              !perf_stats.negative_sampler.device_plan_lock_wait_count.empty() ||
+             !perf_stats.negative_sampler.device_state_pool_hit_count.empty() ||
+             !perf_stats.negative_sampler.device_planned_uniform_fetch_count.empty() ||
+             !perf_stats.negative_sampler.device_cuda_call_count.empty() ||
+             !perf_stats.negative_sampler.device_cpu_call_count.empty() ||
+             !perf_stats.negative_sampler.device_uniform_randint_ns.empty() ||
+             !perf_stats.negative_sampler.device_sample_edge_randint_ns.empty() ||
+             !perf_stats.negative_sampler.device_materialize_ns.empty() ||
+             !perf_stats.negative_sampler.device_filter_ns.empty() ||
              !perf_stats.negative_sampler.device_get_negatives_samples_ns.empty() ||
              !perf_stats.negative_sampler.device_plan_lock_wait_samples_ns.empty())) {
             SPDLOG_WARN("[perf][epoch {}] negative-sampler device stats are unavailable or size-mismatched for {} GPU timing entries",
@@ -549,6 +565,13 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             dataloader_->getEpochsProcessed(), perf_stats.negative_sampler.get_negatives_call_count,
             ns_to_ms(perf_stats.negative_sampler.get_negatives_total_ns), perf_stats.negative_sampler.plan_lock_wait_count,
             ns_to_ms(perf_stats.negative_sampler.plan_lock_wait_ns));
+        SPDLOG_INFO(
+            "[perf][epoch {}][negative_sampler_breakdown] uniform_randint_ms={:.3f} sample_edge_randint_ms={:.3f} materialize_ms={:.3f} filter_ms={:.3f} state_pool_hits={} planned_uniform_fetches={} cuda_calls={} cpu_calls={}",
+            dataloader_->getEpochsProcessed(), ns_to_ms(perf_stats.negative_sampler.uniform_randint_ns),
+            ns_to_ms(perf_stats.negative_sampler.sample_edge_randint_ns), ns_to_ms(perf_stats.negative_sampler.materialize_ns),
+            ns_to_ms(perf_stats.negative_sampler.filter_ns), perf_stats.negative_sampler.state_pool_hit_count,
+            perf_stats.negative_sampler.planned_uniform_fetch_count, perf_stats.negative_sampler.cuda_call_count,
+            perf_stats.negative_sampler.cpu_call_count);
         for (int32_t device_idx = 0; device_idx < static_cast<int32_t>(device_timings.size()); device_idx++) {
             const auto &timing = device_timings[device_idx];
             int64_t swap_count = have_device_swap_stats ? perf_stats.device_swap_count[device_idx] : 0;
@@ -609,6 +632,16 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     perf_stats.negative_sampler.device_plan_lock_wait_count[device_idx],
                     ns_to_ms(perf_stats.negative_sampler.device_plan_lock_wait_ns[device_idx]), ns_to_ms(negative_lock_summary.min),
                     ns_to_ms(negative_lock_summary.median), ns_to_ms(negative_lock_summary.average), ns_to_ms(negative_lock_summary.max));
+                SPDLOG_INFO(
+                    "[perf][epoch {}][gpu {}][negative_sampler_breakdown] uniform_randint_ms={:.3f} sample_edge_randint_ms={:.3f} materialize_ms={:.3f} filter_ms={:.3f} state_pool_hits={} planned_uniform_fetches={} cuda_calls={} cpu_calls={}",
+                    dataloader_->getEpochsProcessed(), device_idx, ns_to_ms(perf_stats.negative_sampler.device_uniform_randint_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_sample_edge_randint_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_materialize_ns[device_idx]),
+                    ns_to_ms(perf_stats.negative_sampler.device_filter_ns[device_idx]),
+                    perf_stats.negative_sampler.device_state_pool_hit_count[device_idx],
+                    perf_stats.negative_sampler.device_planned_uniform_fetch_count[device_idx],
+                    perf_stats.negative_sampler.device_cuda_call_count[device_idx],
+                    perf_stats.negative_sampler.device_cpu_call_count[device_idx]);
             }
         }
         SPDLOG_INFO(
@@ -636,6 +669,14 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                 spread_ms(perf_stats.device_edge_negative_sample_ns), spread_ms(perf_stats.device_edge_map_collect_ids_ns),
                 spread_ms(perf_stats.device_edge_map_lookup_ns), spread_ms(perf_stats.device_edge_map_verify_ns),
                 spread_ms(perf_stats.device_edge_remap_assign_ns), spread_ms(perf_stats.device_edge_finalize_ns));
+        }
+        if (have_device_negative_sampler_stats) {
+            SPDLOG_INFO(
+                "[perf][epoch {}][spread][negative_sampler] uniform_randint_ms={:.3f} sample_edge_randint_ms={:.3f} materialize_ms={:.3f} filter_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), spread_ms(perf_stats.negative_sampler.device_uniform_randint_ns),
+                spread_ms(perf_stats.negative_sampler.device_sample_edge_randint_ns),
+                spread_ms(perf_stats.negative_sampler.device_materialize_ns),
+                spread_ms(perf_stats.negative_sampler.device_filter_ns));
         }
         if (have_device_swap_stats) {
             SPDLOG_INFO("[perf][epoch {}][device] swap_count={}", dataloader_->getEpochsProcessed(),

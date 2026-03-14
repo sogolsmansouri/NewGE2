@@ -72,6 +72,55 @@ bool partition_buffer_pipeline_timing_enabled() {
     return enabled;
 }
 
+struct SortedUniqueMergeResult {
+    torch::Tensor merged_ids;
+    torch::Tensor left_to_merged;
+    torch::Tensor right_to_merged;
+};
+
+SortedUniqueMergeResult merge_sorted_unique_ids(torch::Tensor left_ids, torch::Tensor right_ids) {
+    SortedUniqueMergeResult result;
+
+    auto device = left_ids.defined() ? left_ids.device() : right_ids.device();
+    auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(device);
+
+    if (!left_ids.defined() || left_ids.numel() == 0) {
+        result.merged_ids = right_ids;
+        result.left_to_merged = torch::empty({0}, idx_opts);
+        result.right_to_merged = torch::arange(right_ids.numel(), idx_opts);
+        return result;
+    }
+
+    if (!right_ids.defined() || right_ids.numel() == 0) {
+        result.merged_ids = left_ids;
+        result.left_to_merged = torch::arange(left_ids.numel(), idx_opts);
+        result.right_to_merged = torch::empty({0}, idx_opts);
+        return result;
+    }
+
+    torch::Tensor insert_pos = torch::searchsorted(left_ids, right_ids);
+    torch::Tensor padded_left = torch::cat({left_ids, torch::full({1}, -1, idx_opts)}, 0);
+    torch::Tensor clamped_insert_pos = torch::clamp(insert_pos, 0, left_ids.numel());
+    torch::Tensor right_matches = padded_left.index_select(0, clamped_insert_pos) == right_ids;
+    torch::Tensor right_is_new = ~right_matches;
+    torch::Tensor right_is_new_i64 = right_is_new.to(torch::kInt64);
+    torch::Tensor right_new_before = right_is_new_i64.cumsum(0) - right_is_new_i64;
+    result.right_to_merged = insert_pos + right_new_before;
+
+    torch::Tensor right_new_ids = right_ids.masked_select(right_is_new);
+    torch::Tensor right_new_to_merged = result.right_to_merged.masked_select(right_is_new);
+    result.left_to_merged =
+        torch::arange(left_ids.numel(), idx_opts) + torch::searchsorted(right_new_ids, left_ids);
+
+    result.merged_ids = torch::empty({left_ids.numel() + right_new_ids.numel()}, left_ids.options());
+    result.merged_ids.index_copy_(0, result.left_to_merged, left_ids);
+    if (right_new_ids.numel() > 0) {
+        result.merged_ids.index_copy_(0, right_new_to_merged, right_new_ids);
+    }
+
+    return result;
+}
+
 int64_t partition_buffer_pipeline_timing_max() {
     static int64_t max_timings = std::max<int64_t>(parse_env_int("GEGE_PARTITION_BUFFER_PIPELINE_TIMING_MAX", 8), 0);
     return max_timings;
@@ -1231,20 +1280,34 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
             auto pos_mapped_tensors = std::get<1>(pos_tup);
             torch::Tensor pos_src_mapping = pos_mapped_tensors[0];
             torch::Tensor pos_dst_mapping = pos_mapped_tensors[1];
-            torch::Tensor pos_unique_to_final =
-                torch::arange(pos_unique_node_indices.numel(), torch::TensorOptions().dtype(torch::kInt64).device(pos_unique_node_indices.device()));
+            auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(pos_unique_node_indices.device());
+            torch::Tensor pos_sort_idx = torch::argsort(pos_unique_node_indices);
+            torch::Tensor pos_unique_sorted = pos_unique_node_indices.index_select(0, pos_sort_idx);
+            torch::Tensor pos_unsorted_to_sorted = torch::empty({pos_sort_idx.numel()}, idx_opts);
+            pos_unsorted_to_sorted.scatter_(0, pos_sort_idx, torch::arange(pos_sort_idx.numel(), idx_opts));
+            torch::Tensor pos_src_sorted_mapping = pos_unsorted_to_sorted.index_select(0, pos_src_mapping);
+            torch::Tensor pos_dst_sorted_mapping = pos_unsorted_to_sorted.index_select(0, pos_dst_mapping);
+            torch::Tensor pos_unique_to_final = torch::arange(pos_unique_sorted.numel(), idx_opts);
             torch::Tensor uniform_neg_mapping;
-            torch::Tensor final_unique_node_indices = pos_unique_node_indices;
+            torch::Tensor final_unique_node_indices = pos_unique_sorted;
 
             if (split_map_plan.uniform_ids.defined() && split_map_plan.uniform_ids.numel() > 0) {
-                auto merge_tup =
-                    map_tensors({pos_unique_node_indices, split_map_plan.uniform_ids.flatten(0, 1)}, map_sorted,
+                auto uniform_tup =
+                    map_tensors({split_map_plan.uniform_ids.flatten(0, 1)}, map_sorted,
                                 run_stage_debug ? &split_merge_map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx));
                 has_split_merge_map_tensor_timing = run_stage_debug;
-                final_unique_node_indices = std::get<0>(merge_tup);
-                auto merge_mapped_tensors = std::get<1>(merge_tup);
-                pos_unique_to_final = merge_mapped_tensors[0];
-                uniform_neg_mapping = merge_mapped_tensors[1].reshape(split_map_plan.uniform_ids.sizes());
+                torch::Tensor uniform_unique_node_indices = std::get<0>(uniform_tup);
+                torch::Tensor uniform_inverse = std::get<1>(uniform_tup)[0];
+                torch::Tensor uniform_sort_idx = torch::argsort(uniform_unique_node_indices);
+                torch::Tensor uniform_unique_sorted = uniform_unique_node_indices.index_select(0, uniform_sort_idx);
+                torch::Tensor uniform_unsorted_to_sorted = torch::empty({uniform_sort_idx.numel()}, idx_opts);
+                uniform_unsorted_to_sorted.scatter_(0, uniform_sort_idx, torch::arange(uniform_sort_idx.numel(), idx_opts));
+                torch::Tensor uniform_inverse_sorted = uniform_unsorted_to_sorted.index_select(0, uniform_inverse);
+
+                auto merge_result = merge_sorted_unique_ids(pos_unique_sorted, uniform_unique_sorted);
+                final_unique_node_indices = merge_result.merged_ids;
+                pos_unique_to_final = merge_result.left_to_merged;
+                uniform_neg_mapping = merge_result.right_to_merged.index_select(0, uniform_inverse_sorted).reshape(split_map_plan.uniform_ids.sizes());
             }
 
             auto map_lookup_end = std::chrono::high_resolution_clock::now();
@@ -1265,18 +1328,18 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
             map_verify_elapsed = elapsed_ns(map_verify_start, map_verify_end);
 
             auto remap_assign_start = std::chrono::high_resolution_clock::now();
-            torch::Tensor endpoint_pool = torch::cat({pos_src_mapping, pos_dst_mapping}, 0);
+            torch::Tensor endpoint_pool = torch::cat({pos_src_sorted_mapping, pos_dst_sorted_mapping}, 0);
             torch::Tensor deg_local_mapping;
             torch::Tensor deg_global_ids;
             if (split_map_plan.deg_endpoint_positions.defined() && split_map_plan.deg_endpoint_positions.numel() > 0) {
                 torch::Tensor flat_deg_endpoint_positions = split_map_plan.deg_endpoint_positions.flatten(0, 1);
                 deg_local_mapping = endpoint_pool.index_select(0, flat_deg_endpoint_positions).reshape(split_map_plan.deg_endpoint_positions.sizes());
                 deg_global_ids =
-                    pos_unique_node_indices.index_select(0, deg_local_mapping.flatten(0, 1)).reshape(deg_local_mapping.sizes());
+                    pos_unique_sorted.index_select(0, deg_local_mapping.flatten(0, 1)).reshape(deg_local_mapping.sizes());
             }
 
-            src_mapping = pos_unique_to_final.index_select(0, pos_src_mapping);
-            dst_mapping = pos_unique_to_final.index_select(0, pos_dst_mapping);
+            src_mapping = pos_unique_to_final.index_select(0, pos_src_sorted_mapping);
+            dst_mapping = pos_unique_to_final.index_select(0, pos_dst_sorted_mapping);
 
             torch::Tensor deg_neg_mapping;
             if (deg_local_mapping.defined()) {
@@ -1375,7 +1438,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
             }
             if (has_split_merge_map_tensor_timing) {
                 SPDLOG_INFO(
-                    "[stage-debug][edgeSample][batch {}][step 3 merge_map_tensors] validate_ms={:.3f} cat_ms={:.3f} unique_ms={:.3f} unique_wall_ms={:.3f} split_ms={:.3f} total_ms={:.3f}",
+                    "[stage-debug][edgeSample][batch {}][step 3 uniform_map_tensors] validate_ms={:.3f} cat_ms={:.3f} unique_ms={:.3f} unique_wall_ms={:.3f} split_ms={:.3f} total_ms={:.3f}",
                     debug_batch_id, split_merge_map_tensor_timing.validate_ms, split_merge_map_tensor_timing.cat_ms,
                     split_merge_map_tensor_timing.unique_ms, split_merge_map_tensor_timing.unique_wall_ms,
                     split_merge_map_tensor_timing.split_ms, split_merge_map_tensor_timing.total_ms);

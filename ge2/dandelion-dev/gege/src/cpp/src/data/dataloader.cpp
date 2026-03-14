@@ -58,11 +58,6 @@ bool verify_node_mapping_enabled() {
     return enabled;
 }
 
-bool split_map_deg_enabled() {
-    static bool enabled = parse_env_flag("GEGE_SPLIT_MAP_DEG", false);
-    return enabled;
-}
-
 bool partition_buffer_lp_fast_path_env_enabled(bool default_value) {
     return parse_env_flag("GEGE_PARTITION_BUFFER_LP_FAST_PATH", default_value);
 }
@@ -70,55 +65,6 @@ bool partition_buffer_lp_fast_path_env_enabled(bool default_value) {
 bool partition_buffer_pipeline_timing_enabled() {
     static bool enabled = parse_env_flag("GEGE_PARTITION_BUFFER_PIPELINE_TIMING", false);
     return enabled;
-}
-
-struct SortedUniqueMergeResult {
-    torch::Tensor merged_ids;
-    torch::Tensor left_to_merged;
-    torch::Tensor right_to_merged;
-};
-
-SortedUniqueMergeResult merge_sorted_unique_ids(torch::Tensor left_ids, torch::Tensor right_ids) {
-    SortedUniqueMergeResult result;
-
-    auto device = left_ids.defined() ? left_ids.device() : right_ids.device();
-    auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(device);
-
-    if (!left_ids.defined() || left_ids.numel() == 0) {
-        result.merged_ids = right_ids;
-        result.left_to_merged = torch::empty({0}, idx_opts);
-        result.right_to_merged = torch::arange(right_ids.numel(), idx_opts);
-        return result;
-    }
-
-    if (!right_ids.defined() || right_ids.numel() == 0) {
-        result.merged_ids = left_ids;
-        result.left_to_merged = torch::arange(left_ids.numel(), idx_opts);
-        result.right_to_merged = torch::empty({0}, idx_opts);
-        return result;
-    }
-
-    torch::Tensor insert_pos = torch::searchsorted(left_ids, right_ids);
-    torch::Tensor padded_left = torch::cat({left_ids, torch::full({1}, -1, idx_opts)}, 0);
-    torch::Tensor clamped_insert_pos = torch::clamp(insert_pos, 0, left_ids.numel());
-    torch::Tensor right_matches = padded_left.index_select(0, clamped_insert_pos) == right_ids;
-    torch::Tensor right_is_new = ~right_matches;
-    torch::Tensor right_is_new_i64 = right_is_new.to(torch::kInt64);
-    torch::Tensor right_new_before = right_is_new_i64.cumsum(0) - right_is_new_i64;
-    result.right_to_merged = insert_pos + right_new_before;
-
-    torch::Tensor right_new_ids = right_ids.masked_select(right_is_new);
-    torch::Tensor right_new_to_merged = result.right_to_merged.masked_select(right_is_new);
-    result.left_to_merged =
-        torch::arange(left_ids.numel(), idx_opts) + torch::searchsorted(right_new_ids, left_ids);
-
-    result.merged_ids = torch::empty({left_ids.numel() + right_new_ids.numel()}, left_ids.options());
-    result.merged_ids.index_copy_(0, result.left_to_merged, left_ids);
-    if (right_new_ids.numel() > 0) {
-        result.merged_ids.index_copy_(0, right_new_to_merged, right_new_ids);
-    }
-
-    return result;
 }
 
 int64_t partition_buffer_pipeline_timing_max() {
@@ -446,7 +392,7 @@ void DataLoader::refreshGraphStorageMode() {
     graph_storage_->setPartitionBufferLPFastPathEnabled(enable_fast_path);
 
     if (enable_fast_path) {
-        SPDLOG_INFO("Using partition-buffer LP fast path (arithmetic remap, no in-memory graph build)");
+        // SPDLOG_INFO("Using partition-buffer LP fast path (arithmetic remap, no in-memory graph build)");
     }
 }
 
@@ -752,11 +698,11 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
         if (static_cast<std::size_t>(device_idx) < device_state_build_sequence_.size()) {
             state_sequence = device_state_build_sequence_[device_idx]++;
         }
-        SPDLOG_INFO(
-            "[perf][epoch {}][gpu {}][state {}] phase={} state_idx={} resident_partitions={} active_buckets={} active_edges={} batches={}",
-            epochs_processed_ + 1, device_idx, state_sequence, state_sequence == 0 ? "init" : "swap",
-            device_current_state_index_[device_idx], device_current_state_partitions_[device_idx],
-            device_current_active_bucket_count_[device_idx], device_current_active_edge_count_[device_idx], batches.size());
+        // SPDLOG_INFO(
+        //     "[perf][epoch {}][gpu {}][state {}] phase={} state_idx={} resident_partitions={} active_buckets={} active_edges={} batches={}",
+        //     epochs_processed_ + 1, device_idx, state_sequence, state_sequence == 0 ? "init" : "swap",
+        //     device_current_state_index_[device_idx], device_current_state_partitions_[device_idx],
+        //     device_current_active_bucket_count_[device_idx], device_current_active_edge_count_[device_idx], batches.size());
     }
 }
 
@@ -861,7 +807,7 @@ void DataLoader::setBufferOrdering() {
                 tup = getOptimizedCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices,
                                                            batch_size_, edge_bucket_sizes);
                 used_optimized_custom_schedule = true;
-                SPDLOG_INFO("Using optimized CUSTOM ordering for {} active device(s)", requested_active_devices);
+                // SPDLOG_INFO("Using optimized CUSTOM ordering for {} active device(s)", requested_active_devices);
             } else {
                 tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity, options->fine_to_coarse_ratio,
                                             options->num_cache_partitions, options->randomly_assign_edge_buckets);
@@ -871,7 +817,7 @@ void DataLoader::setBufferOrdering() {
             if (!access_aware_state_generation && !used_optimized_custom_schedule) {
                 reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
             }
-            SPDLOG_INFO("buffer_states_ sizes() {}", buffer_states_.size());
+            // SPDLOG_INFO("buffer_states_ sizes() {}", buffer_states_.size());
             auto edge_buckets_per_buffer_iterator = edge_buckets_per_buffer_.begin();
             edge_buckets_per_buffer_iterators_.resize(devices_.size());
             for (int i = 0; i < devices_.size(); i ++) {
@@ -976,12 +922,12 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                         device_state_build_sequence_[device_idx] > 0) {
                         state_sequence = device_state_build_sequence_[device_idx] - 1;
                     }
-                    SPDLOG_INFO(
-                        "[perf][epoch {}][gpu {}][state {}][rebuild] state_idx={} resident_partitions={} active_buckets={} active_edges={} batches={} rebuild_ms={:.3f}",
-                        epochs_processed_ + 1, device_idx, state_sequence, device_current_state_index_[device_idx],
-                        device_current_state_partitions_[device_idx], device_current_active_bucket_count_[device_idx],
-                        device_current_active_edge_count_[device_idx], all_batches_[device_idx].size(),
-                        static_cast<double>(swap_rebuild_elapsed) / 1'000'000.0);
+                    // SPDLOG_INFO(
+                    //     "[perf][epoch {}][gpu {}][state {}][rebuild] state_idx={} resident_partitions={} active_buckets={} active_edges={} batches={} rebuild_ms={:.3f}",
+                    //     epochs_processed_ + 1, device_idx, state_sequence, device_current_state_index_[device_idx],
+                    //     device_current_state_partitions_[device_idx], device_current_active_bucket_count_[device_idx],
+                    //     device_current_active_edge_count_[device_idx], all_batches_[device_idx].size(),
+                    //     static_cast<double>(swap_rebuild_elapsed) / 1'000'000.0);
                 }
 #ifdef GEGE_CUDA
                 c10::cuda::CUDACachingAllocator::emptyCache();
@@ -1145,30 +1091,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         step_start = now;
     }
 
-    bool use_split_map_deg = false;
-    SplitMapNodeCorruptPlan split_map_plan;
-
     if (negative_sampler_ != nullptr) {
         auto negative_sample_start = std::chrono::high_resolution_clock::now();
-        bool need_src_negatives = batch->edges_.size(1) == 3 && use_inverse_relations_;
-        if (split_map_deg_enabled() && neighbor_sampler_ == nullptr && !need_src_negatives &&
-            instance_of<NegativeSampler, NegativeSamplingBase>(negative_sampler_)) {
-            auto split_sampler = std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler_);
-            split_map_plan =
-                split_sampler->getSplitMapNodeCorruptPlan(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_,
-                                                          device_idx);
-            use_split_map_deg = split_map_plan.valid;
-            if (use_split_map_deg) {
-                batch->src_neg_indices_ = torch::Tensor();
-                batch->src_neg_filter_ = torch::Tensor();
-                batch->dst_neg_indices_ = torch::Tensor();
-                batch->dst_neg_filter_ = torch::Tensor();
-            }
-        }
-
-        if (!use_split_map_deg) {
-            negativeSample(batch, device_idx);
-        }
+        negativeSample(batch, device_idx);
         negative_sample_elapsed = elapsed_ns(negative_sample_start, std::chrono::high_resolution_clock::now());
     }
     if (run_stage_debug) {
@@ -1224,10 +1149,6 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     double remap_assign_ms = 0.0;
     MapTensorTiming map_tensor_timing;
     bool has_map_tensor_timing = false;
-    MapTensorTiming split_pos_map_tensor_timing;
-    MapTensorTiming split_merge_map_tensor_timing;
-    bool has_split_pos_map_tensor_timing = false;
-    bool has_split_merge_map_tensor_timing = false;
 
     if (neighbor_sampler_ != nullptr) {
         auto map_lookup_start = std::chrono::high_resolution_clock::now();
@@ -1268,141 +1189,48 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
         remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
     } else {
+        // map edges and negatives to their corresponding index in unique_node_indices_
         bool map_sorted = !fast_map_tensors_enabled();
-        if (use_split_map_deg) {
-            auto map_lookup_start = std::chrono::high_resolution_clock::now();
-            auto pos_tup =
-                map_tensors({batch->edges_.select(1, 0), batch->edges_.select(1, -1)}, map_sorted,
-                            run_stage_debug ? &split_pos_map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx));
-            has_split_pos_map_tensor_timing = run_stage_debug;
+        auto map_lookup_start = std::chrono::high_resolution_clock::now();
+        auto tup = map_tensors(all_ids, map_sorted, run_stage_debug ? &map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx));
+        auto map_lookup_end = std::chrono::high_resolution_clock::now();
+        map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
+        map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
+        has_map_tensor_timing = run_stage_debug;
+    
 
-            torch::Tensor pos_unique_node_indices = std::get<0>(pos_tup);
-            auto pos_mapped_tensors = std::get<1>(pos_tup);
-            torch::Tensor pos_src_mapping = pos_mapped_tensors[0];
-            torch::Tensor pos_dst_mapping = pos_mapped_tensors[1];
-            auto idx_opts = torch::TensorOptions().dtype(torch::kInt64).device(pos_unique_node_indices.device());
-            torch::Tensor pos_sort_idx = torch::argsort(pos_unique_node_indices);
-            torch::Tensor pos_unique_sorted = pos_unique_node_indices.index_select(0, pos_sort_idx);
-            torch::Tensor pos_unsorted_to_sorted = torch::empty({pos_sort_idx.numel()}, idx_opts);
-            pos_unsorted_to_sorted.scatter_(0, pos_sort_idx, torch::arange(pos_sort_idx.numel(), idx_opts));
-            torch::Tensor pos_src_sorted_mapping = pos_unsorted_to_sorted.index_select(0, pos_src_mapping);
-            torch::Tensor pos_dst_sorted_mapping = pos_unsorted_to_sorted.index_select(0, pos_dst_mapping);
-            torch::Tensor pos_unique_to_final = torch::arange(pos_unique_sorted.numel(), idx_opts);
-            torch::Tensor uniform_neg_mapping;
-            torch::Tensor final_unique_node_indices = pos_unique_sorted;
+        batch->unique_node_indices_ = std::get<0>(tup);
 
-            if (split_map_plan.uniform_ids.defined() && split_map_plan.uniform_ids.numel() > 0) {
-                auto uniform_tup =
-                    map_tensors({split_map_plan.uniform_ids.flatten(0, 1)}, map_sorted,
-                                run_stage_debug ? &split_merge_map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx));
-                has_split_merge_map_tensor_timing = run_stage_debug;
-                torch::Tensor uniform_unique_node_indices = std::get<0>(uniform_tup);
-                torch::Tensor uniform_inverse = std::get<1>(uniform_tup)[0];
-                torch::Tensor uniform_sort_idx = torch::argsort(uniform_unique_node_indices);
-                torch::Tensor uniform_unique_sorted = uniform_unique_node_indices.index_select(0, uniform_sort_idx);
-                torch::Tensor uniform_unsorted_to_sorted = torch::empty({uniform_sort_idx.numel()}, idx_opts);
-                uniform_unsorted_to_sorted.scatter_(0, uniform_sort_idx, torch::arange(uniform_sort_idx.numel(), idx_opts));
-                torch::Tensor uniform_inverse_sorted = uniform_unsorted_to_sorted.index_select(0, uniform_inverse);
-
-                auto merge_result = merge_sorted_unique_ids(pos_unique_sorted, uniform_unique_sorted);
-                final_unique_node_indices = merge_result.merged_ids;
-                pos_unique_to_final = merge_result.left_to_merged;
-                uniform_neg_mapping = merge_result.right_to_merged.index_select(0, uniform_inverse_sorted).reshape(split_map_plan.uniform_ids.sizes());
+        auto map_verify_start = std::chrono::high_resolution_clock::now();
+        if (verify_node_mapping_enabled()) {
+            // Optional expensive guardrail: avoid synchronizing .item() on every batch unless requested.
+            if (torch::any(batch->unique_node_indices_ < 0).item<bool>()) {
+                SPDLOG_ERROR("Node mapping is broken. Try repartition again.");
+                throw std::runtime_error("");
             }
-
-            auto map_lookup_end = std::chrono::high_resolution_clock::now();
-            map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
-            map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
-
-            batch->unique_node_indices_ = final_unique_node_indices;
-
-            auto map_verify_start = std::chrono::high_resolution_clock::now();
-            if (verify_node_mapping_enabled()) {
-                if (torch::any(batch->unique_node_indices_ < 0).item<bool>()) {
-                    SPDLOG_ERROR("Node mapping is broken. Try repartition again.");
-                    throw std::runtime_error("");
-                }
-            }
-            auto map_verify_end = std::chrono::high_resolution_clock::now();
-            map_verify_ms = elapsed_ms(map_verify_start, map_verify_end);
-            map_verify_elapsed = elapsed_ns(map_verify_start, map_verify_end);
-
-            auto remap_assign_start = std::chrono::high_resolution_clock::now();
-            torch::Tensor endpoint_pool = torch::cat({pos_src_sorted_mapping, pos_dst_sorted_mapping}, 0);
-            torch::Tensor deg_local_mapping;
-            torch::Tensor deg_global_ids;
-            if (split_map_plan.deg_endpoint_positions.defined() && split_map_plan.deg_endpoint_positions.numel() > 0) {
-                torch::Tensor flat_deg_endpoint_positions = split_map_plan.deg_endpoint_positions.flatten(0, 1);
-                deg_local_mapping = endpoint_pool.index_select(0, flat_deg_endpoint_positions).reshape(split_map_plan.deg_endpoint_positions.sizes());
-                deg_global_ids =
-                    pos_unique_sorted.index_select(0, deg_local_mapping.flatten(0, 1)).reshape(deg_local_mapping.sizes());
-            }
-
-            src_mapping = pos_unique_to_final.index_select(0, pos_src_sorted_mapping);
-            dst_mapping = pos_unique_to_final.index_select(0, pos_dst_sorted_mapping);
-
-            torch::Tensor deg_neg_mapping;
-            if (deg_local_mapping.defined()) {
-                deg_neg_mapping =
-                    pos_unique_to_final.index_select(0, deg_local_mapping.flatten(0, 1)).reshape(deg_local_mapping.sizes());
-            }
-
-            if (deg_neg_mapping.defined() && uniform_neg_mapping.defined()) {
-                dst_neg_mapping = torch::cat({deg_neg_mapping, uniform_neg_mapping}, 1);
-                batch->dst_neg_indices_ = torch::cat({deg_global_ids, split_map_plan.uniform_ids}, 1);
-            } else if (deg_neg_mapping.defined()) {
-                dst_neg_mapping = deg_neg_mapping;
-                batch->dst_neg_indices_ = deg_global_ids;
-            } else if (uniform_neg_mapping.defined()) {
-                dst_neg_mapping = uniform_neg_mapping;
-                batch->dst_neg_indices_ = split_map_plan.uniform_ids;
-            }
-
-            auto remap_assign_end = std::chrono::high_resolution_clock::now();
-            remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
-            remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
-        } else {
-            // map edges and negatives to their corresponding index in unique_node_indices_
-            auto map_lookup_start = std::chrono::high_resolution_clock::now();
-            auto tup =
-                map_tensors(all_ids, map_sorted, run_stage_debug ? &map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx));
-            auto map_lookup_end = std::chrono::high_resolution_clock::now();
-            map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
-            map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
-            has_map_tensor_timing = run_stage_debug;
-
-            batch->unique_node_indices_ = std::get<0>(tup);
-
-            auto map_verify_start = std::chrono::high_resolution_clock::now();
-            if (verify_node_mapping_enabled()) {
-                // Optional expensive guardrail: avoid synchronizing .item() on every batch unless requested.
-                if (torch::any(batch->unique_node_indices_ < 0).item<bool>()) {
-                    SPDLOG_ERROR("Node mapping is broken. Try repartition again.");
-                    throw std::runtime_error("");
-                }
-            }
-            auto map_verify_end = std::chrono::high_resolution_clock::now();
-            map_verify_ms = elapsed_ms(map_verify_start, map_verify_end);
-            map_verify_elapsed = elapsed_ns(map_verify_start, map_verify_end);
-
-            auto remap_assign_start = std::chrono::high_resolution_clock::now();
-            mapped_tensors = std::get<1>(tup);
-
-            std::size_t mapped_tensor_idx = 0;
-            src_mapping = mapped_tensors[mapped_tensor_idx++];
-            dst_mapping = mapped_tensors[mapped_tensor_idx++];
-
-            if (batch->src_neg_indices_.defined()) {
-                src_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->src_neg_indices_.sizes());
-            }
-
-            if (batch->dst_neg_indices_.defined()) {
-                dst_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->dst_neg_indices_.sizes());
-            }
-            auto remap_assign_end = std::chrono::high_resolution_clock::now();
-            remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
-            remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
         }
+        auto map_verify_end = std::chrono::high_resolution_clock::now();
+        map_verify_ms = elapsed_ms(map_verify_start, map_verify_end);
+        map_verify_elapsed = elapsed_ns(map_verify_start, map_verify_end);
+
+
+        auto remap_assign_start = std::chrono::high_resolution_clock::now();
+        mapped_tensors = std::get<1>(tup);
+
+        std::size_t mapped_tensor_idx = 0;
+        src_mapping = mapped_tensors[mapped_tensor_idx++];
+        dst_mapping = mapped_tensors[mapped_tensor_idx++];
+
+        if (batch->src_neg_indices_.defined()) {
+            src_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->src_neg_indices_.sizes());
+        }
+
+        if (batch->dst_neg_indices_.defined()) {
+            dst_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->dst_neg_indices_.sizes());
+        }
+        auto remap_assign_end = std::chrono::high_resolution_clock::now();
+        remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
+        remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
     }
     if (run_stage_debug) {
         auto now = std::chrono::high_resolution_clock::now();
@@ -1420,30 +1248,6 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         SPDLOG_INFO(
             "[stage-debug][edgeSample][batch {}][step 3 breakdown] collect_ids_ms={:.3f} map_lookup_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f}",
             debug_batch_id, elapsed_ms(map_collect_start, map_collect_end), map_lookup_ms, map_verify_ms, remap_assign_ms);
-        if (use_split_map_deg) {
-            int64_t uniform_ids_numel =
-                split_map_plan.uniform_ids.defined() ? split_map_plan.uniform_ids.numel() : 0;
-            int64_t deg_ids_numel =
-                split_map_plan.deg_endpoint_positions.defined() ? split_map_plan.deg_endpoint_positions.numel() : 0;
-            SPDLOG_INFO(
-                "[stage-debug][edgeSample][batch {}][step 3 split_map_deg] uniform_ids={} deg_local_ids={} final_unique_nodes={}",
-                debug_batch_id, uniform_ids_numel, deg_ids_numel,
-                batch->unique_node_indices_.defined() ? batch->unique_node_indices_.numel() : 0);
-            if (has_split_pos_map_tensor_timing) {
-                SPDLOG_INFO(
-                    "[stage-debug][edgeSample][batch {}][step 3 pos_map_tensors] validate_ms={:.3f} cat_ms={:.3f} unique_ms={:.3f} unique_wall_ms={:.3f} split_ms={:.3f} total_ms={:.3f}",
-                    debug_batch_id, split_pos_map_tensor_timing.validate_ms, split_pos_map_tensor_timing.cat_ms,
-                    split_pos_map_tensor_timing.unique_ms, split_pos_map_tensor_timing.unique_wall_ms, split_pos_map_tensor_timing.split_ms,
-                    split_pos_map_tensor_timing.total_ms);
-            }
-            if (has_split_merge_map_tensor_timing) {
-                SPDLOG_INFO(
-                    "[stage-debug][edgeSample][batch {}][step 3 uniform_map_tensors] validate_ms={:.3f} cat_ms={:.3f} unique_ms={:.3f} unique_wall_ms={:.3f} split_ms={:.3f} total_ms={:.3f}",
-                    debug_batch_id, split_merge_map_tensor_timing.validate_ms, split_merge_map_tensor_timing.cat_ms,
-                    split_merge_map_tensor_timing.unique_ms, split_merge_map_tensor_timing.unique_wall_ms,
-                    split_merge_map_tensor_timing.split_ms, split_merge_map_tensor_timing.total_ms);
-            }
-        }
         if (has_map_tensor_timing) {
             SPDLOG_INFO(
                 "[stage-debug][edgeSample][batch {}][step 3 map_tensors] validate_ms={:.3f} cat_ms={:.3f} unique_ms={:.3f} unique_wall_ms={:.3f} split_ms={:.3f} total_ms={:.3f}",

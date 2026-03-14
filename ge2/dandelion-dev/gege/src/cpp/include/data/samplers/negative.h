@@ -139,12 +139,6 @@ struct NegativeSamplerPerfStats {
     std::vector<std::vector<int64_t>> device_plan_lock_wait_samples_ns;
 };
 
-struct SplitMapNodeCorruptPlan {
-    torch::Tensor uniform_ids;
-    torch::Tensor deg_endpoint_positions;
-    bool valid = false;
-};
-
 /**
  * Samples the negative edges from a given batch.
  */
@@ -185,13 +179,13 @@ class NegativeSampler {
     virtual std::tuple<torch::Tensor, torch::Tensor> compute(torch::Tensor src_embeddings, torch::Tensor dst_embeddings, torch::Tensor dst_neg_embeddings, torch::Tensor src_neg_embeddings,
                                                              torch::Tensor src_embeddings_g, torch::Tensor dst_embeddings_g, torch::Tensor dst_neg_embeddings_g, torch::Tensor src_neg_embeddings_g,
                                                              int batch_num, int embedding_size, int chunk_num, int num_per_chunk, bool has_relations, bool use_inverse_relations) {
-        SPDLOG_INFO("NegativeSampling: compute needs override");
+        // SPDLOG_INFO("NegativeSampling: compute needs override");
         return std::forward_as_tuple(torch::Tensor(), torch::Tensor());
     }
 
     virtual SampleResult sample(torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor dst_negs_scores, torch::Tensor src_negs_scores,
                                 int chunk_num, int num_per_chunk, int selected_negatives_num, bool has_relations, bool use_inverse_relations) {
-        SPDLOG_INFO("NegativeSampling: sample needs override");
+        // SPDLOG_INFO("NegativeSampling: sample needs override");
         return std::forward_as_tuple(torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor());
     }
 
@@ -261,8 +255,6 @@ class NegativeSamplingBase : public NegativeSampler {
                                                           bool inverse = false, int32_t device_idx = 0) override;
     NodeCorruptResult getNodeCorruptNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
                                               bool need_src_negatives = true, int32_t device_idx = 0) override;
-    SplitMapNodeCorruptPlan getSplitMapNodeCorruptPlan(shared_ptr<GegeGraph> graph, torch::Tensor edges = torch::Tensor(),
-                                                       int32_t device_idx = 0);
     void resetPlanCache() override;
     void resetPerfStats() override;
     void initializePerfStats(std::size_t num_devices) override;
@@ -342,7 +334,7 @@ class RNS : public NegativeSamplingBase {
              num_chunks, num_negatives, degree_fraction, filtered, superbatch_negative_plan_batches, local_filter_mode, tournament_selection,
              tiled_tournament_scores,
              tiled_tournament_groups_per_tile) {
-           SPDLOG_INFO("NegativeSampling: Used RNS");
+           // SPDLOG_INFO("NegativeSampling: Used RNS");
     }
 
     std::tuple<torch::Tensor, torch::Tensor> compute(torch::Tensor src_embeddings, torch::Tensor dst_embeddings, torch::Tensor dst_neg_embeddings, torch::Tensor src_neg_embeddings,
@@ -369,7 +361,7 @@ class DNS : public NegativeSamplingBase {
              num_chunks, num_negatives, degree_fraction, filtered, superbatch_negative_plan_batches, local_filter_mode, tournament_selection,
              tiled_tournament_scores,
              tiled_tournament_groups_per_tile) {
-           SPDLOG_INFO("NegativeSampling: Used DNS");
+           // SPDLOG_INFO("NegativeSampling: Used DNS");
     }
 
     std::tuple<torch::Tensor, torch::Tensor> compute(torch::Tensor src_embeddings, torch::Tensor dst_embeddings, torch::Tensor dst_neg_embeddings, torch::Tensor src_neg_embeddings,
@@ -423,7 +415,7 @@ class KBGAN : public NegativeSamplingBase {
              num_chunks, num_negatives, degree_fraction, filtered, superbatch_negative_plan_batches, local_filter_mode, tournament_selection,
              tiled_tournament_scores,
              tiled_tournament_groups_per_tile) {
-           SPDLOG_INFO("NegativeSampling: Used KBGAN");
+           // SPDLOG_INFO("NegativeSampling: Used KBGAN");
     }
 
     std::tuple<torch::Tensor, torch::Tensor> compute(torch::Tensor src_embeddings, torch::Tensor dst_embeddings, torch::Tensor dst_neg_embeddings, torch::Tensor src_neg_embeddings,

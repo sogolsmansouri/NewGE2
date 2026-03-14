@@ -91,9 +91,9 @@ std::string capture_unique_input_batch(const torch::Tensor &all_ids) {
 void maybe_log_unique_backend_banner(const UniqueMapCudaDebugInfo &debug_info) {
     static std::once_flag flag;
     std::call_once(flag, [&debug_info]() {
-        SPDLOG_INFO("[unique-map] requested_backend={} initial_backend={} cuco_compiled={} capture_dir={} capture_max_batches={}",
-                    debug_info.requested_backend, debug_info.executed_backend, debug_info.cuco_compiled, unique_capture_dir(),
-                    unique_capture_max_batches());
+        // SPDLOG_INFO("[unique-map] requested_backend={} initial_backend={} cuco_compiled={} capture_dir={} capture_max_batches={}",
+        //             debug_info.requested_backend, debug_info.executed_backend, debug_info.cuco_compiled, unique_capture_dir(),
+        //             unique_capture_max_batches());
     });
 }
 

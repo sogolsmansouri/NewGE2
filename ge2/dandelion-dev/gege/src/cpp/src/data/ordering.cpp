@@ -703,14 +703,14 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> build_optimized_custom_
         slot_mapping << optimized.slot_to_partition[idx];
     }
 
-    SPDLOG_INFO(
-        "Using optimized CUSTOM ordering: worst_round_spread={:.3f}M worst_batch_spread={} total_round_spread={:.3f}M continuity_hotness={:.3f}M continuity_new_partitions={}",
-        optimized.score.worst_round_spread / 1000000.0,
-        optimized.score.worst_batch_spread,
-        optimized.score.total_round_spread / 1000000.0,
-        optimized.score.continuity_hotness / 1000000.0,
-        optimized.score.continuity_new_partitions);
-    SPDLOG_INFO("Optimized CUSTOM slot_to_partition=[{}]", slot_mapping.str());
+    // SPDLOG_INFO(
+    //     "Using optimized CUSTOM ordering: worst_round_spread={:.3f}M worst_batch_spread={} total_round_spread={:.3f}M continuity_hotness={:.3f}M continuity_new_partitions={}",
+    //     optimized.score.worst_round_spread / 1000000.0,
+    //     optimized.score.worst_batch_spread,
+    //     optimized.score.total_round_spread / 1000000.0,
+    //     optimized.score.continuity_hotness / 1000000.0,
+    //     optimized.score.continuity_new_partitions);
+    // SPDLOG_INFO("Optimized CUSTOM slot_to_partition=[{}]", slot_mapping.str());
     if (!ordered_lane_rounds.empty()) {
         int64_t startup_max_resident_weight = 0;
         int64_t startup_total_resident_weight = 0;
@@ -718,10 +718,10 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> build_optimized_custom_
             startup_max_resident_weight = std::max<int64_t>(startup_max_resident_weight, resident_state_weights[state_idx]);
             startup_total_resident_weight += resident_state_weights[state_idx];
         }
-        SPDLOG_INFO("Optimized CUSTOM startup round={} startup_max_resident_edges={:.3f}M startup_total_resident_edges={:.3f}M",
-                    startup_round,
-                    startup_max_resident_weight / 1000000.0,
-                    startup_total_resident_weight / 1000000.0);
+        // SPDLOG_INFO("Optimized CUSTOM startup round={} startup_max_resident_edges={:.3f}M startup_total_resident_edges={:.3f}M",
+        //             startup_round,
+        //             startup_max_resident_weight / 1000000.0,
+        //             startup_total_resident_weight / 1000000.0);
     }
 
     return convertEdgeBucketOrderToTensors(ordered_states, ordered_buckets);

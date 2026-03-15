@@ -5,6 +5,42 @@
 #include "configuration/constants.h"
 #include "reporting/logger.h"
 
+namespace {
+
+void validate_link_prediction_scores(const torch::Tensor &pos_scores, const torch::Tensor &neg_scores) {
+    if (!pos_scores.defined() || !neg_scores.defined()) {
+        throw GegeRuntimeException("Link prediction ranks require defined positive and negative score tensors");
+    }
+
+    if (pos_scores.dim() != 1) {
+        throw GegeRuntimeException("Link prediction positive scores must be rank 1");
+    }
+
+    if (neg_scores.dim() != 2) {
+        throw GegeRuntimeException("Link prediction negative scores must be rank 2");
+    }
+
+    if (pos_scores.size(0) != neg_scores.size(0)) {
+        throw GegeRuntimeException("Link prediction positive and negative score batches must have the same leading dimension");
+    }
+
+    torch::Tensor pos_finite = torch::isfinite(pos_scores);
+    if (!pos_finite.all().item<bool>()) {
+        int64_t invalid_count = (~pos_finite).sum().item<int64_t>();
+        SPDLOG_ERROR("Link prediction evaluation produced {} non-finite positive scores", invalid_count);
+        throw GegeRuntimeException("Non-finite positive link prediction scores detected during evaluation");
+    }
+
+    torch::Tensor neg_finite = torch::isfinite(neg_scores);
+    if (!neg_finite.all().item<bool>()) {
+        int64_t invalid_count = (~neg_finite).sum().item<int64_t>();
+        SPDLOG_ERROR("Link prediction evaluation produced {} non-finite negative scores", invalid_count);
+        throw GegeRuntimeException("Non-finite negative link prediction scores detected during evaluation");
+    }
+}
+
+}  // namespace
+
 HitskMetric::HitskMetric(int k) {
     k_ = k;
     name_ = "Hits@" + std::to_string(k_);
@@ -52,6 +88,7 @@ void LinkPredictionReporter::clear() {
 }
 
 torch::Tensor LinkPredictionReporter::computeRanks(torch::Tensor pos_scores, torch::Tensor neg_scores) {
+    validate_link_prediction_scores(pos_scores, neg_scores);
     return (neg_scores >= pos_scores.unsqueeze(1)).sum(1) + 1;
 }
 

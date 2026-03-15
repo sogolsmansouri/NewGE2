@@ -1,13 +1,14 @@
 #include "common/pybind_headers.h"
 #include "reporting/reporting.h"
 
-class PyReporter : Reporter {
+class PyReporter : public Reporter {
    public:
     using Reporter::Reporter;
+    void clear() override { PYBIND11_OVERRIDE_PURE_NAME(void, Reporter, "clear", clear); }
     void report() override { PYBIND11_OVERRIDE_PURE_NAME(void, Reporter, "report", report); }
 };
 
-class PyMetric : Metric {
+class PyMetric : public Metric {
    public:
     using Metric::Metric;
 };
@@ -37,6 +38,7 @@ void init_reporting(py::module &m) {
         .def_readwrite("metrics", &Reporter::metrics_)
         .def(py::init<>())
         .def("add_metric", &Reporter::addMetric, py::arg("metric"))
+        .def("clear", &Reporter::clear)
         .def("report", &Reporter::report);
 
     py::class_<LinkPredictionReporter, Reporter, std::shared_ptr<LinkPredictionReporter>>(m, "LinkPredictionReporter")

@@ -5,6 +5,25 @@
 
 #include <thread>
 
+namespace {
+
+bool negative_sampler_filtered(const shared_ptr<NegativeSampler> &negative_sampler) {
+    if (negative_sampler == nullptr) {
+        return false;
+    }
+
+    if (instance_of<NegativeSampler, NegativeSamplingBase>(negative_sampler)) {
+        return std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler)->filtered_;
+    }
+
+    if (instance_of<NegativeSampler, CorruptNodeNegativeSampler>(negative_sampler)) {
+        return std::dynamic_pointer_cast<CorruptNodeNegativeSampler>(negative_sampler)->filtered_;
+    }
+
+    return true;
+}
+
+}  // namespace
 
 SynchronousEvaluator::SynchronousEvaluator(shared_ptr<DataLoader> dataloader, shared_ptr<Model> model) {
     dataloader_ = dataloader;
@@ -17,6 +36,18 @@ void SynchronousEvaluator::evaluate(bool validation) {
             dataloader_->setValidationSet();
         } else {
             dataloader_->setTestSet();
+        }
+    }
+
+    if (dataloader_->learning_task_ == LearningTask::LINK_PREDICTION) {
+        bool using_subgraph_eval = dataloader_->graph_storage_->useInMemorySubGraph();
+        bool filtered_eval = negative_sampler_filtered(dataloader_->evaluation_negative_sampler_);
+
+        if (using_subgraph_eval) {
+            SPDLOG_WARN("Link prediction evaluation is using in-memory subgraph mode; reported ranks/MRR/Hits are restricted to resident nodes");
+        }
+        if (!filtered_eval) {
+            SPDLOG_WARN("Link prediction evaluation is using sampled negatives (filtered=false); reported ranks/MRR/Hits are approximate");
         }
     }
 

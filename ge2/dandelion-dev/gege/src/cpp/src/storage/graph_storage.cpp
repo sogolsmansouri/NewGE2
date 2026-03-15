@@ -105,6 +105,7 @@ double elapsed_graph_storage_ms(std::chrono::high_resolution_clock::time_point s
 GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, shared_ptr<StorageConfig> storage_config) {
     storage_ptrs_ = storage_ptrs;
     train_ = true;
+    configured_full_graph_evaluation_ = storage_config->full_graph_evaluation;
     full_graph_evaluation_ = storage_config->full_graph_evaluation;
     partition_buffer_lp_fast_path_enabled_ = false;
 
@@ -151,6 +152,7 @@ GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, shared_
 GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, bool prefetch) {
     storage_ptrs_ = storage_ptrs;
     train_ = true;
+    configured_full_graph_evaluation_ = false;
     full_graph_evaluation_ = false;
     partition_buffer_lp_fast_path_enabled_ = false;
 

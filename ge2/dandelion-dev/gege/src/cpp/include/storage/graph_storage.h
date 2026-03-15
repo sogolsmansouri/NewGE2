@@ -60,6 +60,7 @@ class GraphModelStorage {
 
    protected:
     bool train_;
+    bool configured_full_graph_evaluation_;
 
     shared_ptr<InMemory> in_memory_embeddings_;
     shared_ptr<InMemory> in_memory_features_;
@@ -361,6 +362,7 @@ class GraphModelStorage {
 
     void setTrainSet() {
         train_ = true;
+        full_graph_evaluation_ = configured_full_graph_evaluation_;
         
         if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
             storage_ptrs_.node_embeddings->device_ = torch::kCUDA;
@@ -381,6 +383,11 @@ class GraphModelStorage {
 
     void setValidationSet() {
         train_ = false;
+        full_graph_evaluation_ = configured_full_graph_evaluation_;
+
+        if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            full_graph_evaluation_ = true;
+        }
 
         if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
             storage_ptrs_.node_embeddings->device_ = torch::kCPU;
@@ -397,6 +404,11 @@ class GraphModelStorage {
 
     void setTestSet() {
         train_ = false;
+        full_graph_evaluation_ = configured_full_graph_evaluation_;
+
+        if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            full_graph_evaluation_ = true;
+        }
         
         if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
             storage_ptrs_.node_embeddings->device_ = torch::kCPU;

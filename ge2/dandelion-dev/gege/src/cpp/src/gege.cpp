@@ -151,7 +151,7 @@ void gege_train(shared_ptr<GegeConfig> gege_config) {
     for (int epoch = 0; epoch < gege_config->training->num_epochs; epoch++) {
         trainer->train(1);
 
-        if ((epoch + 1) % gege_config->evaluation->epochs_per_eval == 0) {
+        if (gege_config->evaluation->epochs_per_eval > 0 && (epoch + 1) % gege_config->evaluation->epochs_per_eval == 0) {
             if (gege_config->storage->dataset->num_valid != -1) {
                 evaluator->evaluate(true);
             }

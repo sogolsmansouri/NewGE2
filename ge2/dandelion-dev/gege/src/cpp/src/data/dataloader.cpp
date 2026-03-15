@@ -1042,7 +1042,7 @@ shared_ptr<Batch> DataLoader::getBatch(at::optional<torch::Device> device, bool 
         if (device.value().is_cuda()) {
             auto device_prepare_start = std::chrono::high_resolution_clock::now();
             batch->to(device.value());
-            loadGPUParameters(batch);
+            loadGPUParameters(batch, device_idx);
             batch->dense_graph_.performMap();
             device_prepare_elapsed = elapsed_ns(device_prepare_start, std::chrono::high_resolution_clock::now());
             add_perf_stat(get_batch_device_prepare_ns_, device_get_batch_device_prepare_ns_, device_idx, device_prepare_elapsed);
@@ -1156,7 +1156,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         batch->root_node_indices_ = std::get<0>(torch::_unique(torch::cat(all_ids)));
 
         // sample neighbors and get unique nodes
-        batch->dense_graph_ = neighbor_sampler_->getNeighbors(batch->root_node_indices_, graph_storage_->current_subgraph_state_->in_memory_subgraph_);
+        batch->dense_graph_ = neighbor_sampler_->getNeighbors(batch->root_node_indices_, graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_);
         batch->unique_node_indices_ = batch->dense_graph_.getNodeIDs();
 
         // map edges and negatives to their corresponding index in unique_node_indices_
@@ -1302,12 +1302,12 @@ void DataLoader::nodeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         batch->node_labels_ = graph_storage_->getNodeLabels(batch->root_node_indices_).flatten(0, 1);
     }
 
-    if (graph_storage_->current_subgraph_state_->global_to_local_index_map_.defined()) {
-        batch->root_node_indices_ = graph_storage_->current_subgraph_state_->global_to_local_index_map_.index_select(0, batch->root_node_indices_);
+    if (graph_storage_->current_subgraph_states_[device_idx]->global_to_local_index_map_.defined()) {
+        batch->root_node_indices_ = graph_storage_->current_subgraph_states_[device_idx]->global_to_local_index_map_.index_select(0, batch->root_node_indices_);
     }
 
     if (neighbor_sampler_ != nullptr) {
-        batch->dense_graph_ = neighbor_sampler_->getNeighbors(batch->root_node_indices_, graph_storage_->current_subgraph_state_->in_memory_subgraph_);
+        batch->dense_graph_ = neighbor_sampler_->getNeighbors(batch->root_node_indices_, graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_);
         batch->unique_node_indices_ = batch->dense_graph_.getNodeIDs();
     } else {
         batch->unique_node_indices_ = batch->root_node_indices_;

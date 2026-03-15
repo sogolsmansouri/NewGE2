@@ -67,6 +67,8 @@ class Reporter {
 
     void addMetric(shared_ptr<Metric> metric) { metrics_.emplace_back(metric); }
 
+    virtual void clear() = 0;
+
     virtual void report() = 0;
 };
 

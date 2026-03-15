@@ -434,14 +434,14 @@ void Model::evaluate_batch(shared_ptr<Batch> batch) {
         torch::Tensor inv_neg_scores = std::get<3>(all_scores);
 
         if (neg_scores.defined()) {
-            std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_)->addResult(pos_scores, neg_scores);
+            std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_)->addResult(pos_scores, neg_scores, batch->edges_);
         }
 
         if (inv_neg_scores.defined()) {
-            std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_)->addResult(inv_pos_scores, inv_neg_scores);
+            std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_)->addResult(inv_pos_scores, inv_neg_scores, batch->edges_);
         }
     } else if (learning_task_ == LearningTask::NODE_CLASSIFICATION) {
-        torch::Tensor y_pred = forward_nc(batch->node_embeddings_, batch->node_features_, batch->dense_graph_, true);
+        torch::Tensor y_pred = forward_nc(batch->node_embeddings_, batch->node_features_, batch->dense_graph_, false);
         torch::Tensor labels = batch->node_labels_;
 
         std::dynamic_pointer_cast<NodeClassificationReporter>(reporter_)->addResult(labels, y_pred);

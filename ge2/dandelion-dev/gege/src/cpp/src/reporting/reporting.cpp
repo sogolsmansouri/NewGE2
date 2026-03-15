@@ -44,9 +44,11 @@ LinkPredictionReporter::~LinkPredictionReporter() { clear(); }
 
 void LinkPredictionReporter::clear() {
     all_ranks_ = torch::Tensor();
+    all_scores_ = torch::Tensor();
+    all_edges_ = torch::Tensor();
     per_batch_ranks_ = {};
     per_batch_scores_ = {};
-    all_scores_ = torch::Tensor();
+    per_batch_edges_ = {};
 }
 
 torch::Tensor LinkPredictionReporter::computeRanks(torch::Tensor pos_scores, torch::Tensor neg_scores) {
@@ -184,8 +186,10 @@ NodeClassificationReporter::~NodeClassificationReporter() { clear(); }
 void NodeClassificationReporter::clear() {
     all_y_true_ = torch::Tensor();
     all_y_pred_ = torch::Tensor();
+    all_nodes_ = torch::Tensor();
     per_batch_y_true_ = {};
     per_batch_y_pred_ = {};
+    per_batch_nodes_ = {};
 }
 
 void NodeClassificationReporter::addResult(torch::Tensor y_true, torch::Tensor y_pred, torch::Tensor node_ids) {

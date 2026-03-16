@@ -105,6 +105,25 @@ double elapsed_graph_storage_ms(std::chrono::high_resolution_clock::time_point s
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+const char *graph_storage_backend_name(const shared_ptr<Storage> &storage) {
+    if (storage == nullptr) {
+        return "null";
+    }
+    if (instance_of<Storage, MemPartitionBufferStorage>(storage)) {
+        return "mem_partition_buffer";
+    }
+    if (instance_of<Storage, PartitionBufferStorage>(storage)) {
+        return "partition_buffer";
+    }
+    if (instance_of<Storage, InMemory>(storage)) {
+        return "in_memory";
+    }
+    if (instance_of<Storage, FlatFile>(storage)) {
+        return "flat_file";
+    }
+    return "storage";
+}
+
 }  // namespace
 
 GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, shared_ptr<StorageConfig> storage_config) {
@@ -322,73 +341,145 @@ void GraphModelStorage::_unload(shared_ptr<Storage> storage, bool write) {
 }
 
 void GraphModelStorage::load() {
-    _load(storage_ptrs_.edges);
-    _load(storage_ptrs_.train_edges);
-    _load(storage_ptrs_.nodes);
+    bool log_startup_timing = startup_timing_enabled();
+    auto total_start = std::chrono::high_resolution_clock::now();
+
+    auto load_with_timing = [&](const char *label, shared_ptr<Storage> storage) {
+        if (storage == nullptr) {
+            return;
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        _load(storage);
+        if (log_startup_timing) {
+            auto end = std::chrono::high_resolution_clock::now();
+            SPDLOG_INFO("[startup-timing][GraphModelStorage::load] label={} backend={} device={} dim0={} dim1={} ms={:.3f}",
+                        label, graph_storage_backend_name(storage), storage->device_.str(), storage->dim0_size_, storage->dim1_size_,
+                        elapsed_graph_storage_ms(start, end));
+        }
+    };
+
+    load_with_timing("edges", storage_ptrs_.edges);
+    load_with_timing("train_edges", storage_ptrs_.train_edges);
+    load_with_timing("nodes", storage_ptrs_.nodes);
 
     if (train_) {
         if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
             //rePartition();
         }
-        _load(storage_ptrs_.node_embeddings);
-        _load(storage_ptrs_.node_optimizer_state);
-        _load(storage_ptrs_.node_features);
+        load_with_timing("node_embeddings", storage_ptrs_.node_embeddings);
+        load_with_timing("node_optimizer_state", storage_ptrs_.node_optimizer_state);
+        load_with_timing("node_features", storage_ptrs_.node_features);
     } else {
         if (storage_ptrs_.node_embeddings != nullptr) {
             if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings) && full_graph_evaluation_) {
-                _load(in_memory_embeddings_);
+                load_with_timing("in_memory_embeddings", in_memory_embeddings_);
             } else {
-                _load(storage_ptrs_.node_embeddings);
+                load_with_timing("node_embeddings", storage_ptrs_.node_embeddings);
             }
         }
 
         if (storage_ptrs_.node_features != nullptr) {
             if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_features) && full_graph_evaluation_) {
-                _load(in_memory_features_);
+                load_with_timing("in_memory_features", in_memory_features_);
             } else {
-                _load(storage_ptrs_.node_features);
+                load_with_timing("node_features", storage_ptrs_.node_features);
             }
         }
     }
 
-    _load(storage_ptrs_.encoded_nodes);
-    _load(storage_ptrs_.node_labels);
-    _load(storage_ptrs_.relation_features);
+    load_with_timing("encoded_nodes", storage_ptrs_.encoded_nodes);
+    load_with_timing("node_labels", storage_ptrs_.node_labels);
+    load_with_timing("relation_features", storage_ptrs_.relation_features);
+
+    if (log_startup_timing) {
+        auto total_end = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO("[startup-timing][GraphModelStorage::load][summary] train={} full_graph_evaluation={} total_ms={:.3f}",
+                    train_, full_graph_evaluation_, elapsed_graph_storage_ms(total_start, total_end));
+    }
 }
 
 void GraphModelStorage::load_g() {
+    bool log_startup_timing = startup_timing_enabled();
+    auto total_start = std::chrono::high_resolution_clock::now();
+
+    auto load_with_timing = [&](const char *label, shared_ptr<Storage> storage) {
+        if (storage == nullptr) {
+            return;
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        _load(storage);
+        if (log_startup_timing) {
+            auto end = std::chrono::high_resolution_clock::now();
+            SPDLOG_INFO("[startup-timing][GraphModelStorage::load_g] label={} backend={} device={} dim0={} dim1={} ms={:.3f}",
+                        label, graph_storage_backend_name(storage), storage->device_.str(), storage->dim0_size_, storage->dim1_size_,
+                        elapsed_graph_storage_ms(start, end));
+        }
+    };
+
     if (train_) {
-        _load(storage_ptrs_.node_embeddings_g);
-        _load(storage_ptrs_.node_optimizer_state_g);
+        load_with_timing("node_embeddings_g", storage_ptrs_.node_embeddings_g);
+        load_with_timing("node_optimizer_state_g", storage_ptrs_.node_optimizer_state_g);
+    }
+
+    if (log_startup_timing) {
+        auto total_end = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO("[startup-timing][GraphModelStorage::load_g][summary] train={} total_ms={:.3f}",
+                    train_, elapsed_graph_storage_ms(total_start, total_end));
     }
 }
 
 void GraphModelStorage::unload(bool write) {
-    _unload(storage_ptrs_.edges, false);
-    _unload(storage_ptrs_.train_edges, false);
-    _unload(storage_ptrs_.validation_edges, false);
-    _unload(storage_ptrs_.test_edges, false);
-    _unload(storage_ptrs_.nodes, false);
-    _unload(storage_ptrs_.train_nodes, false);
-    _unload(storage_ptrs_.valid_nodes, false);
-    _unload(storage_ptrs_.test_nodes, false);
-    _unload(storage_ptrs_.node_embeddings, write);
-    _unload(storage_ptrs_.node_embeddings_g, write);
-    _unload(storage_ptrs_.encoded_nodes, write);
-    _unload(storage_ptrs_.node_optimizer_state, write);
-    _unload(storage_ptrs_.node_optimizer_state_g, write);
-    _unload(storage_ptrs_.node_features, false);
-    _unload(storage_ptrs_.relation_features, false);
+    bool log_startup_timing = startup_timing_enabled();
+    auto total_start = std::chrono::high_resolution_clock::now();
 
-    _unload(in_memory_embeddings_, false);
-    _unload(in_memory_features_, false);
+    auto unload_with_timing = [&](const char *label, shared_ptr<Storage> storage, bool storage_write) {
+        if (storage == nullptr) {
+            return;
+        }
+
+        auto start = std::chrono::high_resolution_clock::now();
+        _unload(storage, storage_write);
+        if (log_startup_timing) {
+            auto end = std::chrono::high_resolution_clock::now();
+            SPDLOG_INFO("[startup-timing][GraphModelStorage::unload] label={} backend={} device={} dim0={} dim1={} write={} ms={:.3f}",
+                        label, graph_storage_backend_name(storage), storage->device_.str(), storage->dim0_size_, storage->dim1_size_,
+                        storage_write, elapsed_graph_storage_ms(start, end));
+        }
+    };
+
+    unload_with_timing("edges", storage_ptrs_.edges, false);
+    unload_with_timing("train_edges", storage_ptrs_.train_edges, false);
+    unload_with_timing("validation_edges", storage_ptrs_.validation_edges, false);
+    unload_with_timing("test_edges", storage_ptrs_.test_edges, false);
+    unload_with_timing("nodes", storage_ptrs_.nodes, false);
+    unload_with_timing("train_nodes", storage_ptrs_.train_nodes, false);
+    unload_with_timing("valid_nodes", storage_ptrs_.valid_nodes, false);
+    unload_with_timing("test_nodes", storage_ptrs_.test_nodes, false);
+    unload_with_timing("node_embeddings", storage_ptrs_.node_embeddings, write);
+    unload_with_timing("node_embeddings_g", storage_ptrs_.node_embeddings_g, write);
+    unload_with_timing("encoded_nodes", storage_ptrs_.encoded_nodes, write);
+    unload_with_timing("node_optimizer_state", storage_ptrs_.node_optimizer_state, write);
+    unload_with_timing("node_optimizer_state_g", storage_ptrs_.node_optimizer_state_g, write);
+    unload_with_timing("node_features", storage_ptrs_.node_features, false);
+    unload_with_timing("relation_features", storage_ptrs_.relation_features, false);
+
+    unload_with_timing("in_memory_embeddings", in_memory_embeddings_, false);
+    unload_with_timing("in_memory_features", in_memory_features_, false);
 
     for (auto f_edges : storage_ptrs_.filter_edges) {
-        _unload(f_edges, false);
+        unload_with_timing("filter_edges", f_edges, false);
     }
     for (int i = 0; i < active_edges_.size(); i ++)
         active_edges_[i] = torch::Tensor();
     active_nodes_ = torch::Tensor();
+
+    if (log_startup_timing) {
+        auto total_end = std::chrono::high_resolution_clock::now();
+        SPDLOG_INFO("[startup-timing][GraphModelStorage::unload][summary] train={} full_graph_evaluation={} write={} total_ms={:.3f}",
+                    train_, full_graph_evaluation_, write, elapsed_graph_storage_ms(total_start, total_end));
+    }
 }
 
 void GraphModelStorage::setEdgesStorage(shared_ptr<Storage> edge_storage) {

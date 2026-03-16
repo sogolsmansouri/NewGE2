@@ -8,6 +8,7 @@
 #include <cstdlib>
 
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include "common/util.h"
@@ -86,6 +87,73 @@ int64_t parse_env_int(const char *name, int64_t default_value) {
     } catch (...) {
         return default_value;
     }
+}
+
+bool eval_finite_debug_enabled() {
+    static bool enabled = parse_env_flag("GEGE_EVAL_FINITE_DEBUG", false);
+    return enabled;
+}
+
+int64_t eval_finite_debug_max_logs() {
+    static int64_t max_logs = std::max<int64_t>(parse_env_int("GEGE_EVAL_FINITE_DEBUG_MAX_LOGS", 32), 0);
+    return max_logs;
+}
+
+std::atomic<int64_t> &eval_finite_debug_log_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_log_eval_finite_debug(int64_t &log_id) {
+    if (!eval_finite_debug_enabled()) {
+        return false;
+    }
+
+    int64_t current = eval_finite_debug_log_counter().fetch_add(1);
+    if (current >= eval_finite_debug_max_logs()) {
+        return false;
+    }
+
+    log_id = current;
+    return true;
+}
+
+std::string tensor_shape_string(const torch::Tensor &tensor) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int64_t dim = 0; dim < tensor.dim(); dim++) {
+        if (dim > 0) {
+            oss << ", ";
+        }
+        oss << tensor.size(dim);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void log_non_finite_rows_if_any(const char *stage, int partition_id, int src_dev, int dst_dev, const torch::Tensor &tensor) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return;
+    }
+
+    torch::Tensor finite = torch::isfinite(tensor);
+    if (finite.all().item<bool>()) {
+        return;
+    }
+
+    int64_t log_id = -1;
+    if (!should_log_eval_finite_debug(log_id)) {
+        return;
+    }
+
+    int64_t invalid_values = (~finite).sum().item<int64_t>();
+    int64_t invalid_rows = invalid_values;
+    if (tensor.dim() >= 2) {
+        invalid_rows = (~finite).reshape({tensor.size(0), -1}).any(1).sum().item<int64_t>();
+    }
+
+    SPDLOG_ERROR("[eval-finite-debug][peer-relay {}][{}] partition={} src_dev={} dst_dev={} invalid_values={} invalid_rows={} shape={}",
+                 log_id, stage, partition_id, src_dev, dst_dev, invalid_values, invalid_rows, tensor_shape_string(tensor));
 }
 
 bool stage_debug_enabled() {
@@ -627,6 +695,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
         auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
         c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
+        std::vector<std::tuple<int, int, int64_t, int64_t>> relay_debug_slots;
 
         auto *next_state_ptr = next_state.data_ptr<int64_t>();
         for (int64_t slot = 0; slot < next_state.numel(); slot++) {
@@ -659,9 +728,26 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
                                                       partition_id, src_buffer->device_.index(), buffer->device_.index(),
                                                       cudaGetErrorString(status)));
             }
+            if (eval_finite_debug_enabled()) {
+                relay_debug_slots.emplace_back(partition_id, src_dev, src_slot, slot);
+            }
         }
 
         cudaStreamSynchronize(comm_stream.stream());
+
+        if (eval_finite_debug_enabled()) {
+            for (const auto &[partition_id, src_dev, src_slot, dst_slot] : relay_debug_slots) {
+                auto *src_buffer = buffers_[src_dev];
+                Partition *dst_partition = buffer->partition_table_[partition_id];
+                int64_t rows = dst_partition->partition_size_;
+                torch::Tensor src_view = src_buffer->buffer_tensor_gpu_view_.slice(
+                    0, src_slot * src_buffer->partition_size_, src_slot * src_buffer->partition_size_ + rows);
+                torch::Tensor dst_view = staged_view.slice(
+                    0, dst_slot * buffer->partition_size_, dst_slot * buffer->partition_size_ + rows);
+                log_non_finite_rows_if_any("src", partition_id, src_buffer->device_.index(), buffer->device_.index(), src_view);
+                log_non_finite_rows_if_any("staged", partition_id, src_buffer->device_.index(), buffer->device_.index(), dst_view);
+            }
+        }
     }
 
     peer_relay_staged_views_[device_idx] = staged_view;

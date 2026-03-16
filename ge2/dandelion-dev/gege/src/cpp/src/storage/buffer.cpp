@@ -151,6 +151,29 @@ std::string tensor_shape_string(const torch::Tensor &tensor) {
     return oss.str();
 }
 
+std::string tensor_prefix_string(const torch::Tensor &tensor, int64_t limit) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return "[]";
+    }
+
+    torch::Tensor flat_cpu = tensor.flatten().to(torch::kCPU).to(torch::kInt64);
+    int64_t count = std::min<int64_t>(flat_cpu.numel(), limit);
+    std::ostringstream oss;
+    oss << "[";
+    auto accessor = flat_cpu.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < count; i++) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << accessor[i];
+    }
+    if (flat_cpu.numel() > count) {
+        oss << ", ...";
+    }
+    oss << "]";
+    return oss.str();
+}
+
 void log_non_finite_rows_if_any(const char *stage, int64_t log_id, const torch::Device &device, int partition_id, const torch::Tensor &tensor) {
     if (!tensor.defined() || tensor.numel() == 0) {
         return;
@@ -170,6 +193,42 @@ void log_non_finite_rows_if_any(const char *stage, int64_t log_id, const torch::
     SPDLOG_ERROR(
         "[eval-finite-debug][buffer {}][{}] device={} partition={} invalid_values={} invalid_rows={} shape={}",
         log_id, stage, device.str(), partition_id, invalid_values, invalid_rows, tensor_shape_string(tensor));
+}
+
+void log_non_finite_index_add_rows_if_any(const char *stage, const torch::Device &device, int64_t debug_update_id,
+                                          const torch::Tensor &local_rows, const torch::Tensor &tensor) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return;
+    }
+
+    torch::Tensor finite = torch::isfinite(tensor);
+    if (finite.all().item<bool>()) {
+        return;
+    }
+
+    int64_t log_id = -1;
+    if (!should_log_eval_finite_debug(log_id)) {
+        return;
+    }
+
+    int64_t invalid_values = (~finite).sum().item<int64_t>();
+    torch::Tensor invalid_row_mask = (~finite).reshape({tensor.size(0), -1}).any(1);
+    torch::Tensor invalid_row_indices = invalid_row_mask.nonzero().flatten();
+    int64_t invalid_rows = invalid_row_indices.numel();
+    int64_t sample_count = std::min<int64_t>(invalid_rows, 8);
+    torch::Tensor sample_rows = torch::Tensor();
+    if (sample_count > 0 && local_rows.defined()) {
+        if (local_rows.numel() == tensor.size(0)) {
+            sample_rows = local_rows.index_select(0, invalid_row_indices.slice(0, 0, sample_count));
+        } else {
+            sample_rows = local_rows.slice(0, 0, std::min<int64_t>(local_rows.numel(), sample_count));
+        }
+    }
+
+    SPDLOG_ERROR(
+        "[eval-finite-debug][indexAdd {}][{}] update_id={} device={} invalid_values={} invalid_rows={} tensor_shape={} sample_local_rows={}",
+        log_id, stage, debug_update_id, device.str(), invalid_values, invalid_rows, tensor_shape_string(tensor),
+        tensor_prefix_string(sample_rows, 8));
 }
 
 bool stage_debug_enabled() {
@@ -1041,8 +1100,25 @@ void MemPartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
     }
     int64_t debug_update_id = -1;
     bool run_stage_debug = should_run_stage_debug(debug_update_id);
+    bool run_eval_finite_debug = eval_finite_debug_enabled();
     auto index_add_start = std::chrono::high_resolution_clock::now();
     auto step_start = index_add_start;
+    torch::Tensor touched_rows;
+
+    if (run_eval_finite_debug) {
+        torch::Tensor values_finite = torch::isfinite(values);
+        if (!values_finite.all().item<bool>()) {
+            torch::Tensor invalid_update_rows = (~values_finite).reshape({values.size(0), -1}).any(1).nonzero().flatten();
+            torch::Tensor sample_rows = torch::Tensor();
+            if (invalid_update_rows.numel() > 0) {
+                sample_rows = indices.index_select(0, invalid_update_rows.slice(0, 0, std::min<int64_t>(invalid_update_rows.numel(), 8)));
+            }
+            log_non_finite_index_add_rows_if_any("values", device_, debug_update_id, sample_rows,
+                                                 values.index_select(0, invalid_update_rows.numel() > 0 ? invalid_update_rows : torch::arange(0, 0, indices.options())));
+        }
+
+        touched_rows = std::get<0>(torch::_unique(indices.to(torch::kInt64)));
+    }
     
     if (values.device().is_cuda()) {
 #ifdef GEGE_CUDA
@@ -1099,6 +1175,16 @@ void MemPartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
             SPDLOG_INFO("[stage-debug][buffer.indexAdd][update {}][step 1] index_add_cpu ms={:.3f} rows={} dim={}",
                         debug_update_id, elapsed_ms(step_start, now), size, d);
         }
+    }
+
+    if (run_eval_finite_debug && touched_rows.defined() && touched_rows.numel() > 0) {
+        torch::Tensor touched_values;
+        if (values.device().is_cuda()) {
+            touched_values = buffer_tensor_gpu_view_.index_select(0, touched_rows);
+        } else {
+            touched_values = buffer_tensor_view_.index_select(0, touched_rows.to(buffer_tensor_view_.device()));
+        }
+        log_non_finite_index_add_rows_if_any("buffer_rows", device_, debug_update_id, touched_rows, touched_values);
     }
 
     if (run_stage_debug) {

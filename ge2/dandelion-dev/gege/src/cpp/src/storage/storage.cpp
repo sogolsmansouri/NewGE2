@@ -550,6 +550,24 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
     peer_relay_build_barrier_ = std::make_unique<ReusableBarrier>(static_cast<int>(devices_.size()));
     peer_relay_next_states_.resize(devices_.size());
     peer_relay_staged_views_.resize(devices_.size());
+
+    try {
+        for (std::size_t device_idx = 0; device_idx < devices_.size(); device_idx++) {
+            auto *buffer = buffers_[device_idx];
+            c10::cuda::CUDAGuard device_guard(buffer->device_);
+            peer_relay_staged_views_[device_idx] = torch::empty_like(buffer->buffer_tensor_gpu_view_);
+        }
+    } catch (const c10::Error &e) {
+        peer_relay_ready_barrier_.reset();
+        peer_relay_build_barrier_.reset();
+        peer_relay_next_states_.clear();
+        peer_relay_staged_views_.clear();
+        cudaGetLastError();
+        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: unable to reserve relay staging buffers; falling back to CPU-backed swaps ({})",
+                    e.what());
+        return;
+    }
+
     peer_relay_runtime_enabled_ = true;
     SPDLOG_INFO("Enabled GEGE_PARTITION_BUFFER_PEER_RELAY for {} CUDA devices; CPU backing store will be synchronized at unload/eval boundaries", devices_.size());
 #endif
@@ -715,7 +733,6 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
     }
 
     peer_relay_next_states_[device_idx] = (*buffer->buffer_state_iterator_).clone();
-    peer_relay_staged_views_[device_idx] = torch::Tensor();
     peer_relay_ready_barrier_->arrive_and_wait();
 
     std::vector<int> current_owner(options_->num_partitions, -1);
@@ -729,9 +746,10 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
     }
 
     auto next_state = peer_relay_next_states_[device_idx].to(torch::kCPU).to(torch::kInt64).contiguous();
-    // Every slot in the next buffer state is fully overwritten by relay copies,
-    // so zero-filling the staging tensor just burns swap time.
-    torch::Tensor staged_view = torch::empty_like(buffer->buffer_tensor_gpu_view_);
+    torch::Tensor staged_view = peer_relay_staged_views_[device_idx];
+    if (!staged_view.defined()) {
+        throw GegeRuntimeException("Peer relay staging buffer is undefined after successful initialization");
+    }
     {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
         auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
@@ -791,7 +809,6 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
         }
     }
 
-    peer_relay_staged_views_[device_idx] = staged_view;
     peer_relay_build_barrier_->arrive_and_wait();
 
     auto previous_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
@@ -804,7 +821,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
         partition->data_ptr_ = nullptr;
     }
 
+    torch::Tensor previous_gpu_view = buffer->buffer_tensor_gpu_view_;
     buffer->buffer_tensor_gpu_view_ = peer_relay_staged_views_[device_idx];
+    peer_relay_staged_views_[device_idx] = previous_gpu_view;
     buffer->buffer_state_ = *buffer->buffer_state_iterator_;
     for (int i = 0; i < buffer->buffer_sizes_; i++) {
         if (buffer->buffer_state_iterator_ != buffer->buffer_states_.end()) {

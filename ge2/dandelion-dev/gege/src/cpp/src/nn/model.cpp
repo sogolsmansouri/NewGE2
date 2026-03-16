@@ -1,5 +1,9 @@
 #include "nn/model.h"
 
+#include <atomic>
+#include <cstdlib>
+#include <sstream>
+
 #ifdef GEGE_CUDA
 #include <torch/csrc/cuda/nccl.h>
 #endif
@@ -11,6 +15,106 @@
 #include "nn/layers/embedding/embedding.h"
 #include "nn/model_helpers.h"
 #include "reporting/logger.h"
+
+namespace {
+
+bool parse_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+    return default_value;
+}
+
+int64_t parse_env_int(const char *name, int64_t default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    try {
+        return std::stoll(std::string(raw));
+    } catch (...) {
+        return default_value;
+    }
+}
+
+bool eval_finite_debug_enabled() {
+    static bool enabled = parse_env_flag("GEGE_EVAL_FINITE_DEBUG", false);
+    return enabled;
+}
+
+int64_t eval_finite_debug_max_logs() {
+    static int64_t max_logs = std::max<int64_t>(parse_env_int("GEGE_EVAL_FINITE_DEBUG_MAX_LOGS", 16), 0);
+    return max_logs;
+}
+
+std::atomic<int64_t> &eval_finite_debug_log_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_log_eval_finite_debug(int64_t &log_id) {
+    if (!eval_finite_debug_enabled()) {
+        return false;
+    }
+
+    int64_t current = eval_finite_debug_log_counter().fetch_add(1);
+    if (current >= eval_finite_debug_max_logs()) {
+        return false;
+    }
+
+    log_id = current;
+    return true;
+}
+
+std::string tensor_shape_string(const torch::Tensor &tensor) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int64_t dim = 0; dim < tensor.dim(); dim++) {
+        if (dim > 0) {
+            oss << ", ";
+        }
+        oss << tensor.size(dim);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void log_eval_tensor_if_non_finite(const char *stage, int batch_id, const torch::Tensor &tensor) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return;
+    }
+
+    torch::Tensor finite = torch::isfinite(tensor);
+    if (finite.all().item<bool>()) {
+        return;
+    }
+
+    int64_t log_id = -1;
+    if (!should_log_eval_finite_debug(log_id)) {
+        return;
+    }
+
+    int64_t invalid_values = (~finite).sum().item<int64_t>();
+    int64_t invalid_rows = invalid_values;
+    if (tensor.dim() >= 2) {
+        invalid_rows = (~finite).reshape({tensor.size(0), -1}).any(1).sum().item<int64_t>();
+    }
+
+    SPDLOG_ERROR("[eval-finite-debug][model {}][{}] batch_id={} invalid_values={} invalid_rows={} shape={} device={}",
+                 log_id, stage, batch_id, invalid_values, invalid_rows, tensor_shape_string(tensor), tensor.device().str());
+}
+
+}  // namespace
 
 Model::Model(shared_ptr<GeneralEncoder> encoder, shared_ptr<Decoder> decoder, shared_ptr<LossFunction> loss, shared_ptr<Reporter> reporter,
              std::vector<shared_ptr<Optimizer>> optimizers)
@@ -316,8 +420,15 @@ torch::Tensor Model::forward_nc(at::optional<torch::Tensor> node_embeddings, at:
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::forward_lp(shared_ptr<Batch> batch, bool train) {
+    if (!train) {
+        log_eval_tensor_if_non_finite("node_embeddings", batch->batch_id_, batch->node_embeddings_);
+        log_eval_tensor_if_non_finite("node_features", batch->batch_id_, batch->node_features_);
+    }
 
     torch::Tensor encoded_nodes = encoder_->forward(batch->node_embeddings_, batch->node_features_, batch->dense_graph_, train);
+    if (!train) {
+        log_eval_tensor_if_non_finite("encoded_nodes", batch->batch_id_, encoded_nodes);
+    }
     // call proper decoder
     torch::Tensor pos_scores;
     torch::Tensor neg_scores;
@@ -354,6 +465,13 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
 
     if (inv_neg_scores.defined()) {
         inv_neg_scores = apply_score_filter(inv_neg_scores, batch->src_neg_filter_);
+    }
+
+    if (!train) {
+        log_eval_tensor_if_non_finite("pos_scores", batch->batch_id_, pos_scores);
+        log_eval_tensor_if_non_finite("neg_scores", batch->batch_id_, neg_scores);
+        log_eval_tensor_if_non_finite("inv_pos_scores", batch->batch_id_, inv_pos_scores);
+        log_eval_tensor_if_non_finite("inv_neg_scores", batch->batch_id_, inv_neg_scores);
     }
 
     return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores);

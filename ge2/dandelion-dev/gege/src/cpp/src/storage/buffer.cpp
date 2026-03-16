@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <iostream>
+#include <sstream>
 #include <string>
 
 #include <functional>
@@ -106,6 +107,69 @@ int64_t parse_env_int(const char *name, int64_t default_value) {
     } catch (...) {
         return default_value;
     }
+}
+
+bool eval_finite_debug_enabled() {
+    static bool enabled = parse_env_flag("GEGE_EVAL_FINITE_DEBUG", false);
+    return enabled;
+}
+
+int64_t eval_finite_debug_max_logs() {
+    static int64_t max_logs = std::max<int64_t>(parse_env_int("GEGE_EVAL_FINITE_DEBUG_MAX_LOGS", 8), 0);
+    return max_logs;
+}
+
+std::atomic<int64_t> &eval_finite_debug_log_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_log_eval_finite_debug(int64_t &log_id) {
+    if (!eval_finite_debug_enabled()) {
+        return false;
+    }
+
+    int64_t current = eval_finite_debug_log_counter().fetch_add(1);
+    if (current >= eval_finite_debug_max_logs()) {
+        return false;
+    }
+
+    log_id = current;
+    return true;
+}
+
+std::string tensor_shape_string(const torch::Tensor &tensor) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int64_t dim = 0; dim < tensor.dim(); dim++) {
+        if (dim > 0) {
+            oss << ", ";
+        }
+        oss << tensor.size(dim);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void log_non_finite_rows_if_any(const char *stage, int64_t log_id, const torch::Device &device, int partition_id, const torch::Tensor &tensor) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return;
+    }
+
+    torch::Tensor finite = torch::isfinite(tensor);
+    if (finite.all().item<bool>()) {
+        return;
+    }
+
+    int64_t invalid_values = (~finite).sum().item<int64_t>();
+    int64_t invalid_rows = invalid_values;
+    if (tensor.dim() >= 2) {
+        invalid_rows = (~finite).reshape({tensor.size(0), -1}).any(1).sum().item<int64_t>();
+    }
+
+    SPDLOG_ERROR(
+        "[eval-finite-debug][buffer {}][{}] device={} partition={} invalid_values={} invalid_rows={} shape={}",
+        log_id, stage, device.str(), partition_id, invalid_values, invalid_rows, tensor_shape_string(tensor));
 }
 
 bool stage_debug_enabled() {
@@ -1150,6 +1214,8 @@ void MemPartitionBuffer::unload(bool write) {
     if (loaded_) {
         int64_t timing_id = -1;
         bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
+        int64_t eval_finite_log_id = -1;
+        bool log_eval_finite = should_log_eval_finite_debug(eval_finite_log_id);
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double gpu_to_cpu_ms = 0.0;
@@ -1163,9 +1229,34 @@ void MemPartitionBuffer::unload(bool write) {
             buff_mem_unload_ = buffer_tensor_view_.data_ptr();
 
         }
+
+        if (log_eval_finite) {
+            auto active_state = buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+            auto *state_ptr = active_state.data_ptr<int64_t>();
+            for (int64_t slot = 0; slot < active_state.numel(); slot++) {
+                int partition_id = static_cast<int>(state_ptr[slot]);
+                Partition *partition = partition_table_[partition_id];
+                int64_t buffer_offset = partition->buffer_idx_ * partition_size_;
+                torch::Tensor partition_view =
+                    buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                log_non_finite_rows_if_any("gpu_copy", eval_finite_log_id, device_, partition_id, partition_view);
+            }
+        }
         
         sync();
         double sync_ms = 0.0;
+        if (log_eval_finite) {
+            auto active_state = buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+            auto *state_ptr = active_state.data_ptr<int64_t>();
+            for (int64_t slot = 0; slot < active_state.numel(); slot++) {
+                int partition_id = static_cast<int>(state_ptr[slot]);
+                Partition *partition = partition_table_[partition_id];
+                torch::Tensor global_ids =
+                    pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_);
+                torch::Tensor host_snapshot = data_storage_.index_select(0, global_ids);
+                log_non_finite_rows_if_any("host_sync", eval_finite_log_id, device_, partition_id, host_snapshot);
+            }
+        }
         if (log_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             sync_ms = elapsed_ms(phase_start, now);

@@ -67,6 +67,110 @@ bool partition_buffer_pipeline_timing_enabled() {
     return enabled;
 }
 
+bool eval_finite_debug_enabled() {
+    static bool enabled = parse_env_flag("GEGE_EVAL_FINITE_DEBUG", false);
+    return enabled;
+}
+
+int64_t eval_finite_debug_max_logs() {
+    static int64_t max_logs = std::max<int64_t>(parse_env_int("GEGE_EVAL_FINITE_DEBUG_MAX_LOGS", 8), 0);
+    return max_logs;
+}
+
+std::atomic<int64_t> &eval_finite_debug_log_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+bool should_log_eval_finite_debug(int64_t &log_id) {
+    if (!eval_finite_debug_enabled()) {
+        return false;
+    }
+
+    int64_t current = eval_finite_debug_log_counter().fetch_add(1);
+    if (current >= eval_finite_debug_max_logs()) {
+        return false;
+    }
+
+    log_id = current;
+    return true;
+}
+
+std::string tensor_shape_string(const torch::Tensor &tensor) {
+    std::ostringstream oss;
+    oss << "[";
+    for (int64_t dim = 0; dim < tensor.dim(); dim++) {
+        if (dim > 0) {
+            oss << ", ";
+        }
+        oss << tensor.size(dim);
+    }
+    oss << "]";
+    return oss.str();
+}
+
+std::string tensor_prefix_string(const torch::Tensor &tensor, int64_t limit) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return "[]";
+    }
+
+    torch::Tensor flat_cpu = tensor.flatten().to(torch::kCPU).to(torch::kInt64);
+    int64_t count = std::min<int64_t>(flat_cpu.numel(), limit);
+    std::ostringstream oss;
+    oss << "[";
+    auto accessor = flat_cpu.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < count; i++) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << accessor[i];
+    }
+    if (flat_cpu.numel() > count) {
+        oss << ", ...";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+void log_eval_embedding_finite_state_if_needed(const shared_ptr<Batch> &batch, const shared_ptr<GraphModelStorage> &graph_storage) {
+    if (!eval_finite_debug_enabled() || batch == nullptr || batch->train_ || !batch->node_embeddings_.defined() || batch->node_embeddings_.numel() == 0) {
+        return;
+    }
+
+    torch::Tensor finite = torch::isfinite(batch->node_embeddings_);
+    if (finite.all().item<bool>()) {
+        return;
+    }
+
+    int64_t log_id = -1;
+    if (!should_log_eval_finite_debug(log_id)) {
+        return;
+    }
+
+    int64_t invalid_values = (~finite).sum().item<int64_t>();
+    torch::Tensor invalid_row_mask = (~finite).reshape({batch->node_embeddings_.size(0), -1}).any(1);
+    torch::Tensor invalid_rows = invalid_row_mask.nonzero().flatten();
+    int64_t invalid_row_count = invalid_rows.numel();
+    int64_t sample_count = std::min<int64_t>(invalid_row_count, 8);
+    torch::Tensor sample_rows = invalid_rows.slice(0, 0, sample_count);
+    torch::Tensor sample_ids = batch->unique_node_indices_.index_select(0, sample_rows.to(batch->unique_node_indices_.device()));
+
+    int64_t min_node_id = -1;
+    int64_t max_node_id = -1;
+    if (batch->unique_node_indices_.defined() && batch->unique_node_indices_.numel() > 0) {
+        min_node_id = batch->unique_node_indices_.min().item<int64_t>();
+        max_node_id = batch->unique_node_indices_.max().item<int64_t>();
+    }
+
+    SPDLOG_ERROR(
+        "[eval-finite-debug][loadCPUParameters {}] batch_id={} invalid_values={} invalid_rows={} unique_nodes={} sample_node_ids={} min_node_id={} max_node_id={} embedding_shape={} embedding_device={} storage_device={}",
+        log_id, batch->batch_id_, invalid_values, invalid_row_count,
+        batch->unique_node_indices_.defined() ? batch->unique_node_indices_.numel() : 0,
+        tensor_prefix_string(sample_ids, 8), min_node_id, max_node_id, tensor_shape_string(batch->node_embeddings_),
+        batch->node_embeddings_.device().str(),
+        graph_storage != nullptr && graph_storage->storage_ptrs_.node_embeddings != nullptr ? graph_storage->storage_ptrs_.node_embeddings->device_.str() : "undefined");
+}
+
 int64_t partition_buffer_pipeline_timing_max() {
     static int64_t max_timings = std::max<int64_t>(parse_env_int("GEGE_PARTITION_BUFFER_PIPELINE_TIMING_MAX", 8), 0);
     return max_timings;
@@ -1325,6 +1429,7 @@ void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
     if (graph_storage_->storage_ptrs_.node_embeddings != nullptr) {
         if (graph_storage_->storage_ptrs_.node_embeddings->device_ != torch::kCUDA) {
             batch->node_embeddings_ = graph_storage_->getNodeEmbeddings(batch->unique_node_indices_);
+            log_eval_embedding_finite_state_if_needed(batch, graph_storage_);
             if (train_) {
                 batch->node_embeddings_state_ = graph_storage_->getNodeEmbeddingState(batch->unique_node_indices_);
                 if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {

@@ -49,9 +49,40 @@ const std::string &unique_capture_dir() {
     return dir;
 }
 
+bool parse_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+    return default_value;
+}
+
 int64_t unique_capture_max_batches() {
     static int64_t max_batches = std::max<int64_t>(parse_env_int("GEGE_UNIQUE_CAPTURE_MAX_BATCHES", 0), 0);
     return max_batches;
+}
+
+bool unique_backend_log_enabled() {
+    static bool enabled = parse_env_flag("GEGE_UNIQUE_LOG", true);
+    return enabled;
+}
+
+int64_t unique_fallback_log_max() {
+    static int64_t max_logs = std::max<int64_t>(parse_env_int("GEGE_UNIQUE_FALLBACK_LOG_MAX", 8), 0);
+    return max_logs;
+}
+
+std::atomic<int64_t> &unique_fallback_log_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
 }
 
 bool unique_capture_enabled() {
@@ -89,12 +120,31 @@ std::string capture_unique_input_batch(const torch::Tensor &all_ids) {
 }
 
 void maybe_log_unique_backend_banner(const UniqueMapCudaDebugInfo &debug_info) {
+    if (!unique_backend_log_enabled()) {
+        return;
+    }
+
     static std::once_flag flag;
     std::call_once(flag, [&debug_info]() {
-        // SPDLOG_INFO("[unique-map] requested_backend={} initial_backend={} cuco_compiled={} capture_dir={} capture_max_batches={}",
-        //             debug_info.requested_backend, debug_info.executed_backend, debug_info.cuco_compiled, unique_capture_dir(),
-        //             unique_capture_max_batches());
+        SPDLOG_INFO("[unique-map] requested_backend={} executed_backend={} sorted_request={} cuco_compiled={} capture_enabled={} capture_dir={} capture_max_batches={}",
+                    debug_info.requested_backend, debug_info.executed_backend, debug_info.sorted_request, debug_info.cuco_compiled,
+                    unique_capture_enabled(), unique_capture_dir(), unique_capture_max_batches());
     });
+}
+
+void maybe_log_unique_backend_fallback(const UniqueMapCudaDebugInfo &debug_info, const torch::Tensor &all_ids) {
+    if (!unique_backend_log_enabled() || !debug_info.used_fallback) {
+        return;
+    }
+
+    int64_t log_id = unique_fallback_log_counter().fetch_add(1);
+    if (log_id >= unique_fallback_log_max()) {
+        return;
+    }
+
+    SPDLOG_WARN("[unique-map][fallback {}] requested_backend={} executed_backend={} fallback_backend={} reason={} sorted_request={} num_ids={} total_fallbacks={}",
+                log_id, debug_info.requested_backend, debug_info.executed_backend, debug_info.fallback_backend, debug_info.fallback_reason,
+                debug_info.sorted_request, all_ids.numel(), debug_info.total_fallbacks);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tensor ids) {
@@ -104,11 +154,17 @@ std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tenso
     torch::Tensor perm = std::get<1>(sort_tup).to(torch::kInt64);
     auto unique_tup = torch::unique_consecutive(sorted_ids, false, true);
     torch::Tensor unique_ids = std::get<0>(unique_tup);
-    torch::Tensor counts = std::get<2>(unique_tup).to(torch::kInt64);
-    auto inverse_opts = torch::TensorOptions().dtype(torch::kInt64).device(sorted_ids.device());
-    torch::Tensor inverse_sorted =
-        torch::repeat_interleave(torch::arange(unique_ids.size(0), inverse_opts), counts);
-    torch::Tensor inverse = torch::empty({sorted_ids.numel()}, inverse_opts);
+
+    torch::Tensor inverse_sorted;
+    if (sorted_ids.is_cuda()) {
+        torch::Tensor counts = std::get<2>(unique_tup).to(torch::kInt64);
+        auto inverse_opts = torch::TensorOptions().dtype(torch::kInt64).device(sorted_ids.device());
+        inverse_sorted = torch::repeat_interleave(torch::arange(unique_ids.size(0), inverse_opts), counts);
+    } else {
+        inverse_sorted = std::get<1>(unique_tup).to(torch::kInt64);
+    }
+
+    torch::Tensor inverse = torch::empty({sorted_ids.numel()}, inverse_sorted.options());
     inverse.scatter_(0, perm, inverse_sorted);
     return std::forward_as_tuple(unique_ids, inverse);
 }
@@ -345,6 +401,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
         map = std::get<0>(unique_tup);
         mapped_all_ids = std::get<1>(unique_tup);
         maybe_log_unique_backend_banner(unique_debug_info);
+        maybe_log_unique_backend_fallback(unique_debug_info, all_ids);
     } else {
         auto unique_tup = unique_with_inverse_compat(all_ids);
         map = std::get<0>(unique_tup);

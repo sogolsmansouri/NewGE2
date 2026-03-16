@@ -73,11 +73,17 @@ std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tenso
     torch::Tensor perm = std::get<1>(sort_tup).to(torch::kInt64);
     auto unique_tup = torch::unique_consecutive(sorted_ids, false, true);
     torch::Tensor unique_ids = std::get<0>(unique_tup);
-    torch::Tensor counts = std::get<2>(unique_tup).to(torch::kInt64);
-    auto inverse_opts = torch::TensorOptions().dtype(torch::kInt64).device(sorted_ids.device());
-    torch::Tensor inverse_sorted =
-        torch::repeat_interleave(torch::arange(unique_ids.size(0), inverse_opts), counts);
-    torch::Tensor inverse = torch::empty({sorted_ids.numel()}, inverse_opts);
+
+    torch::Tensor inverse_sorted;
+    if (sorted_ids.is_cuda()) {
+        torch::Tensor counts = std::get<2>(unique_tup).to(torch::kInt64);
+        auto inverse_opts = torch::TensorOptions().dtype(torch::kInt64).device(sorted_ids.device());
+        inverse_sorted = torch::repeat_interleave(torch::arange(unique_ids.size(0), inverse_opts), counts);
+    } else {
+        inverse_sorted = std::get<1>(unique_tup).to(torch::kInt64);
+    }
+
+    torch::Tensor inverse = torch::empty({sorted_ids.numel()}, inverse_sorted.options());
     inverse.scatter_(0, perm, inverse_sorted);
     return std::forward_as_tuple(unique_ids, inverse);
 }

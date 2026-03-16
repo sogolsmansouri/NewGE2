@@ -302,6 +302,7 @@ class DataLoader {
         if (single_dataset_) {
             throw GegeRuntimeException("This dataloader only has a single dataset and cannot switch");
         } else {
+            unloadStorage();
             batch_size_ = training_config_->batch_size;
             train_ = true;
             loaded_subgraphs = 0;
@@ -321,6 +322,7 @@ class DataLoader {
         if (single_dataset_) {
             throw GegeRuntimeException("This dataloader only has a single dataset and cannot switch");
         } else {
+            unloadStorage();
             batch_size_ = evaluation_config_->batch_size;
             train_ = false;
             graph_storage_->setValidationSet();
@@ -335,6 +337,7 @@ class DataLoader {
         if (single_dataset_) {
             throw GegeRuntimeException("This dataloader only has a single dataset and cannot switch");
         } else {
+            unloadStorage();
             batch_size_ = evaluation_config_->batch_size;
             train_ = false;
             graph_storage_->setTestSet();

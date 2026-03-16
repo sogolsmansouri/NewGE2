@@ -193,6 +193,7 @@ class MemPartitionBufferStorage : public Storage {
     std::unique_ptr<ReusableBarrier> peer_relay_build_barrier_;
     std::vector<torch::Tensor> peer_relay_next_states_;
     std::vector<torch::Tensor> peer_relay_staged_views_;
+    void ensureHostLoaded_();
     void initializePeerRelay_();
     bool peerRelayEnabled_();
 

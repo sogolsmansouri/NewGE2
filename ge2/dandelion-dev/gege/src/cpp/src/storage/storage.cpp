@@ -502,8 +502,7 @@ MemPartitionBufferStorage::~MemPartitionBufferStorage() {
     }
 }
 
-void MemPartitionBufferStorage::load() {
-    // SPDLOG_INFO("MemPartitionBufferStorage Loading {}", filename_);
+void MemPartitionBufferStorage::ensureHostLoaded_() {
     if (!loaded_ && !filename_.empty()) {
         fd_ = open((filename_).c_str(), O_RDWR);
         if (fd_ == -1) {
@@ -524,7 +523,21 @@ void MemPartitionBufferStorage::load() {
         }
         loaded_ = true;
     }
-    
+}
+
+void MemPartitionBufferStorage::load() {
+    // SPDLOG_INFO("MemPartitionBufferStorage Loading {}", filename_);
+    ensureHostLoaded_();
+
+    if (device_ != torch::kCUDA) {
+        for (int i = 0; i < buffers_.size(); i ++) {
+            if (buffers_[i]->loaded_) {
+                buffers_[i]->unload(false);
+            }
+        }
+        return;
+    }
+
     for (int i = 0; i < buffers_.size(); i ++)
         buffers_[i]->load(data_);
 }

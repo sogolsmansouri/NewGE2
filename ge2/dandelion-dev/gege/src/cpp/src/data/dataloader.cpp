@@ -626,7 +626,7 @@ void DataLoader::nextEpoch() {
     }
     buffer_states_.clear();
     if (graph_storage_->useInMemorySubGraph()) {
-        unloadStorage();
+        unloadStorage(true);
     }
 }
 

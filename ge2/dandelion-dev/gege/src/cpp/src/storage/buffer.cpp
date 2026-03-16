@@ -258,6 +258,35 @@ double elapsed_ms(std::chrono::high_resolution_clock::time_point start, std::chr
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+int64_t get_active_slot_count(const torch::Tensor &buffer_state, int capacity, const char *context) {
+    if (!buffer_state.defined()) {
+        return 0;
+    }
+
+    int64_t active_slots = buffer_state.size(0);
+    if (active_slots > capacity) {
+        throw GegeRuntimeException(fmt::format("{} received {} active slots for capacity {}", context, active_slots, capacity));
+    }
+
+    return active_slots;
+}
+
+void checked_cpu_index_add_(const char *context, torch::Tensor &target, torch::Tensor indices, torch::Tensor values) {
+    if (!target.device().is_cpu() || !indices.device().is_cpu() || !values.device().is_cpu()) {
+        throw GegeRuntimeException(std::string(context) + " expects CPU tensors on the CPU update path");
+    }
+
+    if (target.scalar_type() != values.scalar_type()) {
+        throw GegeRuntimeException(std::string(context) + " requires target and values to share dtype");
+    }
+
+    if (indices.scalar_type() != torch::kInt64) {
+        indices = indices.to(torch::kInt64);
+    }
+
+    target.index_add_(0, indices, values);
+}
+
 class ScopedNvtxRange {
    public:
     explicit ScopedNvtxRange(const char *name) {
@@ -446,7 +475,11 @@ void LookaheadBlock::run() {
     while (!done_) {
         // wait until block is empty
         std::unique_lock lock(*lock_);
-        cv_.wait(lock, [this] { return present_ == false; });
+        cv_.wait(lock, [this] { return done_ || present_ == false; });
+
+        if (done_) {
+            break;
+        }
 
         if (partitions_.empty()) {
             break;
@@ -606,8 +639,8 @@ void AsyncWriteBlock::async_write(std::vector<Partition *> partitions) {
         void *mem = mems_[i];
         Partition *partition = partitions_[i];
 
-        memcpy_wrapper(mem, partition->data_ptr_, total_size_);
-        memset_wrapper(partition->data_ptr_, 0, total_size_);
+        memcpy_wrapper(mem, partition->data_ptr_, partition->total_size_);
+        memset_wrapper(partition->data_ptr_, 0, partition->total_size_);
 
         partition->data_ptr_ = mem;
         partition->evicting_ = true;
@@ -693,6 +726,7 @@ void PartitionBuffer::load() {
             num_nodes += partition->partition_size_;
         }
 
+        size_.store(num_nodes);
         in_buffer_ids_ = torch::empty({num_nodes}, torch::kInt64);
 
         if (prefetching_) {
@@ -739,30 +773,21 @@ torch::Tensor PartitionBuffer::indexRead(torch::Tensor indices) {
 
 Indices PartitionBuffer::getRandomIds(int64_t size) { return torch::randint(in_buffer_ids_.size(0), size, torch::kInt64); }
 
-// indices must contain unique values, else there is a possibility of a race condition
+// Duplicate indices are supported via torch::index_add_ on CPU.
 void PartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
     if (!values.defined() || indices.sizes().size() != 1 || indices.size(0) != values.size(0) || buffer_tensor_view_.size(1) != values.size(1)) {
         // TODO: throw invalid inputs for function error
         throw std::runtime_error("");
     }
 
-    // assumes this operation is only used on float valued data, and this op takes place on the CPU
-    auto data_accessor = buffer_tensor_view_.accessor<float, 2>();
-    auto ids_accessor = indices.accessor<int64_t, 1>();
-    auto values_accessor = values.accessor<float, 2>();
-
-    int d = values.size(1);
-    int64_t size = indices.size(0);
-#pragma omp parallel for
-    for (int64_t i = 0; i < size; i++) {
-        for (int j = 0; j < d; j++) {
-            data_accessor[ids_accessor[i]][j] += values_accessor[i][j];
-        }
-    }
+    checked_cpu_index_add_("PartitionBuffer::indexAdd", buffer_tensor_view_, indices, values);
 }
 
 void PartitionBuffer::setBufferOrdering(std::vector<torch::Tensor> buffer_states) {
     buffer_states_ = buffer_states;
+    if (buffer_states_.empty()) {
+        throw GegeRuntimeException("PartitionBuffer::setBufferOrdering requires at least one buffer state");
+    }
     buffer_state_iterator_ = buffer_states_.begin();
     buffer_state_ = *buffer_state_iterator_++;
     
@@ -1065,28 +1090,23 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
     if (!loaded_) {
         auto t1 = std::chrono::high_resolution_clock::now();
         int64_t num_nodes = 0;
-        // buffer_tensor_view_ = torch::from_blob(buff_mem_, {capacity_ * partition_size_, embedding_size_}, dtype_);
         data_storage_ = data_storage;
-        void* tensor_mem_ = data_storage_.data_ptr();
+        int64_t active_slots = get_active_slot_count(buffer_state_, capacity_, "MemPartitionBuffer::load");
 
 #pragma omp parallel for
-        for (int i = 0; i < 4; i++) {
+        for (int64_t i = 0; i < active_slots; i++) {
             int partition_id = buffer_state_[i].item<int>();
             Partition *partition = partition_table_[partition_id];
-            // void *buff_addr = (char *)buff_mem_ + (i * partition_size_ * embedding_size_ * dtype_size_);
-            // void *tensor_addr = (char *)tensor_mem_ + (partition->idx_offset_ * embedding_size_ * dtype_size_);
             partition->present_ = true;
-            partition->buffer_idx_ = i;
+            partition->buffer_idx_ = static_cast<int>(i);
             int64_t buffer_offset = partition->buffer_idx_ * partition_size_;
-            // memset_wrapper(buff_addr, 0, partition->total_size_);
-            // memcpy_wrapper(buff_addr, tensor_addr, partition->total_size_);
             buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_) = 
                     data_storage_.index_select(0, pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_));
-            // partition->data_ptr_ = buff_addr;
             num_nodes += partition->partition_size_;
         }
 
         loaded_ = true;
+        size_.store(num_nodes);
         buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
         auto t2 = std::chrono::high_resolution_clock::now();
         // SPDLOG_INFO("Loaded {} nodes in {} ms", num_nodes, std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
@@ -1157,19 +1177,9 @@ void MemPartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
         buffer_tensor_gpu_view_.index_add_(0, indices, values);
 #endif
     } else {
-        // assumes this operation is only used on float valued data.
-        auto data_accessor = buffer_tensor_view_.accessor<float, 2>();
-        auto ids_accessor = indices.accessor<int64_t, 1>();
-        auto values_accessor = values.accessor<float, 2>();
-
         int d = values.size(1);
         int64_t size = indices.size(0);
-#pragma omp parallel for
-        for (int64_t i = 0; i < size; i++) {
-            for (int j = 0; j < d; j++) {
-                data_accessor[ids_accessor[i]][j] += values_accessor[i][j];
-            }
-        }
+        checked_cpu_index_add_("MemPartitionBuffer::indexAdd", buffer_tensor_view_, indices, values);
         if (run_stage_debug) {
             auto now = std::chrono::high_resolution_clock::now();
             SPDLOG_INFO("[stage-debug][buffer.indexAdd][update {}][step 1] index_add_cpu ms={:.3f} rows={} dim={}",
@@ -1251,25 +1261,17 @@ void MemPartitionBuffer::sync() {
     int64_t timing_id = -1;
     bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
     auto t1 = std::chrono::high_resolution_clock::now();
-    void* tensor_mem_ = data_storage_.data_ptr();
+    int64_t active_slots = get_active_slot_count(buffer_state_, capacity_, "MemPartitionBuffer::sync");
 #pragma omp parallel for
-    for (int i = 0; i < 4; i++) {
+    for (int64_t i = 0; i < active_slots; i++) {
         int partition_id = buffer_state_[i].item<int>();
         Partition *partition = partition_table_[partition_id];
         int64_t buffer_offset = partition->buffer_idx_ * partition_size_;
-        // void *tensor_addr = (char *)tensor_mem_ + (partition->idx_offset_ * embedding_size_ * dtype_size_);
-        // void *buff_addr = (char *)buff_mem_unload_ + (i * partition_size_ * embedding_size_ * dtype_size_);
-
-        // memcpy_wrapper(tensor_addr, buff_addr, partition->total_size_);
-        // memset_wrapper(buff_addr, 0, partition->total_size_);
-        // auto t1 = std::chrono::high_resolution_clock::now();
         data_storage_.index_put_({pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_)}, 
                 buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_));
-        // auto t2 = std::chrono::high_resolution_clock::now();
-        // SPDLOG_INFO("Sync time: {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
         partition->data_ptr_ = nullptr;
-        // partition->tensor_ = torch::Tensor();
         partition->present_ = false;
+        partition->buffer_idx_ = -1;
     }
     auto t2 = std::chrono::high_resolution_clock::now();
     if (log_timing) {
@@ -1283,15 +1285,33 @@ void MemPartitionBuffer::sync() {
 
 void MemPartitionBuffer::setBufferOrdering(std::vector<torch::Tensor> buffer_states) {
     buffer_states_ = buffer_states;
+    if (buffer_states_.empty()) {
+        throw GegeRuntimeException("MemPartitionBuffer::setBufferOrdering requires at least one buffer state");
+    }
+
     buffer_state_iterator_ = buffer_states_.begin();
 
-    for(int i = 0; i < device_.index(); i ++) 
-        buffer_state_iterator_++;
-    
+    int device_index = device_.index();
+    if (device_index < 0) {
+        throw GegeRuntimeException("MemPartitionBuffer::setBufferOrdering requires a concrete CUDA device index");
+    }
+
+    for (int i = 0; i < device_index; i++) {
+        ++buffer_state_iterator_;
+        if (buffer_state_iterator_ == buffer_states_.end()) {
+            throw GegeRuntimeException("MemPartitionBuffer::setBufferOrdering ran out of states before reaching the device offset");
+        }
+    }
+
+    if (buffer_state_iterator_ == buffer_states_.end()) {
+        throw GegeRuntimeException("MemPartitionBuffer::setBufferOrdering could not assign an initial state");
+    }
+
     buffer_state_ = *buffer_state_iterator_;
-    for(int i = 0; i < buffer_sizes_; i ++ ) 
-        if (buffer_state_iterator_ != buffer_states_.end())
-            buffer_state_iterator_++;
+
+    for (int i = 0; i < buffer_sizes_ && buffer_state_iterator_ != buffer_states_.end(); i++) {
+        ++buffer_state_iterator_;
+    }
     loaded_ = false;
 }
 
@@ -1301,11 +1321,11 @@ void MemPartitionBuffer::unload(bool write) {
         int64_t timing_id = -1;
         bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
         int64_t eval_finite_log_id = -1;
-        bool log_eval_finite = should_log_eval_finite_debug(eval_finite_log_id);
+        bool log_eval_finite = write && should_log_eval_finite_debug(eval_finite_log_id);
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double gpu_to_cpu_ms = 0.0;
-        if (buffer_tensor_gpu_view_.device().is_cuda()) {
+        if (write && buffer_tensor_gpu_view_.device().is_cuda()) {
             buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
             if (log_timing) {
                 auto now = std::chrono::high_resolution_clock::now();
@@ -1316,7 +1336,7 @@ void MemPartitionBuffer::unload(bool write) {
 
         }
 
-        if (log_eval_finite) {
+        if (write && log_eval_finite) {
             auto active_state = buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
             auto *state_ptr = active_state.data_ptr<int64_t>();
             for (int64_t slot = 0; slot < active_state.numel(); slot++) {
@@ -1328,10 +1348,22 @@ void MemPartitionBuffer::unload(bool write) {
                 log_non_finite_rows_if_any("gpu_copy", eval_finite_log_id, device_, partition_id, partition_view);
             }
         }
-        
-        sync();
+
+        if (write) {
+            sync();
+        } else if (buffer_state_.defined()) {
+            auto active_state = buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+            auto *state_ptr = active_state.data_ptr<int64_t>();
+            for (int64_t slot = 0; slot < active_state.numel(); slot++) {
+                int partition_id = static_cast<int>(state_ptr[slot]);
+                Partition *partition = partition_table_[partition_id];
+                partition->data_ptr_ = nullptr;
+                partition->present_ = false;
+                partition->buffer_idx_ = -1;
+            }
+        }
         double sync_ms = 0.0;
-        if (log_eval_finite) {
+        if (write && log_eval_finite) {
             auto active_state = buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
             auto *state_ptr = active_state.data_ptr<int64_t>();
             for (int64_t slot = 0; slot < active_state.numel(); slot++) {

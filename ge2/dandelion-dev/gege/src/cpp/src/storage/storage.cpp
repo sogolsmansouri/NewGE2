@@ -183,6 +183,43 @@ double elapsed_ms(std::chrono::high_resolution_clock::time_point start, std::chr
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+void checked_cpu_index_add_(const char *context, torch::Tensor &target, torch::Tensor indices, torch::Tensor values) {
+    if (!target.device().is_cpu() || !indices.device().is_cpu() || !values.device().is_cpu()) {
+        throw GegeRuntimeException(std::string(context) + " expects CPU tensors on the CPU update path");
+    }
+
+    if (target.scalar_type() != values.scalar_type()) {
+        throw GegeRuntimeException(std::string(context) + " requires target and values to share dtype");
+    }
+
+    if (indices.scalar_type() != torch::kInt64) {
+        indices = indices.to(torch::kInt64);
+    }
+
+    target.index_add_(0, indices, values);
+}
+
+void checked_cpu_index_put_(const char *context, torch::Tensor &target, torch::Tensor indices, torch::Tensor values) {
+    if (!target.device().is_cpu() || !indices.device().is_cpu() || !values.device().is_cpu()) {
+        throw GegeRuntimeException(std::string(context) + " expects CPU tensors on the CPU update path");
+    }
+
+    if (target.scalar_type() != values.scalar_type()) {
+        throw GegeRuntimeException(std::string(context) + " requires target and values to share dtype");
+    }
+
+    if (indices.scalar_type() != torch::kInt64) {
+        indices = indices.to(torch::kInt64);
+    }
+
+    torch::Tensor unique_indices = std::get<0>(torch::_unique(indices));
+    if (unique_indices.numel() != indices.numel()) {
+        throw GegeRuntimeException(std::string(context) + " does not support duplicate indices on the CPU write path");
+    }
+
+    target.index_put_({indices}, values);
+}
+
 class ScopedNvtxRange {
    public:
     explicit ScopedNvtxRange(const char *name) {
@@ -622,7 +659,7 @@ void MemPartitionBufferStorage::write() {
         int64_t read_size = dim0_size_ * dim1_size_ * dtype_size;
 
         if (pwrite_wrapper(fd_, data.data_ptr(), read_size, offset) == -1) {
-            SPDLOG_ERROR("Unable to read {}\nError: {}", filename_, errno);
+            SPDLOG_ERROR("Unable to write {}\nError: {}", filename_, errno);
             throw std::runtime_error("");
         }
     }
@@ -643,15 +680,19 @@ void MemPartitionBufferStorage::unload(bool perform_write) {
 }
 
 void MemPartitionBufferStorage::unload(bool perform_write, int32_t device_idx) {
-    if (loaded_) {
-        buffers_[device_idx]->unload(perform_write);
-        if (perform_write) {
-            write();
-            close(fd_);
-            data_ = torch::Tensor();
-            loaded_ = false;
-        }
+    if (!loaded_) {
+        return;
     }
+
+    if (device_idx < 0 || device_idx >= static_cast<int32_t>(buffers_.size())) {
+        throw GegeRuntimeException("MemPartitionBufferStorage::unload received an invalid device index");
+    }
+
+    if (perform_write) {
+        throw GegeRuntimeException("Per-device MemPartitionBufferStorage unload with write-back is unsupported");
+    }
+
+    buffers_[device_idx]->unload(false);
 }
 
 void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
@@ -1251,7 +1292,7 @@ void InMemory::write() {
         int64_t read_size = dim0_size_ * dim1_size_ * dtype_size;
 
         if (pwrite_wrapper(fd_, data.data_ptr(), read_size, offset) == -1) {
-            SPDLOG_ERROR("Unable to read {}\nError: {}", filename_, errno);
+            SPDLOG_ERROR("Unable to write {}\nError: {}", filename_, errno);
             throw std::runtime_error("");
         }
     }
@@ -1263,9 +1304,10 @@ void InMemory::unload(bool perform_write) {
             write();
         }
 
-        // close(fd_);
-        // loaded_ = false;
-        // data_ = torch::Tensor();
+        close(fd_);
+        fd_ = -1;
+        loaded_ = false;
+        data_ = torch::Tensor();
     }
 }
 
@@ -1330,19 +1372,9 @@ void InMemory::indexAdd(Indices indices, torch::Tensor values) {
         data_.index_add_(0, indices, values);
 #endif
     } else {
-        // assumes this operation is only used on float valued data.
-        auto data_accessor = data_.accessor<float, 2>();
-        auto ids_accessor = indices.accessor<int64_t, 1>();
-        auto values_accessor = values.accessor<float, 2>();
-
-        int d = values.size(1);
         int64_t size = indices.size(0);
-#pragma omp parallel for
-        for (int64_t i = 0; i < size; i++) {
-            for (int j = 0; j < d; j++) {
-                data_accessor[ids_accessor[i]][j] += values_accessor[i][j];
-            }
-        }
+        int d = values.size(1);
+        checked_cpu_index_add_("InMemory::indexAdd", data_, indices, values);
         if (run_stage_debug) {
             auto now = std::chrono::high_resolution_clock::now();
             SPDLOG_INFO("[stage-debug][storage.indexAdd][update {}][step 1] index_add_cpu ms={:.3f} rows={} dim={}",
@@ -1365,19 +1397,7 @@ void InMemory::indexPut(Indices indices, torch::Tensor values) {
     if (values.device().is_cuda()) {
         data_[indices] = values;
     } else {
-        // assumes this operation is only used on float valued data.
-        auto data_accessor = data_.accessor<float, 2>();
-        auto ids_accessor = indices.accessor<int64_t, 1>();
-        auto values_accessor = values.accessor<float, 2>();
-
-        int d = values.size(1);
-        int64_t size = indices.size(0);
-#pragma omp parallel for
-        for (int64_t i = 0; i < size; i++) {
-            for (int j = 0; j < d; j++) {
-                data_accessor[ids_accessor[i]][j] = values_accessor[i][j];
-            }
-        }
+        checked_cpu_index_put_("InMemory::indexPut", data_, indices, values);
     }
 }
 

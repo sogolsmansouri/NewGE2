@@ -76,6 +76,11 @@ bool partition_buffer_pipeline_timing_enabled() {
     return enabled;
 }
 
+bool startup_timing_enabled() {
+    static bool enabled = parse_graph_storage_env_flag("GEGE_STARTUP_TIMING", false);
+    return enabled;
+}
+
 int64_t partition_buffer_pipeline_timing_max() {
     static int64_t max_timings = std::max<int64_t>(parse_graph_storage_env_int("GEGE_PARTITION_BUFFER_PIPELINE_TIMING_MAX", 8), 0);
     return max_timings;
@@ -649,6 +654,7 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
     if (useInMemorySubGraph()) {
         int64_t timing_id = -1;
         bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
+        bool log_startup_timing = startup_timing_enabled();
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double bucket_meta_ms = 0.0;
@@ -840,6 +846,13 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
             SPDLOG_INFO(
                 "[partition-buffer-pipeline][init {}] device={} partitions={} buffer_size={} buckets={} edges={} bucket_meta_ms={:.3f} edge_materialize_ms={:.3f} remap_ms={:.3f} graph_build_ms={:.3f} total_ms={:.3f}",
                 timing_id, device_idx, num_partitions, buffer_size, num_edge_buckets_in_mem, total_size, bucket_meta_ms, edge_materialize_ms,
+                remap_ms, graph_build_ms, elapsed_graph_storage_ms(total_start, total_end));
+        }
+        if (log_startup_timing) {
+            auto total_end = std::chrono::high_resolution_clock::now();
+            SPDLOG_INFO(
+                "[startup-timing][initializeInMemorySubGraph] device_idx={} device={} partitions={} buffer_size={} buckets={} edges={} bucket_meta_ms={:.3f} edge_materialize_ms={:.3f} remap_ms={:.3f} graph_build_ms={:.3f} total_ms={:.3f}",
+                device_idx, device.str(), num_partitions, buffer_size, num_edge_buckets_in_mem, total_size, bucket_meta_ms, edge_materialize_ms,
                 remap_ms, graph_build_ms, elapsed_graph_storage_ms(total_start, total_end));
         }
         if (prefetch_) {

@@ -9,6 +9,33 @@
 #include "storage/checkpointer.h"
 #include "storage/io.h"
 
+#include <chrono>
+#include <cstdlib>
+#include <string>
+
+namespace {
+
+bool startup_timing_enabled() {
+    const char *raw = std::getenv("GEGE_STARTUP_TIMING");
+    if (raw == nullptr) {
+        return false;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+
+    return value == "1" || value == "true" || value == "True" || value == "TRUE";
+}
+
+double elapsed_startup_ms(std::chrono::high_resolution_clock::time_point start,
+                          std::chrono::high_resolution_clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+}  // namespace
+
 
 void encode_and_export(shared_ptr<DataLoader> dataloader, shared_ptr<Model> model, shared_ptr<GegeConfig> gege_config) {
     shared_ptr<GraphEncoder> graph_encoder;
@@ -34,6 +61,12 @@ void encode_and_export(shared_ptr<DataLoader> dataloader, shared_ptr<Model> mode
 std::tuple<shared_ptr<Model>, shared_ptr<GraphModelStorage>, shared_ptr<DataLoader> > gege_init(shared_ptr<GegeConfig> gege_config, bool train) {
     Timer initialization_timer = Timer(false);
     initialization_timer.start();
+    bool log_startup_timing = startup_timing_enabled();
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto phase_start = total_start;
+    double model_storage_init_ms = 0.0;
+    double dataloader_ctor_ms = 0.0;
+    double sampler_bind_ms = 0.0;
     GegeLogger gege_logger = GegeLogger(gege_config->storage->model_dir);
     spdlog::set_default_logger(gege_logger.main_logger_);
     gege_logger.setConsoleLogLevel(gege_config->storage->log_level);
@@ -84,6 +117,11 @@ std::tuple<shared_ptr<Model>, shared_ptr<GraphModelStorage>, shared_ptr<DataLoad
         CheckpointMeta checkpoint_meta = std::get<2>(tup);
         epochs_processed = checkpoint_meta.num_epochs;
     }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        model_storage_init_ms = elapsed_startup_ms(phase_start, now);
+        phase_start = now;
+    }
 
     bool use_inverse_relations = true;
     if (gege_config->model->decoder != nullptr && gege_config->model->decoder->type != DecoderType::NODE) {
@@ -96,12 +134,24 @@ std::tuple<shared_ptr<Model>, shared_ptr<GraphModelStorage>, shared_ptr<DataLoad
     shared_ptr<DataLoader> dataloader = std::make_shared<DataLoader>(graph_model_storage, model->learning_task_, gege_config->training,
                                                                      gege_config->evaluation, gege_config->model->encoder, devices,
                                                                      gege_config->training->negative_sampling_method, use_inverse_relations);
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        dataloader_ctor_ms = elapsed_startup_ms(phase_start, now);
+        phase_start = now;
+    }
 
     dataloader->epochs_processed_ = epochs_processed;
 
     model->negative_sampler_ = dataloader->training_negative_sampler_;
     for (int i = 1; i < model->device_models_.size(); i++) {
         model->device_models_[i]->negative_sampler_ = model->negative_sampler_;
+    }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        sampler_bind_ms = elapsed_startup_ms(phase_start, now);
+        SPDLOG_INFO(
+            "[startup-timing][gege_init] train={} devices={} epochs_processed={} model_storage_init_ms={:.3f} dataloader_ctor_ms={:.3f} sampler_bind_ms={:.3f} total_ms={:.3f}",
+            train, devices.size(), epochs_processed, model_storage_init_ms, dataloader_ctor_ms, sampler_bind_ms, elapsed_startup_ms(total_start, now));
     }
 
     initialization_timer.stop();

@@ -67,6 +67,11 @@ bool partition_buffer_pipeline_timing_enabled() {
     return enabled;
 }
 
+bool startup_timing_enabled() {
+    static bool enabled = parse_env_flag("GEGE_STARTUP_TIMING", false);
+    return enabled;
+}
+
 bool eval_finite_debug_enabled() {
     static bool enabled = parse_env_flag("GEGE_EVAL_FINITE_DEBUG", false);
     return enabled;
@@ -754,6 +759,11 @@ void DataLoader::setActiveNodes() {
 }
 
 void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
+    bool log_startup_timing = startup_timing_enabled();
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto phase_start = total_start;
+    double activate_ms = 0.0;
+    double batch_build_ms = 0.0;
     int64_t batch_id = 0;
     int64_t start_idx = 0;
 
@@ -768,6 +778,11 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
             setActiveNodes();
             num_items = graph_storage_->getNumActiveNodes();
         }
+    }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        activate_ms = elapsed_ms(phase_start, now);
+        phase_start = now;
     }
 
     int64_t batch_size = batch_size_;
@@ -794,6 +809,14 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
     all_batches_[device_idx] = batches;
     batches_left_[device_idx] = batches.size();
     batch_iterators_[device_idx] = all_batches_[device_idx].begin();
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        batch_build_ms = elapsed_ms(phase_start, now);
+        SPDLOG_INFO(
+            "[startup-timing][initializeBatches] device={} prepare_encode={} task_id={} items={} batches={} activate_ms={:.3f} batch_build_ms={:.3f} total_ms={:.3f}",
+            device_idx, prepare_encode, prepare_encode ? -1 : static_cast<int>(learning_task_), num_items, batches.size(), activate_ms, batch_build_ms,
+            elapsed_ms(total_start, now));
+    }
     add_perf_sample(device_swap_batch_count_samples_, device_idx, static_cast<int64_t>(batches.size()));
     if (!prepare_encode && learning_task_ == LearningTask::LINK_PREDICTION && graph_storage_->useInMemorySubGraph() &&
         device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_current_state_index_.size() &&
@@ -1513,14 +1536,44 @@ void DataLoader::updateEmbeddingsG(shared_ptr<Batch> batch, bool gpu, int32_t de
 }
 
 void DataLoader::loadStorage() {
+    bool log_startup_timing = startup_timing_enabled();
+    auto total_start = std::chrono::high_resolution_clock::now();
+    auto phase_start = total_start;
+    double plan_reset_ms = 0.0;
+    double ordering_ms = 0.0;
+    double storage_load_ms = 0.0;
+    double gan_load_ms = 0.0;
+    double batch_state_reset_ms = 0.0;
+    double subgraph_init_ms = 0.0;
+    double sort_edges_ms = 0.0;
     if (negative_sampler_ != nullptr) {
         negative_sampler_->resetPlanCache();
     }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        plan_reset_ms = elapsed_ms(phase_start, now);
+        phase_start = now;
+    }
     loaded_subgraphs = 0;
     setBufferOrdering();
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        ordering_ms = elapsed_ms(phase_start, now);
+        phase_start = now;
+    }
     graph_storage_->load();
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        storage_load_ms = elapsed_ms(phase_start, now);
+        phase_start = now;
+    }
     if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {
         graph_storage_->load_g();
+    }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        gan_load_ms = elapsed_ms(phase_start, now);
+        phase_start = now;
     }
 
     batch_id_offset_ = 0;
@@ -1534,6 +1587,11 @@ void DataLoader::loadStorage() {
     for (int device_idx = 0; device_idx < devices_.size(); device_idx ++) {
         all_reads_[device_idx] = false;
     }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        batch_state_reset_ms = elapsed_ms(phase_start, now);
+        phase_start = now;
+    }
 
     if (!buffer_states_.empty()) {
         for(int device_idx = 0; device_idx < devices_.size(); device_idx ++) {
@@ -1542,6 +1600,11 @@ void DataLoader::loadStorage() {
     } else {
         graph_storage_->initializeInMemorySubGraph(torch::empty({}));
     }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        subgraph_init_ms = elapsed_ms(phase_start, now);
+        phase_start = now;
+    }
 
     if (negative_sampler_ != nullptr) {
         if (instance_of<NegativeSampler, CorruptNodeNegativeSampler>(negative_sampler_)) {
@@ -1549,5 +1612,13 @@ void DataLoader::loadStorage() {
                 graph_storage_->sortAllEdges();
             }
         }
+    }
+    if (log_startup_timing) {
+        auto now = std::chrono::high_resolution_clock::now();
+        sort_edges_ms = elapsed_ms(phase_start, now);
+        SPDLOG_INFO(
+            "[startup-timing][loadStorage] devices={} subgraph_states={} use_in_memory_subgraph={} plan_reset_ms={:.3f} ordering_ms={:.3f} storage_load_ms={:.3f} gan_load_ms={:.3f} batch_state_reset_ms={:.3f} subgraph_init_ms={:.3f} sort_edges_ms={:.3f} total_ms={:.3f}",
+            devices_.size(), buffer_states_.size(), graph_storage_->useInMemorySubGraph(), plan_reset_ms, ordering_ms, storage_load_ms, gan_load_ms,
+            batch_state_reset_ms, subgraph_init_ms, sort_edges_ms, elapsed_ms(total_start, now));
     }
 }

@@ -1,0 +1,49 @@
+model:
+  learning_task: LINK_PREDICTION
+  encoder:
+    layers:
+      - - type: EMBEDDING
+          output_dim: 100
+  decoder:
+    type: DISTMULT
+    options:
+      inverse_edges: false  # disabled for arity-4 (no adjusted_dst path)
+      use_relation_features: false
+      edge_decoder_method: CORRUPT_NODE
+  loss:
+    type: SOFTMAX_CE
+    options:
+      reduction: SUM
+  dense_optimizer:
+      type: ADAM
+      options:
+        learning_rate: 0.1
+  sparse_optimizer:
+      type: ADAGRAD
+      options:
+        learning_rate: 0.1
+storage:
+  device_type: cuda
+  dataset:
+    dataset_dir: /home/smansou2/data/jf17k4_ge2_processed/
+  edges:
+    type: DEVICE_MEMORY
+  embeddings:
+    type: DEVICE_MEMORY
+  save_model: true
+training:
+  batch_size: 1000
+  negative_sampling_method: CORRUPT_NODE
+  negative_sampling:
+    num_chunks: 10
+    negatives_per_positive: 50
+    degree_fraction: 0.0
+    filtered: false
+    tournament_selection: false
+    tiled_tournament_scores: false
+  num_epochs: 5
+  epochs_per_shuffle: 1
+evaluation:
+  batch_size: 500
+  negative_sampling:
+    filtered: false

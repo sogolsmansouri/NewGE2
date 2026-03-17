@@ -132,6 +132,8 @@ def map_edge_list_dfs(edge_lists: list, known_node_ids=None, sequential_train_no
                 edge_list.iloc[:, col] = edge_list.iloc[:, col].astype(str).map(nodes_dict.get)
             for col in [1, 3]:
                 edge_list.iloc[:, col] = edge_list.iloc[:, col].astype(str).map(rels_dict.get)
+            # iloc assignment keeps object dtype; convert to int64 so torch.tensor() works
+            edge_list = edge_list.astype(np.int64)
         else:
             node_columns = edge_list.columns[[0, -1]]
             edge_list[node_columns] = edge_list[node_columns].applymap(nodes_dict.get)
@@ -495,7 +497,7 @@ class TorchEdgeListConverter(object):
         self.splits = splits
 
         self.has_rels = False
-        if len(columns) == 3:
+        if len(columns) == 3 or len(columns) == 5:
             self.has_rels = True
 
         if dtype.upper() == "INT32" or dtype.upper() == "INT":

@@ -501,6 +501,11 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
         return;
     }
 
+    if (options_ != nullptr && options_->edge_bucket_ordering != EdgeBucketOrdering::CUSTOM) {
+        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY currently supports CUSTOM edge-bucket ordering only; falling back to CPU-backed swaps");
+        return;
+    }
+
     for (std::size_t src = 0; src < devices_.size(); src++) {
         if (!devices_[src].is_cuda()) {
             SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY requires CUDA devices only; falling back to CPU-backed swaps");

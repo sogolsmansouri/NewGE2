@@ -81,17 +81,21 @@ def map_edge_list_dfs(edge_lists: list, known_node_ids=None, sequential_train_no
 
     all_edges_df = pd.concat(edge_lists)
 
+    num_cols = len(all_edges_df.columns)
+    is_nary_df = num_cols == 5  # arity-4: [src, rel, dst, qrel, qval]
+
     unique_src = all_edges_df.iloc[:, 0].unique()
-    unique_dst = all_edges_df.iloc[:, -1].unique()
+    # For arity-4, dst is col 2 (not last col); last col is qval
+    unique_dst = all_edges_df.iloc[:, 2 if is_nary_df else -1].unique()
 
-    if known_node_ids is None:
-        unique_nodes = np.unique(np.concatenate([unique_src.astype(str), unique_dst.astype(str)]))
-    else:
-        node_ids = [unique_src.astype(str), unique_dst.astype(str)]
+    node_id_arrays = [unique_src.astype(str), unique_dst.astype(str)]
+    if is_nary_df:
+        node_id_arrays.append(all_edges_df.iloc[:, 4].unique().astype(str))  # qval entities
+    if known_node_ids is not None:
         for n in known_node_ids:
-            node_ids.append(n.numpy().astype(str))
+            node_id_arrays.append(n.numpy().astype(str))
 
-        unique_nodes = np.unique(np.concatenate(node_ids))
+    unique_nodes = np.unique(np.concatenate(node_id_arrays))
 
     num_nodes = unique_nodes.shape[0]
     mapped_node_ids = np.random.permutation(num_nodes)
@@ -101,11 +105,18 @@ def map_edge_list_dfs(edge_lists: list, known_node_ids=None, sequential_train_no
     unique_rels = torch.empty([0])
     mapped_rel_ids = torch.empty([0])
     rels_dict = None
-    if len(all_edges_df.columns) == 3:
+    if num_cols == 3 or is_nary_df:
         has_rels = True
 
     if has_rels:
-        unique_rels = all_edges_df.iloc[:, 1].unique()
+        if is_nary_df:
+            # rel (col 1) and qrel (col 3) share the same relation namespace
+            unique_rels = np.unique(np.concatenate([
+                all_edges_df.iloc[:, 1].unique().astype(str),
+                all_edges_df.iloc[:, 3].unique().astype(str),
+            ]))
+        else:
+            unique_rels = all_edges_df.iloc[:, 1].unique()
         num_rels = unique_rels.shape[0]
         mapped_rel_ids = np.random.permutation(num_rels)
         rels_dict = dict(zip(list(unique_rels), list(mapped_rel_ids)))
@@ -114,12 +125,20 @@ def map_edge_list_dfs(edge_lists: list, known_node_ids=None, sequential_train_no
 
     output_edge_lists = []
     for edge_list in edge_lists:
-        node_columns = edge_list.columns[[0, -1]]
-        edge_list[node_columns] = edge_list[node_columns].applymap(nodes_dict.get)
+        if is_nary_df:
+            # Arity-4: remap src(0), dst(2), qval(4) as entities; rel(1), qrel(3) as relations
+            edge_list = edge_list.copy()
+            for col in [0, 2, 4]:
+                edge_list.iloc[:, col] = edge_list.iloc[:, col].astype(str).map(nodes_dict.get)
+            for col in [1, 3]:
+                edge_list.iloc[:, col] = edge_list.iloc[:, col].astype(str).map(rels_dict.get)
+        else:
+            node_columns = edge_list.columns[[0, -1]]
+            edge_list[node_columns] = edge_list[node_columns].applymap(nodes_dict.get)
 
-        if has_rels:
-            rel_columns = edge_list.columns[1]
-            edge_list[rel_columns] = edge_list[rel_columns].map(rels_dict.get)
+            if has_rels:
+                rel_columns = edge_list.columns[1]
+                edge_list[rel_columns] = edge_list[rel_columns].map(rels_dict.get)
 
         output_edge_lists.append(dataframe_to_tensor(edge_list))
 

@@ -895,19 +895,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
             use_tiled_tournament_scores =
                 can_use_tiled_distmult_tournament_scores(decoder, negative_sampler, run_csr_debug, adjusted_src_embeddings, dst_neg_embeddings,
                                                          selected_negatives_num) &&
-                (!has_relations || !decoder->use_inverse_relations_ ||
+                // For arity-4 (is_nary) there are no inverse-relation negatives, so skip the src check
+                (!has_relations || is_nary || !decoder->use_inverse_relations_ ||
                  can_use_tiled_distmult_tournament_scores(decoder, negative_sampler, run_csr_debug, adjusted_dst_embeddings, src_neg_embeddings,
                                                          selected_negatives_num));
 
             if (!use_tiled_tournament_scores) {
                 if (negative_sampling_method == NegativeSamplingMethod::GAN) {
                     dst_negs_scores = candidate_sampling_scores(decoder, adjusted_src_embeddings_g, dst_neg_embeddings_g, chunk_num, num_per_chunk);
-                    if (has_relations && decoder->use_inverse_relations_) {
+                    if (!is_nary && has_relations && decoder->use_inverse_relations_) {
                         src_negs_scores = candidate_sampling_scores(decoder, adjusted_dst_embeddings_g, src_neg_embeddings_g, chunk_num, num_per_chunk);
                     }
                 } else {
                     dst_negs_scores = candidate_sampling_scores(decoder, adjusted_src_embeddings, dst_neg_embeddings, chunk_num, num_per_chunk);
-                    if (has_relations && decoder->use_inverse_relations_) {
+                    if (!is_nary && has_relations && decoder->use_inverse_relations_) {
                         src_negs_scores = candidate_sampling_scores(decoder, adjusted_dst_embeddings, src_neg_embeddings, chunk_num, num_per_chunk);
                     }
                 }
@@ -943,12 +944,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     torch::Tensor score_src_chunked_embeddings;
     if (use_tiled_tournament_scores) {
         score_dst_chunked_embeddings = pad_and_reshape(adjusted_src_embeddings, chunk_num);
-        if (has_relations && decoder->use_inverse_relations_) {
+        if (!is_nary && has_relations && decoder->use_inverse_relations_) {
             score_src_chunked_embeddings = pad_and_reshape(adjusted_dst_embeddings, chunk_num);
         }
         if (negative_sampling_method == NegativeSamplingMethod::DNS) {
             selector_dst_chunked_embeddings = score_dst_chunked_embeddings.detach();
-            if (has_relations && decoder->use_inverse_relations_) {
+            if (!is_nary && has_relations && decoder->use_inverse_relations_) {
                 selector_src_chunked_embeddings = score_src_chunked_embeddings.detach();
             }
         }
@@ -967,7 +968,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
             if (has_relations) {
                 pos_scores = decoder->compute_scores(adjusted_src_embeddings, dst_embeddings);
                 neg_scores = decoder->compute_scores(adjusted_src_embeddings, dst_neg_embeddings);
-                if (decoder->use_inverse_relations_) {
+                if (!is_nary && decoder->use_inverse_relations_) {
                     inv_pos_scores = decoder->compute_scores(adjusted_dst_embeddings, src_embeddings);
                     inv_neg_scores = decoder->compute_scores(adjusted_dst_embeddings, src_neg_embeddings);
                 }
@@ -1034,7 +1035,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
                 } else {
                     neg_scores = decoder->compute_scores(adjusted_src_embeddings, selected_dst_negs_embeddings);
                 }
-                if (decoder->use_inverse_relations_) {
+                if (!is_nary && decoder->use_inverse_relations_) {
                     torch::Tensor selected_src_negs_embeddings;
                     bool use_fused_src_scores = !use_tiled_tournament_scores &&
                                                 can_use_selected_neg_cuda(decoder, run_csr_debug, adjusted_dst_embeddings, src_neg_embeddings, selected_src_neg_indices);

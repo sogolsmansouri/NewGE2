@@ -144,6 +144,9 @@ void verify_unique_batch_indices(int batch_id, torch::Tensor unique_node_indices
 Batch::Batch(bool train) : device_transfer_(0), host_transfer_(0), timer_(false) {
     train_ = train;
     device_id_ = -1;
+    streamed_edge_start_ = -1;
+    streamed_edge_size_ = 0;
+    resident_local_lp_direct_ = false;
     clear();
 }
 
@@ -199,6 +202,50 @@ void Batch::to(torch::Device device) {
 
     if (node_embeddings_state_.defined()) {
         node_embeddings_state_ = node_embeddings_state_.to(device);
+    }
+
+    if (resident_src_embeddings_.defined()) {
+        resident_src_embeddings_ = resident_src_embeddings_.to(device);
+    }
+
+    if (resident_dst_embeddings_.defined()) {
+        resident_dst_embeddings_ = resident_dst_embeddings_.to(device);
+    }
+
+    if (resident_src_neg_embeddings_.defined()) {
+        resident_src_neg_embeddings_ = resident_src_neg_embeddings_.to(device);
+    }
+
+    if (resident_dst_neg_embeddings_.defined()) {
+        resident_dst_neg_embeddings_ = resident_dst_neg_embeddings_.to(device);
+    }
+
+    if (resident_src_embeddings_state_.defined()) {
+        resident_src_embeddings_state_ = resident_src_embeddings_state_.to(device);
+    }
+
+    if (resident_dst_embeddings_state_.defined()) {
+        resident_dst_embeddings_state_ = resident_dst_embeddings_state_.to(device);
+    }
+
+    if (resident_src_neg_embeddings_state_.defined()) {
+        resident_src_neg_embeddings_state_ = resident_src_neg_embeddings_state_.to(device);
+    }
+
+    if (resident_dst_neg_embeddings_state_.defined()) {
+        resident_dst_neg_embeddings_state_ = resident_dst_neg_embeddings_state_.to(device);
+    }
+
+    if (qual_embeddings_.defined()) {
+        qual_embeddings_ = qual_embeddings_.to(device);
+    }
+
+    if (qual_embeddings_state_.defined()) {
+        qual_embeddings_state_ = qual_embeddings_state_.to(device);
+    }
+
+    if (qual_indices_.defined()) {
+        qual_indices_ = qual_indices_.to(device);
     }
 
     if (node_embeddings_g_.defined()) {
@@ -264,6 +311,16 @@ void Batch::accumulateGradients(float learning_rate) {
         node_state_update_ = node_gradients_.pow(2);
         node_embeddings_state_.add_(node_state_update_);
         node_gradients_ = -learning_rate * (node_gradients_ / (node_embeddings_state_.sqrt().add_(1e-10)));
+
+        // Accumulate qualifier value embedding gradients (arity-4)
+        if (qual_embeddings_.defined() && qual_embeddings_.grad().defined()) {
+            qual_gradients_ = qual_embeddings_.grad();
+            qual_state_update_ = qual_gradients_.pow(2);
+            qual_embeddings_state_.add_(qual_state_update_);
+            qual_gradients_ = -learning_rate * (qual_gradients_ / (qual_embeddings_state_.sqrt().add_(1e-10)));
+        }
+        qual_embeddings_state_ = torch::Tensor();
+
         if (run_stage_debug) {
             auto now = std::chrono::high_resolution_clock::now();
             SPDLOG_INFO("[stage-debug][accumulateGradients][batch {}][step 3] optimizer_update ms={:.3f}",
@@ -283,6 +340,68 @@ void Batch::accumulateGradients(float learning_rate) {
     }
 
     SPDLOG_TRACE("Batch: {} cleared gpu embeddings and gradients", batch_id_);
+}
+
+void Batch::accumulateResidentLocalGradients(float learning_rate) {
+    auto append_resident = [](std::vector<torch::Tensor> &ids,
+                              std::vector<torch::Tensor> &grads,
+                              std::vector<torch::Tensor> &states,
+                              const torch::Tensor &node_ids,
+                              const torch::Tensor &embeddings,
+                              const torch::Tensor &embedding_state) {
+        if (!node_ids.defined() || !embeddings.defined()) {
+            return;
+        }
+
+        torch::Tensor embedding_grads = embeddings.grad();
+        if (!embedding_grads.defined() || embedding_grads.numel() == 0) {
+            return;
+        }
+
+        ids.emplace_back(node_ids.reshape({-1}).to(torch::kInt64));
+        grads.emplace_back(embedding_grads.reshape({-1, embedding_grads.size(-1)}));
+        if (embedding_state.defined()) {
+            states.emplace_back(embedding_state.reshape({-1, embedding_state.size(-1)}));
+        }
+    };
+
+    std::vector<torch::Tensor> resident_ids;
+    std::vector<torch::Tensor> resident_grads;
+    std::vector<torch::Tensor> resident_states;
+    resident_ids.reserve(4);
+    resident_grads.reserve(4);
+    resident_states.reserve(4);
+
+    if (edges_.defined()) {
+        append_resident(resident_ids, resident_grads, resident_states, edges_.select(1, 0), resident_src_embeddings_, resident_src_embeddings_state_);
+        append_resident(resident_ids, resident_grads, resident_states, edges_.select(1, -1), resident_dst_embeddings_, resident_dst_embeddings_state_);
+    }
+    append_resident(resident_ids, resident_grads, resident_states, src_neg_indices_, resident_src_neg_embeddings_, resident_src_neg_embeddings_state_);
+    append_resident(resident_ids, resident_grads, resident_states, dst_neg_indices_, resident_dst_neg_embeddings_, resident_dst_neg_embeddings_state_);
+
+    if (resident_ids.empty() || resident_grads.empty()) {
+        return;
+    }
+
+    unique_node_indices_ = torch::cat(resident_ids, 0);
+    node_gradients_ = torch::cat(resident_grads, 0);
+    node_embeddings_state_ = resident_states.empty() ? torch::Tensor() : torch::cat(resident_states, 0);
+
+#ifdef GEGE_CUDA
+    if (node_gradients_.device().is_cuda()) {
+        std::tie(unique_node_indices_, node_gradients_, node_embeddings_state_) =
+            reduce_local_gradients_with_csr(unique_node_indices_, node_gradients_, node_embeddings_state_);
+    }
+#endif
+
+    if (!node_embeddings_state_.defined()) {
+        throw GegeRuntimeException("Resident-local LP direct path requires node optimizer state");
+    }
+
+    node_state_update_ = node_gradients_.pow(2);
+    node_embeddings_state_.add_(node_state_update_);
+    node_gradients_ = -learning_rate * (node_gradients_ / (node_embeddings_state_.sqrt().add_(1e-10)));
+    node_embeddings_state_ = torch::Tensor();
 }
 
 void Batch::accumulateGradientsG(float learning_rate) {
@@ -313,6 +432,17 @@ void Batch::embeddingsToHost() {
         node_state_update_ = temp_grads2;
     }
 
+    if (qual_gradients_.defined() && qual_gradients_.device().is_cuda()) {
+        auto grad_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+        Gradients temp_qgrads = torch::empty(qual_gradients_.sizes(), grad_opts);
+        temp_qgrads.copy_(qual_gradients_, true);
+        Gradients temp_qgrads2 = torch::empty(qual_state_update_.sizes(), grad_opts);
+        temp_qgrads2.copy_(qual_state_update_, true);
+        qual_gradients_ = temp_qgrads;
+        qual_state_update_ = temp_qgrads2;
+        qual_indices_ = qual_indices_.to(torch::kCPU);
+    }
+
     if (unique_node_indices_.defined()) {
         unique_node_indices_ = unique_node_indices_.to(torch::kCPU);
     }
@@ -341,6 +471,9 @@ void Batch::embeddingsToHostG() {
 }
 
 void Batch::clear() {
+    streamed_edge_start_ = -1;
+    streamed_edge_size_ = 0;
+    resident_local_lp_direct_ = false;
     root_node_indices_ = torch::Tensor();
     unique_node_indices_ = torch::Tensor();
     node_embeddings_ = torch::Tensor();
@@ -352,6 +485,12 @@ void Batch::clear() {
     node_embeddings_state_ = torch::Tensor();
     node_embeddings_state_g_ = torch::Tensor();
 
+    qual_embeddings_ = torch::Tensor();
+    qual_gradients_ = torch::Tensor();
+    qual_embeddings_state_ = torch::Tensor();
+    qual_state_update_ = torch::Tensor();
+    qual_indices_ = torch::Tensor();
+
     node_features_ = torch::Tensor();
     node_labels_ = torch::Tensor();
 
@@ -359,6 +498,14 @@ void Batch::clear() {
     dst_neg_indices_mapping_ = torch::Tensor();
 
     edges_ = torch::Tensor();
+    resident_src_embeddings_ = torch::Tensor();
+    resident_dst_embeddings_ = torch::Tensor();
+    resident_src_neg_embeddings_ = torch::Tensor();
+    resident_dst_neg_embeddings_ = torch::Tensor();
+    resident_src_embeddings_state_ = torch::Tensor();
+    resident_dst_embeddings_state_ = torch::Tensor();
+    resident_src_neg_embeddings_state_ = torch::Tensor();
+    resident_dst_neg_embeddings_state_ = torch::Tensor();
     neg_edges_ = torch::Tensor();
     src_neg_indices_ = torch::Tensor();
     dst_neg_indices_ = torch::Tensor();

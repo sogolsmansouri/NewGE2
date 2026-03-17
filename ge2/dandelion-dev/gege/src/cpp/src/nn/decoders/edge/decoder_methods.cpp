@@ -840,7 +840,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
         torch::Tensor dst_negs_scores;
         torch::Tensor src_negs_scores;
 
-        if (negative_sampling_method == NegativeSamplingMethod::DNS || negative_sampling_method == NegativeSamplingMethod::GAN) {
+        if ((negative_sampling_method == NegativeSamplingMethod::DNS || negative_sampling_method == NegativeSamplingMethod::GAN) &&
+            selected_negatives_num < negatives_num) {
             if (negative_sampling_method == NegativeSamplingMethod::GAN) {
                 auto src_dst_g = gather_positive_embeddings(node_embeddings_g, src_ids, dst_ids, use_csr_gather, &positive_gather_plan);
                 auto all_pos_embeddings_g = prepare_pos_embeddings(decoder, positive_edges, std::get<0>(src_dst_g), std::get<1>(src_dst_g), has_relations);

@@ -882,6 +882,9 @@ def load_config(input_config_path, save=False):
     if output_config.training.resume_from_checkpoint != "" and output_config.training.resume_from_checkpoint[-1] != "/":
         output_config.training.resume_from_checkpoint += "/"
 
+    if output_config.evaluation.checkpoint_dir != "" and output_config.evaluation.checkpoint_dir[-1] != "/":
+        output_config.evaluation.checkpoint_dir += "/"
+
     if save and (output_config.training.resume_from_checkpoint != "" or not output_config.training.resume_training):
         # create model_dir when
         # 1. training from scratch [NOT resuming training]

@@ -5,6 +5,33 @@
 #include "storage/io.h"
 #include "storage/storage.h"
 
+namespace {
+
+std::string normalize_checkpoint_dir(std::string directory) {
+    if (!directory.empty() && directory.back() != '/') {
+        directory.push_back('/');
+    }
+    return directory;
+}
+
+std::string read_required_metadata_line(std::ifstream &input_file, const std::string &metadata_path, const char *field_name) {
+    std::string line;
+    if (!std::getline(input_file, line)) {
+        throw std::runtime_error("Invalid checkpoint metadata at " + metadata_path + ": missing " + field_name);
+    }
+    return line;
+}
+
+int parse_metadata_int(const std::string &line, const std::string &metadata_path, const char *field_name) {
+    try {
+        return std::stoi(line);
+    } catch (const std::exception &) {
+        throw std::runtime_error("Invalid checkpoint metadata at " + metadata_path + ": malformed " + field_name + "='" + line + "'");
+    }
+}
+
+}  // namespace
+
 Checkpointer::Checkpointer(std::shared_ptr<Model> model, shared_ptr<GraphModelStorage> storage, std::shared_ptr<CheckpointConfig> config) {
     model_ = model;
     storage_ = storage;
@@ -12,6 +39,7 @@ Checkpointer::Checkpointer(std::shared_ptr<Model> model, shared_ptr<GraphModelSt
 }
 
 void Checkpointer::create_checkpoint(string checkpoint_dir, CheckpointMeta checkpoint_meta, int epochs) {
+    checkpoint_dir = normalize_checkpoint_dir(std::move(checkpoint_dir));
     string tmp_checkpoint_dir = checkpoint_dir + "checkpoint_" + std::to_string(epochs) + "_tmp/";
     createDir(tmp_checkpoint_dir, false);
 
@@ -33,6 +61,7 @@ void Checkpointer::create_checkpoint(string checkpoint_dir, CheckpointMeta check
 }
 
 void Checkpointer::save(string checkpoint_dir, CheckpointMeta checkpoint_meta) {
+    checkpoint_dir = normalize_checkpoint_dir(std::move(checkpoint_dir));
     if (checkpoint_meta.has_model) {
         if (storage_->storage_ptrs_.node_embeddings != nullptr) {
             storage_->storage_ptrs_.node_embeddings->write();
@@ -57,6 +86,7 @@ void Checkpointer::save(string checkpoint_dir, CheckpointMeta checkpoint_meta) {
 
 std::tuple<std::shared_ptr<Model>, shared_ptr<GraphModelStorage>, CheckpointMeta> Checkpointer::load(string checkpoint_dir,
                                                                                                      std::shared_ptr<GegeConfig> gege_config, bool train) {
+    checkpoint_dir = normalize_checkpoint_dir(std::move(checkpoint_dir));
     CheckpointMeta checkpoint_meta = loadMetadata(checkpoint_dir);
 
     std::vector<torch::Device> devices = devices_from_config(gege_config->storage);
@@ -76,41 +106,46 @@ std::tuple<std::shared_ptr<Model>, shared_ptr<GraphModelStorage>, CheckpointMeta
 }
 
 CheckpointMeta Checkpointer::loadMetadata(string directory) {
+    directory = normalize_checkpoint_dir(std::move(directory));
     CheckpointMeta ret_meta;
 
     std::ifstream input_file;
+    const std::string metadata_path = directory + PathConstants::checkpoint_metadata_file;
 
-    input_file.open(directory + PathConstants::checkpoint_metadata_file);
+    input_file.open(metadata_path);
+    if (!input_file.is_open()) {
+        throw std::runtime_error("Unable to open checkpoint metadata file: " + metadata_path);
+    }
 
-    std::string line;
-    std::getline(input_file, line);
-    ret_meta.name = line;
+    ret_meta.name = read_required_metadata_line(input_file, metadata_path, "name");
 
-    std::getline(input_file, line);
+    ret_meta.num_epochs = parse_metadata_int(read_required_metadata_line(input_file, metadata_path, "num_epochs"), metadata_path, "num_epochs");
 
-    ret_meta.num_epochs = std::stoi(line);
+    ret_meta.checkpoint_id = parse_metadata_int(read_required_metadata_line(input_file, metadata_path, "checkpoint_id"), metadata_path, "checkpoint_id");
 
-    std::getline(input_file, line);
-    ret_meta.checkpoint_id = std::stoi(line);
-
-    std::getline(input_file, line);
+    std::string line = read_required_metadata_line(input_file, metadata_path, "link_prediction");
     std::istringstream(line) >> ret_meta.link_prediction;
 
-    std::getline(input_file, line);
+    line = read_required_metadata_line(input_file, metadata_path, "has_state");
     std::istringstream(line) >> ret_meta.has_state;
 
-    std::getline(input_file, line);
+    line = read_required_metadata_line(input_file, metadata_path, "has_encoded");
     std::istringstream(line) >> ret_meta.has_encoded;
 
-    std::getline(input_file, line);
+    line = read_required_metadata_line(input_file, metadata_path, "has_model");
     std::istringstream(line) >> ret_meta.has_model;
 
     return ret_meta;
 }
 
 void Checkpointer::saveMetadata(string directory, CheckpointMeta checkpoint_meta) {
+    directory = normalize_checkpoint_dir(std::move(directory));
     std::ofstream output_file;
-    output_file.open(directory + PathConstants::checkpoint_metadata_file);
+    const std::string metadata_path = directory + PathConstants::checkpoint_metadata_file;
+    output_file.open(metadata_path);
+    if (!output_file.is_open()) {
+        throw std::runtime_error("Unable to open checkpoint metadata file for writing: " + metadata_path);
+    }
 
     output_file << checkpoint_meta.name << "\n";
     output_file << checkpoint_meta.num_epochs << "\n";

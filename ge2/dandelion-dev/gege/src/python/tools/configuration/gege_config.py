@@ -4,7 +4,16 @@ import re
 import shutil
 import sys
 from dataclasses import dataclass, field
-from distutils import dir_util
+try:
+    from distutils import dir_util
+except ImportError:
+    # distutils removed in Python 3.12; shim using shutil
+    class _dir_util_shim:
+        @staticmethod
+        def copy_tree(src, dst):
+            import shutil as _sh
+            _sh.copytree(src, dst, dirs_exist_ok=True)
+    dir_util = _dir_util_shim()
 from pathlib import Path
 from typing import List
 

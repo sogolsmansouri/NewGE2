@@ -22,7 +22,7 @@ namespace {
 std::tuple<torch::Tensor, torch::Tensor> unique_with_counts_sorted(torch::Tensor values) {
     auto sort_tup = torch::sort(values.to(torch::kInt64), 0, false);
     torch::Tensor sorted_values = std::get<0>(sort_tup);
-    auto unique_tup = torch::unique_consecutive(sorted_values, false, false, true);
+    auto unique_tup = torch::unique_consecutive(sorted_values, false, true);
     return std::forward_as_tuple(std::get<0>(unique_tup), std::get<2>(unique_tup));
 }
 

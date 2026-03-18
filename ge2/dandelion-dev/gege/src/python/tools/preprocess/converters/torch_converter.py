@@ -251,7 +251,7 @@ def map_edge_lists(
             in_degrees = torch.scatter_add(
                 in_degrees,
                 0,
-                torch.squeeze(edge_lists[0][:, -1]).to(torch.int64),
+                torch.squeeze(edge_lists[0][:, 2] if is_nary else edge_lists[0][:, -1]).to(torch.int64),
                 torch.ones(
                     [
                         edge_lists[0].shape[0],

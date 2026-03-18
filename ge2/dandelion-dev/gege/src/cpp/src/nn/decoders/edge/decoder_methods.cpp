@@ -5,6 +5,7 @@
 #include "nn/decoders/edge/comparators.h"
 #include "nn/decoders/edge/distmult.h"
 #include "nn/decoders/edge/distmult_selected_neg_cuda.h"
+#include "nn/decoders/edge/tucker4.h"
 #include "reporting/logger.h"
 
 #ifdef GEGE_CUDA
@@ -734,16 +735,28 @@ std::tuple<torch::Tensor, torch::Tensor> prepare_pos_embeddings(shared_ptr<EdgeD
     if (has_relations) {
         rel_ids = positive_edges.select(1, 1);
         rels = decoder->select_relations(rel_ids);
-        adjusted_src_embeddings = decoder->apply_relation(src_embeddings, rels);
 
-        // Arity-4: fuse qualifier value embedding via element-wise product with adjusted source
-        if (is_nary && qual_embeddings.defined()) {
-            adjusted_src_embeddings = adjusted_src_embeddings * qual_embeddings;
-        }
+        auto tucker4_decoder = std::dynamic_pointer_cast<TuckER4>(decoder);
+        if (tucker4_decoder != nullptr && is_nary && qual_embeddings.defined()) {
+            // Tucker-4 path: partial contraction W ×₁ e_s ×₂ e_r ×₄ e_qr ×₅ e_qv
+            // leaving the dst mode open; dot with e_dst gives the Tucker score.
+            torch::Tensor qrel_ids = positive_edges.select(1, 3).to(torch::kInt64);
+            torch::Tensor qrel_embeddings = decoder->select_relations(qrel_ids);
+            adjusted_src_embeddings = tucker4_decoder->tucker4_partial(
+                src_embeddings, rels, qrel_embeddings, qual_embeddings);
+        } else {
+            // StarE / binary path
+            adjusted_src_embeddings = decoder->apply_relation(src_embeddings, rels);
 
-        if (!is_nary && decoder->use_inverse_relations_) {
-            inv_rels = decoder->select_relations(rel_ids, true);
-            adjusted_dst_embeddings = decoder->apply_relation(dst_embeddings, inv_rels);
+            // Arity-4 StarE: fuse qualifier value via element-wise product
+            if (is_nary && qual_embeddings.defined()) {
+                adjusted_src_embeddings = adjusted_src_embeddings * qual_embeddings;
+            }
+
+            if (!is_nary && decoder->use_inverse_relations_) {
+                inv_rels = decoder->select_relations(rel_ids, true);
+                adjusted_dst_embeddings = decoder->apply_relation(dst_embeddings, inv_rels);
+            }
         }
     } else {  // no relations
         adjusted_src_embeddings = src_embeddings;

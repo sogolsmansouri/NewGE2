@@ -453,9 +453,10 @@ shared_ptr<GraphModelStorage> initializeStorageLinkPrediction(shared_ptr<Model> 
 
     storage_ptrs.relation_features = initializeRelationFeatures(model, storage_config);
 
-    // Initialize qualifier value embeddings for arity-4 KGs (5-column edge tensors).
+    // Initialize qualifier value embeddings for arity-3/4 KGs (4- or 5-column edge tensors).
     // These are always-resident InMemory storage (same device as node embeddings).
-    if (storage_ptrs.train_edges != nullptr && storage_ptrs.train_edges->dim1_size_ == 5) {
+    if (storage_ptrs.train_edges != nullptr
+        && (storage_ptrs.train_edges->dim1_size_ == 4 || storage_ptrs.train_edges->dim1_size_ == 5)) {
         int64_t num_nodes = storage_config->dataset->num_nodes;
         int embedding_dim = model->get_base_embedding_dim();
         torch::Dtype emb_dtype = (storage_config->embeddings != nullptr)

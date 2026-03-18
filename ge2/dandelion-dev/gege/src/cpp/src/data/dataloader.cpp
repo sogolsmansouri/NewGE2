@@ -63,21 +63,6 @@ bool verify_node_mapping_enabled() {
     return enabled;
 }
 
-bool resident_local_compaction_enabled() {
-    static bool enabled = parse_env_flag("GEGE_RESIDENT_LOCAL_COMPACTION", true);
-    return enabled;
-}
-
-bool resident_local_lp_direct_enabled() {
-    static bool enabled = parse_env_flag("GEGE_RESIDENT_LOCAL_LP_DIRECT", false);
-    return enabled;
-}
-
-const std::string &resident_local_compaction_backend() {
-    static std::string backend = parse_env_string("GEGE_RESIDENT_LOCAL_COMPACTION_BACKEND", "bitmap");
-    return backend;
-}
-
 bool partition_buffer_lp_fast_path_env_enabled(bool default_value) {
     return parse_env_flag("GEGE_PARTITION_BUFFER_LP_FAST_PATH", default_value);
 }
@@ -427,7 +412,6 @@ std::vector<StreamedEdgeSlice> build_streamed_edge_slices(DataLoader *loader, in
 
     return slices;
 }
-
 }  // namespace
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
@@ -446,7 +430,7 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     waiting_for_batches_ = false;
 
     single_dataset_ = false;
-    async_barrier = 0;
+    resetSwapSyncState();
     graph_storage_ = graph_storage;
     learning_task_ = learning_task;
     training_config_ = training_config;
@@ -569,8 +553,8 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     sampler_lock_ = new std::mutex();
     batch_lock_ = new std::mutex;
     batch_cv_ = new std::condition_variable;
-    async_barrier = 0;
     waiting_for_batches_ = false;
+    resetSwapSyncState();
 
     batch_size_ = batch_size;
     single_dataset_ = true;
@@ -1141,6 +1125,49 @@ void DataLoader::setBufferOrdering() {
 
 void DataLoader::clearBatches() { all_batches_ = std::vector<std::vector<shared_ptr<Batch>>>(); }
 
+void DataLoader::resetSwapSyncState() {
+    std::lock_guard<std::mutex> lock(swap_phase_mutex_);
+    async_barrier = 0;
+    swap_tasks_completed = 0;
+    swap_read_arrivals_ = 0;
+    swap_read_generation_ = 0;
+    swap_rebuild_arrivals_ = 0;
+    swap_rebuild_generation_ = 0;
+}
+
+void DataLoader::waitForSwapReadBarrier(int32_t participants) {
+    std::unique_lock<std::mutex> lock(swap_phase_mutex_);
+    int64_t generation = swap_read_generation_;
+    async_barrier.fetch_add(1);
+    swap_read_arrivals_++;
+    if (swap_read_arrivals_ == participants) {
+        swap_read_arrivals_ = 0;
+        swap_read_generation_++;
+        lock.unlock();
+        swap_phase_cv_.notify_all();
+        return;
+    }
+
+    swap_phase_cv_.wait(lock, [&]() { return swap_read_generation_ != generation; });
+}
+
+void DataLoader::waitForSwapRebuildBarrier(int32_t participants) {
+    std::unique_lock<std::mutex> lock(swap_phase_mutex_);
+    int64_t generation = swap_rebuild_generation_;
+    swap_tasks_completed.fetch_add(1);
+    swap_rebuild_arrivals_++;
+    if (swap_rebuild_arrivals_ == participants) {
+        swap_rebuild_arrivals_ = 0;
+        swap_tasks_completed = 0;
+        swap_rebuild_generation_++;
+        lock.unlock();
+        swap_phase_cv_.notify_all();
+        return;
+    }
+
+    swap_phase_cv_.wait(lock, [&]() { return swap_rebuild_generation_ != generation; });
+}
+
 shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
     // std::unique_lock batch_lock(*batch_lock_);
     // // batch_cv_->wait(batch_lock, [this] { return !waiting_for_batches_; });
@@ -1150,12 +1177,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
         batch = *batch_iterators_[device_idx];
         batch_iterators_[device_idx]++;
 
-        // all_reads_[device_idx] = true;
-
-        // check if all batches have been read
         if (batch_iterators_[device_idx] == all_batches_[device_idx].end()) {
-            ++ async_barrier;
-            // all_reads_[device_idx] = true;
             if (graph_storage_->useInMemorySubGraph()) {
                 if (!graph_storage_->hasSwap(device_idx)) {
                     all_reads_[device_idx] = true;
@@ -1169,16 +1191,8 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
         if (graph_storage_->useInMemorySubGraph()) {
             if (graph_storage_->hasSwap(device_idx)) {
                 // wait for all batches to finish before swapping
-                if (swap_tasks_completed == all_batches_.size()) {
-                    swap_tasks_completed = 0;
-                }
                 auto swap_barrier_start = std::chrono::high_resolution_clock::now();
-                // batch_cv_->wait(batch_lock, [this, device_idx] { 
-                //     return async_barrier.load() % all_batches_.size() == 0; });
-                // batch_lock.unlock();
-                while(async_barrier.load() % all_batches_.size() != 0) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
+                waitForSwapReadBarrier(static_cast<int32_t>(all_batches_.size()));
                 int64_t swap_barrier_elapsed = elapsed_ns(swap_barrier_start, std::chrono::high_resolution_clock::now());
                 swap_barrier_wait_ns_.fetch_add(swap_barrier_elapsed);
                 if (device_idx < device_swap_barrier_wait_ns_.size()) {
@@ -1229,7 +1243,6 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
 
-                swap_tasks_completed ++;
                 activate_devices_ ++;
                 swap_count_.fetch_add(1);
                 if (device_idx < device_swap_count_.size()) {
@@ -1237,9 +1250,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 }
 
                 auto swap_sync_start = std::chrono::high_resolution_clock::now();
-                while(swap_tasks_completed.load() != all_batches_.size()) {
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
+                waitForSwapRebuildBarrier(static_cast<int32_t>(all_batches_.size()));
                 int64_t swap_sync_elapsed = elapsed_ns(swap_sync_start, std::chrono::high_resolution_clock::now());
                 swap_sync_wait_ns_.fetch_add(swap_sync_elapsed);
                 if (device_idx < device_swap_sync_wait_ns_.size()) {
@@ -1262,7 +1273,6 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 batch = *batch_iterators_[device_idx];
                 batch_iterators_[device_idx]++;
 
-                // check if all batches have been read
                 if (batch_iterators_[device_idx] == all_batches_[device_idx].end()) {
                     if (graph_storage_->useInMemorySubGraph()) {
                         if (!graph_storage_->hasSwap(device_idx)) {
@@ -1422,37 +1432,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     // SPDLOG_INFO("false_negative_edges_src: {}", false_negative_edges_src);
     // SPDLOG_INFO("false_negative_edges_dst: {}", false_negative_edges_dst);
     torch::Tensor edge_src = batch->edges_.select(1, 0);
-    torch::Tensor edge_dst = (batch->edges_.size(1) == 5)
+    torch::Tensor edge_dst = (batch->edges_.size(1) >= 4)
                                  ? batch->edges_.select(1, 2)
                                  : batch->edges_.select(1, -1);
-    bool use_resident_local_direct =
-        resident_local_lp_direct_enabled() && train_ && negative_sampling_method_ == NegativeSamplingMethod::RNS &&
-        learning_task_ == LearningTask::LINK_PREDICTION && neighbor_sampler_ == nullptr && graph_storage_->useInMemorySubGraph() &&
-        graph_storage_->storage_ptrs_.node_embeddings != nullptr &&
-        graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA && batch->edges_.defined() && batch->edges_.is_cuda() &&
-        batch->edges_.scalar_type() == torch::kInt64;
-    if (use_resident_local_direct) {
-        batch->resident_local_lp_direct_ = true;
-
-        add_perf_stat(edge_get_edges_ns_, device_edge_get_edges_ns_, device_idx, get_edges_elapsed);
-        add_perf_stat(edge_negative_sample_ns_, device_edge_negative_sample_ns_, device_idx, negative_sample_elapsed);
-        add_perf_stat(edge_map_collect_ids_ns_, device_edge_map_collect_ids_ns_, device_idx, 0);
-        add_perf_stat(edge_map_lookup_ns_, device_edge_map_lookup_ns_, device_idx, 0);
-        add_perf_stat(edge_map_verify_ns_, device_edge_map_verify_ns_, device_idx, 0);
-        add_perf_stat(edge_remap_assign_ns_, device_edge_remap_assign_ns_, device_idx, 0);
-        add_perf_stat(edge_finalize_ns_, device_edge_finalize_ns_, device_idx, 0);
-
-        if (run_stage_debug) {
-            auto now = std::chrono::high_resolution_clock::now();
-            int64_t src_neg_numel = batch->src_neg_indices_.defined() ? batch->src_neg_indices_.numel() : 0;
-            int64_t dst_neg_numel = batch->dst_neg_indices_.defined() ? batch->dst_neg_indices_.numel() : 0;
-            SPDLOG_INFO(
-                "[stage-debug][edgeSample][batch {}][step 3] resident_local_direct ms={:.3f} src_neg_numel={} dst_neg_numel={} total_ms={:.3f}",
-                debug_batch_id, elapsed_ms(step_start, now), src_neg_numel, dst_neg_numel, elapsed_ms(edge_sample_start, now));
-        }
-        return;
-    }
-
     auto map_collect_start = std::chrono::high_resolution_clock::now();
     // For arity-4 [src, rel, dst, qrel, qval]: partition mapping only covers src(col0) and dst(col2).
     // qval(col4) goes to the always-resident qual_embeddings table and does not participate in partitioning.
@@ -1479,8 +1461,6 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     double remap_assign_ms = 0.0;
     MapTensorTiming map_tensor_timing;
     bool has_map_tensor_timing = false;
-    bool use_resident_local_compaction = false;
-    std::string resident_local_backend;
 
     if (neighbor_sampler_ != nullptr) {
         auto map_lookup_start = std::chrono::high_resolution_clock::now();
@@ -1522,15 +1502,8 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
     } else {
         // map edges and negatives to their corresponding index in unique_node_indices_
-        use_resident_local_compaction =
-            resident_local_compaction_enabled() && learning_task_ == LearningTask::LINK_PREDICTION && graph_storage_->useInMemorySubGraph() &&
-            batch->edges_.defined() && batch->edges_.is_cuda() && batch->edges_.scalar_type() == torch::kInt64 &&
-            graph_storage_->getNumNodesInMemory(device_idx) > 0;
-        resident_local_backend = use_resident_local_compaction ? resident_local_compaction_backend() : std::string();
-        bool map_sorted = use_resident_local_compaction ? false : !fast_map_tensors_enabled();
         auto map_lookup_start = std::chrono::high_resolution_clock::now();
-        auto tup = map_tensors(all_ids, map_sorted, run_stage_debug ? &map_tensor_timing : nullptr, graph_storage_->getNumNodesInMemory(device_idx),
-                               resident_local_backend);
+        auto tup = map_tensors(all_ids, !fast_map_tensors_enabled(), run_stage_debug ? &map_tensor_timing : nullptr);
         auto map_lookup_end = std::chrono::high_resolution_clock::now();
         map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
         map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
@@ -1580,10 +1553,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         int64_t duplicate_count = std::max<int64_t>(input_ids_numel - unique_numel, 0);
         double duplicate_ratio = input_ids_numel > 0 ? (double)duplicate_count / (double)input_ids_numel : 0.0;
         SPDLOG_INFO(
-            "[stage-debug][edgeSample][batch {}][step 3] map/remap ms={:.3f} unique_nodes={} input_ids={} duplicates={} duplicate_ratio={:.6f} neighbor_sampler={} fast_map={} verify_map={} resident_local_compaction={} resident_backend={}",
+            "[stage-debug][edgeSample][batch {}][step 3] map/remap ms={:.3f} unique_nodes={} input_ids={} duplicates={} duplicate_ratio={:.6f} neighbor_sampler={} fast_map={} verify_map={}",
             debug_batch_id, elapsed_ms(step_start, now), unique_numel, input_ids_numel, duplicate_count, duplicate_ratio,
-            neighbor_sampler_ != nullptr, fast_map_tensors_enabled(), verify_node_mapping_enabled(), use_resident_local_compaction,
-            resident_local_backend);
+            neighbor_sampler_ != nullptr, fast_map_tensors_enabled(), verify_node_mapping_enabled());
         SPDLOG_INFO(
             "[stage-debug][edgeSample][batch {}][step 3 breakdown] collect_ids_ms={:.3f} map_lookup_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f}",
             debug_batch_id, elapsed_ms(map_collect_start, map_collect_end), map_lookup_ms, map_verify_ms, remap_assign_ms);
@@ -1606,6 +1578,14 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         batch->edges_ = torch::stack({src_mapping, dst_mapping}).transpose(0, 1);
     } else if (batch->edges_.size(1) == 3) {
         batch->edges_ = torch::stack({src_mapping, batch->edges_.select(1, 1), dst_mapping}).transpose(0, 1);
+    } else if (batch->edges_.size(1) == 4) {
+        // Arity-3: [src, rel, dst, qval]
+        // src(col0) and dst(col2) remapped; qval(col3) stays as global id.
+        batch->edges_ = torch::stack({src_mapping,
+                                      batch->edges_.select(1, 1),   // rel
+                                      dst_mapping,
+                                      batch->edges_.select(1, 3)})  // qval (global id)
+                            .transpose(0, 1);
     } else if (batch->edges_.size(1) == 5) {
         // Arity-4: [src, rel, dst, qrel, qval]
         // src(col0) and dst(col2) are remapped to partition-local ids.
@@ -1617,7 +1597,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
                                       batch->edges_.select(1, 4)})  // qval (global id)
                             .transpose(0, 1);
     } else {
-        throw TensorSizeMismatchException(batch->edges_, "Edge list must be a 2, 3, or 5 column tensor");
+        throw TensorSizeMismatchException(batch->edges_, "Edge list must be a 2, 3, 4, or 5 column tensor");
     }
 
     batch->src_neg_indices_mapping_ = src_neg_mapping;
@@ -1696,11 +1676,12 @@ void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
         }
     }
 
-    // Arity-4: load qualifier value embeddings from always-resident CPU storage (if applicable)
+    // Arity-3/4: load qualifier value embeddings from always-resident CPU storage (if applicable).
+    // qval is always the last column: col 3 for arity-3 (4 cols), col 4 for arity-4 (5 cols).
     if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
-        && batch->edges_.size(1) == 5
+        && (batch->edges_.size(1) == 4 || batch->edges_.size(1) == 5)
         && graph_storage_->storage_ptrs_.qual_embeddings->device_ != torch::kCUDA) {
-        torch::Tensor qval_ids = batch->edges_.select(1, 4).to(torch::kInt64);
+        torch::Tensor qval_ids = batch->edges_.select(1, -1).to(torch::kInt64);
         batch->qual_embeddings_ = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(qval_ids);
         batch->qual_indices_ = qval_ids;
         if (train_) {
@@ -1712,41 +1693,6 @@ void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
 }
 
 void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) {
-    if (batch->resident_local_lp_direct_) {
-        auto load_resident_tensor = [&](const torch::Tensor &ids, torch::Tensor &embeddings, torch::Tensor &embedding_state) {
-            if (!ids.defined() || ids.numel() == 0) {
-                embeddings = torch::Tensor();
-                embedding_state = torch::Tensor();
-                return;
-            }
-
-            torch::Tensor flat_ids = ids.reshape({-1});
-            embeddings = graph_storage_->getNodeEmbeddings(flat_ids, device_idx);
-            std::vector<int64_t> embedding_shape(ids.sizes().vec());
-            embedding_shape.emplace_back(embeddings.size(-1));
-            embeddings = embeddings.reshape(embedding_shape);
-
-            if (train_) {
-                embedding_state = graph_storage_->getNodeEmbeddingState(flat_ids, device_idx);
-                std::vector<int64_t> state_shape(ids.sizes().vec());
-                state_shape.emplace_back(embedding_state.size(-1));
-                embedding_state = embedding_state.reshape(state_shape);
-            } else {
-                embedding_state = torch::Tensor();
-            }
-        };
-
-        torch::Tensor edge_src = batch->edges_.select(1, 0);
-        torch::Tensor edge_dst = (batch->edges_.size(1) == 5)
-                                     ? batch->edges_.select(1, 2)
-                                     : batch->edges_.select(1, -1);
-        load_resident_tensor(edge_src, batch->resident_src_embeddings_, batch->resident_src_embeddings_state_);
-        load_resident_tensor(edge_dst, batch->resident_dst_embeddings_, batch->resident_dst_embeddings_state_);
-        load_resident_tensor(batch->src_neg_indices_, batch->resident_src_neg_embeddings_, batch->resident_src_neg_embeddings_state_);
-        load_resident_tensor(batch->dst_neg_indices_, batch->resident_dst_neg_embeddings_, batch->resident_dst_neg_embeddings_state_);
-        return;
-    }
-
     if (graph_storage_->storage_ptrs_.node_embeddings != nullptr) {
         if (graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA) {
 
@@ -1772,11 +1718,12 @@ void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) 
         }
     }
 
-    // Arity-4: load qualifier value embeddings from always-resident GPU storage
+    // Arity-3/4: load qualifier value embeddings from always-resident GPU storage.
+    // qval is always the last column: col 3 for arity-3 (4 cols), col 4 for arity-4 (5 cols).
     if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
-        && batch->edges_.size(1) == 5
+        && (batch->edges_.size(1) == 4 || batch->edges_.size(1) == 5)
         && graph_storage_->storage_ptrs_.qual_embeddings->device_ == torch::kCUDA) {
-        torch::Tensor qval_ids = batch->edges_.select(1, 4).to(torch::kInt64);
+        torch::Tensor qval_ids = batch->edges_.select(1, -1).to(torch::kInt64);
         batch->qual_embeddings_ = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(qval_ids);
         batch->qual_indices_ = qval_ids;
         if (train_) {
@@ -1829,6 +1776,37 @@ void DataLoader::updateEmbeddingsG(shared_ptr<Batch> batch, bool gpu, int32_t de
     }
 }
 
+int64_t DataLoader::getPlannedEpochItemCount() const {
+    if (learning_task_ == LearningTask::LINK_PREDICTION && graph_storage_ != nullptr && graph_storage_->storage_ptrs_.edges != nullptr &&
+        !edge_buckets_per_buffer_.empty()) {
+        auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+        int64_t total_edges = 0;
+        for (const auto &bucket_tensor : edge_buckets_per_buffer_) {
+            torch::Tensor bucket_ids = bucket_tensor.flatten().to(torch::kCPU).to(torch::kInt64);
+            auto accessor = bucket_ids.accessor<int64_t, 1>();
+            for (int64_t i = 0; i < bucket_ids.size(0); i++) {
+                int64_t bucket_id = accessor[i];
+                if (bucket_id >= 0 && static_cast<std::size_t>(bucket_id) < edge_bucket_sizes.size()) {
+                    total_edges += edge_bucket_sizes[bucket_id];
+                }
+            }
+        }
+        if (total_edges > 0) {
+            return total_edges;
+        }
+    }
+
+    if (learning_task_ == LearningTask::LINK_PREDICTION && graph_storage_->storage_ptrs_.train_edges != nullptr) {
+        return graph_storage_->storage_ptrs_.train_edges->getDim0();
+    }
+
+    if (learning_task_ == LearningTask::NODE_CLASSIFICATION && graph_storage_->storage_ptrs_.train_nodes != nullptr) {
+        return graph_storage_->storage_ptrs_.train_nodes->getDim0();
+    }
+
+    return 0;
+}
+
 void DataLoader::loadStorage() {
     bool log_startup_timing = startup_timing_enabled();
     auto total_start = std::chrono::high_resolution_clock::now();
@@ -1872,6 +1850,7 @@ void DataLoader::loadStorage() {
 
     batch_id_offset_ = 0;
     total_batches_processed_ = 0;
+    resetSwapSyncState();
 
     all_batches_ = std::vector<std::vector<shared_ptr<Batch>>>(devices_.size());
     batches_left_ = std::vector<int32_t>(devices_.size());

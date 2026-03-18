@@ -82,15 +82,17 @@ def map_edge_list_dfs(edge_lists: list, known_node_ids=None, sequential_train_no
     all_edges_df = pd.concat(edge_lists)
 
     num_cols = len(all_edges_df.columns)
-    is_nary_df = num_cols == 5  # arity-4: [src, rel, dst, qrel, qval]
+    is_nary_df = num_cols == 5   # arity-4: [src, rel, dst, qrel, qval]
+    is_nary3_df = num_cols == 4  # arity-3: [src, rel, dst, qval]
+    is_any_nary_df = is_nary_df or is_nary3_df
 
     unique_src = all_edges_df.iloc[:, 0].unique()
-    # For arity-4, dst is col 2 (not last col); last col is qval
-    unique_dst = all_edges_df.iloc[:, 2 if is_nary_df else -1].unique()
+    # For arity-3/4, dst is col 2; qval is the last column
+    unique_dst = all_edges_df.iloc[:, 2 if is_any_nary_df else -1].unique()
 
     node_id_arrays = [unique_src.astype(str), unique_dst.astype(str)]
-    if is_nary_df:
-        node_id_arrays.append(all_edges_df.iloc[:, 4].unique().astype(str))  # qval entities
+    if is_any_nary_df:
+        node_id_arrays.append(all_edges_df.iloc[:, -1].unique().astype(str))  # qval: last col
     if known_node_ids is not None:
         for n in known_node_ids:
             node_id_arrays.append(n.numpy().astype(str))
@@ -105,17 +107,18 @@ def map_edge_list_dfs(edge_lists: list, known_node_ids=None, sequential_train_no
     unique_rels = torch.empty([0])
     mapped_rel_ids = torch.empty([0])
     rels_dict = None
-    if num_cols == 3 or is_nary_df:
+    if num_cols == 3 or is_any_nary_df:
         has_rels = True
 
     if has_rels:
         if is_nary_df:
-            # rel (col 1) and qrel (col 3) share the same relation namespace
+            # arity-4: rel (col 1) and qrel (col 3) share the same relation namespace
             unique_rels = np.unique(np.concatenate([
                 all_edges_df.iloc[:, 1].unique().astype(str),
                 all_edges_df.iloc[:, 3].unique().astype(str),
             ]))
         else:
+            # arity-3 and binary: only col 1 is a relation
             unique_rels = all_edges_df.iloc[:, 1].unique()
         num_rels = unique_rels.shape[0]
         mapped_rel_ids = np.random.permutation(num_rels)
@@ -132,7 +135,13 @@ def map_edge_list_dfs(edge_lists: list, known_node_ids=None, sequential_train_no
                 edge_list.iloc[:, col] = edge_list.iloc[:, col].astype(str).map(nodes_dict.get)
             for col in [1, 3]:
                 edge_list.iloc[:, col] = edge_list.iloc[:, col].astype(str).map(rels_dict.get)
-            # iloc assignment keeps object dtype; convert to int64 so torch.tensor() works
+            edge_list = edge_list.astype(np.int64)
+        elif is_nary3_df:
+            # Arity-3: remap src(0), dst(2), qval(3) as entities; rel(1) as relation
+            edge_list = edge_list.copy()
+            for col in [0, 2, 3]:
+                edge_list.iloc[:, col] = edge_list.iloc[:, col].astype(str).map(nodes_dict.get)
+            edge_list.iloc[:, 1] = edge_list.iloc[:, 1].astype(str).map(rels_dict.get)
             edge_list = edge_list.astype(np.int64)
         else:
             node_columns = edge_list.columns[[0, -1]]
@@ -183,19 +192,23 @@ def map_edge_lists(
     mapped_rel_ids = torch.empty([0])
     if all_edges.size(1) == 3:
         has_rels = True
+    elif all_edges.size(1) == 4:
+        has_rels = True
+        is_nary = True   # arity-3: [src, rel, dst, qval]
     elif all_edges.size(1) == 5:
         has_rels = True
-        is_nary = True
+        is_nary = True   # arity-4: [src, rel, dst, qrel, qval]
 
     output_dtype = torch.int32
 
     if perform_unique:
+        is_nary_4 = all_edges.size(1) == 5
         unique_src = torch.unique(all_edges[:, 0])
-        # For arity-4 [src, rel, dst, qrel, qval]: dst is col 2, qval is col 4 (same entity namespace as src/dst)
+        # For arity-3/4: dst is col 2 (not last); qval is last col (-1)
         unique_dst = torch.unique(all_edges[:, 2] if is_nary else all_edges[:, -1])
         entity_tensors = [unique_src, unique_dst]
         if is_nary:
-            entity_tensors.append(torch.unique(all_edges[:, 4]))  # qval entities
+            entity_tensors.append(torch.unique(all_edges[:, -1]))  # qval: last col for both arity-3 and arity-4
         if known_node_ids is not None:
             entity_tensors += known_node_ids
         unique_nodes = torch.unique(torch.cat(entity_tensors), sorted=True)
@@ -203,10 +216,11 @@ def map_edge_lists(
         num_nodes = unique_nodes.size(0)
 
         if has_rels:
-            if is_nary:
-                # rel (col 1) and qrel (col 3) share the same relation namespace
+            if is_nary_4:
+                # arity-4: rel (col 1) and qrel (col 3) share the same relation namespace
                 unique_rels = torch.unique(torch.cat([all_edges[:, 1], all_edges[:, 3]]), sorted=True)
             else:
+                # arity-3 and binary: only col 1 is a relation
                 unique_rels = torch.unique(all_edges[:, 1], sorted=True)
             num_rels = unique_rels.size(0)
     else:
@@ -306,13 +320,19 @@ def map_edge_lists(
     for edge_list in edge_lists:
         new_src = extended_map[edge_list[:, 0].to(torch.int64)]
 
-        if is_nary:
-            # Arity-4: [src, rel, dst, qrel, qval]
+        if is_nary_4:
+            # Arity-4: [src, rel, dst, qrel, qval] — two relations, two extra entities
             new_rel  = mapped_rel_ids[edge_list[:, 1].to(torch.int64)]
             new_dst  = extended_map[edge_list[:, 2].to(torch.int64)]
             new_qrel = mapped_rel_ids[edge_list[:, 3].to(torch.int64)]
             new_qval = extended_map[edge_list[:, 4].to(torch.int64)]
             output_edge_lists.append(torch.stack([new_src, new_rel, new_dst, new_qrel, new_qval], dim=1))
+        elif is_nary:
+            # Arity-3: [src, rel, dst, qval] — one relation, one extra entity
+            new_rel  = mapped_rel_ids[edge_list[:, 1].to(torch.int64)]
+            new_dst  = extended_map[edge_list[:, 2].to(torch.int64)]
+            new_qval = extended_map[edge_list[:, 3].to(torch.int64)]
+            output_edge_lists.append(torch.stack([new_src, new_rel, new_dst, new_qval], dim=1))
         elif has_rels:
             new_dst = extended_map[edge_list[:, -1].to(torch.int64)]
             new_rel = mapped_rel_ids[edge_list[:, 1].to(torch.int64)]

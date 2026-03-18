@@ -5,6 +5,7 @@
 #include "nn/decoders/edge/comparators.h"
 #include "nn/decoders/edge/distmult.h"
 #include "nn/decoders/edge/distmult_selected_neg_cuda.h"
+#include "nn/decoders/edge/tucker3.h"
 #include "nn/decoders/edge/tucker4.h"
 #include "reporting/logger.h"
 
@@ -552,7 +553,7 @@ std::tuple<torch::Tensor, torch::Tensor> only_pos_forward(shared_ptr<EdgeDecoder
     torch::Tensor inv_pos_scores;
 
     bool has_relations;
-    bool is_nary = edges.size(1) == 5;
+    bool is_nary = (edges.size(1) == 4 || edges.size(1) == 5);
     if (edges.size(1) == 3 || is_nary) {
         has_relations = true;
     } else if (edges.size(1) == 2) {
@@ -619,7 +620,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corr
     torch::Tensor neg_scores;
     torch::Tensor inv_neg_scores;
     bool has_relations;
-    bool is_nary = positive_edges.size(1) == 5;
+    bool is_nary = (positive_edges.size(1) == 4 || positive_edges.size(1) == 5);
     if (positive_edges.size(1) == 3 || is_nary) {
         has_relations = true;
     } else if (positive_edges.size(1) == 2) {
@@ -730,25 +731,30 @@ std::tuple<torch::Tensor, torch::Tensor> prepare_pos_embeddings(shared_ptr<EdgeD
     torch::Tensor rel_ids;
     torch::Tensor rels;
     torch::Tensor inv_rels;
-    bool is_nary = positive_edges.size(1) == 5;
+    bool is_nary = (positive_edges.size(1) == 4 || positive_edges.size(1) == 5);
 
     if (has_relations) {
         rel_ids = positive_edges.select(1, 1);
         rels = decoder->select_relations(rel_ids);
 
+        auto tucker3_decoder = std::dynamic_pointer_cast<TuckER3>(decoder);
         auto tucker4_decoder = std::dynamic_pointer_cast<TuckER4>(decoder);
-        if (tucker4_decoder != nullptr && is_nary && qual_embeddings.defined()) {
-            // Tucker-4 path: partial contraction W ×₁ e_s ×₂ e_r ×₄ e_qr ×₅ e_qv
-            // leaving the dst mode open; dot with e_dst gives the Tucker score.
+        if (tucker3_decoder != nullptr && positive_edges.size(1) == 4 && qual_embeddings.defined()) {
+            // Tucker-3 path for arity-3 [src, rel, dst, qval]:
+            // partial contraction W ×₁ e_s ×₂ e_r ×₄ e_qv; dot with e_dst gives score.
+            adjusted_src_embeddings = tucker3_decoder->tucker3_partial(
+                src_embeddings, rels, qual_embeddings);
+        } else if (tucker4_decoder != nullptr && positive_edges.size(1) == 5 && qual_embeddings.defined()) {
+            // Tucker-4 path for arity-4 [src, rel, dst, qrel, qval]:
+            // partial contraction W ×₁ e_s ×₂ e_r ×₄ e_qr ×₅ e_qv; dot with e_dst gives score.
             torch::Tensor qrel_ids = positive_edges.select(1, 3).to(torch::kInt64);
             torch::Tensor qrel_embeddings = decoder->select_relations(qrel_ids);
             adjusted_src_embeddings = tucker4_decoder->tucker4_partial(
                 src_embeddings, rels, qrel_embeddings, qual_embeddings);
         } else {
-            // StarE / binary path
+            // StarE / binary path: apply_relation(src, rel) then fuse qval for n-ary
             adjusted_src_embeddings = decoder->apply_relation(src_embeddings, rels);
 
-            // Arity-4 StarE: fuse qualifier value via element-wise product
             if (is_nary && qual_embeddings.defined()) {
                 adjusted_src_embeddings = adjusted_src_embeddings * qual_embeddings;
             }
@@ -774,7 +780,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     auto step_start = decoder_total_start;
 
     bool has_relations;
-    bool is_nary = positive_edges.size(1) == 5;
+    bool is_nary = (positive_edges.size(1) == 4 || positive_edges.size(1) == 5);
     if (positive_edges.size(1) == 3 || is_nary) {
         has_relations = true;
     } else if (positive_edges.size(1) == 2) {
@@ -1164,7 +1170,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
 std::tuple<torch::Tensor, torch::Tensor> get_rewards(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
                                                       torch::Tensor qual_embeddings) {
     bool has_relations;
-    bool is_nary = positive_edges.size(1) == 5;
+    bool is_nary = (positive_edges.size(1) == 4 || positive_edges.size(1) == 5);
     if (positive_edges.size(1) == 3 || is_nary) {
         has_relations = true;
     } else if (positive_edges.size(1) == 2) {
@@ -1222,7 +1228,7 @@ std::tuple<torch::Tensor, torch::Tensor> get_rewards(shared_ptr<EdgeDecoder> dec
 torch::Tensor forward_g(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings_g, torch::Tensor dst_negs, torch::Tensor src_negs, torch::Tensor reward, torch::Tensor inv_reward,
                         torch::Tensor qual_embeddings) {
     bool has_relations;
-    bool is_nary = positive_edges.size(1) == 5;
+    bool is_nary = (positive_edges.size(1) == 4 || positive_edges.size(1) == 5);
     if (positive_edges.size(1) == 3 || is_nary) {
         has_relations = true;
     } else if (positive_edges.size(1) == 2) {

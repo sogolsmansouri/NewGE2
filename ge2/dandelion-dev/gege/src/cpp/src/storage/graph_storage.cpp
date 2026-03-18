@@ -349,6 +349,21 @@ torch::Tensor GraphModelStorage::mapEdgesWithDenseMap_(torch::Tensor edges, torc
         mapped_edges = torch::stack({global_to_local_index_map.index_select(0, edges.select(1, 0)),
                                      global_to_local_index_map.index_select(0, edges.select(1, -1))})
                            .transpose(0, 1);
+    } else if (storage_ptrs_.edges->dim1_size_ == 4) {
+        // Arity-3: [src, rel, dst, qval] — remap src (col 0) and dst (col 2) only
+        mapped_edges = torch::stack({global_to_local_index_map.index_select(0, edges.select(1, 0)),
+                                     edges.select(1, 1),
+                                     global_to_local_index_map.index_select(0, edges.select(1, 2)),
+                                     edges.select(1, 3)})
+                           .transpose(0, 1);
+    } else if (storage_ptrs_.edges->dim1_size_ == 5) {
+        // Arity-4: [src, rel, dst, qrel, qval] — remap src (col 0) and dst (col 2) only
+        mapped_edges = torch::stack({global_to_local_index_map.index_select(0, edges.select(1, 0)),
+                                     edges.select(1, 1),
+                                     global_to_local_index_map.index_select(0, edges.select(1, 2)),
+                                     edges.select(1, 3),
+                                     edges.select(1, 4)})
+                           .transpose(0, 1);
     } else {
         SPDLOG_ERROR("Unexpected number of edge columns");
         throw GegeRuntimeException("Unexpected number of edge columns");
@@ -364,7 +379,8 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
     }
 
     torch::Tensor src = edges.select(1, 0);
-    torch::Tensor dst = edges.select(1, -1);
+    // For arity-3/4 [src, rel, dst, ...], dst is col 2, not the last column
+    torch::Tensor dst = (storage_ptrs_.edges->dim1_size_ >= 4) ? edges.select(1, 2) : edges.select(1, -1);
     torch::Tensor src_partitions = torch::floor(src.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
     torch::Tensor dst_partitions = torch::floor(dst.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
     torch::Tensor src_slots = partition_to_buffer_slot.index_select(0, src_partitions);
@@ -384,6 +400,14 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
         mapped_edges = torch::stack({src_local, edges.select(1, 1), dst_local}).transpose(0, 1);
     } else if (storage_ptrs_.edges->dim1_size_ == 2) {
         mapped_edges = torch::stack({src_local, dst_local}).transpose(0, 1);
+    } else if (storage_ptrs_.edges->dim1_size_ == 4) {
+        // Arity-3: preserve rel (col 1), qval (col 3); remap src and dst
+        mapped_edges = torch::stack({src_local, edges.select(1, 1), dst_local,
+                                     edges.select(1, 3)}).transpose(0, 1);
+    } else if (storage_ptrs_.edges->dim1_size_ == 5) {
+        // Arity-4: preserve rel (col 1), qrel (col 3), qval (col 4); remap src and dst
+        mapped_edges = torch::stack({src_local, edges.select(1, 1), dst_local,
+                                     edges.select(1, 3), edges.select(1, 4)}).transpose(0, 1);
     } else {
         SPDLOG_ERROR("Unexpected number of edge columns");
         throw GegeRuntimeException("Unexpected number of edge columns");
@@ -455,6 +479,8 @@ void GraphModelStorage::load() {
     load_with_timing("encoded_nodes", storage_ptrs_.encoded_nodes);
     load_with_timing("node_labels", storage_ptrs_.node_labels);
     load_with_timing("relation_features", storage_ptrs_.relation_features);
+    load_with_timing("qual_embeddings", storage_ptrs_.qual_embeddings);
+    load_with_timing("qual_optimizer_state", storage_ptrs_.qual_optimizer_state);
 
     if (log_startup_timing) {
         auto total_end = std::chrono::high_resolution_clock::now();
@@ -528,6 +554,8 @@ void GraphModelStorage::unload(bool write) {
     unload_with_timing("node_optimizer_state_g", storage_ptrs_.node_optimizer_state_g, write);
     unload_with_timing("node_features", storage_ptrs_.node_features, false);
     unload_with_timing("relation_features", storage_ptrs_.relation_features, false);
+    unload_with_timing("qual_embeddings", storage_ptrs_.qual_embeddings, write);
+    unload_with_timing("qual_optimizer_state", storage_ptrs_.qual_optimizer_state, write);
 
     unload_with_timing("in_memory_embeddings", in_memory_embeddings_, false);
     unload_with_timing("in_memory_features", in_memory_features_, false);
@@ -958,9 +986,26 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
                     torch::stack({current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 0)),
                                   current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, -1))})
                         .transpose(0, 1);
+            } else if (storage_ptrs_.edges->dim1_size_ == 4) {
+                // Arity-3: remap src (col 0) and dst (col 2); preserve rel (col 1), qval (col 3)
+                mapped_edges =
+                    torch::stack({current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 0)),
+                                  current_subgraph_state_->all_in_memory_edges_.select(1, 1),
+                                  current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 2)),
+                                  current_subgraph_state_->all_in_memory_edges_.select(1, 3)})
+                        .transpose(0, 1);
+            } else if (storage_ptrs_.edges->dim1_size_ == 5) {
+                // Arity-4: remap src (col 0) and dst (col 2); preserve rel, qrel, qval
+                mapped_edges =
+                    torch::stack({current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 0)),
+                                  current_subgraph_state_->all_in_memory_edges_.select(1, 1),
+                                  current_subgraph_state_->global_to_local_index_map_.index_select(0, current_subgraph_state_->all_in_memory_edges_.select(1, 2)),
+                                  current_subgraph_state_->all_in_memory_edges_.select(1, 3),
+                                  current_subgraph_state_->all_in_memory_edges_.select(1, 4)})
+                        .transpose(0, 1);
             } else {
                 SPDLOG_ERROR("Unexpected number of edge columns");
-                std::runtime_error("Unexpected number of edge columns");
+                throw GegeRuntimeException("Unexpected number of edge columns");
             }
             mapped_edges = mapped_edges.to(device);
 
@@ -1410,9 +1455,24 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             mapped_edges = torch::stack({subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 0)),
                                          subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, -1))})
                                .transpose(0, 1);
+        } else if (storage_ptrs_.edges->dim1_size_ == 4) {
+            // Arity-3: remap src (col 0) and dst (col 2); preserve rel (col 1), qval (col 3)
+            mapped_edges = torch::stack({subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 0)),
+                                         subgraph->all_in_memory_edges_.select(1, 1),
+                                         subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 2)),
+                                         subgraph->all_in_memory_edges_.select(1, 3)})
+                               .transpose(0, 1);
+        } else if (storage_ptrs_.edges->dim1_size_ == 5) {
+            // Arity-4: remap src (col 0) and dst (col 2); preserve rel, qrel, qval
+            mapped_edges = torch::stack({subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 0)),
+                                         subgraph->all_in_memory_edges_.select(1, 1),
+                                         subgraph->global_to_local_index_map_.index_select(0, subgraph->all_in_memory_edges_.select(1, 2)),
+                                         subgraph->all_in_memory_edges_.select(1, 3),
+                                         subgraph->all_in_memory_edges_.select(1, 4)})
+                               .transpose(0, 1);
         } else {
             SPDLOG_ERROR("Unexpected number of edge columns");
-            std::runtime_error("Unexpected number of edge columns");
+            throw GegeRuntimeException("Unexpected number of edge columns");
         }
 
         mapped_edges = mapped_edges.to(devices_[device_idx]);

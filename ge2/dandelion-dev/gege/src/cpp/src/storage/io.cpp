@@ -1,5 +1,6 @@
 #include "storage/io.h"
 
+#include <fstream>
 #include "configuration/constants.h"
 #include "nn/initialization.h"
 #include "nn/model.h"
@@ -35,6 +36,20 @@ std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>> initia
     int num_columns = 3;
     if (storage_config->dataset->num_relations == 1) {
         num_columns = 2;
+    }
+    // Auto-detect arity-4 (5-column) edges from the training file's actual byte size.
+    // If num_train > 0, we probe the file: file_size / (num_train * element_bytes) gives num_columns.
+    if (num_train > 0) {
+        int element_bytes = (dtype == torch::kInt32) ? 4 : 8;
+        std::ifstream probe(train_filename, std::ios::binary | std::ios::ate);
+        if (probe.is_open()) {
+            int64_t file_bytes = static_cast<int64_t>(probe.tellg());
+            probe.close();
+            int64_t detected_cols = file_bytes / (num_train * element_bytes);
+            if (detected_cols == 5) {
+                num_columns = 5;  // Arity-4: [src, rel, dst, qrel, qval]
+            }
+        }
     }
     switch (storage_config->edges->type) {
         case StorageBackend::PARTITION_BUFFER: {
@@ -437,6 +452,43 @@ shared_ptr<GraphModelStorage> initializeStorageLinkPrediction(shared_ptr<Model> 
     }
 
     storage_ptrs.relation_features = initializeRelationFeatures(model, storage_config);
+
+    // Initialize qualifier value embeddings for arity-3/4 KGs (4- or 5-column edge tensors).
+    // These are always-resident InMemory storage (same device as node embeddings).
+    if (storage_ptrs.train_edges != nullptr
+        && (storage_ptrs.train_edges->dim1_size_ == 4 || storage_ptrs.train_edges->dim1_size_ == 5)) {
+        int64_t num_nodes = storage_config->dataset->num_nodes;
+        int embedding_dim = model->get_base_embedding_dim();
+        torch::Dtype emb_dtype = (storage_config->embeddings != nullptr)
+            ? storage_config->embeddings->options->dtype
+            : torch::kFloat32;
+        torch::Device emb_device = (storage_config->embeddings != nullptr &&
+                                    storage_config->embeddings->type == StorageBackend::DEVICE_MEMORY)
+            ? storage_config->device_type
+            : torch::kCPU;
+
+        string qual_emb_file = storage_config->model_dir + "qual_embeddings" + PathConstants::file_ext;
+        string qual_state_file = storage_config->model_dir + "qual_embeddings_state" + PathConstants::file_ext;
+
+        if (reinitialize) {
+            // Initialize qualifier value embeddings from the same distribution as node embeddings.
+            shared_ptr<FlatFile> init_qual_emb = std::make_shared<FlatFile>(qual_emb_file, emb_dtype);
+            shared_ptr<FlatFile> init_qual_state = std::make_shared<FlatFile>(qual_state_file, emb_dtype);
+            int64_t offset = 0;
+            while (offset < num_nodes) {
+                int64_t curr = std::min((int64_t)MAX_NODE_EMBEDDING_INIT_SIZE, num_nodes - offset);
+                torch::Tensor weights = initialize_subtensor(init_config, {curr, embedding_dim}, {num_nodes, embedding_dim}, torch::TensorOptions());
+                init_qual_emb->append(weights);
+                init_qual_state->append(torch::zeros_like(weights));
+                offset += curr;
+            }
+        }
+
+        storage_ptrs.qual_embeddings = std::make_shared<InMemory>(qual_emb_file, num_nodes, embedding_dim, emb_dtype, emb_device);
+        if (train) {
+            storage_ptrs.qual_optimizer_state = std::make_shared<InMemory>(qual_state_file, num_nodes, embedding_dim, emb_dtype, emb_device);
+        }
+    }
 
     shared_ptr<GraphModelStorage> graph_model_storage = std::make_shared<GraphModelStorage>(storage_ptrs, storage_config);
 

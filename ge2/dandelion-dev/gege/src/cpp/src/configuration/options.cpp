@@ -187,6 +187,10 @@ DecoderType getDecoderType(std::string string_val) {
         return DecoderType::TRANSE;
     } else if (string_val == "COMPLEX") {
         return DecoderType::COMPLEX;
+    } else if (string_val == "TUCKER3") {
+        return DecoderType::TUCKER3;
+    } else if (string_val == "TUCKER4") {
+        return DecoderType::TUCKER4;
     } else {
         throw std::runtime_error("Unrecognized decoder type string");
     }

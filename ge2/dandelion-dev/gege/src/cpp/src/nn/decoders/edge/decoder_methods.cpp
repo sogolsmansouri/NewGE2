@@ -594,12 +594,9 @@ std::tuple<torch::Tensor, torch::Tensor> only_pos_forward(shared_ptr<EdgeDecoder
 
     if (has_relations) {
         rel_ids = edges.select(1, 1);
-
         auto all_pos_embeddings = prepare_pos_embeddings(decoder, edges, src, dst, has_relations, qual_embeddings);
         torch::Tensor adjusted_src = std::get<0>(all_pos_embeddings);
-
         pos_scores = decoder->compute_scores(adjusted_src, dst);
-
         if (!is_nary && decoder->use_inverse_relations_) {
             torch::Tensor inv_rels = decoder->select_relations(rel_ids, true);
             inv_pos_scores = decoder->compute_scores(decoder->apply_relation(dst, inv_rels), src);
@@ -657,7 +654,6 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corr
 
     if (has_relations) {
         rel_ids = positive_edges.select(1, 1);
-
         auto all_pos_embeddings = prepare_pos_embeddings(decoder, positive_edges, src, dst, has_relations, qual_embeddings);
         torch::Tensor adjusted_src = std::get<0>(all_pos_embeddings);
 

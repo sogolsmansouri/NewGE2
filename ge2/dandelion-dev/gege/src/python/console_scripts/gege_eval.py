@@ -18,7 +18,10 @@ def main():
     )
 
     args = parser.parse_args()
-    config = ge.config.loadConfig(args.config, save=True)
+    # Evaluation must not rewrite the checkpoint's full_config.yaml. Doing so
+    # mutates saved checkpoints and can poison later training runs that reuse
+    # checkpoint configs as templates.
+    config = ge.config.loadConfig(args.config, save=False)
     ge.manager.gege_eval(config)
 
 

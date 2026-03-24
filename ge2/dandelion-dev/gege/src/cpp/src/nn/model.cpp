@@ -486,7 +486,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
     auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
 
     if (edge_decoder->decoder_method_ == EdgeDecoderMethod::ONLY_POS) {
-        std::tie(pos_scores, inv_pos_scores) = only_pos_forward(edge_decoder, batch->edges_, encoded_nodes);
+        std::tie(pos_scores, inv_pos_scores) = only_pos_forward(edge_decoder, batch->edges_, encoded_nodes, batch->qual_embeddings_);
     } else if (edge_decoder->decoder_method_ == EdgeDecoderMethod::POS_AND_NEG) {
         throw GegeRuntimeException("Decoder method currently unsupported.");
         std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) = neg_and_pos_forward(edge_decoder, batch->edges_, batch->neg_edges_, encoded_nodes);
@@ -494,10 +494,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
         if (train) {
             std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
                 mod_node_corrupt_forward(negative_sampling_method_, negative_sampling_selected_ratio_, negative_sampler_, edge_decoder, batch->edges_, encoded_nodes,
-                                         batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, batch->node_embeddings_g_);
+                                         batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, batch->node_embeddings_g_,
+                                         batch->qual_embeddings_);
         } else {  // evalutate
             std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
-                node_corrupt_forward(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_);
+                node_corrupt_forward(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_,
+                                     batch->qual_embeddings_);
         }
     } else if (edge_decoder->decoder_method_ == EdgeDecoderMethod::CORRUPT_REL) {
         throw GegeRuntimeException("Decoder method currently unsupported.");
@@ -532,6 +534,11 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
 
     if (batch->node_embeddings_.defined()) {
         batch->node_embeddings_.requires_grad_();
+    }
+
+    // Arity-4: enable gradient tracking for qualifier value embeddings
+    if (batch->qual_embeddings_.defined()) {
+        batch->qual_embeddings_.requires_grad_();
     }
 
     torch::Tensor loss;
@@ -575,10 +582,10 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
 
         auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
         torch::Tensor encoded_nodes = encoder_->forward(batch->node_embeddings_, batch->node_features_, batch->dense_graph_, true);
-        auto rewards = get_rewards(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_);
+        auto rewards = get_rewards(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, batch->qual_embeddings_);
         torch::Tensor reward = std::get<0>(rewards);
         torch::Tensor inv_reward = std::get<1>(rewards);
-        torch::Tensor loss_g = forward_g(edge_decoder, batch->edges_, batch->node_embeddings_g_, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, reward, inv_reward);
+        torch::Tensor loss_g = forward_g(edge_decoder, batch->edges_, batch->node_embeddings_g_, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, reward, inv_reward, batch->qual_embeddings_);
 
         loss_g.backward();
         step_g();

@@ -16,37 +16,85 @@ model:
   learning_task: LINK_PREDICTION
   encoder:
     layers:
-      - - type: EMBEDDING
-          output_dim: 100
-          bias: true
-          init:
-            type: GLOROT_NORMAL
+    - - type: EMBEDDING
+        options: {}
+        input_dim: -1
+        output_dim: 100
+        init:
+          type: GLOROT_UNIFORM
+          options: {}
+        optimizer:
+          type: DEFAULT
+          options:
+            learning_rate: 0.1
+            eps: 1.0e-10
+            init_value: 0.0
+            lr_decay: 0.0
+            weight_decay: 0.0
+        bias: false
+        bias_init:
+          type: ZEROS
+          options: {}
+        activation: NONE
+    train_neighbor_sampling: []
+    eval_neighbor_sampling: []
+    embedding_dim: 100
   decoder:
     type: DISTMULT
     options:
-      input_dim: 100
       inverse_edges: true
+      use_relation_features: false
       edge_decoder_method: CORRUPT_NODE
+    optimizer:
+      type: ADAGRAD
+      options:
+        learning_rate: 0.1
+        eps: 1.0e-10
+        init_value: 0.0
+        lr_decay: 0.0
+        weight_decay: 0.0
   loss:
     type: SOFTMAX_CE
     options:
       reduction: SUM
   dense_optimizer:
-    type: ADAM
+    type: ADAGRAD
     options:
-      learning_rate: 0.01
+      learning_rate: 0.1
+      eps: 1.0e-10
+      init_value: 0.0
+      lr_decay: 0.0
+      weight_decay: 0.0
   sparse_optimizer:
     type: ADAGRAD
     options:
       learning_rate: 0.1
-
+      eps: 1.0e-10
+      init_value: 0.0
+      lr_decay: 0.0
+      weight_decay: 0.0
 storage:
   device_type: cuda
-  device_ids: [0]
+  device_ids:
+  - 0
   dataset:
-    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/freebase86m_16p
+    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/freebase86m_16p/
+    num_edges: 304727650
+    num_nodes: 86054151
+    num_relations: 14824
+    num_train: 304727650
+    num_valid: 16929318
+    num_test: 16929308
+    node_feature_dim: -1
+    rel_feature_dim: -1
+    num_classes: -1
+    initialized: false
   edges:
     type: HOST_MEMORY
+    options:
+      dtype: int
+  nodes:
+    type: DEVICE_MEMORY
     options:
       dtype: int
   embeddings:
@@ -59,13 +107,18 @@ storage:
       fine_to_coarse_ratio: 1
       num_cache_partitions: 0
       edge_bucket_ordering: CUSTOM
+      node_partition_ordering: DISPERSED
       randomly_assign_edge_buckets: false
+  features:
+    type: DEVICE_MEMORY
+    options:
+      dtype: float
   prefetch: false
   shuffle_input: true
   full_graph_evaluation: false
-  model_dir: /dev/shm/smansou2_ge2/paper_single_gpu/freebase86m_16p_opt
+  export_encoded_nodes: false
+  model_dir: /dev/shm/smansou2_ge2/paper_single_gpu/freebase86m_16p_opt/
   log_level: info
-
 training:
   batch_size: 50000
   negative_sampling_method: RNS
@@ -92,18 +145,17 @@ training:
     save_state: false
   resume_training: false
   resume_from_checkpoint: ''
-
 evaluation:
-  epochs_per_eval: 1000
-  batch_size: 1000
+  batch_size: 250
   negative_sampling:
     num_chunks: 1
     negatives_per_positive: 2000
     degree_fraction: 0.5
     superbatch_negative_plan_batches: 0
-    filtered: false
+    filtered: true
     local_filter_mode: DEG
     tournament_selection: false
     tiled_tournament_scores: false
     tiled_tournament_groups_per_tile: 64
-  checkpoint_dir: /dev/shm/smansou2_ge2/paper_single_gpu/freebase86m_16p_opt
+  epochs_per_eval: 0
+  checkpoint_dir: /dev/shm/smansou2_ge2/paper_single_gpu/freebase86m_16p_opt/

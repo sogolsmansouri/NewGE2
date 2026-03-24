@@ -1,4 +1,5 @@
 model:
+  random_seed: 5650194872900178194
   learning_task: LINK_PREDICTION
   encoder:
     layers:
@@ -23,12 +24,9 @@ model:
 
 storage:
   device_type: cuda
+  device_ids: [0]
   dataset:
-    # Point this at a Twitter 16p dataset directory that contains:
-    # - train_edges.bin
-    # - valid_edges.bin with 10,000 edges
-    # - test_edges.bin with 10,000 edges
-    dataset_dir: ./datasets/twitter_16p_paper_10k_eval
+    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/livejournal_16p_10k_eval
   edges:
     type: HOST_MEMORY
     options:
@@ -47,6 +45,8 @@ storage:
   prefetch: false
   shuffle_input: true
   full_graph_evaluation: true
+  model_dir: /dev/shm/smansou2_ge2/paper_single_gpu/livejournal_16p_opt
+  log_level: info
 
 training:
   batch_size: 50000
@@ -54,20 +54,15 @@ training:
   negative_sampling:
     num_chunks: 50
     negatives_per_positive: 1000
-    # GE2 paper says Twitter used a hybrid of RNS and DegreeNS, but the
-    # report text in this repo does not specify the mixture ratio. The
-    # current codebase exposes that hybrid through degree_fraction.
     degree_fraction: 0.5
     filtered: false
-  num_epochs: 10
+  num_epochs: 30
   epochs_per_shuffle: 1
-  dense_sync_batches: 1
-  save_model: true
+  save_model: false
 
 evaluation:
-  # Keep evaluation out of the training runtime path. Run the separate
-  # paper eval config with gege_eval after training completes.
-  epochs_per_eval: 0
+  checkpoint_dir: /dev/shm/smansou2_ge2/paper_single_gpu/livejournal_16p_opt
+  epochs_per_eval: 1
   batch_size: 1000
   negative_sampling:
     filtered: true

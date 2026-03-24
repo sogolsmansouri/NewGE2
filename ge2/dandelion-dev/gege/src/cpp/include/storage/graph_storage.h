@@ -21,6 +21,9 @@ struct GraphModelStoragePtrs {
     shared_ptr<Storage> encoded_nodes = nullptr;
     shared_ptr<Storage> node_optimizer_state = nullptr;
     shared_ptr<Storage> node_optimizer_state_g = nullptr;
+    // N-ary arity-4: qualifier value embeddings always resident in GPU memory (InMemory storage)
+    shared_ptr<Storage> qual_embeddings = nullptr;
+    shared_ptr<Storage> qual_optimizer_state = nullptr;
     std::vector<shared_ptr<Storage>> filter_edges;
 };
 
@@ -113,6 +116,15 @@ class GraphModelStorage {
     EdgeList getEdges(Indices indices, int32_t device_idx = 0);
 
     EdgeList getEdgesRange(int64_t start, int64_t size, int32_t device_idx = 0);
+
+    EdgeList getCurrentStateMappedEdgesRange(int64_t start, int64_t size, int32_t device_idx = 0) {
+        if (device_idx < 0 || static_cast<std::size_t>(device_idx) >= current_subgraph_states_.size() ||
+            current_subgraph_states_[device_idx] == nullptr || !current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.defined()) {
+            return torch::Tensor();
+        }
+
+        return current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.narrow(0, start, size);
+    }
 
     Indices getRandomNodeIds(int64_t size);
 

@@ -15,6 +15,9 @@ class Batch {
     int batch_id_;      /**< ID of the batch */
     int64_t start_idx_; /**< Offset in the edges storage */
     int batch_size_;    /**< Number of edges in the batch */
+    int64_t streamed_edge_start_; /**< Offset in the current in-memory mapped-edge state when bucket streaming is enabled */
+    int64_t streamed_edge_size_;  /**< Size of the streamed edge slice in the current in-memory mapped-edge state */
+    bool resident_local_lp_direct_; /**< If true, use the resident-local direct LP path instead of batch-local compaction */
     bool train_;        /**< If true, this batch is a training batch and requires gradient tracking */
     int device_id_;     /**< ID of the device the batch is assigned to */
 
@@ -38,6 +41,13 @@ class Batch {
     torch::Tensor node_embeddings_state_g_; /**< Optimizer state for each node embedding in the batch. Generator for GAN */
     torch::Tensor node_state_update_g_;     /**< Updates to adjust the optimizer state. Generator for GAN */
 
+    // N-ary (arity-4) qualifier value embeddings: always-resident, per-edge, shape (batch_size, dim)
+    torch::Tensor qual_embeddings_;       /**< Qualifier value embedding for each edge in the batch (arity-4 only) */
+    torch::Tensor qual_gradients_;        /**< Gradients for qualifier value embeddings */
+    torch::Tensor qual_embeddings_state_; /**< Optimizer state for qualifier value embeddings */
+    torch::Tensor qual_state_update_;     /**< Optimizer state update for qualifier value embeddings */
+    torch::Tensor qual_indices_;          /**< Global qualifier value node ids (col 4 of arity-4 edge tensor) */
+
     torch::Tensor node_features_; /**< Feature vector for each unique node in the the batch.  */
     torch::Tensor node_labels_;   /**< Label for each unique node in the the batch.  */
 
@@ -45,6 +55,14 @@ class Batch {
     Indices dst_neg_indices_mapping_; /**< Maps ids from the sampled nodes, which corrupt the destination nodes of edges, to global node ids */
 
     torch::Tensor edges_;
+    torch::Tensor resident_src_embeddings_;
+    torch::Tensor resident_dst_embeddings_;
+    torch::Tensor resident_src_neg_embeddings_;
+    torch::Tensor resident_dst_neg_embeddings_;
+    torch::Tensor resident_src_embeddings_state_;
+    torch::Tensor resident_dst_embeddings_state_;
+    torch::Tensor resident_src_neg_embeddings_state_;
+    torch::Tensor resident_dst_neg_embeddings_state_;
 
     // Encoder
     DENSEGraph dense_graph_;
@@ -67,6 +85,8 @@ class Batch {
 
     void accumulateGradients(float learning_rate); /**< Accumulates gradients into the unique_node_gradients, and applies optimizer update rule to create the
                                                       unique_node_gradients2 tensor */
+
+    void accumulateResidentLocalGradients(float learning_rate); /**< Accumulates resident-local direct LP gradients back into unique node updates */
 
     void accumulateGradientsG(float learning_rate); /**< Accumulates gradients into the unique_node_gradients, and applies optimizer update rule to create the
                                                       unique_node_gradients2 tensor */

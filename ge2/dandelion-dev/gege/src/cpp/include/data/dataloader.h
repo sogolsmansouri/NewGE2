@@ -1,7 +1,9 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
 #include <map>
+#include <mutex>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -87,6 +89,12 @@ class DataLoader {
     std::vector<int> batches_left_;
     int total_batches_processed_;
     std::vector<bool> all_reads_;
+    std::mutex swap_phase_mutex_;
+    std::condition_variable swap_phase_cv_;
+    int32_t swap_read_arrivals_ = 0;
+    int64_t swap_read_generation_ = 0;
+    int32_t swap_rebuild_arrivals_ = 0;
+    int64_t swap_rebuild_generation_ = 0;
     
     // record the number of devices that have finished the current batches.
     std::atomic<int64_t> activate_devices_;
@@ -275,6 +283,12 @@ class DataLoader {
      */
     void loadStorage();
 
+    void resetSwapSyncState();
+
+    void waitForSwapReadBarrier(int32_t participants);
+
+    void waitForSwapRebuildBarrier(int32_t participants);
+
     bool epochComplete(int32_t device_idx = 0) { return (batches_left_[device_idx] == 0) && all_reads_[device_idx]; }
 
     /**
@@ -288,6 +302,8 @@ class DataLoader {
      * @return Number of edges in the graph
      */
     int64_t getNumEdges() { return graph_storage_->getNumEdges(); }
+
+    int64_t getPlannedEpochItemCount() const;
 
     int64_t getEpochsProcessed() { return epochs_processed_; }
 
@@ -309,7 +325,7 @@ class DataLoader {
             batch_size_ = training_config_->batch_size;
             train_ = true;
             loaded_subgraphs = 0;
-            async_barrier = 0;
+            resetSwapSyncState();
             graph_storage_->setTrainSet();
             negative_sampler_ = training_negative_sampler_;
             neighbor_sampler_ = training_neighbor_sampler_;

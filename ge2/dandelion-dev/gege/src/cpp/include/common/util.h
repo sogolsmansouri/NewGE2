@@ -98,6 +98,6 @@ struct MapTensorTiming {
 };
 
 std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted = true,
-                                                                   MapTensorTiming *timing = nullptr, int64_t value_domain_size = -1);
+                                                                   MapTensorTiming *timing = nullptr);
 
 std::vector<torch::Tensor> apply_tensor_map(torch::Tensor map, std::vector<torch::Tensor> unmapped_tensors);

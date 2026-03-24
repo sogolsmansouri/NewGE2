@@ -1,0 +1,91 @@
+model:
+  random_seed: 741135446461071584
+  learning_task: LINK_PREDICTION
+  encoder:
+    layers:
+      - - type: EMBEDDING
+          output_dim: 100
+  decoder:
+    type: DISTMULT
+    options:
+      input_dim: 100
+  loss:
+    type: SOFTMAX_CE
+    options:
+      reduction: SUM
+  dense_optimizer:
+    type: ADAGRAD
+    options:
+      learning_rate: 0.1
+  sparse_optimizer:
+    type: ADAGRAD
+    options:
+      learning_rate: 0.1
+
+storage:
+  device_type: cuda
+  device_ids: [0]
+  dataset:
+    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/twitter_16p_paper_10k_eval
+  edges:
+    type: HOST_MEMORY
+    options:
+      dtype: int
+  embeddings:
+    type: MEM_PARTITION_BUFFER
+    options:
+      dtype: float
+      num_partitions: 16
+      buffer_capacity: 4
+      prefetching: false
+      fine_to_coarse_ratio: 1
+      num_cache_partitions: 0
+      edge_bucket_ordering: CUSTOM
+      randomly_assign_edge_buckets: false
+  prefetch: false
+  shuffle_input: true
+  full_graph_evaluation: false
+  model_dir: /dev/shm/smansou2_ge2/paper_single_gpu/twitter_16p_baseline
+  log_level: info
+
+training:
+  batch_size: 50000
+  negative_sampling_method: RNS
+  negative_sampling_selected_ratio: 1.0
+  dense_sync_batches: 1
+  logical_active_devices: 0
+  negative_sampling:
+    num_chunks: 50
+    negatives_per_positive: 1000
+    degree_fraction: 0.5
+    superbatch_negative_plan_batches: 0
+    filtered: false
+    local_filter_mode: DEG
+    tournament_selection: false
+    tiled_tournament_scores: false
+    tiled_tournament_groups_per_tile: 64
+  num_epochs: 10
+  epochs_per_shuffle: 1
+  logs_per_epoch: 10
+  save_model: true
+  checkpoint:
+    save_best: false
+    interval: -1
+    save_state: false
+  resume_training: false
+  resume_from_checkpoint: ''
+
+evaluation:
+  epochs_per_eval: 1000
+  batch_size: 1000
+  negative_sampling:
+    num_chunks: 1
+    negatives_per_positive: 1000
+    degree_fraction: 0.5
+    superbatch_negative_plan_batches: 0
+    filtered: false
+    local_filter_mode: DEG
+    tournament_selection: false
+    tiled_tournament_scores: false
+    tiled_tournament_groups_per_tile: 64
+  checkpoint_dir: /dev/shm/smansou2_ge2/paper_single_gpu/twitter_16p_baseline

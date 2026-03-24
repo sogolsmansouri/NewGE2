@@ -21,6 +21,11 @@ bool parse_env_flag(const char *name, bool default_value) {
     return default_value;
 }
 
+bool dot_compare_cuda_elementwise_enabled() {
+    static bool enabled = parse_env_flag("GEGE_DOT_COMPARE_CUDA_ELEMENTWISE", false);
+    return enabled;
+}
+
 torch::Tensor pairwise_l2_distance_2d_3d(torch::Tensor src, torch::Tensor dst, bool squared_distance) {
     src = pad_and_reshape(src, dst.size(0));
 
@@ -133,9 +138,17 @@ torch::Tensor DotCompare::operator()(torch::Tensor src, torch::Tensor dst) {
     if (src.dim() == 2 && dst.dim() == 2) {
         return (src * dst).sum(-1);
     } else if (src.dim() == 2 && dst.dim() == 3) {
+        if (dst.device().is_cuda() && dot_compare_cuda_elementwise_enabled()) {
+            src = pad_and_reshape(src, dst.size(0));
+            return (src.unsqueeze(2) * dst.unsqueeze(1)).sum(-1).flatten(0, 1).clone();
+        }
         src = pad_and_reshape(src, dst.size(0));
         return src.bmm(dst.transpose(-1, -2)).flatten(0, 1);
     } else if (src.dim() == 2 && dst.dim() == 4) {
+        if (dst.device().is_cuda() && dot_compare_cuda_elementwise_enabled()) {
+            int64_t chunk_num = dst.size(0);
+            return (pad_and_reshape(src, chunk_num).unsqueeze(2) * dst).sum(-1).reshape({dst.size(0) * dst.size(1), dst.size(2)}).clone();
+        }
         int64_t chunk_num = dst.size(0);
         int64_t num_per_chunk = dst.size(1);
         int64_t selected_negatives_num = dst.size(2);

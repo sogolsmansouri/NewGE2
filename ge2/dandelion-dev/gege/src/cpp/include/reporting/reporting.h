@@ -90,6 +90,7 @@ class LinkPredictionReporter : public Reporter {
     torch::Tensor computeRanks(torch::Tensor pos_scores, torch::Tensor neg_scores);
 
     void addResult(torch::Tensor pos_scores, torch::Tensor neg_scores, torch::Tensor edges = torch::Tensor());
+    void addRanks(torch::Tensor ranks);
 
     void report() override;
 

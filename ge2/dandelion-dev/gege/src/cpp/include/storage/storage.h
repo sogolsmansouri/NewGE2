@@ -132,6 +132,8 @@ class MemPartitionBufferStorage : public Storage {
 
     void unload(bool perform_write) override;
 
+    void syncToHostWithoutDiskWrite();
+
     void unload(bool perform_write, int32_t device_idx);
 
     void write() override;

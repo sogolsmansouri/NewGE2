@@ -194,7 +194,14 @@ void Batch::to(torch::Device device) {
     }
 
     if (node_embeddings_.defined()) {
-        node_embeddings_ = node_embeddings_.to(device);
+        // For large embedding tables (e.g. Twitter 41M nodes), keep on CPU
+        // to avoid GPU OOM. The chunked eval path will move gathered chunks
+        // to GPU for scoring.
+        int64_t emb_bytes = node_embeddings_.numel() * node_embeddings_.element_size();
+        constexpr int64_t GPU_EMB_LIMIT = 8LL * 1024 * 1024 * 1024;  // 8 GB
+        if (emb_bytes < GPU_EMB_LIMIT) {
+            node_embeddings_ = node_embeddings_.to(device);
+        }
     }
 
     if (node_embeddings_state_.defined()) {

@@ -152,7 +152,7 @@ std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tenso
     auto sort_tup = torch::sort(ids64, 0, false);
     torch::Tensor sorted_ids = std::get<0>(sort_tup);
     torch::Tensor perm = std::get<1>(sort_tup).to(torch::kInt64);
-    auto unique_tup = torch::unique_consecutive(sorted_ids, false, true);
+    auto unique_tup = torch::unique_consecutive(sorted_ids, true, true);
     torch::Tensor unique_ids = std::get<0>(unique_tup);
 
     torch::Tensor inverse_sorted;
@@ -367,8 +367,7 @@ std::string get_directory(std::string filename) {
     return directory;
 }
 
-std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted, MapTensorTiming *timing,
-                                                                  int64_t value_domain_size) {
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted, MapTensorTiming *timing) {
     auto total_start = std::chrono::high_resolution_clock::now();
     auto step_start = total_start;
 
@@ -397,7 +396,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
     unique_debug_info.measure_device_timing = timing != nullptr;
 #ifdef GEGE_CUDA
     if (all_ids.is_cuda() && all_ids.scalar_type() == torch::kInt64) {
-        auto unique_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &unique_debug_info, value_domain_size);
+        auto unique_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &unique_debug_info);
         map = std::get<0>(unique_tup);
         mapped_all_ids = std::get<1>(unique_tup);
         maybe_log_unique_backend_banner(unique_debug_info);

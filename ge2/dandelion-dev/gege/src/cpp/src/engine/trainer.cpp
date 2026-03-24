@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <iomanip>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -79,6 +80,18 @@ struct DeviceEpochTiming {
     int64_t finalize_region_ns = 0;
 };
 
+struct SingleDeviceStateTiming {
+    int64_t state_idx = -1;
+    int64_t batch_count = 0;
+    int64_t batch_fetch_region_ns = 0;
+    int64_t gpu_load_region_ns = 0;
+    int64_t map_region_ns = 0;
+    int64_t compute_region_ns = 0;
+    int64_t embedding_update_region_ns = 0;
+    int64_t embedding_update_g_region_ns = 0;
+    int64_t finalize_region_ns = 0;
+};
+
 struct SampleSummary {
     std::size_t count = 0;
     int64_t min = 0;
@@ -144,16 +157,30 @@ SynchronousTrainer::SynchronousTrainer(shared_ptr<DataLoader> dataloader, shared
     int64_t num_items = 0;
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         item_name = "Edges";
-        num_items = dataloader_->graph_storage_->storage_ptrs_.train_edges->getDim0();
+        num_items = dataloader_->getPlannedEpochItemCount();
     } else if (learning_task_ == LearningTask::NODE_CLASSIFICATION) {
         item_name = "Nodes";
-        num_items = dataloader_->graph_storage_->storage_ptrs_.train_nodes->getDim0();
+        num_items = dataloader_->getPlannedEpochItemCount();
     }
 
     progress_reporter_ = std::make_shared<ProgressReporter>(item_name, num_items, logs_per_epoch);
 }
 
 void SynchronousTrainer::train(int num_epochs) {
+    auto parse_optional_env_int = [](const char *name) -> std::optional<int32_t> {
+        const char *env_value = std::getenv(name);
+        if (env_value == nullptr || env_value[0] == '\0') {
+            return std::nullopt;
+        }
+        try {
+            return std::max(0, std::stoi(env_value));
+        } catch (const std::exception &) {
+            SPDLOG_WARN("Ignoring invalid {}={}", name, env_value);
+            return std::nullopt;
+        }
+    };
+    std::optional<int32_t> profiled_logical_lane = parse_optional_env_int("GEGE_PROFILE_LOGICAL_LANE");
+
     if (!dataloader_->single_dataset_) {
         dataloader_->setTrainSet();
     }
@@ -166,47 +193,78 @@ void SynchronousTrainer::train(int num_epochs) {
     for (int epoch = 0; epoch < num_epochs; epoch++) {
         dataloader_->resetPerfStats();
         timer.start();
+        std::vector<SingleDeviceStateTiming> state_timings;
         SPDLOG_INFO("################ Starting training epoch {} ################", dataloader_->getEpochsProcessed() + 1);
         while (dataloader_->hasNextBatch()) {
-            Timer timer0 = Timer(false);
-            timer0.start();
-
+            auto batch_fetch_start = std::chrono::high_resolution_clock::now();
             shared_ptr<Batch> batch = dataloader_->getBatch();
+            auto batch_fetch_end = std::chrono::high_resolution_clock::now();
 
+            int64_t state_idx = -1;
+            if (!dataloader_->device_current_state_index_.empty()) {
+                state_idx = dataloader_->device_current_state_index_[0];
+            }
+            if (state_timings.empty() || state_timings.back().state_idx != state_idx) {
+                SingleDeviceStateTiming timing;
+                timing.state_idx = state_idx;
+                state_timings.emplace_back(timing);
+            }
+            auto &state_timing = state_timings.back();
+            state_timing.batch_count++;
+            state_timing.batch_fetch_region_ns += elapsed_ns(batch_fetch_start, batch_fetch_end);
+
+            auto gpu_load_start = std::chrono::high_resolution_clock::now();
             if (dataloader_->graph_storage_->embeddingsOffDevice()) {
                 batch->to(model_->device_);
             } else {
                 dataloader_->loadGPUParameters(batch);
             }
+            auto gpu_load_end = std::chrono::high_resolution_clock::now();
+            state_timing.gpu_load_region_ns += elapsed_ns(gpu_load_start, gpu_load_end);
 
             if (batch->node_embeddings_.defined()) {
                 batch->node_embeddings_.requires_grad_();
             }
 
+            auto map_start = std::chrono::high_resolution_clock::now();
             batch->dense_graph_.performMap();
+            auto map_end = std::chrono::high_resolution_clock::now();
+            state_timing.map_region_ns += elapsed_ns(map_start, map_end);
 
+            auto compute_start = std::chrono::high_resolution_clock::now();
             model_->train_batch(batch);
+            auto compute_end = std::chrono::high_resolution_clock::now();
+            state_timing.compute_region_ns += elapsed_ns(compute_start, compute_end);
 
-            if (batch->node_embeddings_.defined()) {
+            if (batch->node_gradients_.defined()) {
+                auto embedding_update_start = std::chrono::high_resolution_clock::now();
                 if (dataloader_->graph_storage_->embeddingsOffDevice()) {
                     batch->embeddingsToHost();
                 } else {
                     dataloader_->updateEmbeddings(batch, true);
                 }
                 dataloader_->updateEmbeddings(batch, false);
+                auto embedding_update_end = std::chrono::high_resolution_clock::now();
+                state_timing.embedding_update_region_ns += elapsed_ns(embedding_update_start, embedding_update_end);
             }
 
             if (batch->node_embeddings_g_.defined()) {
+                auto embedding_update_g_start = std::chrono::high_resolution_clock::now();
                 if (dataloader_->graph_storage_->embeddingsOffDeviceG()) {
                     batch->embeddingsToHostG();
                 } else {
                     dataloader_->updateEmbeddingsG(batch, true);
                 }
                 dataloader_->updateEmbeddingsG(batch, false);
+                auto embedding_update_g_end = std::chrono::high_resolution_clock::now();
+                state_timing.embedding_update_g_region_ns += elapsed_ns(embedding_update_g_start, embedding_update_g_end);
             }
 
+            auto finalize_start = std::chrono::high_resolution_clock::now();
             batch->clear();
             dataloader_->finishedBatch();
+            auto finalize_end = std::chrono::high_resolution_clock::now();
+            state_timing.finalize_region_ns += elapsed_ns(finalize_start, finalize_end);
             progress_reporter_->addResult(batch->batch_size_);
         }
 
@@ -220,10 +278,10 @@ void SynchronousTrainer::train(int num_epochs) {
         int64_t num_items = 0;
         if (learning_task_ == LearningTask::LINK_PREDICTION) {
             item_name = "Edges";
-            num_items = dataloader_->graph_storage_->storage_ptrs_.train_edges->getDim0();
+            num_items = dataloader_->getPlannedEpochItemCount();
         } else if (learning_task_ == LearningTask::NODE_CLASSIFICATION) {
             item_name = "Nodes";
-            num_items = dataloader_->graph_storage_->storage_ptrs_.train_nodes->getDim0();
+            num_items = dataloader_->getPlannedEpochItemCount();
         }
 
         int64_t epoch_time = timer.getDuration();
@@ -232,6 +290,57 @@ void SynchronousTrainer::train(int num_epochs) {
         SPDLOG_INFO("{} per Second: {}", item_name, items_per_second);
 
         auto perf_stats = dataloader_->getPerfStats();
+        if (profiled_logical_lane.has_value() && !state_timings.empty()) {
+            const std::vector<int64_t> *active_bucket_samples = nullptr;
+            const std::vector<int64_t> *active_edge_samples = nullptr;
+            const std::vector<int64_t> *swap_batch_samples = nullptr;
+            const std::vector<int64_t> *rebuild_samples = nullptr;
+            if (!perf_stats.device_swap_active_bucket_samples.empty()) {
+                active_bucket_samples = &perf_stats.device_swap_active_bucket_samples[0];
+            }
+            if (!perf_stats.device_swap_active_edge_samples.empty()) {
+                active_edge_samples = &perf_stats.device_swap_active_edge_samples[0];
+            }
+            if (!perf_stats.device_swap_batch_count_samples.empty()) {
+                swap_batch_samples = &perf_stats.device_swap_batch_count_samples[0];
+            }
+            if (!perf_stats.device_swap_rebuild_samples_ns.empty()) {
+                rebuild_samples = &perf_stats.device_swap_rebuild_samples_ns[0];
+            }
+
+            double lane_process_ms_total = 0.0;
+            double lane_rebuild_ms_total = 0.0;
+            for (std::size_t state_pos = 0; state_pos < state_timings.size(); state_pos++) {
+                const auto &state_timing = state_timings[state_pos];
+                int64_t active_buckets = (active_bucket_samples != nullptr && state_pos < active_bucket_samples->size())
+                    ? (*active_bucket_samples)[state_pos]
+                    : -1;
+                int64_t active_edges = (active_edge_samples != nullptr && state_pos < active_edge_samples->size())
+                    ? (*active_edge_samples)[state_pos]
+                    : -1;
+                int64_t profiled_batches = (swap_batch_samples != nullptr && state_pos < swap_batch_samples->size())
+                    ? (*swap_batch_samples)[state_pos]
+                    : state_timing.batch_count;
+                int64_t rebuild_ns = (rebuild_samples != nullptr && state_pos > 0 && (state_pos - 1) < rebuild_samples->size())
+                    ? (*rebuild_samples)[state_pos - 1]
+                    : 0;
+                int64_t process_ns = state_timing.batch_fetch_region_ns + state_timing.gpu_load_region_ns + state_timing.map_region_ns +
+                                     state_timing.compute_region_ns + state_timing.embedding_update_region_ns +
+                                     state_timing.embedding_update_g_region_ns + state_timing.finalize_region_ns;
+                lane_process_ms_total += ns_to_ms(process_ns);
+                lane_rebuild_ms_total += ns_to_ms(rebuild_ns);
+                SPDLOG_INFO(
+                    "[perf][epoch {}][logical_lane {}][state_pos {}] state_idx={} active_buckets={} active_edges={} batches={} process_ms={:.3f} batch_fetch_ms={:.3f} gpu_load_ms={:.3f} map_ms={:.3f} compute_ms={:.3f} embedding_update_ms={:.3f} embedding_update_g_ms={:.3f} finalize_ms={:.3f} rebuild_ms={:.3f}",
+                    dataloader_->getEpochsProcessed(), profiled_logical_lane.value(), state_pos, state_timing.state_idx, active_buckets, active_edges,
+                    profiled_batches, ns_to_ms(process_ns), ns_to_ms(state_timing.batch_fetch_region_ns), ns_to_ms(state_timing.gpu_load_region_ns),
+                    ns_to_ms(state_timing.map_region_ns), ns_to_ms(state_timing.compute_region_ns),
+                    ns_to_ms(state_timing.embedding_update_region_ns), ns_to_ms(state_timing.embedding_update_g_region_ns),
+                    ns_to_ms(state_timing.finalize_region_ns), ns_to_ms(rebuild_ns));
+            }
+            SPDLOG_INFO("[perf][epoch {}][logical_lane {}] process_ms_total={:.3f} rebuild_ms_total={:.3f} cycle_ms_total={:.3f} states={}",
+                        dataloader_->getEpochsProcessed(), profiled_logical_lane.value(), lane_process_ms_total, lane_rebuild_ms_total,
+                        lane_process_ms_total + lane_rebuild_ms_total, state_timings.size());
+        }
         if (perf_stats.swap_count > 0) {
             SPDLOG_INFO(
                 "[perf][epoch {}] swap_count={} swap_barrier_wait_ms={:.3f} swap_update_ms={:.3f} swap_rebuild_ms={:.3f} swap_sync_wait_ms={:.3f}",
@@ -267,10 +376,10 @@ SynchronousMultiGPUTrainer::SynchronousMultiGPUTrainer(shared_ptr<DataLoader> da
     int64_t num_items = 0;
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         item_name = "Edges";
-        num_items = dataloader_->graph_storage_->storage_ptrs_.train_edges->getDim0();
+        num_items = dataloader_->getPlannedEpochItemCount();
     } else if (learning_task_ == LearningTask::NODE_CLASSIFICATION) {
         item_name = "Nodes";
-        num_items = dataloader_->graph_storage_->storage_ptrs_.train_nodes->getDim0();
+        num_items = dataloader_->getPlannedEpochItemCount();
     }
 
     progress_reporter_ = std::make_shared<ProgressReporter>(item_name, num_items, logs_per_epoch);
@@ -348,7 +457,7 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     auto compute_end = std::chrono::high_resolution_clock::now();
                     device_timings[device_idx].compute_region_ns += elapsed_ns(compute_start, compute_end);
 
-                    if (batch->node_embeddings_.defined()) {
+                    if (batch->node_gradients_.defined()) {
                         auto embedding_update_start = std::chrono::high_resolution_clock::now();
                         if (dataloader_->graph_storage_->embeddingsOffDevice()) {
                             batch->embeddingsToHost();
@@ -442,10 +551,10 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
         int64_t num_items = 0;
         if (learning_task_ == LearningTask::LINK_PREDICTION) {
             item_name = "Edges";
-            num_items = dataloader_->graph_storage_->storage_ptrs_.train_edges->getDim0();
+            num_items = dataloader_->getPlannedEpochItemCount();
         } else if (learning_task_ == LearningTask::NODE_CLASSIFICATION) {
             item_name = "Nodes";
-            num_items = dataloader_->graph_storage_->storage_ptrs_.train_nodes->getDim0();
+            num_items = dataloader_->getPlannedEpochItemCount();
         }
 
         int64_t epoch_time = timer.getDuration();

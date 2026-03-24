@@ -20,5 +20,4 @@ struct UniqueMapCudaDebugInfo {
 // Returns {unique_ids, inverse_indices} for a 1D CUDA int64 tensor.
 // Ordering of unique_ids depends on the selected backend.
 std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda(torch::Tensor all_ids, bool sorted,
-                                                                         UniqueMapCudaDebugInfo *debug_info = nullptr,
-                                                                         int64_t value_domain_size = -1);
+                                                                         UniqueMapCudaDebugInfo *debug_info = nullptr);

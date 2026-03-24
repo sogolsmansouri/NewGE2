@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <fstream>
 #include <sstream>
 
 #ifdef GEGE_CUDA
@@ -52,6 +53,32 @@ bool eval_finite_debug_enabled() {
     return enabled;
 }
 
+bool eval_chunked_ranks_enabled() {
+    static bool enabled = parse_env_flag("GEGE_EVAL_CHUNKED_RANKS", true);
+    return enabled;
+}
+
+int64_t eval_negative_chunk_size() {
+    static int64_t chunk_size = std::max<int64_t>(parse_env_int("GEGE_EVAL_NEGATIVE_CHUNK_SIZE", 131072), 1);
+    return chunk_size;
+}
+
+bool negative_sampler_filtered_for_eval(const shared_ptr<NegativeSampler> &negative_sampler) {
+    if (negative_sampler == nullptr) {
+        return false;
+    }
+
+    if (instance_of<NegativeSampler, NegativeSamplingBase>(negative_sampler)) {
+        return std::dynamic_pointer_cast<NegativeSamplingBase>(negative_sampler)->filtered_;
+    }
+
+    if (instance_of<NegativeSampler, CorruptNodeNegativeSampler>(negative_sampler)) {
+        return std::dynamic_pointer_cast<CorruptNodeNegativeSampler>(negative_sampler)->filtered_;
+    }
+
+    return false;
+}
+
 int64_t eval_finite_debug_max_logs() {
     static int64_t max_logs = std::max<int64_t>(parse_env_int("GEGE_EVAL_FINITE_DEBUG_MAX_LOGS", 16), 0);
     return max_logs;
@@ -76,6 +103,12 @@ bool should_log_eval_finite_debug(int64_t &log_id) {
     return true;
 }
 
+bool should_log_eval_chunked_path() {
+    static std::atomic<bool> logged{false};
+    bool expected = false;
+    return logged.compare_exchange_strong(expected, true);
+}
+
 std::string tensor_shape_string(const torch::Tensor &tensor) {
     std::ostringstream oss;
     oss << "[";
@@ -90,7 +123,7 @@ std::string tensor_shape_string(const torch::Tensor &tensor) {
 }
 
 void log_eval_tensor_if_non_finite(const char *stage, int batch_id, const torch::Tensor &tensor) {
-    if (!tensor.defined() || tensor.numel() == 0) {
+    if (!eval_finite_debug_enabled() || !tensor.defined() || tensor.numel() == 0) {
         return;
     }
 
@@ -230,11 +263,24 @@ void Model::save(std::string directory) {
 void Model::load(std::string directory, bool train) {
     string model_filename = directory + PathConstants::model_file;
     string model_state_filename = directory + PathConstants::model_state_file;
+    string per_device_model_filename =
+            model_filename + "_" + std::to_string(device_.has_index() ? device_.index() : 0);
 
     torch::serialize::InputArchive model_archive;
     torch::serialize::InputArchive state_archive;
 
-    model_archive.load_from(model_filename);
+    const bool has_combined_model_file = static_cast<bool>(std::ifstream(model_filename));
+    const bool has_per_device_model_file = static_cast<bool>(std::ifstream(per_device_model_filename));
+
+    if (has_combined_model_file) {
+        model_archive.load_from(model_filename);
+    } else if (decoder_ != nullptr && has_per_device_model_file) {
+        model_archive.load_from(per_device_model_filename);
+    } else {
+        throw std::runtime_error(
+                "Unable to find compatible model checkpoint. Expected " + model_filename +
+                " or " + per_device_model_filename);
+    }
 
     if (train) {
         state_archive.load_from(model_state_filename);
@@ -248,7 +294,9 @@ void Model::load(std::string directory, bool train) {
         optimizers_[optimizer_idx++]->load(tmp_state_archive);
     }
 
-    std::dynamic_pointer_cast<torch::nn::Module>(encoder_)->load(model_archive);
+    if (has_combined_model_file) {
+        std::dynamic_pointer_cast<torch::nn::Module>(encoder_)->load(model_archive);
+    }
 
     if (decoder_ != nullptr) {
         std::dynamic_pointer_cast<torch::nn::Module>(decoder_)->load(model_archive);
@@ -481,7 +529,7 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
     if (call_step) {
         clear_grad();
     }
-    
+
     if (batch->node_embeddings_.defined()) {
         batch->node_embeddings_.requires_grad_();
     }
@@ -490,8 +538,6 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
 
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         auto all_scores = forward_lp(batch, true);
-
-        auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
 
         torch::Tensor pos_scores = std::get<0>(all_scores);
         torch::Tensor neg_scores = std::get<1>(all_scores);
@@ -545,6 +591,26 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
 
 void Model::evaluate_batch(shared_ptr<Batch> batch) {
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
+        auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
+        bool filtered_eval = negative_sampler_filtered_for_eval(negative_sampler_);
+        if (edge_decoder != nullptr && edge_decoder->decoder_method_ == EdgeDecoderMethod::CORRUPT_NODE && filtered_eval &&
+            eval_chunked_ranks_enabled() && batch->dst_neg_indices_mapping_.defined()) {
+            if (should_log_eval_chunked_path()) {
+                SPDLOG_INFO("Link prediction evaluation is using chunked exact filtered ranks; batch_size={} negative_chunk_size={}",
+                            batch->edges_.size(0), eval_negative_chunk_size());
+            }
+            torch::Tensor encoded_nodes = encoder_->forward(batch->node_embeddings_, batch->node_features_, batch->dense_graph_, false);
+            auto chunked_ranks = node_corrupt_ranks_chunked(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->dst_neg_filter_,
+                                                            batch->src_neg_indices_mapping_, batch->src_neg_filter_, batch->qual_embeddings_,
+                                                            eval_negative_chunk_size());
+            auto reporter = std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_);
+            reporter->addRanks(std::get<0>(chunked_ranks));
+            if (std::get<1>(chunked_ranks).defined()) {
+                reporter->addRanks(std::get<1>(chunked_ranks));
+            }
+            return;
+        }
+
         auto all_scores = forward_lp(batch, false);
         torch::Tensor pos_scores = std::get<0>(all_scores);
         torch::Tensor neg_scores = std::get<1>(all_scores);

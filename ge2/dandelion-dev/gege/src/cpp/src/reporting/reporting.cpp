@@ -106,6 +106,14 @@ void LinkPredictionReporter::addResult(torch::Tensor pos_scores, torch::Tensor n
     unlock();
 }
 
+void LinkPredictionReporter::addRanks(torch::Tensor ranks) {
+    lock();
+    if (ranks.defined()) {
+        per_batch_ranks_.emplace_back(ranks.to(torch::kCPU));
+    }
+    unlock();
+}
+
 void LinkPredictionReporter::report() {
     all_ranks_ = torch::cat(per_batch_ranks_).to(torch::kCPU);
     if (per_batch_scores_.size() > 0) {

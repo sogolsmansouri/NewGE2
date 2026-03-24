@@ -177,6 +177,13 @@ UniqueBackend unique_backend() {
     return backend;
 }
 
+UniqueBackend resolve_unique_backend(const std::string& override_backend) {
+    if (!override_backend.empty()) {
+        return parse_unique_backend(override_backend.c_str());
+    }
+    return unique_backend();
+}
+
 const char* unique_backend_name(UniqueBackend backend) {
     switch (backend) {
         case UniqueBackend::kSort:
@@ -193,12 +200,12 @@ const char* unique_backend_name(UniqueBackend backend) {
     }
 }
 
-void initialize_debug_info(UniqueMapCudaDebugInfo* debug_info, bool sorted) {
+void initialize_debug_info(UniqueMapCudaDebugInfo* debug_info, bool sorted, UniqueBackend requested_backend) {
     int64_t total_calls = unique_backend_call_counter.fetch_add(1) + 1;
     if (debug_info == nullptr) return;
 
     bool measure_device_timing = debug_info->measure_device_timing;
-    debug_info->requested_backend = unique_backend_name(unique_backend());
+    debug_info->requested_backend = unique_backend_name(requested_backend);
     debug_info->executed_backend.clear();
     debug_info->fallback_backend.clear();
     debug_info->fallback_reason.clear();
@@ -1000,19 +1007,20 @@ std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda_cuco(to
 } // namespace
 
 std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda(torch::Tensor all_ids, bool sorted,
-                                                                         UniqueMapCudaDebugInfo* debug_info, int64_t value_domain_size) {
-    initialize_debug_info(debug_info, sorted);
+                                                                         UniqueMapCudaDebugInfo* debug_info) {
+    UniqueBackend requested_backend = resolve_unique_backend(std::string());
+    initialize_debug_info(debug_info, sorted, requested_backend);
     if (sorted) {
         return map_tensors_unique_inverse_cuda_sort(all_ids, debug_info);
     }
 
-    switch (unique_backend()) {
+    switch (requested_backend) {
         case UniqueBackend::kSort:
             return map_tensors_unique_inverse_cuda_sort(all_ids, debug_info);
         case UniqueBackend::kHash:
             return map_tensors_unique_inverse_cuda_hash(all_ids, debug_info);
         case UniqueBackend::kBitmap:
-            return map_tensors_unique_inverse_cuda_bitmap(all_ids, debug_info, value_domain_size);
+            return map_tensors_unique_inverse_cuda_bitmap(all_ids, debug_info, -1);
         case UniqueBackend::kCuco:
             return map_tensors_unique_inverse_cuda_cuco(all_ids, debug_info);
         case UniqueBackend::kAuto:

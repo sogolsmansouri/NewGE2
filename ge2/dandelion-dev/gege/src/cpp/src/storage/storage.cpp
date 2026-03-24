@@ -702,6 +702,18 @@ void MemPartitionBufferStorage::unload(bool perform_write) {
     }
 }
 
+void MemPartitionBufferStorage::syncToHostWithoutDiskWrite() {
+    if (!loaded_) {
+        return;
+    }
+
+    for (int i = 0; i < buffers_.size(); i++) {
+        if (buffers_[i]->loaded_) {
+            buffers_[i]->unload(true);
+        }
+    }
+}
+
 void MemPartitionBufferStorage::unload(bool perform_write, int32_t device_idx) {
     if (!loaded_) {
         return;

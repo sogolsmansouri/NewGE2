@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <random>
+#include <sstream>
 #include <string>
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -79,6 +80,69 @@ bool partition_buffer_pipeline_timing_enabled() {
 bool startup_timing_enabled() {
     static bool enabled = parse_graph_storage_env_flag("GEGE_STARTUP_TIMING", false);
     return enabled;
+}
+
+template <typename T>
+std::string vector_prefix_string(const std::vector<T> &values, std::size_t limit = 8) {
+    std::ostringstream oss;
+    oss << "[";
+    std::size_t count = std::min<std::size_t>(values.size(), limit);
+    for (std::size_t i = 0; i < count; i++) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << values[i];
+    }
+    if (values.size() > count) {
+        oss << ", ...";
+    }
+    oss << "]";
+    return oss.str();
+}
+
+EdgeList merge_sorted_edges_with_additional(const EdgeList &base_sorted_edges, const EdgeList &additional_edges, int sort_dim) {
+    if (!additional_edges.defined() || additional_edges.numel() == 0) {
+        return base_sorted_edges;
+    }
+
+    torch::Tensor additional_i64 = additional_edges.to(torch::kInt64);
+    torch::Tensor additional_sorted =
+        additional_i64.index_select(0, torch::argsort(additional_i64.select(1, sort_dim), 0, false));
+
+    if (!base_sorted_edges.defined() || base_sorted_edges.numel() == 0) {
+        return additional_sorted;
+    }
+
+    torch::Tensor base_i64 = base_sorted_edges.to(torch::kInt64);
+    torch::Tensor insertion_points =
+        torch::searchsorted(base_i64.select(1, sort_dim).contiguous(), additional_sorted.select(1, sort_dim).contiguous()).to(torch::kInt64);
+
+    torch::Tensor merged =
+        torch::empty({base_i64.size(0) + additional_sorted.size(0), base_i64.size(1)}, base_i64.options());
+
+    auto insertion_accessor = insertion_points.accessor<int64_t, 1>();
+    int64_t prev_base = 0;
+    int64_t out_offset = 0;
+
+    for (int64_t add_idx = 0; add_idx < additional_sorted.size(0); add_idx++) {
+        int64_t insert_at = insertion_accessor[add_idx];
+        int64_t copy_count = insert_at - prev_base;
+        if (copy_count > 0) {
+            merged.narrow(0, out_offset, copy_count).copy_(base_i64.narrow(0, prev_base, copy_count));
+            out_offset += copy_count;
+        }
+
+        merged.narrow(0, out_offset, 1).copy_(additional_sorted.narrow(0, add_idx, 1));
+        out_offset += 1;
+        prev_base = insert_at;
+    }
+
+    if (prev_base < base_i64.size(0)) {
+        int64_t tail_count = base_i64.size(0) - prev_base;
+        merged.narrow(0, out_offset, tail_count).copy_(base_i64.narrow(0, prev_base, tail_count));
+    }
+
+    return merged;
 }
 
 int64_t partition_buffer_pipeline_timing_max() {
@@ -959,17 +1023,34 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
         EdgeList src_sort;
         EdgeList dst_sort;
 
-        if (storage_ptrs_.train_edges != nullptr) {
+        if (!train_ && full_graph_evaluation_) {
+            EdgeList eval_edges;
+            if (storage_ptrs_.edges != nullptr) {
+                eval_edges = storage_ptrs_.edges->range(0, storage_ptrs_.edges->getDim0()).to(torch::kInt64);
+            } else {
+                eval_edges = torch::empty({0, 2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+            }
+            src_sort = eval_edges.index_select(0, torch::argsort(eval_edges.select(1, 0))).to(torch::kInt64);
+            dst_sort = eval_edges.index_select(0, torch::argsort(eval_edges.select(1, -1))).to(torch::kInt64);
+        } else if (storage_ptrs_.train_edges != nullptr) {
             src_sort = storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()).to(torch::kInt64);
             dst_sort = storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()).to(torch::kInt64);
+            src_sort = src_sort.index_select(0, torch::argsort(src_sort.select(1, 0))).to(torch::kInt64);
+            dst_sort = dst_sort.index_select(0, torch::argsort(dst_sort.select(1, -1))).to(torch::kInt64);
         } else {
             src_sort = storage_ptrs_.edges->range(0, storage_ptrs_.edges->getDim0()).to(torch::kInt64);
             dst_sort = storage_ptrs_.edges->range(0, storage_ptrs_.edges->getDim0()).to(torch::kInt64);
+            src_sort = src_sort.index_select(0, torch::argsort(src_sort.select(1, 0))).to(torch::kInt64);
+            dst_sort = dst_sort.index_select(0, torch::argsort(dst_sort.select(1, -1))).to(torch::kInt64);
         }
-        src_sort = src_sort.index_select(0, torch::argsort(src_sort.select(1, 0))).to(torch::kInt64);
-        dst_sort = dst_sort.index_select(0, torch::argsort(dst_sort.select(1, -1))).to(torch::kInt64);
 
         current_subgraph_states_[0]->in_memory_subgraph_ = std::make_shared<GegeGraph>(src_sort, dst_sort, getNumNodesInMemory());
+        // Clear all_src/dst_sorted_edges_ so that sortAllEdges() will rebuild them
+        // from all edges (train+val+test) instead of just the eval edges.
+        // The GegeGraph constructor sets all_*_sorted_edges_ = *_sorted_edges_ by default,
+        // which would cause sortAllEdges() to skip rebuilding.
+        current_subgraph_states_[0]->in_memory_subgraph_->all_src_sorted_edges_ = torch::Tensor();
+        current_subgraph_states_[0]->in_memory_subgraph_->all_dst_sorted_edges_ = torch::Tensor();
     }
 }
 
@@ -1066,6 +1147,10 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     int num_partitions = getNumPartitions();
     int num_swap_partitions = evict_partition_ids.size();
     int num_remaining_partitions = buffer_size - num_swap_partitions;
+    int64_t kept_bucket_count = 0;
+    int64_t fetched_bucket_count = 0;
+    int64_t reused_edge_count = 0;
+    int64_t fetched_edge_count = 0;
 
     // get edge buckets that will be kept in memory
     torch::Tensor keep_mask = torch::ones({num_edge_buckets_in_mem}, torch::kBool);
@@ -1088,6 +1173,10 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     torch::Tensor in_mem_edge_bucket_ids = current_subgraph_states_[device_idx]->in_memory_edge_bucket_ids_.masked_select(keep_mask);
     torch::Tensor in_mem_edge_bucket_sizes = current_subgraph_states_[device_idx]->in_memory_edge_bucket_sizes_.masked_select(keep_mask);
     torch::Tensor local_or_global_edge_bucket_starts = current_subgraph_states_[device_idx]->in_memory_edge_bucket_starts_.masked_select(keep_mask);
+    kept_bucket_count = in_mem_edge_bucket_ids.numel();
+    if (in_mem_edge_bucket_sizes.defined() && in_mem_edge_bucket_sizes.numel() > 0) {
+        reused_edge_count = in_mem_edge_bucket_sizes.sum().item<int64_t>();
+    }
 
     // get new in memory partition ids
     keep_mask = torch::ones({buffer_size}, torch::kBool);
@@ -1110,6 +1199,11 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     torch::Tensor new_in_mem_partition_ids = current_subgraph_states_[device_idx]->in_memory_partition_ids_.masked_scatter(~keep_mask, admit_ids_tensor);
     auto old_in_mem_partition_ids_accessor = old_in_mem_partition_ids.accessor<int64_t, 1>();
     auto new_in_mem_partition_ids_accessor = new_in_mem_partition_ids.accessor<int64_t, 1>();
+    std::vector<int> retained_partition_ids;
+    retained_partition_ids.reserve(static_cast<std::size_t>(old_in_mem_partition_ids.numel()));
+    for (int64_t i = 0; i < old_in_mem_partition_ids.numel(); i++) {
+        retained_partition_ids.emplace_back(static_cast<int>(old_in_mem_partition_ids_accessor[i]));
+    }
 
     // get new incoming edge buckets
     int num_new_edge_buckets = num_swap_partitions * (num_remaining_partitions + buffer_size);
@@ -1117,6 +1211,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     torch::Tensor new_edge_bucket_ids = torch::zeros({num_new_edge_buckets}, torch::kInt64);
     torch::Tensor new_edge_bucket_sizes = torch::zeros({num_new_edge_buckets}, torch::kInt64);
     torch::Tensor new_global_edge_bucket_starts = torch::zeros({num_new_edge_buckets}, torch::kInt64);
+    fetched_bucket_count = num_new_edge_buckets;
 
     auto new_edge_bucket_ids_accessor = new_edge_bucket_ids.accessor<int64_t, 1>();
     auto new_edge_bucket_sizes_accessor = new_edge_bucket_sizes.accessor<int64_t, 1>();
@@ -1158,6 +1253,9 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             new_edge_bucket_sizes_accessor[idx] = edge_bucket_size;
             new_global_edge_bucket_starts_accessor[idx] = edge_bucket_start;
         }
+    }
+    if (new_edge_bucket_sizes.defined() && new_edge_bucket_sizes.numel() > 0) {
+        fetched_edge_count = new_edge_bucket_sizes.sum().item<int64_t>();
     }
 
     // concatenate old and new
@@ -1237,7 +1335,32 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     if (shouldUsePartitionBufferLPFastPath_()) {
         torch::Tensor partition_to_buffer_slot = getPartitionToBufferSlotMap_(device_idx);
         int64_t partition_size = getPartitionSize_(device_idx);
-        mapped_edges = mapEdgesWithPartitionSlots_(subgraph->all_in_memory_edges_, partition_to_buffer_slot, partition_size, devices_[device_idx]);
+        auto previous_state = current_subgraph_states_[device_idx];
+        bool can_reuse_mapped_buckets = previous_state != nullptr && previous_state->all_in_memory_mapped_edges_.defined();
+        mapped_edges = torch::empty({total_size, storage_ptrs_.edges->dim1_size_},
+                                    torch::TensorOptions().dtype(torch::kInt64).device(devices_[device_idx]));
+
+        for (int i = 0; i < num_edge_buckets_in_mem; i++) {
+            int64_t edge_bucket_size = in_mem_edge_bucket_sizes_accessor[i];
+            if (edge_bucket_size == 0) {
+                continue;
+            }
+
+            int64_t edge_bucket_start = local_or_global_edge_bucket_starts_accessor[i];
+            bool in_mem = in_mem_mask_accessor[i];
+            int64_t local_offset = in_mem_edge_bucket_starts_accessor[i];
+
+            if (in_mem && can_reuse_mapped_buckets) {
+                mapped_edges.narrow(0, local_offset, edge_bucket_size)
+                    .copy_(previous_state->all_in_memory_mapped_edges_.narrow(0, edge_bucket_start, edge_bucket_size));
+                continue;
+            }
+
+            torch::Tensor mapped_bucket =
+                mapEdgesWithPartitionSlots_(subgraph->all_in_memory_edges_.narrow(0, local_offset, edge_bucket_size), partition_to_buffer_slot,
+                                            partition_size, devices_[device_idx]);
+            mapped_edges.narrow(0, local_offset, edge_bucket_size).copy_(mapped_bucket);
+        }
         if (log_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             remap_ms = elapsed_graph_storage_ms(phase_start, now);
@@ -1333,9 +1456,12 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     if (log_timing) {
         auto total_end = std::chrono::high_resolution_clock::now();
         SPDLOG_INFO(
-            "[partition-buffer-pipeline][update {}] device={} evict={} admit={} buckets={} edges={} state_prepare_ms={:.3f} edge_materialize_ms={:.3f} remap_ms={:.3f} graph_build_ms={:.3f} total_ms={:.3f}",
-            timing_id, device_idx, evict_partition_ids.size(), admit_partition_ids.size(), num_edge_buckets_in_mem, total_size, state_prepare_ms,
-            edge_materialize_ms, remap_ms, graph_build_ms, elapsed_graph_storage_ms(total_start, total_end));
+            "[partition-buffer-pipeline][update {}] device={} retained_ids={} evict_ids={} admit_ids={} kept_buckets={} fetched_buckets={} reused_edges={} "
+            "fetched_edges={} total_buckets={} total_edges={} state_prepare_ms={:.3f} edge_materialize_ms={:.3f} remap_ms={:.3f} graph_build_ms={:.3f} total_ms={:.3f}",
+            timing_id, device_idx, vector_prefix_string(retained_partition_ids),
+            vector_prefix_string(evict_partition_ids), vector_prefix_string(admit_partition_ids), kept_bucket_count, fetched_bucket_count, reused_edge_count,
+            fetched_edge_count, num_edge_buckets_in_mem, total_size, state_prepare_ms, edge_materialize_ms, remap_ms, graph_build_ms,
+            elapsed_graph_storage_ms(total_start, total_end));
     }
 
     if (prefetch_) {
@@ -1359,14 +1485,73 @@ EdgeList GraphModelStorage::merge_sorted_edge_buckets(EdgeList edges, torch::Ten
 }
 
 void GraphModelStorage::sortAllEdges(int32_t device_idx) {
-    if (!useInMemorySubGraph()) {
+    if (!train_ && full_graph_evaluation_) {
+        auto in_memory_graph = current_subgraph_states_[0]->in_memory_subgraph_;
+        if (in_memory_graph == nullptr) {
+            current_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
+            current_subgraph_states_[0] = current_subgraph_state_;
+            in_memory_graph = std::make_shared<GegeGraph>();
+            current_subgraph_states_[0]->in_memory_subgraph_ = in_memory_graph;
+        }
+
+        if (in_memory_graph->all_src_sorted_edges_.defined() && in_memory_graph->all_src_sorted_edges_.numel() > 0) {
+            return;
+        }
+
+        EdgeList base_src_sorted;
+        EdgeList base_dst_sorted;
+        if (storage_ptrs_.train_edges != nullptr) {
+            EdgeList train_edges_i64 = storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()).to(torch::kInt64);
+            base_src_sorted = train_edges_i64.index_select(0, torch::argsort(train_edges_i64.select(1, 0))).to(torch::kInt64);
+            train_edges_i64 = EdgeList();
+
+            train_edges_i64 = storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()).to(torch::kInt64);
+            base_dst_sorted = train_edges_i64.index_select(0, torch::argsort(train_edges_i64.select(1, -1))).to(torch::kInt64);
+            train_edges_i64 = EdgeList();
+            storage_ptrs_.train_edges->unload();
+        } else {
+            base_src_sorted = in_memory_graph->src_sorted_edges_;
+            base_dst_sorted = in_memory_graph->dst_sorted_edges_;
+        }
+
+        in_memory_graph->src_sorted_edges_ = base_src_sorted;
+        in_memory_graph->dst_sorted_edges_ = base_dst_sorted;
 
         std::vector<EdgeList> additional_edges = {};
 
-        if (storage_ptrs_.train_edges != nullptr) {
-            storage_ptrs_.train_edges->load();
-            additional_edges.emplace_back(storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()));
+        if (storage_ptrs_.validation_edges != nullptr) {
+            storage_ptrs_.validation_edges->load();
+            additional_edges.emplace_back(storage_ptrs_.validation_edges->range(0, storage_ptrs_.validation_edges->getDim0()));
         }
+
+        if (storage_ptrs_.test_edges != nullptr) {
+            storage_ptrs_.test_edges->load();
+            additional_edges.emplace_back(storage_ptrs_.test_edges->range(0, storage_ptrs_.test_edges->getDim0()));
+        }
+
+        for (auto f_edges : storage_ptrs_.filter_edges) {
+            f_edges->load();
+            additional_edges.emplace_back(f_edges->range(0, f_edges->getDim0()));
+        }
+
+        if (additional_edges.empty()) {
+            in_memory_graph->all_src_sorted_edges_ = in_memory_graph->src_sorted_edges_;
+            in_memory_graph->all_dst_sorted_edges_ = in_memory_graph->dst_sorted_edges_;
+        } else {
+            torch::Tensor extra_edges = torch::cat(additional_edges).to(torch::kInt64);
+            in_memory_graph->all_src_sorted_edges_ = merge_sorted_edges_with_additional(in_memory_graph->src_sorted_edges_, extra_edges, 0);
+            in_memory_graph->all_dst_sorted_edges_ = merge_sorted_edges_with_additional(in_memory_graph->dst_sorted_edges_, extra_edges, -1);
+        }
+
+        for (auto f_edges : storage_ptrs_.filter_edges) {
+            f_edges->unload();
+        }
+
+        return;
+    }
+
+    if (!useInMemorySubGraph()) {
+        std::vector<EdgeList> additional_edges = {};
 
         if (!train_) {
             if (storage_ptrs_.validation_edges != nullptr) {
@@ -1386,7 +1571,15 @@ void GraphModelStorage::sortAllEdges(int32_t device_idx) {
             additional_edges.emplace_back(f_edges->range(0, f_edges->getDim0()));
         }
 
-        current_subgraph_states_[0]->in_memory_subgraph_->sortAllEdges(torch::cat(additional_edges));
+        auto in_memory_graph = current_subgraph_states_[0]->in_memory_subgraph_;
+        if (additional_edges.empty()) {
+            in_memory_graph->all_src_sorted_edges_ = in_memory_graph->src_sorted_edges_;
+            in_memory_graph->all_dst_sorted_edges_ = in_memory_graph->dst_sorted_edges_;
+        } else {
+            torch::Tensor extra_edges = torch::cat(additional_edges).to(torch::kInt64);
+            in_memory_graph->all_src_sorted_edges_ = merge_sorted_edges_with_additional(in_memory_graph->src_sorted_edges_, extra_edges, 0);
+            in_memory_graph->all_dst_sorted_edges_ = merge_sorted_edges_with_additional(in_memory_graph->dst_sorted_edges_, extra_edges, -1);
+        }
 
         for (auto f_edges : storage_ptrs_.filter_edges) {
             f_edges->unload();

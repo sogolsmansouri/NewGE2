@@ -142,7 +142,7 @@ std::tuple<shared_ptr<Model>, shared_ptr<GraphModelStorage>, shared_ptr<DataLoad
 
     dataloader->epochs_processed_ = epochs_processed;
 
-    model->negative_sampler_ = dataloader->training_negative_sampler_;
+    model->negative_sampler_ = train ? dataloader->training_negative_sampler_ : dataloader->evaluation_negative_sampler_;
     for (int i = 1; i < model->device_models_.size(); i++) {
         model->device_models_[i]->negative_sampler_ = model->negative_sampler_;
     }

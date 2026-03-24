@@ -217,11 +217,7 @@ class MemPartitionBuffer : public PartitionBuffer {
 
     void setBufferOrdering(std::vector<torch::Tensor> buffer_states);
 
-    void setPermutation(torch::Tensor perm, torch::Tensor pos) {
-        SPDLOG_INFO("setPermutation");
-        perm_ = perm;
-        pos_ = pos;
-    }
+    void setPermutation(torch::Tensor perm, torch::Tensor pos);
 
     void sync();
 
@@ -233,4 +229,15 @@ class MemPartitionBuffer : public PartitionBuffer {
     torch::Tensor buffer_tensor_gpu_view_;
     torch::Tensor perm_;
     torch::Tensor pos_;
+
+   private:
+    void refreshHostPartitionRanges_();
+    bool hasContiguousHostPartitionRange_(int partition_id) const;
+    int64_t contiguousHostPartitionStart_(int partition_id) const;
+    torch::Tensor hostPartitionRows_(Partition *partition);
+    void copyPartitionFromHostToPinned_(Partition *partition, torch::Tensor pinned_view);
+    void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
+
+    std::vector<int64_t> partition_host_start_offsets_;
+    std::vector<bool> partition_host_contiguous_;
 };

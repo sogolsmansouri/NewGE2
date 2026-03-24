@@ -14,6 +14,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corr
                                                                                             torch::Tensor node_embeddings, torch::Tensor dst_negs,
                                                                                             torch::Tensor src_negs = torch::Tensor());
 
+std::tuple<torch::Tensor, torch::Tensor> node_corrupt_ranks_chunked(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
+                                                                    torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor dst_filter,
+                                                                    torch::Tensor src_negs = torch::Tensor(), torch::Tensor src_filter = torch::Tensor(),
+                                                                    torch::Tensor qual_embeddings = torch::Tensor(), int64_t chunk_size = 131072);
+
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> rel_corrupt_forward(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
                                                                                            torch::Tensor node_embeddings, torch::Tensor neg_rel_ids);
 

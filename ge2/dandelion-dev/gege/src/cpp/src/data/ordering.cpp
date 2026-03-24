@@ -1230,6 +1230,129 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> generate_access_aware_s
 
 }  // namespace
 
+std::vector<int64_t> getSingleGpuGpuAwareCustomPermutation(const vector<torch::Tensor> &buffer_states,
+                                                           const vector<int64_t> &edge_bucket_sizes,
+                                                           int num_partitions) {
+    std::vector<int64_t> identity(buffer_states.size());
+    std::iota(identity.begin(), identity.end(), 0);
+    if (buffer_states.size() <= 1 || edge_bucket_sizes.size() != static_cast<size_t>(num_partitions * num_partitions)) {
+        return identity;
+    }
+
+    auto hotness = build_partition_hotness(edge_bucket_sizes, num_partitions);
+    std::vector<std::vector<int64_t>> state_partitions;
+    state_partitions.reserve(buffer_states.size());
+    std::vector<int64_t> resident_weights;
+    resident_weights.reserve(buffer_states.size());
+    for (auto &state : buffer_states) {
+        auto partitions = tensor_to_partitions(state);
+        std::sort(partitions.begin(), partitions.end());
+        resident_weights.emplace_back(compute_state_resident_weight(std::vector<int>(partitions.begin(), partitions.end()), edge_bucket_sizes, num_partitions));
+        state_partitions.emplace_back(std::move(partitions));
+    }
+
+    auto transition_score = [&](int64_t prev_idx, int64_t next_idx) {
+        int64_t overlap_count = 0;
+        int64_t shared_hotness = 0;
+        std::size_t i = 0;
+        std::size_t j = 0;
+        const auto &lhs = state_partitions[prev_idx];
+        const auto &rhs = state_partitions[next_idx];
+        while (i < lhs.size() && j < rhs.size()) {
+            if (lhs[i] == rhs[j]) {
+                overlap_count++;
+                shared_hotness += hotness[lhs[i]];
+                i++;
+                j++;
+            } else if (lhs[i] < rhs[j]) {
+                i++;
+            } else {
+                j++;
+            }
+        }
+        return std::make_pair(overlap_count, shared_hotness);
+    };
+
+    std::vector<int64_t> best_order;
+    std::tuple<int64_t, int64_t, int64_t, int64_t> best_key{-1, -1, std::numeric_limits<int64_t>::min(), std::numeric_limits<int64_t>::max()};
+
+    for (int64_t start_idx = 0; start_idx < static_cast<int64_t>(buffer_states.size()); start_idx++) {
+        std::vector<int64_t> order;
+        order.reserve(buffer_states.size());
+        std::vector<bool> used(buffer_states.size(), false);
+        order.emplace_back(start_idx);
+        used[start_idx] = true;
+
+        int64_t overlap_transitions = 0;
+        int64_t total_shared_hotness = 0;
+
+        while (order.size() < buffer_states.size()) {
+            int64_t prev_idx = order.back();
+            int64_t best_next = -1;
+            std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> best_next_key{
+                std::numeric_limits<int64_t>::min(),
+                std::numeric_limits<int64_t>::min(),
+                std::numeric_limits<int64_t>::min(),
+                std::numeric_limits<int64_t>::min(),
+                std::numeric_limits<int64_t>::min()};
+
+            for (int64_t candidate_idx = 0; candidate_idx < static_cast<int64_t>(buffer_states.size()); candidate_idx++) {
+                if (used[candidate_idx]) {
+                    continue;
+                }
+
+                auto [overlap_count, shared_hotness] = transition_score(prev_idx, candidate_idx);
+                int64_t future_overlap_choices = 0;
+                for (int64_t other_idx = 0; other_idx < static_cast<int64_t>(buffer_states.size()); other_idx++) {
+                    if (used[other_idx] || other_idx == candidate_idx) {
+                        continue;
+                    }
+                    if (transition_score(candidate_idx, other_idx).first > 0) {
+                        future_overlap_choices++;
+                    }
+                }
+
+                auto candidate_key = std::make_tuple(overlap_count,
+                                                     shared_hotness,
+                                                     future_overlap_choices,
+                                                     resident_weights[candidate_idx],
+                                                     -candidate_idx);
+                if (candidate_key > best_next_key) {
+                    best_next_key = candidate_key;
+                    best_next = candidate_idx;
+                }
+            }
+
+            if (best_next == -1) {
+                break;
+            }
+
+            auto [chosen_overlap, chosen_hotness] = transition_score(prev_idx, best_next);
+            overlap_transitions += chosen_overlap > 0 ? 1 : 0;
+            total_shared_hotness += chosen_hotness;
+            used[best_next] = true;
+            order.emplace_back(best_next);
+        }
+
+        if (order.size() != buffer_states.size()) {
+            continue;
+        }
+
+        auto candidate_key =
+            std::make_tuple(overlap_transitions, total_shared_hotness, -resident_weights[start_idx], -start_idx);
+        if (candidate_key > best_key) {
+            best_key = candidate_key;
+            best_order = std::move(order);
+        }
+    }
+
+    if (best_order.empty()) {
+        return identity;
+    }
+
+    return best_order;
+}
+
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(EdgeBucketOrdering edge_bucket_ordering, int num_partitions, int buffer_capacity,
                                                                                int fine_to_coarse_ratio, int num_cache_partitions,
                                                                                bool randomly_assign_edge_buckets) {

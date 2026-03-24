@@ -4,6 +4,9 @@
 #include "reporting/logger.h"
 
 #include <thread>
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDAGuard.h>
+#endif
 
 namespace {
 
@@ -70,31 +73,44 @@ void SynchronousEvaluator::evaluate(bool validation) {
     model_->reporter_->clear();
     Timer timer = Timer(false);
     timer.start();
-    std::vector<std::thread> threads;
-    threads.reserve(num_devices);
-    for (int32_t device_idx = 0; device_idx < num_devices; device_idx++) {
-        threads.emplace_back([this, device_idx]() {
-            shared_ptr<Model> eval_model = model_;
-            if (device_idx < model_->device_models_.size() && model_->device_models_[device_idx] != nullptr) {
-                eval_model = model_->device_models_[device_idx];
-            }
+    auto process_device = [this](int32_t device_idx) {
+        shared_ptr<Model> eval_model = model_;
+        if (device_idx < model_->device_models_.size() && model_->device_models_[device_idx] != nullptr) {
+            eval_model = model_->device_models_[device_idx];
+        }
+#ifdef GEGE_CUDA
+        c10::optional<c10::cuda::CUDAGuard> device_guard;
+        if (eval_model->device_.is_cuda()) {
+            device_guard.emplace(eval_model->device_);
+        }
+#endif
+        eval_model->negative_sampler_ = dataloader_->evaluation_negative_sampler_;
 
-            while (dataloader_->hasNextBatch(device_idx)) {
-                shared_ptr<Batch> batch = dataloader_->getBatch(c10::nullopt, false, device_idx);
-                if (batch == nullptr) {
-                    break;
-                }
-                batch->to(eval_model->device_);
-                dataloader_->loadGPUParameters(batch, device_idx);
-                batch->dense_graph_.performMap();
-                eval_model->evaluate_batch(batch);
-                dataloader_->finishedBatch(device_idx);
-                batch->clear();
+        while (dataloader_->hasNextBatch(device_idx)) {
+            shared_ptr<Batch> batch = dataloader_->getBatch(c10::nullopt, false, device_idx);
+            if (batch == nullptr) {
+                break;
             }
-        });
-    }
-    for (auto &thread : threads) {
-        thread.join();
+            batch->to(eval_model->device_);
+            dataloader_->loadGPUParameters(batch, device_idx);
+            batch->dense_graph_.performMap();
+            eval_model->evaluate_batch(batch);
+            dataloader_->finishedBatch(device_idx);
+            batch->clear();
+        }
+    };
+
+    if (num_devices == 1) {
+        process_device(0);
+    } else {
+        std::vector<std::thread> threads;
+        threads.reserve(num_devices);
+        for (int32_t device_idx = 0; device_idx < num_devices; device_idx++) {
+            threads.emplace_back(process_device, device_idx);
+        }
+        for (auto &thread : threads) {
+            thread.join();
+        }
     }
     timer.stop();
 

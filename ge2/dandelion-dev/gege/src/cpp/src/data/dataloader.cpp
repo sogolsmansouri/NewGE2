@@ -53,6 +53,16 @@ bool fast_map_tensors_enabled() {
     return enabled;
 }
 
+bool single_gpu_gpu_aware_custom_enabled() {
+    static bool enabled = parse_env_flag("GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM", false);
+    return enabled;
+}
+
+bool keep_storage_hot_between_epochs_enabled() {
+    static bool enabled = parse_env_flag("GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS", false);
+    return enabled;
+}
+
 bool verify_node_mapping_enabled() {
     static bool enabled = parse_env_flag("GEGE_VERIFY_NODE_MAPPING", false);
     return enabled;
@@ -85,6 +95,43 @@ int64_t eval_finite_debug_max_logs() {
 std::atomic<int64_t> &eval_finite_debug_log_counter() {
     static std::atomic<int64_t> counter{0};
     return counter;
+}
+
+bool uses_mem_partition_buffer_storage(const shared_ptr<GraphModelStorage> &graph_storage) {
+    if (graph_storage == nullptr) {
+        return false;
+    }
+
+    return instance_of<Storage, MemPartitionBufferStorage>(graph_storage->storage_ptrs_.node_embeddings) ||
+           instance_of<Storage, MemPartitionBufferStorage>(graph_storage->storage_ptrs_.node_features) ||
+           instance_of<Storage, MemPartitionBufferStorage>(graph_storage->storage_ptrs_.node_optimizer_state) ||
+           instance_of<Storage, MemPartitionBufferStorage>(graph_storage->storage_ptrs_.node_embeddings_g) ||
+           instance_of<Storage, MemPartitionBufferStorage>(graph_storage->storage_ptrs_.node_optimizer_state_g);
+}
+
+bool should_keep_storage_hot_between_epochs(const shared_ptr<GraphModelStorage> &graph_storage, bool train) {
+    return train && graph_storage != nullptr && graph_storage->useInMemorySubGraph() && uses_mem_partition_buffer_storage(graph_storage) &&
+           keep_storage_hot_between_epochs_enabled();
+}
+
+void sync_mem_partition_buffers_to_host(const shared_ptr<GraphModelStorage> &graph_storage) {
+    if (graph_storage == nullptr) {
+        return;
+    }
+
+    auto sync_storage = [](const shared_ptr<Storage> &storage) {
+        if (storage != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage)) {
+            std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage)->syncToHostWithoutDiskWrite();
+        }
+    };
+
+    sync_storage(graph_storage->storage_ptrs_.node_embeddings);
+    sync_storage(graph_storage->storage_ptrs_.node_embeddings_g);
+    sync_storage(graph_storage->storage_ptrs_.node_optimizer_state);
+    sync_storage(graph_storage->storage_ptrs_.node_optimizer_state_g);
+    sync_storage(graph_storage->storage_ptrs_.node_features);
+    sync_storage(graph_storage->storage_ptrs_.qual_embeddings);
+    sync_storage(graph_storage->storage_ptrs_.qual_optimizer_state);
 }
 
 bool should_log_eval_finite_debug(int64_t &log_id) {
@@ -626,7 +673,17 @@ void DataLoader::nextEpoch() {
     }
     buffer_states_.clear();
     if (graph_storage_->useInMemorySubGraph()) {
-        unloadStorage(true);
+        auto epoch_boundary_start = std::chrono::high_resolution_clock::now();
+        bool keep_storage_hot = should_keep_storage_hot_between_epochs(graph_storage_, train_);
+        if (keep_storage_hot) {
+            sync_mem_partition_buffers_to_host(graph_storage_);
+        }
+        unloadStorage(!keep_storage_hot);
+        auto epoch_boundary_end = std::chrono::high_resolution_clock::now();
+        if (keep_storage_hot) {
+            SPDLOG_INFO("[epoch-boundary] epoch={} keep_storage_hot=1 unload_write=0 total_ms={:.3f}",
+                        epochs_processed_, elapsed_ms(epoch_boundary_start, epoch_boundary_end));
+        }
     }
 }
 
@@ -941,6 +998,75 @@ void DataLoader::setBufferOrdering() {
             }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
+            if (single_gpu_gpu_aware_custom_enabled() && requested_active_devices == 1 && physical_devices == 1 &&
+                options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && !options->randomly_assign_edge_buckets &&
+                buffer_states_.size() > 1 && edge_buckets_per_buffer_.size() == buffer_states_.size()) {
+                auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+                auto permutation = getSingleGpuGpuAwareCustomPermutation(buffer_states_, edge_bucket_sizes, options->num_partitions);
+                bool changed = false;
+                for (std::size_t idx = 0; idx < permutation.size(); idx++) {
+                    if (permutation[idx] != static_cast<int64_t>(idx)) {
+                        changed = true;
+                        break;
+                    }
+                }
+                if (changed) {
+                    std::vector<torch::Tensor> reordered_states;
+                    std::vector<torch::Tensor> reordered_buckets;
+                    reordered_states.reserve(buffer_states_.size());
+                    reordered_buckets.reserve(edge_buckets_per_buffer_.size());
+                    int64_t retained_transitions = 0;
+                    int64_t total_shared_hotness = 0;
+                    std::vector<int64_t> partition_hotness(options->num_partitions, 0);
+                    if (edge_bucket_sizes.size() == static_cast<std::size_t>(options->num_partitions * options->num_partitions)) {
+                        for (int partition = 0; partition < options->num_partitions; partition++) {
+                            int64_t outgoing = 0;
+                            int64_t incoming = 0;
+                            for (int other = 0; other < options->num_partitions; other++) {
+                                outgoing += edge_bucket_sizes[partition * options->num_partitions + other];
+                                incoming += edge_bucket_sizes[other * options->num_partitions + partition];
+                            }
+                            partition_hotness[partition] =
+                                outgoing + incoming - edge_bucket_sizes[partition * options->num_partitions + partition];
+                        }
+                    }
+                    std::vector<std::vector<int64_t>> ordered_partitions;
+                    ordered_partitions.reserve(buffer_states_.size());
+                    for (auto idx : permutation) {
+                        reordered_states.emplace_back(buffer_states_[idx]);
+                        reordered_buckets.emplace_back(edge_buckets_per_buffer_[idx]);
+                        auto partitions = buffer_states_[idx].to(torch::kCPU).to(torch::kInt64).contiguous();
+                        auto *part_ptr = partitions.data_ptr<int64_t>();
+                        std::vector<int64_t> part_vec(part_ptr, part_ptr + partitions.numel());
+                        std::sort(part_vec.begin(), part_vec.end());
+                        ordered_partitions.emplace_back(std::move(part_vec));
+                    }
+                    for (std::size_t idx = 1; idx < ordered_partitions.size(); idx++) {
+                        std::size_t left = 0;
+                        std::size_t right = 0;
+                        while (left < ordered_partitions[idx - 1].size() && right < ordered_partitions[idx].size()) {
+                            if (ordered_partitions[idx - 1][left] == ordered_partitions[idx][right]) {
+                                retained_transitions++;
+                                int64_t partition_id = ordered_partitions[idx][right];
+                                if (partition_id >= 0 && partition_id < static_cast<int64_t>(partition_hotness.size())) {
+                                    total_shared_hotness += partition_hotness[partition_id];
+                                }
+                                break;
+                            } else if (ordered_partitions[idx - 1][left] < ordered_partitions[idx][right]) {
+                                left++;
+                            } else {
+                                right++;
+                            }
+                        }
+                    }
+                    buffer_states_ = std::move(reordered_states);
+                    edge_buckets_per_buffer_ = std::move(reordered_buckets);
+                    SPDLOG_INFO("Using single-GPU GPU-aware CUSTOM ordering: retained_transitions={}/{} shared_hotness={:.3f}M",
+                                retained_transitions,
+                                buffer_states_.size() > 0 ? static_cast<int64_t>(buffer_states_.size()) - 1 : 0,
+                                total_shared_hotness / 1000000.0);
+                }
+            }
             if (!access_aware_state_generation && !used_optimized_custom_schedule) {
                 reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
             }

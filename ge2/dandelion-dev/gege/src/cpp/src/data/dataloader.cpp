@@ -278,6 +278,11 @@ bool bucket_streaming_lp_enabled() {
     return enabled;
 }
 
+bool gpu_active_edge_shuffle_enabled() {
+    static bool enabled = parse_env_flag("GEGE_GPU_ACTIVE_EDGE_SHUFFLE", true);
+    return enabled;
+}
+
 int64_t bucket_streaming_block_size(int64_t default_value) {
     int64_t configured = parse_env_int("GEGE_BUCKET_STREAMING_BLOCK_SIZE", default_value);
     return configured > 0 ? configured : default_value;
@@ -874,16 +879,22 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     } else {
         active_edges = graph_storage_->storage_ptrs_.edges->range(0, graph_storage_->storage_ptrs_.edges->getDim0());
     }
-    auto opts = torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU);
+    bool use_device_shuffle = active_edges.defined() && !active_edges.device().is_cpu() && gpu_active_edge_shuffle_enabled();
+    auto opts = torch::TensorOptions()
+                    .dtype(use_device_shuffle ? torch::kInt32 : torch::kInt64)
+                    .device(use_device_shuffle ? active_edges.device() : torch::Device(torch::kCPU));
     auto perm = torch::randperm(active_edges.size(0), opts);
-    perm = perm.to(active_edges.device());
+    if (perm.device() != active_edges.device()) {
+        perm = perm.to(active_edges.device());
+    }
     active_edges = active_edges.index_select(0, perm);
     if (log_timing) {
         auto now = std::chrono::high_resolution_clock::now();
         shuffle_ms = elapsed_ms(phase_start, now);
         SPDLOG_INFO(
-            "[partition-buffer-pipeline][setActiveEdges {}] device={} buckets={} edges={} bucket_lookup_ms={:.3f} gather_ms={:.3f} shuffle_ms={:.3f} total_ms={:.3f}",
-            timing_id, device_idx, selection.num_active_buckets, active_edges.size(0), bucket_lookup_ms, gather_ms, shuffle_ms, elapsed_ms(total_start, now));
+            "[partition-buffer-pipeline][setActiveEdges {}] device={} buckets={} edges={} shuffle_backend={} bucket_lookup_ms={:.3f} gather_ms={:.3f} shuffle_ms={:.3f} total_ms={:.3f}",
+            timing_id, device_idx, selection.num_active_buckets, active_edges.size(0), use_device_shuffle ? "device" : "cpu",
+            bucket_lookup_ms, gather_ms, shuffle_ms, elapsed_ms(total_start, now));
     }
     record_active_edge_state(this, device_idx, selection, active_edges.defined() ? active_edges.size(0) : 0);
     graph_storage_->setActiveEdges(active_edges, device_idx);

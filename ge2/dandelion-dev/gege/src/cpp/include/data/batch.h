@@ -56,6 +56,10 @@ class Batch {
     torch::Tensor qval_neg_embeddings_state_; /**< Optimizer state for negative qualifier value embeddings */
     torch::Tensor qval_neg_state_update_;     /**< Optimizer state update for negative qualifier value embeddings */
 
+    // Auxiliary n-ary negative-sampling channel: qualifier-relation corruption for arity-4.
+    Indices qrel_neg_indices_;      /**< Negative qualifier relation ids [num_chunks, num_negatives] */
+    torch::Tensor qrel_neg_filter_; /**< False-negative filter for qrel corruption */
+
     torch::Tensor node_features_; /**< Feature vector for each unique node in the the batch.  */
     torch::Tensor node_labels_;   /**< Label for each unique node in the the batch.  */
 

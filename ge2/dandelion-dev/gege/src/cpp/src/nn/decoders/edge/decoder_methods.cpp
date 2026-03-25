@@ -610,6 +610,84 @@ torch::Tensor compute_nary_qval_corrupt_scores(shared_ptr<EdgeDecoder> decoder, 
     return decoder->compute_scores(dst_embeddings, adjusted_src_neg);
 }
 
+torch::Tensor compute_nary_src_corrupt_scores(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
+                                              torch::Tensor src_neg_embeddings, torch::Tensor dst_embeddings,
+                                              bool has_relations, torch::Tensor qual_embeddings) {
+    if (!src_neg_embeddings.defined() || !qual_embeddings.defined() || !(positive_edges.size(1) == 4 || positive_edges.size(1) == 5)) {
+        return torch::Tensor();
+    }
+
+    int64_t chunk_num = src_neg_embeddings.size(0);
+    int64_t negatives_num = src_neg_embeddings.size(1);
+    int64_t embedding_dim = dst_embeddings.size(1);
+    int64_t edge_width = positive_edges.size(1);
+    int64_t num_per_chunk =
+        static_cast<int64_t>(std::ceil(static_cast<double>(positive_edges.size(0)) / static_cast<double>(chunk_num)));
+
+    torch::Tensor padded_edges = pad_rows_for_chunks(positive_edges, chunk_num).reshape({chunk_num, num_per_chunk, edge_width});
+    torch::Tensor padded_dst = pad_and_reshape(dst_embeddings, chunk_num);
+    torch::Tensor padded_qual = pad_and_reshape(qual_embeddings, chunk_num);
+
+    torch::Tensor expanded_edges =
+        padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, edge_width}).reshape({-1, edge_width});
+    torch::Tensor expanded_dst =
+        padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+    torch::Tensor flat_src_negs =
+        src_neg_embeddings.unsqueeze(1).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+    torch::Tensor flat_qual =
+        padded_qual.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+
+    auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, flat_src_negs, expanded_dst, has_relations, flat_qual);
+    torch::Tensor adjusted_src_neg =
+        std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, negatives_num, embedding_dim});
+
+    return decoder->compute_scores(dst_embeddings, adjusted_src_neg);
+}
+
+torch::Tensor compute_nary_qrel_corrupt_scores(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
+                                               torch::Tensor src_embeddings, torch::Tensor dst_embeddings,
+                                               bool has_relations, torch::Tensor qual_embeddings,
+                                               torch::Tensor qrel_neg_indices, torch::Tensor qrel_neg_filter) {
+    if (!qrel_neg_indices.defined() || !qual_embeddings.defined() || positive_edges.size(1) != 5) {
+        return torch::Tensor();
+    }
+
+    int64_t chunk_num = qrel_neg_indices.size(0);
+    int64_t negatives_num = qrel_neg_indices.size(1);
+    int64_t embedding_dim = src_embeddings.size(1);
+    int64_t edge_width = positive_edges.size(1);
+    int64_t num_per_chunk =
+        static_cast<int64_t>(std::ceil(static_cast<double>(positive_edges.size(0)) / static_cast<double>(chunk_num)));
+
+    torch::Tensor padded_edges = pad_rows_for_chunks(positive_edges, chunk_num).reshape({chunk_num, num_per_chunk, edge_width});
+    torch::Tensor padded_src = pad_and_reshape(src_embeddings, chunk_num);
+    torch::Tensor padded_dst = pad_and_reshape(dst_embeddings, chunk_num);
+    torch::Tensor padded_qual = pad_and_reshape(qual_embeddings, chunk_num);
+
+    torch::Tensor expanded_edges =
+        padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, edge_width}).reshape({-1, edge_width}).clone();
+    torch::Tensor flat_qrel_negs =
+        qrel_neg_indices.unsqueeze(1).expand({chunk_num, num_per_chunk, negatives_num}).reshape({-1});
+    expanded_edges.index_put_({torch::indexing::Slice(), 3}, flat_qrel_negs);
+
+    torch::Tensor expanded_src =
+        padded_src.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+    torch::Tensor expanded_dst =
+        padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+    torch::Tensor flat_qual =
+        padded_qual.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+
+    auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, expanded_src, expanded_dst, has_relations, flat_qual);
+    torch::Tensor adjusted_src_neg =
+        std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, negatives_num, embedding_dim});
+
+    torch::Tensor scores = decoder->compute_scores(dst_embeddings, adjusted_src_neg);
+    if (qrel_neg_filter.defined()) {
+        scores = apply_score_filter(scores, qrel_neg_filter);
+    }
+    return scores;
+}
+
 }  // namespace
 
 std::tuple<torch::Tensor, torch::Tensor> only_pos_forward(shared_ptr<EdgeDecoder> decoder, torch::Tensor edges, torch::Tensor node_embeddings,
@@ -669,14 +747,15 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> neg_and_p
     return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corrupt_forward(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
-                                                                                            torch::Tensor node_embeddings, torch::Tensor dst_negs,
-                                                                                            torch::Tensor src_negs, torch::Tensor qual_embeddings,
-                                                                                            torch::Tensor qval_neg_embeddings) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corrupt_forward(
+    shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
+    torch::Tensor qual_embeddings, torch::Tensor qval_neg_embeddings, torch::Tensor qrel_neg_indices, torch::Tensor qrel_neg_filter) {
     torch::Tensor pos_scores;
     torch::Tensor inv_pos_scores;
     torch::Tensor neg_scores;
     torch::Tensor inv_neg_scores;
+    torch::Tensor aux_neg_scores;
+    torch::Tensor aux2_neg_scores;
     bool has_relations;
     bool is_nary = (positive_edges.size(1) == 4 || positive_edges.size(1) == 5);
     if (positive_edges.size(1) == 3 || is_nary) {
@@ -717,9 +796,19 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corr
 
             inv_pos_scores = decoder->compute_scores(adjusted_dst, src);
             inv_neg_scores = decoder->compute_scores(adjusted_dst, src_neg_embs);
-        } else if (is_nary && qval_neg_embeddings.defined()) {
-            inv_pos_scores = pos_scores.clone();
-            inv_neg_scores = compute_nary_qval_corrupt_scores(decoder, positive_edges, src, dst, has_relations, qval_neg_embeddings);
+        } else if (is_nary) {
+            if (qval_neg_embeddings.defined()) {
+                inv_pos_scores = pos_scores.clone();
+                inv_neg_scores = compute_nary_qval_corrupt_scores(decoder, positive_edges, src, dst, has_relations, qval_neg_embeddings);
+            }
+            if (src_negs.defined()) {
+                torch::Tensor src_neg_embs = gather_negative_embeddings(node_embeddings, src_negs, use_csr_gather);
+                aux_neg_scores = compute_nary_src_corrupt_scores(decoder, positive_edges, src_neg_embs, dst, has_relations, qual_embeddings);
+            }
+            if (qrel_neg_indices.defined()) {
+                aux2_neg_scores =
+                    compute_nary_qrel_corrupt_scores(decoder, positive_edges, src, dst, has_relations, qual_embeddings, qrel_neg_indices, qrel_neg_filter);
+            }
         }
     } else {
         pos_scores = decoder->compute_scores(src, dst);
@@ -736,7 +825,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corr
         }
     }
 
-    return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores);
+    return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores, aux_neg_scores, aux2_neg_scores);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> node_corrupt_ranks_chunked(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
@@ -933,9 +1022,11 @@ std::tuple<torch::Tensor, torch::Tensor> prepare_pos_embeddings(shared_ptr<EdgeD
     return std::forward_as_tuple(adjusted_src_embeddings, adjusted_dst_embeddings);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_corrupt_forward(NegativeSamplingMethod negative_sampling_method, float negative_sampling_selected_ratio, shared_ptr<NegativeSampler> negative_sampler,
-                                                                                                shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
-                                                                                                torch::Tensor node_embeddings_g, torch::Tensor qual_embeddings, torch::Tensor qval_neg_embeddings) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_corrupt_forward(
+    NegativeSamplingMethod negative_sampling_method, float negative_sampling_selected_ratio, shared_ptr<NegativeSampler> negative_sampler,
+    shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
+    torch::Tensor node_embeddings_g, torch::Tensor qual_embeddings, torch::Tensor qval_neg_embeddings, torch::Tensor qrel_neg_indices,
+    torch::Tensor qrel_neg_filter) {
     int64_t stage_debug_batch_id = -1;
     bool run_stage_debug = should_run_stage_debug(stage_debug_batch_id);
     auto decoder_total_start = std::chrono::high_resolution_clock::now();
@@ -954,6 +1045,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     if (is_nary && qval_neg_embeddings.defined() && negative_sampling_method != NegativeSamplingMethod::RNS) {
         throw GegeRuntimeException("Qualifier-value corruption for n-ary facts currently supports RNS only");
     }
+    if (is_nary && src_negs.defined() && negative_sampling_method != NegativeSamplingMethod::RNS) {
+        throw GegeRuntimeException("Source corruption for n-ary facts currently supports RNS only");
+    }
+    if (is_nary && qrel_neg_indices.defined() && negative_sampling_method != NegativeSamplingMethod::RNS) {
+        throw GegeRuntimeException("Qualifier-relation corruption for n-ary facts currently supports RNS only");
+    }
 
     torch::Tensor src_ids = positive_edges.select(1, 0);
     torch::Tensor dst_ids = is_nary ? positive_edges.select(1, 2) : positive_edges.select(1, -1);
@@ -965,7 +1062,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     PositiveGatherPlan positive_gather_plan = build_positive_gather_plan(src_ids, dst_ids, use_csr_gather);
     NegativeGatherPlan dst_neg_gather_plan = build_negative_gather_plan(dst_negs, use_csr_gather);
     NegativeGatherPlan src_neg_gather_plan;
-    if (!is_nary && has_relations && decoder->use_inverse_relations_) {
+    if ((!is_nary && has_relations && decoder->use_inverse_relations_) || (is_nary && src_negs.defined())) {
         src_neg_gather_plan = build_negative_gather_plan(src_negs, use_csr_gather);
     }
     auto src_dst = gather_positive_embeddings(node_embeddings, src_ids, dst_ids, use_csr_gather, &positive_gather_plan);
@@ -1013,7 +1110,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     if (has_relations) {
         adjusted_src_embeddings = std::get<0>(all_pos_embeddings);
         dst_neg_embeddings = gather_negative_embeddings(node_embeddings, dst_negs, use_csr_gather, &dst_neg_gather_plan);
-        if (!is_nary && decoder->use_inverse_relations_) {
+        if ((!is_nary && decoder->use_inverse_relations_) || (is_nary && src_negs.defined())) {
             adjusted_dst_embeddings = std::get<1>(all_pos_embeddings);
             src_neg_embeddings = gather_negative_embeddings(node_embeddings, src_negs, use_csr_gather, &src_neg_gather_plan);
         }
@@ -1144,6 +1241,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     torch::Tensor inv_pos_scores;
     torch::Tensor neg_scores;
     torch::Tensor inv_neg_scores;
+    torch::Tensor aux_neg_scores;
+    torch::Tensor aux2_neg_scores;
     if (run_csr_debug) {
         SPDLOG_INFO("[csr-debug][batch {}] csr_gather_enabled={} use_csr_gather={}", csr_debug_batch_id, csr_gather_enabled(), use_csr_gather);
     }
@@ -1156,9 +1255,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
                 if (!is_nary && decoder->use_inverse_relations_) {
                     inv_pos_scores = decoder->compute_scores(adjusted_dst_embeddings, src_embeddings);
                     inv_neg_scores = decoder->compute_scores(adjusted_dst_embeddings, src_neg_embeddings);
-                } else if (is_nary && qval_neg_embeddings.defined()) {
-                    inv_pos_scores = pos_scores.clone();
-                    inv_neg_scores = compute_nary_qval_corrupt_scores(decoder, positive_edges, src_embeddings, dst_embeddings, has_relations, qval_neg_embeddings);
+                } else if (is_nary) {
+                    if (qval_neg_embeddings.defined()) {
+                        inv_pos_scores = pos_scores.clone();
+                        inv_neg_scores = compute_nary_qval_corrupt_scores(decoder, positive_edges, src_embeddings, dst_embeddings, has_relations,
+                                                                          qval_neg_embeddings);
+                    }
+                    if (src_neg_embeddings.defined()) {
+                        aux_neg_scores =
+                            compute_nary_src_corrupt_scores(decoder, positive_edges, src_neg_embeddings, dst_embeddings, has_relations, qual_embeddings);
+                    }
+                    if (qrel_neg_indices.defined()) {
+                        aux2_neg_scores = compute_nary_qrel_corrupt_scores(decoder, positive_edges, src_embeddings, dst_embeddings, has_relations,
+                                                                           qual_embeddings, qrel_neg_indices, qrel_neg_filter);
+                    }
                 }
             } else {
                 pos_scores = decoder->compute_scores(adjusted_src_embeddings, dst_embeddings);
@@ -1333,7 +1443,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
     // SPDLOG_INFO("neg_scores size[1]: {}", neg_scores.sizes()[1]);  // num_per_chunk
     // SPDLOG_INFO("neg_scores size[2]: {}", neg_scores.sizes()[2]);  // embedding size
 
-    return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores);
+    return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores, aux_neg_scores, aux2_neg_scores);
 }
 
 std::tuple<torch::Tensor, torch::Tensor> get_rewards(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,

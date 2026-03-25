@@ -59,6 +59,7 @@ class GraphModelStorage {
 
     int64_t num_nodes_;
     int64_t num_edges_;
+    int64_t num_relations_;
     bool partition_buffer_lp_fast_path_enabled_;
 
    protected:
@@ -175,6 +176,8 @@ class GraphModelStorage {
     bool embeddingsOffDevice();
 
     bool embeddingsOffDeviceG();
+
+    int64_t getNumRelations() const { return num_relations_; }
 
     void sortAllEdges(int32_t device_idx = 0);
 

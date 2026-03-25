@@ -16,7 +16,10 @@
 #include <string>
 
 #if defined(__has_include)
-#if __has_include(<cuco/static_map.cuh>)
+#if __has_include(<cuco/static_map.cuh>) && __has_include(<nv/target>) && \
+    defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__) &&         \
+    ((__CUDACC_VER_MAJOR__ > 11) ||                                            \
+     (__CUDACC_VER_MAJOR__ == 11 && __CUDACC_VER_MINOR__ >= 5))
 #define GEGE_HAS_CUCO 1
 #include <cuco/static_map.cuh>
 #include <cuda/std/atomic>

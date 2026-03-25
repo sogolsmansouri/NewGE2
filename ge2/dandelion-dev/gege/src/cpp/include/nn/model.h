@@ -34,7 +34,7 @@ class Model : public torch::nn::Module {
 
     torch::Tensor forward_nc(at::optional<torch::Tensor> node_embeddings, at::optional<torch::Tensor> node_features, DENSEGraph dense_graph, bool train);
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward_lp(shared_ptr<Batch> batch, bool train);
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward_lp(shared_ptr<Batch> batch, bool train);
 
     void train_batch(shared_ptr<Batch> batch, bool call_step = true);
 

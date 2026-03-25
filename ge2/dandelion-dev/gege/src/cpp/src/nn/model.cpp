@@ -467,7 +467,7 @@ torch::Tensor Model::forward_nc(at::optional<torch::Tensor> node_embeddings, at:
     return y_pred;
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::forward_lp(shared_ptr<Batch> batch, bool train) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::forward_lp(shared_ptr<Batch> batch, bool train) {
     if (!train) {
         log_eval_tensor_if_non_finite("node_embeddings", batch->batch_id_, batch->node_embeddings_);
         log_eval_tensor_if_non_finite("node_features", batch->batch_id_, batch->node_features_);
@@ -482,6 +482,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
     torch::Tensor neg_scores;
     torch::Tensor inv_pos_scores;
     torch::Tensor inv_neg_scores;
+    torch::Tensor aux_neg_scores;
+    torch::Tensor aux2_neg_scores;
 
     auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
 
@@ -492,14 +494,14 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
         std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) = neg_and_pos_forward(edge_decoder, batch->edges_, batch->neg_edges_, encoded_nodes);
     } else if (edge_decoder->decoder_method_ == EdgeDecoderMethod::CORRUPT_NODE) {
         if (train) {
-            std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
+            std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores, aux_neg_scores, aux2_neg_scores) =
                 mod_node_corrupt_forward(negative_sampling_method_, negative_sampling_selected_ratio_, negative_sampler_, edge_decoder, batch->edges_, encoded_nodes,
                                          batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, batch->node_embeddings_g_,
-                                         batch->qual_embeddings_, batch->qval_neg_embeddings_);
+                                         batch->qual_embeddings_, batch->qval_neg_embeddings_, batch->qrel_neg_indices_, batch->qrel_neg_filter_);
         } else {  // evalutate
-            std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
+            std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores, aux_neg_scores, aux2_neg_scores) =
                 node_corrupt_forward(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_,
-                                     batch->qual_embeddings_, batch->qval_neg_embeddings_);
+                                     batch->qual_embeddings_, batch->qval_neg_embeddings_, batch->qrel_neg_indices_, batch->qrel_neg_filter_);
         }
     } else if (edge_decoder->decoder_method_ == EdgeDecoderMethod::CORRUPT_REL) {
         throw GegeRuntimeException("Decoder method currently unsupported.");
@@ -521,14 +523,20 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
         }
     }
 
+    if (aux_neg_scores.defined() && batch->src_neg_filter_.defined()) {
+        aux_neg_scores = apply_score_filter(aux_neg_scores, batch->src_neg_filter_);
+    }
+
     if (!train) {
         log_eval_tensor_if_non_finite("pos_scores", batch->batch_id_, pos_scores);
         log_eval_tensor_if_non_finite("neg_scores", batch->batch_id_, neg_scores);
         log_eval_tensor_if_non_finite("inv_pos_scores", batch->batch_id_, inv_pos_scores);
         log_eval_tensor_if_non_finite("inv_neg_scores", batch->batch_id_, inv_neg_scores);
+        log_eval_tensor_if_non_finite("aux_neg_scores", batch->batch_id_, aux_neg_scores);
+        log_eval_tensor_if_non_finite("aux2_neg_scores", batch->batch_id_, aux2_neg_scores);
     }
 
-    return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores);
+    return std::forward_as_tuple(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores, aux_neg_scores, aux2_neg_scores);
 }
 
 void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
@@ -557,6 +565,8 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
         torch::Tensor neg_scores = std::get<1>(all_scores);
         torch::Tensor inv_pos_scores = std::get<2>(all_scores);
         torch::Tensor inv_neg_scores = std::get<3>(all_scores);
+        torch::Tensor aux_neg_scores = std::get<4>(all_scores);
+        torch::Tensor aux2_neg_scores = std::get<5>(all_scores);
 
         if (inv_neg_scores.defined()) {
             torch::Tensor rhs_loss = loss_function_->operator()(pos_scores, neg_scores, true);
@@ -564,6 +574,13 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
             loss = lhs_loss + rhs_loss;
         } else {
             loss = (*loss_function_)(pos_scores, neg_scores, true);
+        }
+
+        if (aux_neg_scores.defined()) {
+            loss = loss + loss_function_->operator()(pos_scores, aux_neg_scores, true);
+        }
+        if (aux2_neg_scores.defined()) {
+            loss = loss + loss_function_->operator()(pos_scores, aux2_neg_scores, true);
         }
     } else if (learning_task_ == LearningTask::NODE_CLASSIFICATION) {
         torch::Tensor y_pred = forward_nc(batch->node_embeddings_, batch->node_features_, batch->dense_graph_, true);
@@ -607,8 +624,9 @@ void Model::evaluate_batch(shared_ptr<Batch> batch) {
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
         bool filtered_eval = negative_sampler_filtered_for_eval(negative_sampler_);
+        bool is_nary = batch->edges_.defined() && (batch->edges_.size(1) == 4 || batch->edges_.size(1) == 5);
         if (edge_decoder != nullptr && edge_decoder->decoder_method_ == EdgeDecoderMethod::CORRUPT_NODE && filtered_eval &&
-            eval_chunked_ranks_enabled() && batch->dst_neg_indices_mapping_.defined()) {
+            eval_chunked_ranks_enabled() && batch->dst_neg_indices_mapping_.defined() && !is_nary) {
             if (should_log_eval_chunked_path()) {
                 SPDLOG_INFO("Link prediction evaluation is using chunked exact filtered ranks; batch_size={} negative_chunk_size={}",
                             batch->edges_.size(0), eval_negative_chunk_size());
@@ -630,13 +648,24 @@ void Model::evaluate_batch(shared_ptr<Batch> batch) {
         torch::Tensor neg_scores = std::get<1>(all_scores);
         torch::Tensor inv_pos_scores = std::get<2>(all_scores);
         torch::Tensor inv_neg_scores = std::get<3>(all_scores);
+        torch::Tensor aux_neg_scores = std::get<4>(all_scores);
+        torch::Tensor aux2_neg_scores = std::get<5>(all_scores);
+        auto reporter = std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_);
 
         if (neg_scores.defined()) {
-            std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_)->addResult(pos_scores, neg_scores, batch->edges_);
+            reporter->addResult(pos_scores, neg_scores, batch->edges_);
         }
 
         if (inv_neg_scores.defined()) {
-            std::dynamic_pointer_cast<LinkPredictionReporter>(reporter_)->addResult(inv_pos_scores, inv_neg_scores, batch->edges_);
+            reporter->addResult(inv_pos_scores.defined() ? inv_pos_scores : pos_scores, inv_neg_scores, batch->edges_);
+        }
+
+        if (aux_neg_scores.defined()) {
+            reporter->addResult(pos_scores, aux_neg_scores, batch->edges_);
+        }
+
+        if (aux2_neg_scores.defined()) {
+            reporter->addResult(pos_scores, aux2_neg_scores, batch->edges_);
         }
     } else if (learning_task_ == LearningTask::NODE_CLASSIFICATION) {
         torch::Tensor y_pred = forward_nc(batch->node_embeddings_, batch->node_features_, batch->dense_graph_, false);

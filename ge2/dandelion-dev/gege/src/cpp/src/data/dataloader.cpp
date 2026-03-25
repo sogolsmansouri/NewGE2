@@ -1771,8 +1771,10 @@ void DataLoader::nodeSample(shared_ptr<Batch> batch, int32_t device_idx) {
 }
 
 void DataLoader::negativeSample(shared_ptr<Batch> batch, int32_t device_idx) {
-    // For arity-4, inverse relations (src corruption) are not supported in this implementation.
-    bool need_src_negatives = (batch->edges_.size(1) == 3) && use_inverse_relations_;
+    bool is_nary = (batch->edges_.size(1) == 4 || batch->edges_.size(1) == 5);
+    // Binary/triple LP uses the existing inverse-relation path. For n-ary, enable src corruption during training only;
+    // eval still reports the existing dst/qval tasks until slot-specific reporting is extended.
+    bool need_src_negatives = ((batch->edges_.size(1) == 3) && use_inverse_relations_) || (is_nary && batch->train_);
     std::tie(batch->src_neg_indices_, batch->src_neg_filter_, batch->dst_neg_indices_, batch->dst_neg_filter_) =
         negative_sampler_->getNodeCorruptNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_,
                                                    need_src_negatives, device_idx);
@@ -1791,6 +1793,44 @@ void DataLoader::negativeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         std::tie(batch->qval_neg_indices_, batch->qval_neg_filter_) =
             negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_,
                                             qval_corrupt_edges, false, device_idx);
+    }
+
+    if (batch->edges_.size(1) == 5) {
+        auto ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(batch->edges_.device());
+        int64_t num_relations = graph_storage_->getNumRelations();
+        torch::Tensor qrel_ids = batch->edges_.select(1, 3).to(torch::kInt64);
+
+        if (batch->train_) {
+            int64_t chunk_num = batch->dst_neg_indices_.defined() ? batch->dst_neg_indices_.size(0) : 1;
+            int64_t negatives_num = batch->dst_neg_indices_.defined() ? batch->dst_neg_indices_.size(1) : 0;
+            if (chunk_num > 0 && negatives_num > 0) {
+                batch->qrel_neg_indices_ = torch::randint(0, num_relations, {chunk_num, negatives_num}, ind_opts);
+
+                int64_t num_per_chunk =
+                    static_cast<int64_t>(std::ceil(static_cast<double>(qrel_ids.size(0)) / static_cast<double>(chunk_num)));
+                int64_t padded_rows = num_per_chunk * chunk_num;
+                if (padded_rows != qrel_ids.size(0)) {
+                    torch::nn::functional::PadFuncOptions options({0, padded_rows - qrel_ids.size(0)});
+                    qrel_ids = torch::nn::functional::pad(qrel_ids, options);
+                }
+                torch::Tensor padded_qrel = qrel_ids.reshape({chunk_num, num_per_chunk});
+                torch::Tensor qrel_matches = padded_qrel.unsqueeze(2).eq(batch->qrel_neg_indices_.unsqueeze(1));
+                torch::Tensor match_idx = torch::nonzero(qrel_matches);
+                if (match_idx.numel() > 0) {
+                    torch::Tensor filter_rows = match_idx.select(1, 0) * num_per_chunk + match_idx.select(1, 1);
+                    torch::Tensor filter_cols = match_idx.select(1, 2);
+                    batch->qrel_neg_filter_ = torch::stack({filter_rows, filter_cols}, 1);
+                }
+            }
+        } else if (num_relations > 0) {
+            // For exact qualifier-role prediction on small n-ary benchmarks, rank against all relations.
+            batch->qrel_neg_indices_ = torch::arange(num_relations, ind_opts).view({1, num_relations});
+            if (qrel_ids.numel() > 0) {
+                torch::Tensor filter_rows = torch::arange(qrel_ids.size(0), ind_opts);
+                torch::Tensor filter_cols = qrel_ids;
+                batch->qrel_neg_filter_ = torch::stack({filter_rows, filter_cols}, 1);
+            }
+        }
     }
 }
 

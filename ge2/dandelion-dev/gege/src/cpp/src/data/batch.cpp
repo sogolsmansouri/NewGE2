@@ -259,6 +259,14 @@ void Batch::to(torch::Device device) {
         qval_neg_filter_ = qval_neg_filter_.to(device);
     }
 
+    if (qrel_neg_filter_.defined()) {
+        qrel_neg_filter_ = qrel_neg_filter_.to(device);
+    }
+
+    if (qrel_neg_indices_.defined()) {
+        qrel_neg_indices_ = qrel_neg_indices_.to(device);
+    }
+
     if (qval_neg_indices_.defined()) {
         qval_neg_indices_ = qval_neg_indices_.to(device);
     }
@@ -533,6 +541,8 @@ void Batch::clear() {
     qual_embeddings_state_ = torch::Tensor();
     qual_state_update_ = torch::Tensor();
     qual_indices_ = torch::Tensor();
+    qrel_neg_indices_ = torch::Tensor();
+    qrel_neg_filter_ = torch::Tensor();
     qval_neg_indices_ = torch::Tensor();
     qval_neg_filter_ = torch::Tensor();
     qval_neg_embeddings_ = torch::Tensor();

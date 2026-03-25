@@ -217,6 +217,7 @@ GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, shared_
 
     num_nodes_ = storage_config->dataset->num_nodes;
     num_edges_ = storage_config->dataset->num_edges;
+    num_relations_ = storage_config->dataset->num_relations;
 
     if (full_graph_evaluation_) {
         if (storage_ptrs_.node_embeddings != nullptr) {

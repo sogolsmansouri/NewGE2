@@ -60,6 +60,11 @@ bool eval_chunked_ranks_enabled() {
     return enabled;
 }
 
+bool emulate_dot_single_relation_enabled() {
+    static bool enabled = parse_env_flag("GEGE_EMULATE_DOT_SINGLE_RELATION", false);
+    return enabled;
+}
+
 int64_t eval_negative_chunk_size() {
     static int64_t chunk_size = std::max<int64_t>(parse_env_int("GEGE_EVAL_NEGATIVE_CHUNK_SIZE", 131072), 1);
     return chunk_size;
@@ -141,11 +146,24 @@ shared_ptr<InitConfig> default_relation_init_config(const shared_ptr<ModelConfig
 void maybe_apply_distmult_relation_init(const shared_ptr<Decoder> &decoder, const shared_ptr<InitConfig> &init_config) {
     auto distmult = std::dynamic_pointer_cast<DistMult>(decoder);
     auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder);
-    if (distmult == nullptr || edge_decoder == nullptr || init_config == nullptr || !edge_decoder->relations_.defined()) {
+    if (distmult == nullptr || edge_decoder == nullptr || !edge_decoder->relations_.defined()) {
         return;
     }
 
     torch::NoGradGuard no_grad;
+    if (emulate_dot_single_relation_enabled() && edge_decoder->relations_.size(0) == 1) {
+        edge_decoder->relations_.fill_(1.0f);
+        if (edge_decoder->use_inverse_relations_ && edge_decoder->inverse_relations_.defined()) {
+            edge_decoder->inverse_relations_.fill_(1.0f);
+        }
+        SPDLOG_INFO("[relation-init] decoder=DISTMULT single_relation_dot_emulation=1 forcing relation embeddings to ones");
+        return;
+    }
+
+    if (init_config == nullptr) {
+        return;
+    }
+
     auto relation_init = initialize_tensor(init_config,
                                            {edge_decoder->relations_.size(0), edge_decoder->relations_.size(1)},
                                            edge_decoder->relations_.options());

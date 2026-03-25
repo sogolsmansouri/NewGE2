@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 
 #ifdef GEGE_CUDA
@@ -14,6 +15,7 @@
 #include "data/samplers/negative.h"
 #include "nn/decoders/edge/decoder_methods.h"
 #include "nn/layers/embedding/embedding.h"
+#include "nn/initialization.h"
 #include "nn/model_helpers.h"
 #include "reporting/logger.h"
 
@@ -120,6 +122,79 @@ std::string tensor_shape_string(const torch::Tensor &tensor) {
     }
     oss << "]";
     return oss.str();
+}
+
+shared_ptr<InitConfig> default_relation_init_config(const shared_ptr<ModelConfig> &model_config) {
+    if (model_config == nullptr || model_config->encoder == nullptr || model_config->encoder->layers.empty() ||
+        model_config->encoder->layers[0].empty() || model_config->encoder->layers[0][0] == nullptr) {
+        return nullptr;
+    }
+
+    auto first_layer = model_config->encoder->layers[0][0];
+    if (first_layer->type != LayerType::EMBEDDING) {
+        return nullptr;
+    }
+
+    return first_layer->init;
+}
+
+void maybe_apply_distmult_relation_init(const shared_ptr<Decoder> &decoder, const shared_ptr<InitConfig> &init_config) {
+    auto distmult = std::dynamic_pointer_cast<DistMult>(decoder);
+    auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder);
+    if (distmult == nullptr || edge_decoder == nullptr || init_config == nullptr || !edge_decoder->relations_.defined()) {
+        return;
+    }
+
+    torch::NoGradGuard no_grad;
+    auto relation_init = initialize_tensor(init_config,
+                                           {edge_decoder->relations_.size(0), edge_decoder->relations_.size(1)},
+                                           edge_decoder->relations_.options());
+    edge_decoder->relations_.copy_(relation_init);
+
+    if (edge_decoder->use_inverse_relations_ && edge_decoder->inverse_relations_.defined()) {
+        auto inverse_relation_init = initialize_tensor(init_config,
+                                                       {edge_decoder->inverse_relations_.size(0), edge_decoder->inverse_relations_.size(1)},
+                                                       edge_decoder->inverse_relations_.options());
+        edge_decoder->inverse_relations_.copy_(inverse_relation_init);
+    }
+}
+
+std::string tensor_stats_string(const torch::Tensor &tensor) {
+    if (!tensor.defined() || tensor.numel() == 0) {
+        return "undefined";
+    }
+
+    torch::Tensor cpu = tensor.detach().to(torch::kCPU).to(torch::kFloat32).contiguous();
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(6)
+        << "shape=" << tensor_shape_string(cpu)
+        << " mean=" << cpu.mean().item<double>()
+        << " std=" << cpu.std(/*unbiased=*/false).item<double>()
+        << " min=" << cpu.min().item<double>()
+        << " max=" << cpu.max().item<double>();
+    return oss.str();
+}
+
+void log_edge_decoder_relation_stats(const char *stage, const shared_ptr<Decoder> &decoder) {
+    auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder);
+    if (edge_decoder == nullptr || !edge_decoder->relations_.defined()) {
+        return;
+    }
+
+    const char *decoder_name = "EDGE";
+    if (std::dynamic_pointer_cast<DistMult>(decoder) != nullptr) {
+        decoder_name = "DISTMULT";
+    } else if (std::dynamic_pointer_cast<ComplEx>(decoder) != nullptr) {
+        decoder_name = "COMPLEX";
+    } else if (std::dynamic_pointer_cast<TransE>(decoder) != nullptr) {
+        decoder_name = "TRANSE";
+    }
+
+    SPDLOG_INFO("[relation-stats][{}] decoder={} relations: {}", stage, decoder_name, tensor_stats_string(edge_decoder->relations_));
+    if (edge_decoder->use_inverse_relations_ && edge_decoder->inverse_relations_.defined()) {
+        SPDLOG_INFO("[relation-stats][{}] decoder={} inverse_relations: {}",
+                    stage, decoder_name, tensor_stats_string(edge_decoder->inverse_relations_));
+    }
 }
 
 void log_eval_tensor_if_non_finite(const char *stage, int batch_id, const torch::Tensor &tensor) {
@@ -230,6 +305,7 @@ void Model::step_all() {
 
 void Model::save(std::string directory) {
     SPDLOG_INFO("Model::save");
+    log_edge_decoder_relation_stats("save_pre", decoder_);
     string model_filename = directory + PathConstants::model_file;
     string model_state_filename = directory + PathConstants::model_state_file;
     string model_meta_filename = directory + PathConstants::model_config_file;
@@ -301,6 +377,8 @@ void Model::load(std::string directory, bool train) {
     if (decoder_ != nullptr) {
         std::dynamic_pointer_cast<torch::nn::Module>(decoder_)->load(model_archive);
     }
+
+    log_edge_decoder_relation_stats(train ? "load_train" : "load_eval", decoder_);
 }
 
 void Model::all_reduce_rel() {
@@ -576,6 +654,9 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
     }
 
     if (negative_sampling_method_ == NegativeSamplingMethod::GAN && learning_task_ == LearningTask::LINK_PREDICTION) {
+        if (batch->edges_.defined() && batch->edges_.dim() == 2 && batch->edges_.size(1) >= 4) {
+            throw GegeRuntimeException("GAN negative sampling is not yet supported for n-ary edge tensors.");
+        }
         if (batch->node_embeddings_g_.defined()) {
             batch->node_embeddings_g_.requires_grad_();
         }
@@ -701,6 +782,8 @@ shared_ptr<Model> initModelFromConfig(shared_ptr<ModelConfig> model_config, std:
 
         decoder = get_edge_decoder(model_config->decoder->type, decoder_options->edge_decoder_method, num_relations, dim, tensor_options,
                                    decoder_options->inverse_edges);
+        maybe_apply_distmult_relation_init(decoder, default_relation_init_config(model_config));
+        log_edge_decoder_relation_stats("init", decoder);
     } else {
         decoder = get_node_decoder(model_config->decoder->type);
     }

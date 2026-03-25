@@ -30,6 +30,17 @@ int parse_metadata_int(const std::string &line, const std::string &metadata_path
     }
 }
 
+void sync_mem_partition_buffer_storage_if_needed(const shared_ptr<Storage> &storage, const char *name) {
+    if (storage == nullptr || !instance_of<Storage, MemPartitionBufferStorage>(storage)) {
+        return;
+    }
+
+    auto mem_storage = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage);
+    SPDLOG_INFO("[checkpoint-save] {} backend=mem_partition_buffer loaded={} device={} syncing_host_before_write=1",
+                name, mem_storage->loaded_, mem_storage->device_.str());
+    mem_storage->syncToHostWithoutDiskWrite();
+}
+
 }  // namespace
 
 Checkpointer::Checkpointer(std::shared_ptr<Model> model, shared_ptr<GraphModelStorage> storage, std::shared_ptr<CheckpointConfig> config) {
@@ -64,9 +75,11 @@ void Checkpointer::save(string checkpoint_dir, CheckpointMeta checkpoint_meta) {
     checkpoint_dir = normalize_checkpoint_dir(std::move(checkpoint_dir));
     if (checkpoint_meta.has_model) {
         if (storage_->storage_ptrs_.node_embeddings != nullptr) {
+            sync_mem_partition_buffer_storage_if_needed(storage_->storage_ptrs_.node_embeddings, "node_embeddings");
             storage_->storage_ptrs_.node_embeddings->write();
         }
         if (storage_->storage_ptrs_.node_embeddings_g != nullptr) {
+            sync_mem_partition_buffer_storage_if_needed(storage_->storage_ptrs_.node_embeddings_g, "node_embeddings_g");
             storage_->storage_ptrs_.node_embeddings_g->write();
         }
         model_->save(checkpoint_dir);
@@ -74,9 +87,11 @@ void Checkpointer::save(string checkpoint_dir, CheckpointMeta checkpoint_meta) {
 
     if (checkpoint_meta.has_state) {
         if (storage_->storage_ptrs_.node_optimizer_state != nullptr) {
+            sync_mem_partition_buffer_storage_if_needed(storage_->storage_ptrs_.node_optimizer_state, "node_optimizer_state");
             storage_->storage_ptrs_.node_optimizer_state->write();
         }
         if (storage_->storage_ptrs_.node_optimizer_state_g != nullptr) {
+            sync_mem_partition_buffer_storage_if_needed(storage_->storage_ptrs_.node_optimizer_state_g, "node_optimizer_state_g");
             storage_->storage_ptrs_.node_optimizer_state_g->write();
         }
     }

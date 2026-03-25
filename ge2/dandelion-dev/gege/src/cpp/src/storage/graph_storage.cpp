@@ -916,6 +916,7 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
         }
 
         torch::Tensor mapped_edges;
+        torch::Tensor bucket_layout_mapped_edges;
         current_subgraph_state_->global_to_local_index_map_ = torch::Tensor();
 
         if (shouldUsePartitionBufferLPFastPath_()) {
@@ -937,6 +938,8 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
                 }
                 SPDLOG_INFO("Partition-buffer LP fast path validation passed during initializeInMemorySubGraph (validation #{})", validation_id);
             }
+            bucket_layout_mapped_edges = mapped_edges.to(torch::kInt64);
+
             if (current_subgraph_state_->in_memory_subgraph_ != nullptr) {
                 current_subgraph_state_->in_memory_subgraph_ = nullptr;
             }
@@ -1008,6 +1011,7 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
                 throw GegeRuntimeException("Unexpected number of edge columns");
             }
             mapped_edges = mapped_edges.to(device);
+            bucket_layout_mapped_edges = mapped_edges.to(torch::kInt64);
 
             if (log_timing) {
                 auto now = std::chrono::high_resolution_clock::now();
@@ -1016,26 +1020,27 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
             }
 
             torch::Tensor mapped_edges_dst_sort;
-            mapped_edges = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
-            mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
+            torch::Tensor mapped_edges_src_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
+            mapped_edges_dst_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
 #ifdef GEGE_CUDA
             c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
 
-            mapped_edges = mapped_edges.to(torch::kInt64);
+            mapped_edges_src_sort = mapped_edges_src_sort.to(torch::kInt64);
             mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);
 
             if (current_subgraph_state_->in_memory_subgraph_ != nullptr) {
                 current_subgraph_state_->in_memory_subgraph_ = nullptr;
             }
 
-            current_subgraph_state_->in_memory_subgraph_ = std::make_shared<GegeGraph>(mapped_edges, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
+            current_subgraph_state_->in_memory_subgraph_ =
+                std::make_shared<GegeGraph>(mapped_edges_src_sort, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
             if (log_timing) {
                 auto now = std::chrono::high_resolution_clock::now();
                 graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
             }
         }
-        current_subgraph_state_->all_in_memory_mapped_edges_ = mapped_edges;
+        current_subgraph_state_->all_in_memory_mapped_edges_ = bucket_layout_mapped_edges;
         current_subgraph_state_->in_memory_partition_ids_ = new_in_mem_partition_ids;
         current_subgraph_state_->in_memory_edge_bucket_ids_ = in_mem_edge_bucket_ids;
         current_subgraph_state_->in_memory_edge_bucket_sizes_ = in_mem_edge_bucket_sizes;
@@ -1376,6 +1381,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     }
 
     torch::Tensor mapped_edges;
+    torch::Tensor bucket_layout_mapped_edges;
     subgraph->global_to_local_index_map_ = torch::Tensor();
     if (shouldUsePartitionBufferLPFastPath_()) {
         torch::Tensor partition_to_buffer_slot = getPartitionToBufferSlotMap_(device_idx);
@@ -1421,6 +1427,8 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             }
             SPDLOG_INFO("Partition-buffer LP fast path validation passed during updateInMemorySubGraph_ (validation #{})", validation_id);
         }
+        bucket_layout_mapped_edges = mapped_edges.to(torch::kInt64);
+
         if (subgraph->in_memory_subgraph_ != nullptr) {
             subgraph->in_memory_subgraph_ = nullptr;
         }
@@ -1476,6 +1484,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
         }
 
         mapped_edges = mapped_edges.to(devices_[device_idx]);
+        bucket_layout_mapped_edges = mapped_edges.to(torch::kInt64);
         if (log_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             remap_ms = elapsed_graph_storage_ms(phase_start, now);
@@ -1485,27 +1494,28 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
         c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
 
-        mapped_edges = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
-        mapped_edges_dst_sort = merge_sorted_edge_buckets(mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
+        torch::Tensor mapped_edges_src_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
+        mapped_edges_dst_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
         
 #ifdef GEGE_CUDA
         c10::cuda::CUDACachingAllocator::emptyCache();
 #endif
 
-        mapped_edges = mapped_edges.to(torch::kInt64);
+        mapped_edges_src_sort = mapped_edges_src_sort.to(torch::kInt64);
         mapped_edges_dst_sort = mapped_edges_dst_sort.to(torch::kInt64);
 
         if (subgraph->in_memory_subgraph_ != nullptr) {
             subgraph->in_memory_subgraph_ = nullptr;
         }
 
-        subgraph->in_memory_subgraph_ = std::make_shared<GegeGraph>(mapped_edges, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
+        subgraph->in_memory_subgraph_ =
+            std::make_shared<GegeGraph>(mapped_edges_src_sort, mapped_edges_dst_sort, getNumNodesInMemory(device_idx));
         if (log_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
         }
     }
-    subgraph->all_in_memory_mapped_edges_ = mapped_edges;
+    subgraph->all_in_memory_mapped_edges_ = bucket_layout_mapped_edges;
 
     // update state
     subgraph->in_memory_partition_ids_ = new_in_mem_partition_ids;

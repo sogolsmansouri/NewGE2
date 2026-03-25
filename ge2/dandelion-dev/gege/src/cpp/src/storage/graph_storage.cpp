@@ -105,6 +105,10 @@ EdgeList merge_sorted_edges_with_additional(const EdgeList &base_sorted_edges, c
         return base_sorted_edges;
     }
 
+    if (sort_dim < 0) {
+        sort_dim = additional_edges.size(1) >= 4 ? 2 : additional_edges.size(1) - 1;
+    }
+
     torch::Tensor additional_i64 = additional_edges.to(torch::kInt64);
     torch::Tensor additional_sorted =
         additional_i64.index_select(0, torch::argsort(additional_i64.select(1, sort_dim), 0, false));
@@ -1068,6 +1072,10 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
         EdgeList src_sort;
         EdgeList dst_sort;
 
+        auto dst_column = [](const EdgeList &edges) -> int64_t {
+            return edges.size(1) >= 4 ? 2 : -1;
+        };
+
         if (!train_ && full_graph_evaluation_) {
             EdgeList eval_edges;
             if (storage_ptrs_.edges != nullptr) {
@@ -1076,17 +1084,17 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
                 eval_edges = torch::empty({0, 2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
             }
             src_sort = eval_edges.index_select(0, torch::argsort(eval_edges.select(1, 0))).to(torch::kInt64);
-            dst_sort = eval_edges.index_select(0, torch::argsort(eval_edges.select(1, -1))).to(torch::kInt64);
+            dst_sort = eval_edges.index_select(0, torch::argsort(eval_edges.select(1, dst_column(eval_edges)))).to(torch::kInt64);
         } else if (storage_ptrs_.train_edges != nullptr) {
             src_sort = storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()).to(torch::kInt64);
             dst_sort = storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()).to(torch::kInt64);
             src_sort = src_sort.index_select(0, torch::argsort(src_sort.select(1, 0))).to(torch::kInt64);
-            dst_sort = dst_sort.index_select(0, torch::argsort(dst_sort.select(1, -1))).to(torch::kInt64);
+            dst_sort = dst_sort.index_select(0, torch::argsort(dst_sort.select(1, dst_column(dst_sort)))).to(torch::kInt64);
         } else {
             src_sort = storage_ptrs_.edges->range(0, storage_ptrs_.edges->getDim0()).to(torch::kInt64);
             dst_sort = storage_ptrs_.edges->range(0, storage_ptrs_.edges->getDim0()).to(torch::kInt64);
             src_sort = src_sort.index_select(0, torch::argsort(src_sort.select(1, 0))).to(torch::kInt64);
-            dst_sort = dst_sort.index_select(0, torch::argsort(dst_sort.select(1, -1))).to(torch::kInt64);
+            dst_sort = dst_sort.index_select(0, torch::argsort(dst_sort.select(1, dst_column(dst_sort)))).to(torch::kInt64);
         }
 
         current_subgraph_states_[0]->in_memory_subgraph_ = std::make_shared<GegeGraph>(src_sort, dst_sort, getNumNodesInMemory());
@@ -1534,7 +1542,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
 EdgeList GraphModelStorage::merge_sorted_edge_buckets(EdgeList edges, torch::Tensor starts, int buffer_size, bool src) {
     int sort_dim = 0;
     if (!src) {
-        sort_dim = -1;
+        sort_dim = edges.size(1) >= 4 ? 2 : edges.size(1) - 1;
     }
     torch::Tensor result;
     {
@@ -1566,7 +1574,8 @@ void GraphModelStorage::sortAllEdges(int32_t device_idx) {
             train_edges_i64 = EdgeList();
 
             train_edges_i64 = storage_ptrs_.train_edges->range(0, storage_ptrs_.train_edges->getDim0()).to(torch::kInt64);
-            base_dst_sorted = train_edges_i64.index_select(0, torch::argsort(train_edges_i64.select(1, -1))).to(torch::kInt64);
+            int64_t dst_col = train_edges_i64.size(1) >= 4 ? 2 : -1;
+            base_dst_sorted = train_edges_i64.index_select(0, torch::argsort(train_edges_i64.select(1, dst_col))).to(torch::kInt64);
             train_edges_i64 = EdgeList();
             storage_ptrs_.train_edges->unload();
         } else {

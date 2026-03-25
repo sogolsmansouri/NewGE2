@@ -2,8 +2,116 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 
 namespace {
+
+int64_t dst_column(const torch::Tensor &edges) {
+    return edges.size(1) >= 4 ? 2 : edges.size(1) - 1;
+}
+
+bool nary_context_matches(torch::TensorAccessor<int64_t, 2> edges_accessor,
+                          torch::TensorAccessor<int64_t, 2> sorted_edges_accessor,
+                          int64_t edge_id,
+                          int64_t sorted_edge_id,
+                          int64_t corrupt_id,
+                          int64_t edge_width) {
+    for (int64_t col = 0; col < edge_width; col++) {
+        if (col == corrupt_id) {
+            continue;
+        }
+        if (edges_accessor[edge_id][col] != sorted_edges_accessor[sorted_edge_id][col]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+torch::Tensor compute_filter_corruption_nary_cpu_impl(shared_ptr<GegeGraph> graph,
+                                                      torch::Tensor edges,
+                                                      torch::Tensor corruption_nodes,
+                                                      bool inverse,
+                                                      bool global) {
+    torch::Device target_device = edges.device();
+    edges = edges.to(torch::kCPU).to(torch::kInt64).contiguous();
+    corruption_nodes = corruption_nodes.to(torch::kCPU).to(torch::kInt64).contiguous();
+
+    int64_t tup_id = inverse ? 2 : 0;
+    int64_t corrupt_id = inverse ? 0 : 2;
+    int64_t edge_width = edges.size(1);
+    int64_t num_chunks = corruption_nodes.size(0);
+    int64_t num_edges = edges.size(0);
+    int64_t chunk_size = static_cast<int64_t>(std::ceil(static_cast<double>(num_edges) / static_cast<double>(num_chunks)));
+
+    torch::Tensor nodes = edges.select(1, tup_id).contiguous();
+    torch::Tensor all_sorted_edges;
+    if (global) {
+        if (inverse) {
+            all_sorted_edges = graph->all_dst_sorted_edges_.defined() ? graph->all_dst_sorted_edges_ : graph->dst_sorted_edges_;
+        } else {
+            all_sorted_edges = graph->all_src_sorted_edges_.defined() ? graph->all_src_sorted_edges_ : graph->src_sorted_edges_;
+        }
+        all_sorted_edges = all_sorted_edges.to(torch::kCPU).to(torch::kInt64).contiguous();
+    } else {
+        all_sorted_edges = edges.index_select(0, nodes.argsort()).contiguous();
+    }
+
+    torch::Tensor all_sorted_nodes = all_sorted_edges.select(1, tup_id).contiguous();
+    torch::Tensor starts = torch::searchsorted(all_sorted_nodes, nodes);
+    torch::Tensor ends = torch::searchsorted(all_sorted_nodes, nodes + 1);
+
+    auto edges_accessor = edges.accessor<int64_t, 2>();
+    auto starts_accessor = starts.accessor<int64_t, 1>();
+    auto ends_accessor = ends.accessor<int64_t, 1>();
+    auto sorted_edges_accessor = all_sorted_edges.accessor<int64_t, 2>();
+    auto negs_accessor = corruption_nodes.accessor<int64_t, 2>();
+
+    std::vector<std::vector<int64_t>> filters(num_edges);
+
+    if (global) {
+#pragma omp parallel for
+        for (int64_t edge_id = 0; edge_id < num_edges; edge_id++) {
+            for (int64_t curr = starts_accessor[edge_id]; curr < ends_accessor[edge_id]; curr++) {
+                if (nary_context_matches(edges_accessor, sorted_edges_accessor, edge_id, curr, corrupt_id, edge_width)) {
+                    filters[edge_id].emplace_back(sorted_edges_accessor[curr][corrupt_id]);
+                }
+            }
+        }
+    } else {
+#pragma omp parallel for
+        for (int64_t edge_id = 0; edge_id < num_edges; edge_id++) {
+            int64_t chunk_id = edge_id / chunk_size;
+            for (int64_t neg_id = 0; neg_id < corruption_nodes.size(1); neg_id++) {
+                int64_t neg_node = negs_accessor[chunk_id][neg_id];
+                for (int64_t curr = starts_accessor[edge_id]; curr < ends_accessor[edge_id]; curr++) {
+                    if (sorted_edges_accessor[curr][corrupt_id] == neg_node &&
+                        nary_context_matches(edges_accessor, sorted_edges_accessor, edge_id, curr, corrupt_id, edge_width)) {
+                        filters[edge_id].emplace_back(neg_id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    int64_t num_filt = 0;
+    for (const auto &edge_filter : filters) {
+        num_filt += edge_filter.size();
+    }
+
+    torch::Tensor filter = torch::empty({num_filt, 2}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    auto filter_accessor = filter.accessor<int64_t, 2>();
+    int64_t offset = 0;
+    for (int64_t edge_id = 0; edge_id < num_edges; edge_id++) {
+        for (int64_t j = 0; j < static_cast<int64_t>(filters[edge_id].size()); j++) {
+            filter_accessor[offset][0] = edge_id;
+            filter_accessor[offset][1] = filters[edge_id][j];
+            offset++;
+        }
+    }
+
+    return filter.to(target_device);
+}
 
 std::string planned_uniform_cache_key(const torch::Device &device, int64_t num_nodes, int num_chunks, int num_uniform) {
     std::string key = device.str();
@@ -241,7 +349,8 @@ std::tuple<torch::Tensor, torch::Tensor> batch_sample(torch::Tensor edges, int n
     if (inverse) {
         edge_sample = edges.index_select(0, sample_edge_id).select(1, 0);
     } else {
-        edge_sample = edges.index_select(0, sample_edge_id).select(1, -1);
+        int64_t dst_col = dst_column(edges);
+        edge_sample = edges.index_select(0, sample_edge_id).select(1, dst_col);
     }
     return std::forward_as_tuple(edge_sample, sample_edge_id);
 }
@@ -315,7 +424,9 @@ torch::Tensor compute_filter_corruption_cpu(shared_ptr<GegeGraph> graph, torch::
         throw TensorSizeMismatchException(edges, "Edge list must have three (if chunked) or two dimensions");
     }
 
-    if (edges.size(-1) == 3) {
+    if (edges.size(-1) == 4 || edges.size(-1) == 5) {
+        return compute_filter_corruption_nary_cpu_impl(graph, edges, corruption_nodes, inverse, global);
+    } else if (edges.size(-1) == 3) {
         has_relations = true;
     } else if (edges.size(-1) == 2) {
         has_relations = false;
@@ -462,7 +573,9 @@ torch::Tensor compute_filter_corruption_gpu(shared_ptr<GegeGraph> graph, torch::
         throw TensorSizeMismatchException(edges, "Edge list must have three (if chunked) or two dimensions");
     }
 
-    if (edges.size(-1) == 3) {
+    if (edges.size(-1) == 4 || edges.size(-1) == 5) {
+        return compute_filter_corruption_nary_cpu_impl(graph, edges, corruption_nodes, inverse, global);
+    } else if (edges.size(-1) == 3) {
         has_relations = true;
     } else if (edges.size(-1) == 2) {
         has_relations = false;

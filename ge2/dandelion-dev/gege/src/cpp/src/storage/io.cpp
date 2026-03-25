@@ -37,7 +37,7 @@ std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>> initia
     if (storage_config->dataset->num_relations == 1) {
         num_columns = 2;
     }
-    // Auto-detect arity-4 (5-column) edges from the training file's actual byte size.
+    // Auto-detect edge arity from the training file's actual byte size.
     // If num_train > 0, we probe the file: file_size / (num_train * element_bytes) gives num_columns.
     if (num_train > 0) {
         int element_bytes = (dtype == torch::kInt32) ? 4 : 8;
@@ -45,9 +45,12 @@ std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>> initia
         if (probe.is_open()) {
             int64_t file_bytes = static_cast<int64_t>(probe.tellg());
             probe.close();
-            int64_t detected_cols = file_bytes / (num_train * element_bytes);
-            if (detected_cols == 5) {
-                num_columns = 5;  // Arity-4: [src, rel, dst, qrel, qval]
+            int64_t denom = num_train * element_bytes;
+            if (denom > 0 && file_bytes % denom == 0) {
+                int64_t detected_cols = file_bytes / denom;
+                if (detected_cols >= 2 && detected_cols <= 5) {
+                    num_columns = static_cast<int>(detected_cols);
+                }
             }
         }
     }

@@ -7,6 +7,14 @@
 #include "omp.h"
 #endif
 
+namespace {
+
+int64_t dst_column(const EdgeList &edges) {
+    return edges.size(1) >= 4 ? 2 : edges.size(1) - 1;
+}
+
+}  // namespace
+
 GegeGraph::GegeGraph(){};
 
 GegeGraph::GegeGraph(EdgeList src_sorted_edges, EdgeList dst_sorted_edges, int64_t num_nodes_in_memory) {
@@ -16,7 +24,7 @@ GegeGraph::GegeGraph(EdgeList src_sorted_edges, EdgeList dst_sorted_edges, int64
     dst_sorted_edges_ = dst_sorted_edges;
 
     auto contiguous_src = src_sorted_edges_.select(1, 0).contiguous();
-    auto contiguous_dst = dst_sorted_edges_.select(1, -1).contiguous();
+    auto contiguous_dst = dst_sorted_edges_.select(1, dst_column(dst_sorted_edges_)).contiguous();
     torch::Tensor arange_tensor = torch::arange(0, num_nodes_in_memory_, contiguous_src.device());
 
     all_src_sorted_edges_ = src_sorted_edges_;
@@ -33,13 +41,10 @@ GegeGraph::GegeGraph(EdgeList src_sorted_edges, EdgeList dst_sorted_edges, int64
     max_in_num_neighbors_ = torch::max(in_num_neighbors_).item<int>();
 }
 
-GegeGraph::GegeGraph(EdgeList edges) {
-    EdgeList src_sorted_edges = edges.index_select(0, edges.select(1, 0).argsort(0, false));
-    EdgeList dst_sorted_edges = edges.index_select(0, edges.select(1, -1).argsort(0, false));
-    int64_t num_nodes_in_memory = std::get<0>(torch::_unique(torch::cat({edges.select(1, 0), edges.select(1, -1)}))).size(0);
-
-    GegeGraph(src_sorted_edges, dst_sorted_edges, num_nodes_in_memory);
-}
+GegeGraph::GegeGraph(EdgeList edges)
+    : GegeGraph(edges.index_select(0, edges.select(1, 0).argsort(0, false)),
+                edges.index_select(0, edges.select(1, dst_column(edges)).argsort(0, false)),
+                std::get<0>(torch::_unique(torch::cat({edges.select(1, 0), edges.select(1, dst_column(edges))}))).size(0)) {}
 
 GegeGraph::~GegeGraph() { clear(); }
 
@@ -211,7 +216,7 @@ std::tuple<torch::Tensor, torch::Tensor> GegeGraph::getNeighborsForNodeIds(torch
 
 void GegeGraph::sortAllEdges(EdgeList all_edges) {
     all_src_sorted_edges_ = all_edges.index_select(0, all_edges.select(1, 0).argsort(0, false)).to(torch::kInt64);
-    all_dst_sorted_edges_ = all_edges.index_select(0, all_edges.select(1, -1).argsort(0, false)).to(torch::kInt64);
+    all_dst_sorted_edges_ = all_edges.index_select(0, all_edges.select(1, dst_column(all_edges)).argsort(0, false)).to(torch::kInt64);
 }
 
 DENSEGraph::DENSEGraph(){};
@@ -310,7 +315,7 @@ Indices DENSEGraph::getNeighborIDs(bool incoming, bool global_ids) {
         if (incoming) {
             return dst_sorted_edges_.select(1, 0);
         } else {
-            return src_sorted_edges_.select(1, -1);
+            return src_sorted_edges_.select(1, dst_column(src_sorted_edges_));
         }
     } else {
         // return node ids local to the batch
@@ -335,7 +340,7 @@ void DENSEGraph::performMap() {
 
     if (out_neighbors_vec_.size() > 0) {
         src_sorted_edges_ = torch::cat({out_neighbors_vec_}, 0);
-        out_neighbors_mapping_ = local_id_to_batch_map.gather(0, src_sorted_edges_.select(1, -1));
+        out_neighbors_mapping_ = local_id_to_batch_map.gather(0, src_sorted_edges_.select(1, dst_column(src_sorted_edges_)));
 
         out_neighbors_vec_ = {};
 

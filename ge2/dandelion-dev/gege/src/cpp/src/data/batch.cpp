@@ -380,8 +380,9 @@ void Batch::accumulateResidentLocalGradients(float learning_rate) {
     resident_states.reserve(4);
 
     if (edges_.defined()) {
+        int64_t dst_col = edges_.size(1) >= 4 ? 2 : edges_.size(1) - 1;
         append_resident(resident_ids, resident_grads, resident_states, edges_.select(1, 0), resident_src_embeddings_, resident_src_embeddings_state_);
-        append_resident(resident_ids, resident_grads, resident_states, edges_.select(1, -1), resident_dst_embeddings_, resident_dst_embeddings_state_);
+        append_resident(resident_ids, resident_grads, resident_states, edges_.select(1, dst_col), resident_dst_embeddings_, resident_dst_embeddings_state_);
     }
     append_resident(resident_ids, resident_grads, resident_states, src_neg_indices_, resident_src_neg_embeddings_, resident_src_neg_embeddings_state_);
     append_resident(resident_ids, resident_grads, resident_states, dst_neg_indices_, resident_dst_neg_embeddings_, resident_dst_neg_embeddings_state_);

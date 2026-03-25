@@ -42,11 +42,11 @@ class PandasDelimitedFileReader(Reader):
 
         if len(self.columns) == 2:
             self.has_rels = False
-        elif len(self.columns) == 3 or len(self.columns) == 5:
+        elif len(self.columns) in (3, 4, 5):
             self.has_rels = True
         else:
             raise RuntimeError(
-                "Incorrect number of columns specified, expected length 2, 3, or 5, received {}".format(len(self.columns))
+                "Incorrect number of columns specified, expected length 2, 3, 4, or 5, received {}".format(len(self.columns))
             )
 
     def read(self):

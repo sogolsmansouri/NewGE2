@@ -354,6 +354,7 @@ class InMemory : public Storage {
     
     void rePartition(torch::Tensor permutation, int64_t num_nodes, int64_t num_partitions) {
         int64_t partition_size = ceil((double)num_nodes / num_partitions);
+        int64_t dst_col = data_.size(1) >= 4 ? 2 : data_.size(1) - 1;
  
         auto src_partitions = torch::floor(
                                   permutation.index_select(0, data_.select(1, 0).squeeze())
@@ -361,7 +362,7 @@ class InMemory : public Storage {
                                       .div(static_cast<double>(partition_size)))
                                   .to(torch::kInt64);
         auto dst_partitions = torch::floor(
-                                  permutation.index_select(0, data_.select(1, -1).squeeze())
+                                  permutation.index_select(0, data_.select(1, dst_col).squeeze())
                                       .to(torch::kFloat64)
                                       .div(static_cast<double>(partition_size)))
                                   .to(torch::kInt64);
@@ -378,7 +379,7 @@ class InMemory : public Storage {
                                            .div(static_cast<double>(partition_size)))
                                        .to(torch::kInt64);
         auto edge_bucket_ids_dst = torch::floor(
-                                       permutation.index_select(0, data_.select(1, -1).squeeze())
+                                       permutation.index_select(0, data_.select(1, dst_col).squeeze())
                                            .to(torch::kFloat64)
                                            .div(static_cast<double>(partition_size)))
                                        .to(torch::kInt64);

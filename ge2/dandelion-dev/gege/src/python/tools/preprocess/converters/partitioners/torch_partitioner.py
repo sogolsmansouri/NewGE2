@@ -14,9 +14,9 @@ def partition_edges(edges, num_nodes, num_partitions):
 
     # All node ids are non-negative, so floor division is equivalent to truncation
     # and works across older Torch versions that do not support rounding_mode.
-    # For arity-4 [src, rel, dst, qrel, qval], dst is col 2 (not the last column).
+    # For n-ary edges [src, rel, dst, ...], dst is col 2 (not the last column).
     src_partitions = edges[:, 0] // partition_size
-    dst_col = 2 if edges.size(1) == 5 else -1
+    dst_col = 2 if edges.size(1) >= 4 else -1
     dst_partitions = edges[:, dst_col] // partition_size
 
     # Sort by a single flat bucket id instead of relying on stable multi-pass sort.

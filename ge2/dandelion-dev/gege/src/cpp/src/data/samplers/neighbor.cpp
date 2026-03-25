@@ -472,7 +472,8 @@ DENSEGraph LayeredNeighborSampler::getNeighbors(torch::Tensor node_ids, shared_p
                 hash_map.index_fill_(0, delta_incoming_edges.select(1, 0), 1);
             }
             if (delta_outgoing_edges.size(0) > 0) {
-                hash_map.index_fill_(0, delta_outgoing_edges.select(1, -1), 1);
+                int64_t dst_col = delta_outgoing_edges.size(1) >= 4 ? 2 : delta_outgoing_edges.size(1) - 1;
+                hash_map.index_fill_(0, delta_outgoing_edges.select(1, dst_col), 1);
             }
             hash_map.index_fill_(0, node_ids, 0);
 

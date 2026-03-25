@@ -1,4 +1,4 @@
-# Freebase86M Binary Optimization Summary
+# Binary Optimization Summary
 
 All runs below use the paper-style exact `paper-10k` evaluation unless noted otherwise.
 
@@ -30,3 +30,29 @@ GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1
 - `GEGE_BUCKET_STREAMING_LP=1` reduces epoch time but consistently lowers MRR.
 - The main win on the standard path comes from `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1`, which collapses `swap_rebuild_ms` from about `13.2s` to `0.19s` per epoch while preserving model quality.
 - This makes the non-bucket path nearly as fast as the bucket-streaming path, without the MRR drop.
+
+## Twitter Dot-Emulation Follow-Up
+
+Paper-style exact `paper-10k` evaluation, single GPU, 10 epochs.
+
+| Run | Epochs | GPU-aware CUSTOM | Keep Hot | Bucket Streaming | Fast Map | CSR Gather | CSR Update | GPU Active Shuffle | Dot Emulation | Epoch Runtime | swap_rebuild_ms | MRR | Hits@10 | Notes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `twitter_dotemu_20260325` | 10 | 1 | 1 | 0 | 1 | 0 | 0 | 1 | 1 | `330851ms` | `292.204` | `0.016501` | `0.037000` | matches or slightly exceeds Table 4 Twitter GE2/Dot |
+| `livejournal_dotemu_20260325` | 10 | 1 | 1 | 0 | 1 | 0 | 0 | 1 | 1 | `15401ms` | `35.954` | `0.127892` | `0.303700` | below Table 4 LiveJournal GE2/Dot (`0.152/0.343`) |
+
+Active flags used:
+
+```bash
+GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM=1
+GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1
+GEGE_BUCKET_STREAMING_LP=0
+GEGE_FAST_MAP_TENSORS=1
+GEGE_CSR_GATHER=0
+GEGE_CSR_UPDATE=0
+GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1
+GEGE_EMULATE_DOT_SINGLE_RELATION=1
+GEGE_UNIQUE_BACKEND=bitmap
+GEGE_UNIQUE_BITMAP_NUM_NODES=41652230
+GEGE_EVAL_CHUNKED_RANKS=1
+GEGE_EVAL_NEGATIVE_CHUNK_SIZE=32768
+```

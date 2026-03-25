@@ -41,12 +41,20 @@ class Batch {
     torch::Tensor node_embeddings_state_g_; /**< Optimizer state for each node embedding in the batch. Generator for GAN */
     torch::Tensor node_state_update_g_;     /**< Updates to adjust the optimizer state. Generator for GAN */
 
-    // N-ary (arity-4) qualifier value embeddings: always-resident, per-edge, shape (batch_size, dim)
-    torch::Tensor qual_embeddings_;       /**< Qualifier value embedding for each edge in the batch (arity-4 only) */
-    torch::Tensor qual_gradients_;        /**< Gradients for qualifier value embeddings */
-    torch::Tensor qual_embeddings_state_; /**< Optimizer state for qualifier value embeddings */
-    torch::Tensor qual_state_update_;     /**< Optimizer state update for qualifier value embeddings */
-    torch::Tensor qual_indices_;          /**< Global qualifier value node ids (col 4 of arity-4 edge tensor) */
+    // N-ary qualifier value embeddings: always-resident, per-edge, shape (batch_size, dim)
+    torch::Tensor qual_embeddings_;       /**< Positive qualifier value embedding for each edge in the batch (arity-3/4) */
+    torch::Tensor qual_gradients_;        /**< Gradients for positive qualifier value embeddings */
+    torch::Tensor qual_embeddings_state_; /**< Optimizer state for positive qualifier value embeddings */
+    torch::Tensor qual_state_update_;     /**< Optimizer state update for positive qualifier value embeddings */
+    torch::Tensor qual_indices_;          /**< Global positive qualifier value ids (last column of arity-3/4 edge tensor) */
+
+    // Auxiliary n-ary negative-sampling channel: qualifier-value corruption.
+    Indices qval_neg_indices_;                /**< Global qualifier value ids sampled to corrupt qval */
+    torch::Tensor qval_neg_filter_;           /**< False-negative filter for qval corruption */
+    torch::Tensor qval_neg_embeddings_;       /**< Negative qualifier value embeddings [num_chunks, num_neg, dim] */
+    torch::Tensor qval_neg_gradients_;        /**< Gradients for negative qualifier value embeddings */
+    torch::Tensor qval_neg_embeddings_state_; /**< Optimizer state for negative qualifier value embeddings */
+    torch::Tensor qval_neg_state_update_;     /**< Optimizer state update for negative qualifier value embeddings */
 
     torch::Tensor node_features_; /**< Feature vector for each unique node in the the batch.  */
     torch::Tensor node_labels_;   /**< Label for each unique node in the the batch.  */

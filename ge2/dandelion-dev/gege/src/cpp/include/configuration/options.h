@@ -52,7 +52,7 @@ enum class GraphSageAggregator { GCN, MEAN };
 
 GraphSageAggregator getGraphSageAggregator(std::string string_val);
 
-enum class DecoderType { NODE, DISTMULT, TRANSE, COMPLEX, TUCKER3, TUCKER4 };
+enum class DecoderType { NODE, DISTMULT, TRANSE, COMPLEX, TUCKER3, TUCKER4, TRING2, TRING3, TRING4 };
 
 DecoderType getDecoderType(std::string string_val);
 

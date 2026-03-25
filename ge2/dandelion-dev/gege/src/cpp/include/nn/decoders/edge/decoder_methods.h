@@ -5,8 +5,9 @@
 #include "data/samplers/negative.h"
 #include "nn/decoders/edge/edge_decoder.h"
 
-// qual_embeddings: per-edge qualifier value embeddings for arity-4, shape (batch_size, dim).
-// Pass an undefined tensor (default) for binary/arity-3 edges.
+// qual_embeddings: per-edge positive qualifier-value embeddings for arity-3/4, shape (batch_size, dim).
+// qval_neg_embeddings: sampled qualifier-value negatives for arity-3/4, shape (num_chunks, num_negatives, dim).
+// Pass an undefined tensor (default) for binary edges.
 
 std::tuple<torch::Tensor, torch::Tensor> only_pos_forward(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings,
                                                           torch::Tensor qual_embeddings = torch::Tensor());
@@ -17,7 +18,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> neg_and_p
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corrupt_forward(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
                                                                                             torch::Tensor node_embeddings, torch::Tensor dst_negs,
                                                                                             torch::Tensor src_negs = torch::Tensor(),
-                                                                                            torch::Tensor qual_embeddings = torch::Tensor());
+                                                                                            torch::Tensor qual_embeddings = torch::Tensor(),
+                                                                                            torch::Tensor qval_neg_embeddings = torch::Tensor());
 
 std::tuple<torch::Tensor, torch::Tensor> node_corrupt_ranks_chunked(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
                                                                     torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor dst_filter,
@@ -33,7 +35,8 @@ std::tuple<torch::Tensor, torch::Tensor> prepare_pos_embeddings(shared_ptr<EdgeD
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_corrupt_forward(NegativeSamplingMethod negative_sampling_method, float negative_sampling_selected_ratio,
                                                                                                 shared_ptr<NegativeSampler> negative_sampler, shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
                                                                                                 torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
-                                                                                                torch::Tensor node_embeddings_g, torch::Tensor qual_embeddings = torch::Tensor());
+                                                                                                torch::Tensor node_embeddings_g, torch::Tensor qual_embeddings = torch::Tensor(),
+                                                                                                torch::Tensor qval_neg_embeddings = torch::Tensor());
 
 std::tuple<torch::Tensor, torch::Tensor> get_rewards(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
                                                       torch::Tensor qual_embeddings = torch::Tensor());

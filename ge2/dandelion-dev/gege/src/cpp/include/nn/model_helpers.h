@@ -4,6 +4,9 @@
 #include "nn/decoders/edge/complex.h"
 #include "nn/decoders/edge/distmult.h"
 #include "nn/decoders/edge/edge_decoder.h"
+#include "nn/decoders/edge/tring2.h"
+#include "nn/decoders/edge/tring3.h"
+#include "nn/decoders/edge/tring4.h"
 #include "nn/decoders/edge/transe.h"
 #include "nn/decoders/edge/tucker3.h"
 #include "nn/decoders/edge/tucker4.h"
@@ -36,6 +39,16 @@ std::shared_ptr<Decoder> get_edge_decoder(DecoderType decoder_type, EdgeDecoderM
         decoder = std::make_shared<TuckER4>(num_relations, embedding_dim, tensor_options,
                                             /*core_dim_e=*/10, /*core_dim_r=*/10,
                                             edge_decoder_method);
+    } else if (decoder_type == DecoderType::TRING2) {
+        decoder = std::make_shared<TRing2>(num_relations, embedding_dim, tensor_options,
+                                           use_inverse_relations, /*ring_rank=*/50,
+                                           edge_decoder_method);
+    } else if (decoder_type == DecoderType::TRING3) {
+        decoder = std::make_shared<TRing3>(num_relations, embedding_dim, tensor_options,
+                                           /*ring_rank=*/50, edge_decoder_method);
+    } else if (decoder_type == DecoderType::TRING4) {
+        decoder = std::make_shared<TRing4>(num_relations, embedding_dim, tensor_options,
+                                           /*ring_rank=*/40, edge_decoder_method);
     } else {
         throw std::runtime_error("Decoder not supported for learning task.");
     }

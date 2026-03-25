@@ -1532,8 +1532,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         auto now = std::chrono::high_resolution_clock::now();
         int64_t src_neg_numel = batch->src_neg_indices_.defined() ? batch->src_neg_indices_.numel() : 0;
         int64_t dst_neg_numel = batch->dst_neg_indices_.defined() ? batch->dst_neg_indices_.numel() : 0;
-        SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 2] negativeSample ms={:.3f} src_neg_numel={} dst_neg_numel={}",
-                    debug_batch_id, elapsed_ms(step_start, now), src_neg_numel, dst_neg_numel);
+        int64_t qval_neg_numel = batch->qval_neg_indices_.defined() ? batch->qval_neg_indices_.numel() : 0;
+        SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 2] negativeSample ms={:.3f} src_neg_numel={} dst_neg_numel={} qval_neg_numel={}",
+                    debug_batch_id, elapsed_ms(step_start, now), src_neg_numel, dst_neg_numel, qval_neg_numel);
         step_start = now;
     }
     // std::cout << batch->src_neg_indices_ << std::endl;
@@ -1775,6 +1776,22 @@ void DataLoader::negativeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     std::tie(batch->src_neg_indices_, batch->src_neg_filter_, batch->dst_neg_indices_, batch->dst_neg_filter_) =
         negative_sampler_->getNodeCorruptNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_,
                                                    need_src_negatives, device_idx);
+
+    if (batch->edges_.size(1) == 4 || batch->edges_.size(1) == 5) {
+        torch::Tensor qval_corrupt_edges;
+        if (batch->edges_.size(1) == 4) {
+            qval_corrupt_edges = torch::stack({batch->edges_.select(1, 0), batch->edges_.select(1, 1),
+                                               batch->edges_.select(1, 3), batch->edges_.select(1, 2)}, 1);
+        } else {
+            qval_corrupt_edges = torch::stack({batch->edges_.select(1, 0), batch->edges_.select(1, 1),
+                                               batch->edges_.select(1, 4), batch->edges_.select(1, 3),
+                                               batch->edges_.select(1, 2)}, 1);
+        }
+
+        std::tie(batch->qval_neg_indices_, batch->qval_neg_filter_) =
+            negative_sampler_->getNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_,
+                                            qval_corrupt_edges, false, device_idx);
+    }
 }
 
 void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
@@ -1802,8 +1819,7 @@ void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
         }
     }
 
-    // Arity-3/4: load qualifier value embeddings from always-resident CPU storage (if applicable).
-    // qval is always the last column: col 3 for arity-3 (4 cols), col 4 for arity-4 (5 cols).
+    // Arity-3/4: load positive qualifier value embeddings from always-resident CPU storage.
     if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
         && (batch->edges_.size(1) == 4 || batch->edges_.size(1) == 5)
         && graph_storage_->storage_ptrs_.qual_embeddings->device_ != torch::kCUDA) {
@@ -1812,6 +1828,15 @@ void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
         batch->qual_indices_ = qval_ids;
         if (train_) {
             batch->qual_embeddings_state_ = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(qval_ids);
+        }
+    }
+
+    if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
+        && batch->qval_neg_indices_.defined()
+        && graph_storage_->storage_ptrs_.qual_embeddings->device_ != torch::kCUDA) {
+        batch->qval_neg_embeddings_ = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(batch->qval_neg_indices_);
+        if (train_) {
+            batch->qval_neg_embeddings_state_ = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(batch->qval_neg_indices_);
         }
     }
 
@@ -1844,8 +1869,7 @@ void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) 
         }
     }
 
-    // Arity-3/4: load qualifier value embeddings from always-resident GPU storage.
-    // qval is always the last column: col 3 for arity-3 (4 cols), col 4 for arity-4 (5 cols).
+    // Arity-3/4: load positive qualifier value embeddings from always-resident GPU storage.
     if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
         && (batch->edges_.size(1) == 4 || batch->edges_.size(1) == 5)
         && graph_storage_->storage_ptrs_.qual_embeddings->device_ == torch::kCUDA) {
@@ -1856,6 +1880,15 @@ void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) 
             batch->qual_embeddings_state_ = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(qval_ids);
         }
     }
+
+    if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
+        && batch->qval_neg_indices_.defined()
+        && graph_storage_->storage_ptrs_.qual_embeddings->device_ == torch::kCUDA) {
+        batch->qval_neg_embeddings_ = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(batch->qval_neg_indices_);
+        if (train_) {
+            batch->qval_neg_embeddings_state_ = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(batch->qval_neg_indices_);
+        }
+    }
 }
 
 void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t device_idx) {
@@ -1864,11 +1897,16 @@ void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t dev
             graph_storage_->updateAddNodeEmbeddings(batch->unique_node_indices_, batch->node_gradients_, device_idx);
             graph_storage_->updateAddNodeEmbeddingState(batch->unique_node_indices_, batch->node_state_update_, device_idx);
         }
-        // Arity-4: write back qualifier value embedding gradients to always-resident GPU table
+        // Write back positive qualifier value embedding gradients to the always-resident table.
         if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
             && batch->qual_indices_.defined() && batch->qual_gradients_.defined()) {
             graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(batch->qual_indices_, batch->qual_gradients_);
             graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(batch->qual_indices_, batch->qual_state_update_);
+        }
+        if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
+            && batch->qval_neg_indices_.defined() && batch->qval_neg_gradients_.defined()) {
+            graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(batch->qval_neg_indices_, batch->qval_neg_gradients_);
+            graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(batch->qval_neg_indices_, batch->qval_neg_state_update_);
         }
     } else {
         batch->host_transfer_.synchronize();
@@ -1876,11 +1914,16 @@ void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t dev
             graph_storage_->updateAddNodeEmbeddings(batch->unique_node_indices_, batch->node_gradients_);
             graph_storage_->updateAddNodeEmbeddingState(batch->unique_node_indices_, batch->node_state_update_);
         }
-        // Arity-4: write back qualifier value embedding gradients (CPU path)
+        // Write back positive qualifier value embedding gradients (CPU path).
         if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
             && batch->qual_indices_.defined() && batch->qual_gradients_.defined()) {
             graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(batch->qual_indices_, batch->qual_gradients_);
             graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(batch->qual_indices_, batch->qual_state_update_);
+        }
+        if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
+            && batch->qval_neg_indices_.defined() && batch->qval_neg_gradients_.defined()) {
+            graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(batch->qval_neg_indices_, batch->qval_neg_gradients_);
+            graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(batch->qval_neg_indices_, batch->qval_neg_state_update_);
         }
         batch->clear();
     }

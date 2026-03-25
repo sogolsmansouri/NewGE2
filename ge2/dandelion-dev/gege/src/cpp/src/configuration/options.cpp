@@ -191,6 +191,12 @@ DecoderType getDecoderType(std::string string_val) {
         return DecoderType::TUCKER3;
     } else if (string_val == "TUCKER4") {
         return DecoderType::TUCKER4;
+    } else if (string_val == "TRING2" || string_val == "GETD2") {
+        return DecoderType::TRING2;
+    } else if (string_val == "TRING3" || string_val == "GETD3") {
+        return DecoderType::TRING3;
+    } else if (string_val == "TRING4" || string_val == "GETD4") {
+        return DecoderType::TRING4;
     } else {
         throw std::runtime_error("Unrecognized decoder type string");
     }

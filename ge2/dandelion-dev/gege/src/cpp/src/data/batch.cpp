@@ -255,6 +255,22 @@ void Batch::to(torch::Device device) {
         qual_indices_ = qual_indices_.to(device);
     }
 
+    if (qval_neg_filter_.defined()) {
+        qval_neg_filter_ = qval_neg_filter_.to(device);
+    }
+
+    if (qval_neg_indices_.defined()) {
+        qval_neg_indices_ = qval_neg_indices_.to(device);
+    }
+
+    if (qval_neg_embeddings_.defined()) {
+        qval_neg_embeddings_ = qval_neg_embeddings_.to(device);
+    }
+
+    if (qval_neg_embeddings_state_.defined()) {
+        qval_neg_embeddings_state_ = qval_neg_embeddings_state_.to(device);
+    }
+
     if (node_embeddings_g_.defined()) {
         node_embeddings_g_ = node_embeddings_g_.to(device);
     }
@@ -319,14 +335,22 @@ void Batch::accumulateGradients(float learning_rate) {
         node_embeddings_state_.add_(node_state_update_);
         node_gradients_ = -learning_rate * (node_gradients_ / (node_embeddings_state_.sqrt().add_(1e-10)));
 
-        // Accumulate qualifier value embedding gradients (arity-4)
+        // Accumulate qualifier value embedding gradients.
         if (qual_embeddings_.defined() && qual_embeddings_.grad().defined()) {
             qual_gradients_ = qual_embeddings_.grad();
             qual_state_update_ = qual_gradients_.pow(2);
             qual_embeddings_state_.add_(qual_state_update_);
             qual_gradients_ = -learning_rate * (qual_gradients_ / (qual_embeddings_state_.sqrt().add_(1e-10)));
         }
+
+        if (qval_neg_embeddings_.defined() && qval_neg_embeddings_.grad().defined()) {
+            qval_neg_gradients_ = qval_neg_embeddings_.grad();
+            qval_neg_state_update_ = qval_neg_gradients_.pow(2);
+            qval_neg_embeddings_state_.add_(qval_neg_state_update_);
+            qval_neg_gradients_ = -learning_rate * (qval_neg_gradients_ / (qval_neg_embeddings_state_.sqrt().add_(1e-10)));
+        }
         qual_embeddings_state_ = torch::Tensor();
+        qval_neg_embeddings_state_ = torch::Tensor();
 
         if (run_stage_debug) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -451,6 +475,17 @@ void Batch::embeddingsToHost() {
         qual_indices_ = qual_indices_.to(torch::kCPU);
     }
 
+    if (qval_neg_gradients_.defined() && qval_neg_gradients_.device().is_cuda()) {
+        auto grad_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+        Gradients temp_qneg_grads = torch::empty(qval_neg_gradients_.sizes(), grad_opts);
+        temp_qneg_grads.copy_(qval_neg_gradients_, true);
+        Gradients temp_qneg_updates = torch::empty(qval_neg_state_update_.sizes(), grad_opts);
+        temp_qneg_updates.copy_(qval_neg_state_update_, true);
+        qval_neg_gradients_ = temp_qneg_grads;
+        qval_neg_state_update_ = temp_qneg_updates;
+        qval_neg_indices_ = qval_neg_indices_.to(torch::kCPU);
+    }
+
     if (unique_node_indices_.defined()) {
         unique_node_indices_ = unique_node_indices_.to(torch::kCPU);
     }
@@ -498,6 +533,12 @@ void Batch::clear() {
     qual_embeddings_state_ = torch::Tensor();
     qual_state_update_ = torch::Tensor();
     qual_indices_ = torch::Tensor();
+    qval_neg_indices_ = torch::Tensor();
+    qval_neg_filter_ = torch::Tensor();
+    qval_neg_embeddings_ = torch::Tensor();
+    qval_neg_gradients_ = torch::Tensor();
+    qval_neg_embeddings_state_ = torch::Tensor();
+    qval_neg_state_update_ = torch::Tensor();
 
     node_features_ = torch::Tensor();
     node_labels_ = torch::Tensor();

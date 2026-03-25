@@ -1,0 +1,64 @@
+model:
+  learning_task: LINK_PREDICTION
+  encoder:
+    layers:
+      - - type: EMBEDDING
+          output_dim: 100
+  decoder:
+    type: TRING4            # GETD-style Tensor Ring scorer for [src,rel,dst,qrel,qval]
+    options:
+      inverse_edges: false
+      use_relation_features: false
+      edge_decoder_method: CORRUPT_NODE
+  loss:
+    type: SOFTMAX_CE
+    options:
+      reduction: SUM
+  dense_optimizer:
+      type: ADAM
+      options:
+        learning_rate: 0.01
+  sparse_optimizer:
+      type: ADAGRAD
+      options:
+        learning_rate: 0.1
+
+storage:
+  device_type: cuda
+  device_ids: [0]
+  dataset:
+    dataset_dir: /home/smansou2/data/jf17k4_ge2_processed/
+  edges:
+    type: HOST_MEMORY
+    options:
+      dtype: int
+  embeddings:
+    type: MEM_PARTITION_BUFFER
+    options:
+      num_partitions: 4
+      buffer_capacity: 2
+      prefetching: false
+      fine_to_coarse_ratio: 1
+      num_cache_partitions: 0
+      edge_bucket_ordering: NEW_BETA
+      randomly_assign_edge_buckets: false
+  prefetch: false
+  save_model: true
+
+training:
+  batch_size: 500
+  negative_sampling_method: RNS
+  logical_active_devices: 2
+  negative_sampling:
+    num_chunks: 10
+    negatives_per_positive: 100
+    degree_fraction: 0.0
+    filtered: false
+    tournament_selection: false
+  num_epochs: 5
+  epochs_per_shuffle: 1
+
+evaluation:
+  batch_size: 500
+  negative_sampling:
+    filtered: false

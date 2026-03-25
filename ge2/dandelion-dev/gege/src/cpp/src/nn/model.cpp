@@ -495,11 +495,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
             std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
                 mod_node_corrupt_forward(negative_sampling_method_, negative_sampling_selected_ratio_, negative_sampler_, edge_decoder, batch->edges_, encoded_nodes,
                                          batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, batch->node_embeddings_g_,
-                                         batch->qual_embeddings_);
+                                         batch->qual_embeddings_, batch->qval_neg_embeddings_);
         } else {  // evalutate
             std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
                 node_corrupt_forward(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_,
-                                     batch->qual_embeddings_);
+                                     batch->qual_embeddings_, batch->qval_neg_embeddings_);
         }
     } else if (edge_decoder->decoder_method_ == EdgeDecoderMethod::CORRUPT_REL) {
         throw GegeRuntimeException("Decoder method currently unsupported.");
@@ -514,7 +514,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
     }
 
     if (inv_neg_scores.defined()) {
-        inv_neg_scores = apply_score_filter(inv_neg_scores, batch->src_neg_filter_);
+        if (batch->qval_neg_filter_.defined()) {
+            inv_neg_scores = apply_score_filter(inv_neg_scores, batch->qval_neg_filter_);
+        } else {
+            inv_neg_scores = apply_score_filter(inv_neg_scores, batch->src_neg_filter_);
+        }
     }
 
     if (!train) {
@@ -536,9 +540,12 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
         batch->node_embeddings_.requires_grad_();
     }
 
-    // Arity-4: enable gradient tracking for qualifier value embeddings
+    // Enable gradient tracking for positive and negative qualifier-value embeddings.
     if (batch->qual_embeddings_.defined()) {
         batch->qual_embeddings_.requires_grad_();
+    }
+    if (batch->qval_neg_embeddings_.defined()) {
+        batch->qval_neg_embeddings_.requires_grad_();
     }
 
     torch::Tensor loss;

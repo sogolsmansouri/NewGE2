@@ -94,7 +94,12 @@ void init_options(py::module &m) {
         .value("NODE", DecoderType::NODE)
         .value("DISTMULT", DecoderType::DISTMULT)
         .value("TRANSE", DecoderType::TRANSE)
-        .value("COMPLEX", DecoderType::COMPLEX);
+        .value("COMPLEX", DecoderType::COMPLEX)
+        .value("TUCKER3", DecoderType::TUCKER3)
+        .value("TUCKER4", DecoderType::TUCKER4)
+        .value("TRING2", DecoderType::TRING2)
+        .value("TRING3", DecoderType::TRING3)
+        .value("TRING4", DecoderType::TRING4);
 
     m.def("getDecoderType", &getDecoderType, py::arg("string_val"));
 

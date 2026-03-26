@@ -71,6 +71,11 @@ int64_t parse_env_int(const char *name, int64_t default_value) {
     }
 }
 
+int64_t nary_aux_negative_chunk_size() {
+    static int64_t chunk_size = std::max<int64_t>(parse_env_int("GEGE_NARY_AUX_NEG_CHUNK_SIZE", 32), 1);
+    return chunk_size;
+}
+
 std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tensor ids) {
     torch::Tensor ids64 = ids.to(torch::kInt64);
     auto sort_tup = torch::sort(ids64, 0, false);
@@ -594,20 +599,33 @@ torch::Tensor compute_nary_qval_corrupt_scores(shared_ptr<EdgeDecoder> decoder, 
     torch::Tensor padded_src = pad_and_reshape(src_embeddings, chunk_num);
     torch::Tensor padded_dst = pad_and_reshape(dst_embeddings, chunk_num);
 
-    torch::Tensor expanded_edges =
-        padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, edge_width}).reshape({-1, edge_width});
-    torch::Tensor expanded_src =
-        padded_src.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
-    torch::Tensor expanded_dst =
-        padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
-    torch::Tensor flat_qval_negs =
-        qval_neg_embeddings.unsqueeze(1).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+    torch::Tensor padded_dst_flat = padded_dst.reshape({chunk_num * num_per_chunk, embedding_dim});
+    torch::Tensor scores = torch::empty({chunk_num * num_per_chunk, negatives_num}, dst_embeddings.options());
+    int64_t neg_chunk_size = nary_aux_negative_chunk_size();
+    for (int64_t neg_start = 0; neg_start < negatives_num; neg_start += neg_chunk_size) {
+        int64_t local_negatives = std::min<int64_t>(neg_chunk_size, negatives_num - neg_start);
+        torch::Tensor qval_neg_chunk = qval_neg_embeddings.narrow(1, neg_start, local_negatives);
+        torch::Tensor expanded_edges =
+            padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, edge_width}).reshape({-1, edge_width});
+        torch::Tensor expanded_src =
+            padded_src.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
+        torch::Tensor expanded_dst =
+            padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
+        torch::Tensor flat_qval_negs =
+            qval_neg_chunk.unsqueeze(1).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
 
-    auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, expanded_src, expanded_dst, has_relations, flat_qval_negs);
-    torch::Tensor adjusted_src_neg =
-        std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, negatives_num, embedding_dim});
+        auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, expanded_src, expanded_dst, has_relations, flat_qval_negs);
+        torch::Tensor adjusted_src_neg =
+            std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, local_negatives, embedding_dim});
 
-    return decoder->compute_scores(dst_embeddings, adjusted_src_neg);
+        torch::Tensor local_scores = decoder->compute_scores(padded_dst_flat, adjusted_src_neg);
+        if (local_scores.dim() == 3) {
+            local_scores = local_scores.reshape({chunk_num * num_per_chunk, local_negatives});
+        }
+        scores.slice(1, neg_start, neg_start + local_negatives).copy_(local_scores);
+    }
+
+    return scores;
 }
 
 torch::Tensor compute_nary_src_corrupt_scores(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
@@ -628,20 +646,33 @@ torch::Tensor compute_nary_src_corrupt_scores(shared_ptr<EdgeDecoder> decoder, t
     torch::Tensor padded_dst = pad_and_reshape(dst_embeddings, chunk_num);
     torch::Tensor padded_qual = pad_and_reshape(qual_embeddings, chunk_num);
 
-    torch::Tensor expanded_edges =
-        padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, edge_width}).reshape({-1, edge_width});
-    torch::Tensor expanded_dst =
-        padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
-    torch::Tensor flat_src_negs =
-        src_neg_embeddings.unsqueeze(1).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
-    torch::Tensor flat_qual =
-        padded_qual.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+    torch::Tensor padded_dst_flat = padded_dst.reshape({chunk_num * num_per_chunk, embedding_dim});
+    torch::Tensor scores = torch::empty({chunk_num * num_per_chunk, negatives_num}, dst_embeddings.options());
+    int64_t neg_chunk_size = nary_aux_negative_chunk_size();
+    for (int64_t neg_start = 0; neg_start < negatives_num; neg_start += neg_chunk_size) {
+        int64_t local_negatives = std::min<int64_t>(neg_chunk_size, negatives_num - neg_start);
+        torch::Tensor src_neg_chunk = src_neg_embeddings.narrow(1, neg_start, local_negatives);
+        torch::Tensor expanded_edges =
+            padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, edge_width}).reshape({-1, edge_width});
+        torch::Tensor expanded_dst =
+            padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
+        torch::Tensor flat_src_negs =
+            src_neg_chunk.unsqueeze(1).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
+        torch::Tensor flat_qual =
+            padded_qual.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
 
-    auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, flat_src_negs, expanded_dst, has_relations, flat_qual);
-    torch::Tensor adjusted_src_neg =
-        std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, negatives_num, embedding_dim});
+        auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, flat_src_negs, expanded_dst, has_relations, flat_qual);
+        torch::Tensor adjusted_src_neg =
+            std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, local_negatives, embedding_dim});
 
-    return decoder->compute_scores(dst_embeddings, adjusted_src_neg);
+        torch::Tensor local_scores = decoder->compute_scores(padded_dst_flat, adjusted_src_neg);
+        if (local_scores.dim() == 3) {
+            local_scores = local_scores.reshape({chunk_num * num_per_chunk, local_negatives});
+        }
+        scores.slice(1, neg_start, neg_start + local_negatives).copy_(local_scores);
+    }
+
+    return scores;
 }
 
 torch::Tensor compute_nary_qrel_corrupt_scores(shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges,
@@ -664,24 +695,36 @@ torch::Tensor compute_nary_qrel_corrupt_scores(shared_ptr<EdgeDecoder> decoder, 
     torch::Tensor padded_dst = pad_and_reshape(dst_embeddings, chunk_num);
     torch::Tensor padded_qual = pad_and_reshape(qual_embeddings, chunk_num);
 
-    torch::Tensor expanded_edges =
-        padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, edge_width}).reshape({-1, edge_width}).clone();
-    torch::Tensor flat_qrel_negs =
-        qrel_neg_indices.unsqueeze(1).expand({chunk_num, num_per_chunk, negatives_num}).reshape({-1});
-    expanded_edges.index_put_({torch::indexing::Slice(), 3}, flat_qrel_negs);
+    torch::Tensor padded_dst_flat = padded_dst.reshape({chunk_num * num_per_chunk, embedding_dim});
+    torch::Tensor scores = torch::empty({chunk_num * num_per_chunk, negatives_num}, dst_embeddings.options());
+    int64_t neg_chunk_size = nary_aux_negative_chunk_size();
+    for (int64_t neg_start = 0; neg_start < negatives_num; neg_start += neg_chunk_size) {
+        int64_t local_negatives = std::min<int64_t>(neg_chunk_size, negatives_num - neg_start);
+        torch::Tensor qrel_neg_chunk = qrel_neg_indices.narrow(1, neg_start, local_negatives);
+        torch::Tensor expanded_edges =
+            padded_edges.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, edge_width}).reshape({-1, edge_width}).clone();
+        torch::Tensor flat_qrel_negs =
+            qrel_neg_chunk.unsqueeze(1).expand({chunk_num, num_per_chunk, local_negatives}).reshape({-1});
+        expanded_edges.index_put_({torch::indexing::Slice(), 3}, flat_qrel_negs);
 
-    torch::Tensor expanded_src =
-        padded_src.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
-    torch::Tensor expanded_dst =
-        padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
-    torch::Tensor flat_qual =
-        padded_qual.unsqueeze(2).expand({chunk_num, num_per_chunk, negatives_num, embedding_dim}).reshape({-1, embedding_dim});
+        torch::Tensor expanded_src =
+            padded_src.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
+        torch::Tensor expanded_dst =
+            padded_dst.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
+        torch::Tensor flat_qual =
+            padded_qual.unsqueeze(2).expand({chunk_num, num_per_chunk, local_negatives, embedding_dim}).reshape({-1, embedding_dim});
 
-    auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, expanded_src, expanded_dst, has_relations, flat_qual);
-    torch::Tensor adjusted_src_neg =
-        std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, negatives_num, embedding_dim});
+        auto neg_pos_embeddings = prepare_pos_embeddings(decoder, expanded_edges, expanded_src, expanded_dst, has_relations, flat_qual);
+        torch::Tensor adjusted_src_neg =
+            std::get<0>(neg_pos_embeddings).reshape({chunk_num, num_per_chunk, local_negatives, embedding_dim});
 
-    torch::Tensor scores = decoder->compute_scores(dst_embeddings, adjusted_src_neg);
+        torch::Tensor local_scores = decoder->compute_scores(padded_dst_flat, adjusted_src_neg);
+        if (local_scores.dim() == 3) {
+            local_scores = local_scores.reshape({chunk_num * num_per_chunk, local_negatives});
+        }
+        scores.slice(1, neg_start, neg_start + local_negatives).copy_(local_scores);
+    }
+
     if (qrel_neg_filter.defined()) {
         scores = apply_score_filter(scores, qrel_neg_filter);
     }

@@ -1874,9 +1874,16 @@ void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
     if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
         && batch->qval_neg_indices_.defined()
         && graph_storage_->storage_ptrs_.qual_embeddings->device_ != torch::kCUDA) {
-        batch->qval_neg_embeddings_ = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(batch->qval_neg_indices_);
+        torch::Tensor flat_qval_neg_ids = batch->qval_neg_indices_.reshape({-1});
+        torch::Tensor flat_qval_neg_embeddings = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(flat_qval_neg_ids);
+        batch->qval_neg_embeddings_ = flat_qval_neg_embeddings.view({batch->qval_neg_indices_.size(0),
+                                                                     batch->qval_neg_indices_.size(1),
+                                                                     flat_qval_neg_embeddings.size(-1)});
         if (train_) {
-            batch->qval_neg_embeddings_state_ = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(batch->qval_neg_indices_);
+            torch::Tensor flat_qval_neg_state = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(flat_qval_neg_ids);
+            batch->qval_neg_embeddings_state_ = flat_qval_neg_state.view({batch->qval_neg_indices_.size(0),
+                                                                          batch->qval_neg_indices_.size(1),
+                                                                          flat_qval_neg_state.size(-1)});
         }
     }
 
@@ -1924,9 +1931,16 @@ void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) 
     if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
         && batch->qval_neg_indices_.defined()
         && graph_storage_->storage_ptrs_.qual_embeddings->device_ == torch::kCUDA) {
-        batch->qval_neg_embeddings_ = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(batch->qval_neg_indices_);
+        torch::Tensor flat_qval_neg_ids = batch->qval_neg_indices_.reshape({-1});
+        torch::Tensor flat_qval_neg_embeddings = graph_storage_->storage_ptrs_.qual_embeddings->indexRead(flat_qval_neg_ids);
+        batch->qval_neg_embeddings_ = flat_qval_neg_embeddings.view({batch->qval_neg_indices_.size(0),
+                                                                     batch->qval_neg_indices_.size(1),
+                                                                     flat_qval_neg_embeddings.size(-1)});
         if (train_) {
-            batch->qval_neg_embeddings_state_ = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(batch->qval_neg_indices_);
+            torch::Tensor flat_qval_neg_state = graph_storage_->storage_ptrs_.qual_optimizer_state->indexRead(flat_qval_neg_ids);
+            batch->qval_neg_embeddings_state_ = flat_qval_neg_state.view({batch->qval_neg_indices_.size(0),
+                                                                          batch->qval_neg_indices_.size(1),
+                                                                          flat_qval_neg_state.size(-1)});
         }
     }
 }
@@ -1945,8 +1959,11 @@ void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t dev
         }
         if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
             && batch->qval_neg_indices_.defined() && batch->qval_neg_gradients_.defined()) {
-            graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(batch->qval_neg_indices_, batch->qval_neg_gradients_);
-            graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(batch->qval_neg_indices_, batch->qval_neg_state_update_);
+            torch::Tensor flat_qval_neg_ids = batch->qval_neg_indices_.reshape({-1});
+            torch::Tensor flat_qval_neg_grads = batch->qval_neg_gradients_.reshape({-1, batch->qval_neg_gradients_.size(-1)});
+            torch::Tensor flat_qval_neg_state = batch->qval_neg_state_update_.reshape({-1, batch->qval_neg_state_update_.size(-1)});
+            graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(flat_qval_neg_ids, flat_qval_neg_grads);
+            graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(flat_qval_neg_ids, flat_qval_neg_state);
         }
     } else {
         batch->host_transfer_.synchronize();
@@ -1962,8 +1979,11 @@ void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t dev
         }
         if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr
             && batch->qval_neg_indices_.defined() && batch->qval_neg_gradients_.defined()) {
-            graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(batch->qval_neg_indices_, batch->qval_neg_gradients_);
-            graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(batch->qval_neg_indices_, batch->qval_neg_state_update_);
+            torch::Tensor flat_qval_neg_ids = batch->qval_neg_indices_.reshape({-1});
+            torch::Tensor flat_qval_neg_grads = batch->qval_neg_gradients_.reshape({-1, batch->qval_neg_gradients_.size(-1)});
+            torch::Tensor flat_qval_neg_state = batch->qval_neg_state_update_.reshape({-1, batch->qval_neg_state_update_.size(-1)});
+            graph_storage_->storage_ptrs_.qual_embeddings->indexAdd(flat_qval_neg_ids, flat_qval_neg_grads);
+            graph_storage_->storage_ptrs_.qual_optimizer_state->indexAdd(flat_qval_neg_ids, flat_qval_neg_state);
         }
         batch->clear();
     }

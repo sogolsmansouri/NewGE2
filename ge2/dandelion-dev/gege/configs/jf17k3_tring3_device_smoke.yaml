@@ -1,0 +1,55 @@
+model:
+  learning_task: LINK_PREDICTION
+  encoder:
+    layers:
+      - - type: EMBEDDING
+          output_dim: 100
+  decoder:
+    type: TRING3
+    options:
+      inverse_edges: false
+      use_relation_features: false
+      edge_decoder_method: CORRUPT_NODE
+  loss:
+    type: SOFTMAX_CE
+    options:
+      reduction: SUM
+  dense_optimizer:
+      type: ADAM
+      options:
+        learning_rate: 0.01
+  sparse_optimizer:
+      type: ADAGRAD
+      options:
+        learning_rate: 0.1
+
+storage:
+  device_type: cuda
+  device_ids: [0]
+  dataset:
+    dataset_dir: /home/smansou2/data/jf17k3_ge2_processed/
+  edges:
+    type: DEVICE_MEMORY
+  embeddings:
+    type: DEVICE_MEMORY
+  save_model: false
+
+training:
+  batch_size: 16
+  negative_sampling_method: RNS
+  negative_sampling:
+    num_chunks: 2
+    negatives_per_positive: 10
+    degree_fraction: 0.0
+    filtered: false
+    tournament_selection: false
+  num_epochs: 1
+  epochs_per_shuffle: 1
+
+evaluation:
+  batch_size: 16
+  negative_sampling:
+    filtered: false
+
+# Current safe-mode requirement for this config:
+#   GEGE_CSR_GATHER=0 GEGE_CSR_UPDATE=0

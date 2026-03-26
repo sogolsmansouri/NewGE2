@@ -517,7 +517,7 @@ class TorchEdgeListConverter(object):
         self.splits = splits
 
         self.has_rels = False
-        if len(columns) == 3 or len(columns) == 5:
+        if len(columns) in (3, 4, 5):
             self.has_rels = True
 
         if dtype.upper() == "INT32" or dtype.upper() == "INT":

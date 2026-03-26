@@ -1129,7 +1129,8 @@ void DataLoader::setBufferOrdering() {
                 SPDLOG_INFO("Using access-aware state generation for CUSTOM ordering with {} logical device(s)", requested_active_devices);
             } else if (optimized_custom_schedule && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
                        !options->randomly_assign_edge_buckets && (requested_active_devices == physical_devices || replay_logical_lane) &&
-                       requested_active_devices == 4 && options->buffer_capacity == 4) {
+                       requested_active_devices >= 1 && requested_active_devices <= options->buffer_capacity &&
+                       options->buffer_capacity == 4) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
                 tup = getOptimizedCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices,
                                                            batch_size_, edge_bucket_sizes);
@@ -1141,7 +1142,7 @@ void DataLoader::setBufferOrdering() {
             }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
-            if (single_gpu_gpu_aware_custom_enabled() && requested_active_devices == 1 && physical_devices == 1 &&
+            if (!used_optimized_custom_schedule && single_gpu_gpu_aware_custom_enabled() && requested_active_devices == 1 && physical_devices == 1 &&
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && !options->randomly_assign_edge_buckets &&
                 buffer_states_.size() > 1 && edge_buckets_per_buffer_.size() == buffer_states_.size()) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();

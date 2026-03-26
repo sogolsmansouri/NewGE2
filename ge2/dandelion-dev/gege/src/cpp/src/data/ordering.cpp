@@ -2016,8 +2016,9 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getOptimizedCustomEdgeB
         return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
     }
 
-    if (buffer_capacity != 4 || active_devices != 4) {
-        SPDLOG_INFO("Optimized CUSTOM ordering currently supports buffer_capacity=4 and active_devices=4; falling back to standard CUSTOM ordering");
+    if (buffer_capacity != 4 || active_devices <= 0 || active_devices > buffer_capacity) {
+        SPDLOG_INFO("Optimized CUSTOM ordering currently supports buffer_capacity=4 and active_devices in [1, {}]; falling back to standard CUSTOM ordering",
+                    buffer_capacity);
         return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
     }
 

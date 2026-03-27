@@ -881,7 +881,7 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     }
     bool use_device_shuffle = active_edges.defined() && !active_edges.device().is_cpu() && gpu_active_edge_shuffle_enabled();
     auto opts = torch::TensorOptions()
-                    .dtype(use_device_shuffle ? torch::kInt32 : torch::kInt64)
+                    .dtype(torch::kInt64)
                     .device(use_device_shuffle ? active_edges.device() : torch::Device(torch::kCPU));
     auto perm = torch::randperm(active_edges.size(0), opts);
     if (perm.device() != active_edges.device()) {

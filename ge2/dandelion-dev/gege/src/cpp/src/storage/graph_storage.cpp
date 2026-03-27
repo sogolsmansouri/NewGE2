@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <random>
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
 #include <c10/cuda/CUDAStream.h>
 #include <ATen/cuda/CUDAEvent.h>
 

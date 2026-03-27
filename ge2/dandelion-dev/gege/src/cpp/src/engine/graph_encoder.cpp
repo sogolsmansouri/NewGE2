@@ -33,10 +33,6 @@ void SynchronousGraphEncoder::encode(bool separate_layers) {
 
         encoded_nodes = encoded_nodes.contiguous().to(torch::kCPU);
 
-        if (model_->device_.is_cuda()) {
-            torch::cuda::synchronize();
-        }
-
         dataloader_->graph_storage_->updatePutEncodedNodesRange(batch->start_idx_, batch->batch_size_, encoded_nodes);
         dataloader_->finishedBatch();
     }

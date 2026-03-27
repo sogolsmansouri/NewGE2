@@ -6,6 +6,14 @@
 #include "omp.h"
 #endif
 
+namespace {
+
+torch::Tensor trunc_div_int_tensor(torch::Tensor values, int64_t divisor, torch::ScalarType output_dtype = torch::kInt64) {
+    return torch::floor(values.to(torch::kFloat64).div(static_cast<double>(divisor))).to(output_dtype);
+}
+
+}  // namespace
+
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(EdgeBucketOrdering edge_bucket_ordering, int num_partitions, int buffer_capacity,
                                                                                int fine_to_coarse_ratio, int num_cache_partitions,
                                                                                bool randomly_assign_edge_buckets) {
@@ -346,7 +354,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getDispersedNodePartiti
     // randomly assign train nodes to buffers
 
     int64_t partition_size = ceil((double)total_num_nodes / num_partitions);
-    torch::Tensor train_nodes_partition = train_nodes.divide(partition_size, "trunc");
+    torch::Tensor train_nodes_partition = trunc_div_int_tensor(train_nodes, partition_size, torch::kInt32);
 
     std::vector<std::vector<int>> partition_buffer_states(num_partitions);
 
@@ -387,7 +395,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getDispersedNodePartiti
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getSequentialNodePartitionOrdering(Indices train_nodes, int64_t total_num_nodes, int num_partitions,
                                                                                             int buffer_capacity) {
     int64_t partition_size = ceil((double)total_num_nodes / num_partitions);
-    torch::Tensor train_nodes_partition = train_nodes.divide(partition_size, "trunc");
+    torch::Tensor train_nodes_partition = trunc_div_int_tensor(train_nodes, partition_size, torch::kInt32);
 
     int32_t max_train_partition = torch::max(train_nodes_partition).item<int32_t>();
     int32_t num_train_partitions = max_train_partition + 1;

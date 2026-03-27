@@ -2,6 +2,9 @@
 
 #include "configuration/options.h"
 #include "reporting/logger.h"
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
 
 using std::get;
 using std::tie;

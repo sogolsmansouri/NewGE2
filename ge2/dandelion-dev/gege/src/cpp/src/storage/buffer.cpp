@@ -8,6 +8,9 @@
 #include <functional>
 #include <future>
 #include <shared_mutex>
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
 
 #include "configuration/constants.h"
 #include "reporting/logger.h"
@@ -943,4 +946,3 @@ torch::Tensor MemPartitionBuffer::indexRead(torch::Tensor indices) {
     
     return buffer_tensor_gpu_view_.index_select(0, indices);
 }
-

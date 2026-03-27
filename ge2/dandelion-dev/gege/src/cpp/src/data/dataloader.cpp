@@ -2,6 +2,9 @@
 
 #include "common/util.h"
 #include "data/ordering.h"
+#ifdef GEGE_CUDA
+#include <c10/cuda/CUDACachingAllocator.h>
+#endif
 
 DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask learning_task, shared_ptr<TrainingConfig> training_config,
                        shared_ptr<EvaluationConfig> evaluation_config, shared_ptr<EncoderConfig> encoder_config, vector<torch::Device> devices,

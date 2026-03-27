@@ -785,6 +785,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
     peer_relay_ready_barrier_->arrive_and_wait();
 
     std::vector<int> current_owner(options_->num_partitions, -1);
+    std::vector<bool> next_required(options_->num_partitions, false);
     for (int src_dev = 0; src_dev < static_cast<int>(buffers_.size()); src_dev++) {
         auto *src_buffer = buffers_[src_dev];
         auto current_state = src_buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
@@ -792,53 +793,115 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
         for (int64_t i = 0; i < current_state.numel(); i++) {
             current_owner[state_ptr[i]] = src_dev;
         }
+
+        auto next_state = peer_relay_next_states_[src_dev].to(torch::kCPU).to(torch::kInt64).contiguous();
+        auto *next_ptr = next_state.data_ptr<int64_t>();
+        for (int64_t i = 0; i < next_state.numel(); i++) {
+            int64_t partition_id = next_ptr[i];
+            if (partition_id >= 0 && partition_id < static_cast<int64_t>(next_required.size())) {
+                next_required[partition_id] = true;
+            }
+        }
     }
 
     auto next_state = peer_relay_next_states_[device_idx].to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto previous_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
     torch::Tensor staged_view = peer_relay_staged_views_[device_idx];
     if (!staged_view.defined()) {
         throw GegeRuntimeException("Peer relay staging buffer is undefined after successful initialization");
     }
+
+    auto load_partition_from_host = [&](Partition *partition, const torch::Tensor &cpu_view) {
+        if (!buffer->pos_.defined()) {
+            cpu_view.copy_(data_.narrow(0, partition->idx_offset_, partition->partition_size_));
+            return;
+        }
+        torch::Tensor host_indices = buffer->pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_);
+        cpu_view.copy_(data_.index_select(0, host_indices));
+    };
+
+    auto write_partition_to_host = [&](Partition *partition, const torch::Tensor &cpu_view) {
+        if (!buffer->pos_.defined()) {
+            data_.narrow(0, partition->idx_offset_, partition->partition_size_).copy_(cpu_view);
+            return;
+        }
+        torch::Tensor host_indices = buffer->pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_);
+        data_.index_put_({host_indices}, cpu_view);
+    };
+
     {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
         auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
         c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
         std::vector<std::tuple<int, int, int64_t, int64_t>> relay_debug_slots;
+        std::vector<int> host_evict_ids;
+
+        auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
+        for (int64_t slot = 0; slot < previous_state.numel(); slot++) {
+            int partition_id = static_cast<int>(previous_state_ptr[slot]);
+            if (partition_id < 0 || partition_id >= static_cast<int>(next_required.size()) || next_required[partition_id]) {
+                continue;
+            }
+
+            Partition *partition = buffer->partition_table_[partition_id];
+            int64_t src_slot = partition->buffer_idx_;
+            int64_t buffer_offset = src_slot * buffer->partition_size_;
+            torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+            torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+            cpu_view.copy_(gpu_view.detach(), true);
+            host_evict_ids.emplace_back(partition_id);
+        }
+
+        if (!host_evict_ids.empty()) {
+            cudaStreamSynchronize(comm_stream.stream());
+            for (auto partition_id : host_evict_ids) {
+                Partition *partition = buffer->partition_table_[partition_id];
+                int64_t src_slot = partition->buffer_idx_;
+                int64_t buffer_offset = src_slot * buffer->partition_size_;
+                torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                write_partition_to_host(partition, cpu_view);
+            }
+        }
 
         auto *next_state_ptr = next_state.data_ptr<int64_t>();
         for (int64_t slot = 0; slot < next_state.numel(); slot++) {
             int partition_id = static_cast<int>(next_state_ptr[slot]);
             int src_dev = current_owner[partition_id];
-            if (src_dev < 0) {
-                throw GegeRuntimeException(fmt::format("Peer relay could not find current owner for partition {}", partition_id));
-            }
-
-            auto *src_buffer = buffers_[src_dev];
-            Partition *src_partition = src_buffer->partition_table_[partition_id];
             Partition *dst_partition = buffer->partition_table_[partition_id];
-            int64_t src_slot = src_partition->buffer_idx_;
             int64_t rows = dst_partition->partition_size_;
             int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
+            int64_t dst_offset = slot * buffer->partition_size_;
+            if (src_dev >= 0) {
+                auto *src_buffer = buffers_[src_dev];
+                Partition *src_partition = src_buffer->partition_table_[partition_id];
+                int64_t src_slot = src_partition->buffer_idx_;
 
-            void *dst_ptr = static_cast<char *>(staged_view.data_ptr()) + (slot * buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
-            void *src_ptr = static_cast<char *>(src_buffer->buffer_tensor_gpu_view_.data_ptr()) +
-                            (src_slot * src_buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
+                void *dst_ptr = static_cast<char *>(staged_view.data_ptr()) + (dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
+                void *src_ptr = static_cast<char *>(src_buffer->buffer_tensor_gpu_view_.data_ptr()) +
+                                (src_slot * src_buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
 
-            cudaError_t status;
-            if (src_dev == device_idx) {
-                status = cudaMemcpyAsync(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice, comm_stream.stream());
-            } else {
-                status = cudaMemcpyPeerAsync(dst_ptr, buffer->device_.index(), src_ptr, src_buffer->device_.index(), bytes, comm_stream.stream());
+                cudaError_t status;
+                if (src_dev == device_idx) {
+                    status = cudaMemcpyAsync(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice, comm_stream.stream());
+                } else {
+                    status = cudaMemcpyPeerAsync(dst_ptr, buffer->device_.index(), src_ptr, src_buffer->device_.index(), bytes, comm_stream.stream());
+                }
+
+                if (status != cudaSuccess) {
+                    throw GegeRuntimeException(fmt::format("Peer relay copy failed for partition {} from device {} to {}: {}",
+                                                          partition_id, src_buffer->device_.index(), buffer->device_.index(),
+                                                          cudaGetErrorString(status)));
+                }
+                if (eval_finite_debug_enabled()) {
+                    relay_debug_slots.emplace_back(partition_id, src_dev, src_slot, slot);
+                }
+                continue;
             }
 
-            if (status != cudaSuccess) {
-                throw GegeRuntimeException(fmt::format("Peer relay copy failed for partition {} from device {} to {}: {}",
-                                                      partition_id, src_buffer->device_.index(), buffer->device_.index(),
-                                                      cudaGetErrorString(status)));
-            }
-            if (eval_finite_debug_enabled()) {
-                relay_debug_slots.emplace_back(partition_id, src_dev, src_slot, slot);
-            }
+            torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
+            load_partition_from_host(dst_partition, cpu_view);
+            torch::Tensor gpu_view = staged_view.slice(0, dst_offset, dst_offset + rows);
+            gpu_view.copy_(cpu_view, true);
         }
 
         cudaStreamSynchronize(comm_stream.stream());
@@ -860,7 +923,6 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
 
     peer_relay_build_barrier_->arrive_and_wait();
 
-    auto previous_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
     auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
     for (int64_t i = 0; i < previous_state.numel(); i++) {
         int partition_id = static_cast<int>(previous_state_ptr[i]);

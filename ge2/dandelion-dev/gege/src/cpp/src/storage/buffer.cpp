@@ -1119,8 +1119,10 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
                     device_.str(), capacity_ * partition_size_, embedding_size_);
     }
     // buffer_tensor_gpu_view_ = buffer_tensor_view_.to(device_);
-    perm_ = torch::arange(0, total_embeddings_, torch::kInt64);
-    pos_  = torch::arange(0, total_embeddings_, torch::kInt64);
+    // The initial host ordering is identity. Materialize permutation tensors only
+    // when repartitioning installs a non-trivial mapping.
+    perm_ = torch::Tensor();
+    pos_ = torch::Tensor();
     refreshHostPartitionRanges_();
     if (log_startup_timing) {
         SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] end device={}", device_.str());
@@ -1139,6 +1141,11 @@ void MemPartitionBuffer::refreshHostPartitionRanges_() {
     partition_host_contiguous_.assign(static_cast<std::size_t>(num_partitions_), false);
 
     if (!pos_.defined()) {
+        for (int partition_id = 0; partition_id < num_partitions_; partition_id++) {
+            Partition *partition = partition_table_[partition_id];
+            partition_host_contiguous_[partition_id] = true;
+            partition_host_start_offsets_[partition_id] = partition->idx_offset_;
+        }
         return;
     }
 
@@ -1227,8 +1234,12 @@ torch::Tensor MemPartitionBuffer::getGlobalToLocalMap(bool get_current) {
         Partition *partition = partition_table_[partition_id];
         int64_t partition_offset = partition->idx_offset_;
         int64_t buffer_offset = partition->buffer_idx_ * partition_size_;
-        buffer_index_map.index_put_({pos_.slice(0, partition_offset, partition_offset + partition->partition_size_)}, 
-                                                torch::arange(buffer_offset, buffer_offset + partition->partition_size_));
+        torch::Tensor local_indices = torch::arange(buffer_offset, buffer_offset + partition->partition_size_);
+        if (hasContiguousHostPartitionRange_(partition_id)) {
+            buffer_index_map.narrow(0, contiguousHostPartitionStart_(partition_id), partition->partition_size_).copy_(local_indices);
+        } else {
+            buffer_index_map.index_put_({pos_.slice(0, partition_offset, partition_offset + partition->partition_size_)}, local_indices);
+        }
     }
     return buffer_index_map;
 }
@@ -1728,11 +1739,14 @@ void MemPartitionBuffer::unload(bool write) {
             for (int64_t slot = 0; slot < active_state.numel(); slot++) {
                 int partition_id = static_cast<int>(state_ptr[slot]);
                 Partition *partition = partition_table_[partition_id];
-                torch::Tensor global_ids =
-                    pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_);
-                torch::Tensor host_snapshot = hasContiguousHostPartitionRange_(partition_id)
-                                                 ? data_storage_.narrow(0, contiguousHostPartitionStart_(partition_id), partition->partition_size_)
-                                                 : data_storage_.index_select(0, global_ids);
+                torch::Tensor host_snapshot;
+                if (hasContiguousHostPartitionRange_(partition_id)) {
+                    host_snapshot = data_storage_.narrow(0, contiguousHostPartitionStart_(partition_id), partition->partition_size_);
+                } else {
+                    torch::Tensor global_ids =
+                        pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_);
+                    host_snapshot = data_storage_.index_select(0, global_ids);
+                }
                 log_non_finite_rows_if_any("host_sync", eval_finite_log_id, device_, partition_id, host_snapshot);
             }
         }

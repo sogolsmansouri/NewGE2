@@ -1112,7 +1112,8 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
         SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] pinned host buffer ready device={} rows={} dim={}",
                     device_.str(), capacity_ * partition_size_, embedding_size_);
     }
-    buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, dtype_).to(device_);
+    torch::TensorOptions device_options = torch::TensorOptions().dtype(dtype_).device(device_);
+    buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, device_options);
     if (log_startup_timing) {
         SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] device buffer ready device={} rows={} dim={}",
                     device_.str(), capacity_ * partition_size_, embedding_size_);

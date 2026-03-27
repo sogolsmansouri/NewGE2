@@ -750,16 +750,12 @@ void Model::broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig
             shared_ptr<Decoder> decoder = decoder_clone_helper(decoder_, device);
             device_models_[i] = std::make_shared<Model>(encoder, decoder, loss_function_, reporter_);
             device_models_[i]->device_ = device;
-            for (auto optim : optimizers_) {
-                // device_models_[i]->optimizers_.emplace_back(optim->clone());
+            device_models_[i]->negative_sampling_method_ = negative_sampling_method_;
+            device_models_[i]->negative_sampling_selected_ratio_ = negative_sampling_selected_ratio_;
+            if (!optimizers_.empty()) {
                 device_models_[i]->setup_optimizers(model_config);
-                device_models_[i]->sparse_lr_ = sparse_lr_;
             }
-            if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {
-                for (auto optim : optimizers_g_) {
-                    device_models_[i]->optimizers_g_.emplace_back(optim->clone());
-                }
-            }
+            device_models_[i]->sparse_lr_ = sparse_lr_;
         } else {
             device_models_[i] = std::dynamic_pointer_cast<Model>(shared_from_this());
         }

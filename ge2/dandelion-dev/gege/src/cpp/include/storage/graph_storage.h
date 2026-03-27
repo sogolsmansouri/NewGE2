@@ -1,5 +1,7 @@
 #pragma once
 
+#include <exception>
+
 #include "configuration/constants.h"
 #include "storage/storage.h"
 
@@ -267,12 +269,28 @@ class GraphModelStorage {
 
         if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
             std::vector<std::thread> threads;
-            threads.push_back(std::thread(&MemPartitionBufferStorage::performNextSwap, std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings), device_idx));
+            std::exception_ptr thread_exception = nullptr;
+            std::mutex thread_exception_lock;
+            auto run_mem_swap = [&](std::shared_ptr<MemPartitionBufferStorage> storage) {
+                try {
+                    storage->performNextSwap(device_idx);
+                } catch (...) {
+                    std::lock_guard<std::mutex> lock(thread_exception_lock);
+                    if (thread_exception == nullptr) {
+                        thread_exception = std::current_exception();
+                    }
+                }
+            };
+
+            threads.push_back(std::thread(run_mem_swap, std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)));
             if (storage_ptrs_.node_optimizer_state != nullptr && train_) {
-                threads.push_back(std::thread(&MemPartitionBufferStorage::performNextSwap, std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state), device_idx));
+                threads.push_back(std::thread(run_mem_swap, std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)));
             }
             for(auto& thread : threads) {
                 thread.join();
+            }
+            if (thread_exception != nullptr) {
+                std::rethrow_exception(thread_exception);
             }
 
             // std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->performNextSwap(device_idx);

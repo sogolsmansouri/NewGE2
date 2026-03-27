@@ -99,6 +99,26 @@ set(Python_EXECUTABLE "${Python3_EXECUTABLE}" CACHE FILEPATH "" FORCE)
 find_package(Python COMPONENTS Interpreter Development REQUIRED)
 find_package(Torch REQUIRED)
 
+# Older ARC Torch/Caffe2 packages may report optional CUDA deps such as
+# nvToolsExt as unresolved `*-NOTFOUND` entries. Link against the resolved
+# subset so missing profiling libraries do not break the build.
+if(DEFINED LIBNVTOOLSEXT AND "${LIBNVTOOLSEXT}" MATCHES "NOTFOUND")
+    message(WARNING "Torch reported unresolved nvToolsExt library (${LIBNVTOOLSEXT}); continuing without explicit nvToolsExt linkage.")
+    set(LIBNVTOOLSEXT "" CACHE FILEPATH "Optional nvToolsExt library" FORCE)
+endif()
+
+set(GEGE_TORCH_LIBRARIES ${TORCH_LIBRARIES})
+set(_gege_missing_torch_libs "")
+foreach(_gege_torch_lib IN LISTS GEGE_TORCH_LIBRARIES)
+    if("${_gege_torch_lib}" MATCHES "NOTFOUND")
+        list(APPEND _gege_missing_torch_libs "${_gege_torch_lib}")
+    endif()
+endforeach()
+if(_gege_missing_torch_libs)
+    list(REMOVE_ITEM GEGE_TORCH_LIBRARIES ${_gege_missing_torch_libs})
+    message(WARNING "Dropping unresolved Torch libraries: ${_gege_missing_torch_libs}")
+endif()
+
 execute_process(
         COMMAND ${GEGE_PYTHON_EXECUTABLE} -c "import torch; print(int(bool(torch._C._GLIBCXX_USE_CXX11_ABI)), end='')"
         OUTPUT_VARIABLE TORCH_CXX11_ABI
@@ -160,7 +180,7 @@ add_library(${PROJECT_NAME}
             ${project_CUDA_THIRD_PARTY_SOURCES})
 
 target_link_libraries(${PROJECT_NAME} ${Python3_LIBRARIES})
-target_link_libraries(${PROJECT_NAME} ${TORCH_LIBRARIES})
+target_link_libraries(${PROJECT_NAME} ${GEGE_TORCH_LIBRARIES})
 target_link_libraries(${PROJECT_NAME} spdlog)
 set_target_properties(${PROJECT_NAME} PROPERTIES PUBLIC_HEADER "${project_HEADERS}")
 set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)

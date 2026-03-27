@@ -131,7 +131,7 @@ foreach(_gege_torch_target torch torch_cpu torch_cuda c10_cuda c10)
             set_property(TARGET ${_gege_torch_target} PROPERTY INTERFACE_LINK_LIBRARIES "${_gege_filtered_target_link_libs}")
         endif()
     endif()
-endif()
+endforeach()
 
 execute_process(
         COMMAND ${GEGE_PYTHON_EXECUTABLE} -c "import torch; print(int(bool(torch._C._GLIBCXX_USE_CXX11_ABI)), end='')"

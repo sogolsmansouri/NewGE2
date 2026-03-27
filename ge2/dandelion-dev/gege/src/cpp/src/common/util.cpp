@@ -71,7 +71,7 @@ int64_t unique_capture_max_batches() {
 }
 
 bool unique_backend_log_enabled() {
-    static bool enabled = parse_env_flag("GEGE_UNIQUE_LOG", true);
+    static bool enabled = parse_env_flag("GEGE_UNIQUE_LOG", false);
     return enabled;
 }
 

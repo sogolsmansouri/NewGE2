@@ -33,8 +33,10 @@ class TorchWriter(object):
 
         if valid_edges_tens is not None:
             dataset_stats.num_valid = valid_edges_tens.size(0)
+            dataset_stats.num_edges += valid_edges_tens.size(0)
         if test_edges_tens is not None:
             dataset_stats.num_test = test_edges_tens.size(0)
+            dataset_stats.num_edges += test_edges_tens.size(0)
 
         dataset_stats.num_nodes = num_nodes
         dataset_stats.num_relations = num_rels

@@ -56,7 +56,7 @@ bool eval_finite_debug_enabled() {
 }
 
 bool eval_chunked_ranks_enabled() {
-    static bool enabled = parse_env_flag("GEGE_EVAL_CHUNKED_RANKS", true);
+    static bool enabled = parse_env_flag("GEGE_EVAL_CHUNKED_RANKS", false);
     return enabled;
 }
 

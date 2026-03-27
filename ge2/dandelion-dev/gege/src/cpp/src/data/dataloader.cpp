@@ -54,7 +54,7 @@ bool stage_debug_enabled() {
 }
 
 bool fast_map_tensors_enabled() {
-    static bool enabled = parse_env_flag("GEGE_FAST_MAP_TENSORS", true);
+    static bool enabled = parse_env_flag("GEGE_FAST_MAP_TENSORS", false);
     return enabled;
 }
 
@@ -279,7 +279,7 @@ bool bucket_streaming_lp_enabled() {
 }
 
 bool gpu_active_edge_shuffle_enabled() {
-    static bool enabled = parse_env_flag("GEGE_GPU_ACTIVE_EDGE_SHUFFLE", true);
+    static bool enabled = parse_env_flag("GEGE_GPU_ACTIVE_EDGE_SHUFFLE", false);
     return enabled;
 }
 
@@ -681,7 +681,7 @@ void DataLoader::refreshGraphStorageMode() {
     bool enable_fast_path = false;
     if (graph_storage_ != nullptr && learning_task_ == LearningTask::LINK_PREDICTION && train_ && graph_storage_->useInMemorySubGraph() &&
         neighbor_sampler_ == nullptr && !negative_sampler_filtered(negative_sampler_)) {
-        enable_fast_path = partition_buffer_lp_fast_path_env_enabled(true);
+        enable_fast_path = partition_buffer_lp_fast_path_env_enabled(false);
     }
     graph_storage_->setPartitionBufferLPFastPathEnabled(enable_fast_path);
 
@@ -1120,7 +1120,7 @@ void DataLoader::setBufferOrdering() {
                             physical_devices, requested_active_devices);
             }
             bool access_aware_state_generation = false;
-            bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", true);
+            bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
             const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
             if (access_aware_state_generation_env != nullptr && access_aware_state_generation_env[0] != '\0' &&
                 std::string(access_aware_state_generation_env) != "0") {

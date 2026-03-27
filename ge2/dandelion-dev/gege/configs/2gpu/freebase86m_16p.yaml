@@ -1,3 +1,5 @@
+# Shared 2-GPU Freebase86M paper config.
+
 model:
   random_seed: 741135446461071584
   learning_task: LINK_PREDICTION
@@ -5,28 +7,33 @@ model:
     layers:
       - - type: EMBEDDING
           output_dim: 100
+          bias: true
+          init:
+            type: GLOROT_NORMAL
   decoder:
     type: DISTMULT
     options:
       input_dim: 100
+      inverse_edges: true
+      edge_decoder_method: CORRUPT_NODE
   loss:
     type: SOFTMAX_CE
     options:
       reduction: SUM
   dense_optimizer:
-    type: ADAGRAD
+    type: ADAM
     options:
-      learning_rate: 0.1
+      learning_rate: 0.01
   sparse_optimizer:
     type: ADAGRAD
     options:
       learning_rate: 0.1
 
 storage:
-  device_type: cpu
-  device_ids: [0]
+  device_type: cuda
+  device_ids: [0, 1]
   dataset:
-    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/twitter_16p_paper_10k_eval
+    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/freebase86m_16p_paper_10k_eval
   edges:
     type: HOST_MEMORY
     options:
@@ -44,25 +51,38 @@ storage:
       randomly_assign_edge_buckets: false
   prefetch: false
   shuffle_input: true
-  full_graph_evaluation: true
-  model_dir: /dev/shm/smansou2_ge2/paper_single_gpu/twitter_16p_opt
+  full_graph_evaluation: false
+  model_dir: /dev/shm/smansou2_ge2/config_matrix/main/2gpu/freebase86m_16p
   log_level: info
 
 training:
   batch_size: 50000
   negative_sampling_method: RNS
+  negative_sampling_selected_ratio: 1.0
   negative_sampling:
     num_chunks: 50
     negatives_per_positive: 1000
     degree_fraction: 0.5
     filtered: false
+    local_filter_mode: DEG
   num_epochs: 10
   epochs_per_shuffle: 1
-  save_model: false
+  logs_per_epoch: 10
+  save_model: true
+  checkpoint:
+    save_best: false
+    interval: -1
+    save_state: false
+  resume_training: false
+  resume_from_checkpoint: ''
 
 evaluation:
-  checkpoint_dir: /dev/shm/smansou2_ge2/paper_single_gpu/twitter_16p_opt
-  epochs_per_eval: 1
-  batch_size: 1000
+  epochs_per_eval: 1000
+  batch_size: 250
   negative_sampling:
+    num_chunks: 1
+    negatives_per_positive: 10000
+    degree_fraction: 0.0
     filtered: true
+    local_filter_mode: DEG
+  checkpoint_dir: /dev/shm/smansou2_ge2/config_matrix/main/2gpu/freebase86m_16p

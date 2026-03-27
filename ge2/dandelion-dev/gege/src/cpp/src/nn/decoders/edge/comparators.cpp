@@ -89,7 +89,7 @@ torch::Tensor L2Compare::operator()(torch::Tensor src, torch::Tensor dst) {
     } else if (src.dim() == 2 && dst.dim() == 3) {
         return pairwise_l2_distance_2d_3d(src, dst, false);
     } else if (src.dim() == 2 && dst.dim() == 4) {
-        if (!parse_env_flag("GEGE_L2_SELECTED_BMM", true)) {
+        if (!parse_env_flag("GEGE_L2_SELECTED_BMM", false)) {
             int64_t chunk_num = dst.size(0);
             torch::Tensor src_view = pad_and_reshape(src, chunk_num).unsqueeze(2);
             double tol = 1e-8;

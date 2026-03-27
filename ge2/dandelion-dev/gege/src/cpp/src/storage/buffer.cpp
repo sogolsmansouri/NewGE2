@@ -60,7 +60,7 @@ bool parse_env_flag(const char *name, bool default_value) {
 }
 
 bool csr_update_enabled() {
-    static bool enabled = parse_env_flag("GEGE_CSR_UPDATE", true);
+    static bool enabled = parse_env_flag("GEGE_CSR_UPDATE", false);
     return enabled;
 }
 
@@ -85,7 +85,7 @@ bool startup_timing_enabled() {
 }
 
 bool mem_partition_buffer_pinned_host_enabled() {
-    static bool enabled = parse_env_flag("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST", true);
+    static bool enabled = parse_env_flag("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST", false);
     return enabled;
 }
 

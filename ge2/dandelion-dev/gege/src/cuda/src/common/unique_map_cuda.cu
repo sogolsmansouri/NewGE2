@@ -153,7 +153,7 @@ int64_t parse_env_int64(const char* name, int64_t default_value) {
 }
 
 bool hash_unique_enabled() {
-    static bool enabled = parse_env_flag("GEGE_UNIQUE_HASH", true);
+    static bool enabled = parse_env_flag("GEGE_UNIQUE_HASH", false);
     return enabled;
 }
 

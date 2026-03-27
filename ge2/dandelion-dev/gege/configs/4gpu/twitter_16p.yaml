@@ -1,5 +1,9 @@
+# Shared 4-GPU Twitter paper config.
+# Run with:
+#   GEGE_EMULATE_DOT_SINGLE_RELATION=1
+
 model:
-  random_seed: 5650194872900178194
+  random_seed: 741135446461071584
   learning_task: LINK_PREDICTION
   encoder:
     layers:
@@ -14,9 +18,9 @@ model:
     options:
       reduction: SUM
   dense_optimizer:
-    type: ADAGRAD
+    type: SGD
     options:
-      learning_rate: 0.1
+      learning_rate: 0.0
   sparse_optimizer:
     type: ADAGRAD
     options:
@@ -24,9 +28,9 @@ model:
 
 storage:
   device_type: cuda
-  device_ids: [0]
+  device_ids: [0, 1, 2, 3]
   dataset:
-    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/livejournal_16p_10k_eval
+    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/twitter_16p_paper_10k_eval
   edges:
     type: HOST_MEMORY
     options:
@@ -44,25 +48,38 @@ storage:
       randomly_assign_edge_buckets: false
   prefetch: false
   shuffle_input: true
-  full_graph_evaluation: true
-  model_dir: /dev/shm/smansou2_ge2/paper_single_gpu/livejournal_16p_baseline
+  full_graph_evaluation: false
+  model_dir: /dev/shm/smansou2_ge2/config_matrix/main/4gpu/twitter_16p
   log_level: info
 
 training:
   batch_size: 50000
   negative_sampling_method: RNS
+  negative_sampling_selected_ratio: 1.0
   negative_sampling:
     num_chunks: 50
     negatives_per_positive: 1000
     degree_fraction: 0.5
     filtered: false
-  num_epochs: 30
+    local_filter_mode: DEG
+  num_epochs: 10
   epochs_per_shuffle: 1
-  save_model: false
+  logs_per_epoch: 10
+  save_model: true
+  checkpoint:
+    save_best: false
+    interval: -1
+    save_state: false
+  resume_training: false
+  resume_from_checkpoint: ''
 
 evaluation:
-  checkpoint_dir: /dev/shm/smansou2_ge2/paper_single_gpu/livejournal_16p_baseline
-  epochs_per_eval: 1
-  batch_size: 1000
+  epochs_per_eval: 1000
+  batch_size: 1
   negative_sampling:
+    num_chunks: 1
+    negatives_per_positive: 10000
+    degree_fraction: 0.0
     filtered: true
+    local_filter_mode: DEG
+  checkpoint_dir: /dev/shm/smansou2_ge2/config_matrix/main/4gpu/twitter_16p

@@ -40,7 +40,7 @@ std::vector<int64_t> tensor_to_partitions(torch::Tensor tensor) {
 bool optimized_custom_schedule_enabled() {
     const char *raw = std::getenv("GEGE_OPTIMIZED_CUSTOM_SCHEDULE");
     if (raw == nullptr) {
-        return true;
+        return false;
     }
 
     std::string value(raw);

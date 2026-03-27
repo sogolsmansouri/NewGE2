@@ -1,3 +1,7 @@
+# Shared 2-GPU LiveJournal paper config.
+# Run with:
+#   GEGE_EMULATE_DOT_SINGLE_RELATION=1
+
 model:
   random_seed: 5650194872900178194
   learning_task: LINK_PREDICTION
@@ -14,23 +18,27 @@ model:
     options:
       reduction: SUM
   dense_optimizer:
-      type: ADAGRAD
-      options:
-        learning_rate: 0.1
+    type: SGD
+    options:
+      learning_rate: 0.0
   sparse_optimizer:
-      type: ADAGRAD
-      options:
-        learning_rate: 0.1
+    type: ADAGRAD
+    options:
+      learning_rate: 0.1
+
 storage:
   device_type: cuda
-  device_ids: [0]
+  device_ids: [0, 1]
   dataset:
-    dataset_dir: ./datasets/livejournal_16p
+    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/livejournal_16p_10k_eval
   edges:
     type: HOST_MEMORY
+    options:
+      dtype: int
   embeddings:
     type: MEM_PARTITION_BUFFER
     options:
+      dtype: float
       num_partitions: 16
       buffer_capacity: 4
       prefetching: false
@@ -39,23 +47,39 @@ storage:
       edge_bucket_ordering: CUSTOM
       randomly_assign_edge_buckets: false
   prefetch: false
-  save_model: false
+  shuffle_input: true
+  full_graph_evaluation: false
+  model_dir: /dev/shm/smansou2_ge2/config_matrix/main/2gpu/livejournal_16p
+  log_level: info
+
 training:
   batch_size: 50000
   negative_sampling_method: RNS
-  negative_sampling_selected_ratio: 0.1
+  negative_sampling_selected_ratio: 1.0
   negative_sampling:
     num_chunks: 50
     negatives_per_positive: 1000
-    degree_fraction: 0.0
+    degree_fraction: 0.5
     filtered: false
+    local_filter_mode: DEG
   num_epochs: 30
   epochs_per_shuffle: 1
+  logs_per_epoch: 10
+  save_model: true
+  checkpoint:
+    save_best: false
+    interval: -1
+    save_state: false
+  resume_training: false
+  resume_from_checkpoint: ''
+
 evaluation:
-  epochs_per_eval: 10
-  batch_size: 1000
+  epochs_per_eval: 1000
+  batch_size: 1
   negative_sampling:
     num_chunks: 1
     negatives_per_positive: 10000
     degree_fraction: 0.0
-    filtered: false
+    filtered: true
+    local_filter_mode: DEG
+  checkpoint_dir: /dev/shm/smansou2_ge2/config_matrix/main/2gpu/livejournal_16p

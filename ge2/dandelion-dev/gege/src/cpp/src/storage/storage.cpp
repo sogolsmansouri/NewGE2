@@ -57,7 +57,7 @@ bool parse_env_flag(const char *name, bool default_value) {
 }
 
 bool csr_update_enabled() {
-    static bool enabled = parse_env_flag("GEGE_CSR_UPDATE", true);
+    static bool enabled = parse_env_flag("GEGE_CSR_UPDATE", false);
     return enabled;
 }
 

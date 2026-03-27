@@ -191,6 +191,10 @@ void SynchronousTrainer::train(int num_epochs) {
 
     Timer timer = Timer(false);
     for (int epoch = 0; epoch < num_epochs; epoch++) {
+        auto epoch_start_wall = std::chrono::high_resolution_clock::now();
+        if (has_last_epoch_end_) {
+            SPDLOG_INFO("Inter-Epoch Gap: {}ms", elapsed_ns(last_epoch_end_, epoch_start_wall) / 1000000);
+        }
         dataloader_->resetPerfStats();
         timer.start();
         std::vector<SingleDeviceStateTiming> state_timings;
@@ -269,6 +273,8 @@ void SynchronousTrainer::train(int num_epochs) {
         }
 
         SPDLOG_INFO("################ Finished training epoch {} ################", dataloader_->getEpochsProcessed() + 1);
+        last_epoch_end_ = std::chrono::high_resolution_clock::now();
+        has_last_epoch_end_ = true;
         timer.stop();
 
         dataloader_->nextEpoch();
@@ -402,6 +408,10 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
     Timer timer = Timer(false);
 
     for (int epoch = 0; epoch < num_epochs; epoch++) {
+        auto epoch_start_wall = std::chrono::high_resolution_clock::now();
+        if (has_last_epoch_end_) {
+            SPDLOG_INFO("Inter-Epoch Gap: {}ms", elapsed_ns(last_epoch_end_, epoch_start_wall) / 1000000);
+        }
         dataloader_->resetPerfStats();
         timer.start();
         std::atomic<int64_t> need_sync = 0;
@@ -543,6 +553,8 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
         }
 
         SPDLOG_INFO("################ Finished training epoch {} ################", dataloader_->getEpochsProcessed() + 1);
+        last_epoch_end_ = std::chrono::high_resolution_clock::now();
+        has_last_epoch_end_ = true;
         timer.stop();
         dataloader_->nextEpoch();
         progress_reporter_->clear();

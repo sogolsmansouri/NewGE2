@@ -20,7 +20,7 @@ class Livejournal(LinkPredictionDataset):
     def __init__(self, output_directory: Path, spark=False):
         super().__init__(output_directory, spark)
 
-        self.dataset_name = "twitter"
+        self.dataset_name = "livejournal"
         self.dataset_url = "https://snap.stanford.edu/data/soc-LiveJournal1.txt.gz"
 
     def download(self, overwrite=False):
@@ -47,7 +47,7 @@ class Livejournal(LinkPredictionDataset):
             columns=[0, 1],
             header_length=0,
             num_partitions=num_partitions,
-            splits=[0.9, 0.05, 0.05],
+            splits=splits,
             remap_ids=remap_ids,
             partitioned_evaluation=partitioned_eval,
         )

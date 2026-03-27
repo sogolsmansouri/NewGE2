@@ -1,5 +1,7 @@
 #pragma once
 
+#include <chrono>
+
 #include "configuration/options.h"
 #include "data/dataloader.h"
 #include "nn/model.h"
@@ -24,6 +26,8 @@ class Trainer {
 
 class SynchronousTrainer : public Trainer {
     std::shared_ptr<Model> model_;
+    bool has_last_epoch_end_ = false;
+    std::chrono::high_resolution_clock::time_point last_epoch_end_;
 
    public:
     SynchronousTrainer(shared_ptr<DataLoader> dataloader, std::shared_ptr<Model> model, int logs_per_epoch = 10);
@@ -33,6 +37,8 @@ class SynchronousTrainer : public Trainer {
 
 class SynchronousMultiGPUTrainer : public Trainer {
     std::shared_ptr<Model> model_;
+    bool has_last_epoch_end_ = false;
+    std::chrono::high_resolution_clock::time_point last_epoch_end_;
 
    public:
     SynchronousMultiGPUTrainer(shared_ptr<DataLoader> dataloader, std::shared_ptr<Model> model, int logs_per_epoch = 10);

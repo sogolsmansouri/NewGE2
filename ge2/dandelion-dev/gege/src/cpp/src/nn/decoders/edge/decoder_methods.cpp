@@ -91,12 +91,12 @@ std::tuple<torch::Tensor, torch::Tensor> unique_with_inverse_compat(torch::Tenso
 }
 
 bool csr_debug_enabled() {
-    static bool enabled = parse_env_flag("GEGE_CSR_DEBUG", true);
+    static bool enabled = parse_env_flag("GEGE_CSR_DEBUG", false);
     return enabled;
 }
 
 bool csr_gather_enabled() {
-    static bool enabled = parse_env_flag("GEGE_CSR_GATHER", true);
+    static bool enabled = parse_env_flag("GEGE_CSR_GATHER", false);
     return enabled;
 }
 
@@ -108,10 +108,10 @@ bool stage_debug_enabled() {
 bool selected_neg_cuda_enabled() {
     const char *new_name = std::getenv("GEGE_SELECTED_NEG_CUDA");
     if (new_name != nullptr) {
-        return parse_env_flag("GEGE_SELECTED_NEG_CUDA", true);
+        return parse_env_flag("GEGE_SELECTED_NEG_CUDA", false);
     }
 
-    static bool enabled = parse_env_flag("GEGE_DISTMULT_SELECTED_CUDA", true);
+    static bool enabled = parse_env_flag("GEGE_DISTMULT_SELECTED_CUDA", false);
     return enabled;
 }
 
@@ -131,7 +131,7 @@ std::atomic<int64_t> &tiled_tournament_scores_validate_counter() {
 }
 
 bool transe_squared_sampling_enabled() {
-    static bool enabled = parse_env_flag("GEGE_TRANSE_SQUARED_SAMPLING", true);
+    static bool enabled = parse_env_flag("GEGE_TRANSE_SQUARED_SAMPLING", false);
     return enabled;
 }
 

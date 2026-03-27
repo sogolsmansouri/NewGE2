@@ -1093,6 +1093,11 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     :PartitionBuffer(capacity, num_partitions, fine_to_coarse_ratio, partition_size, embedding_size, total_embeddings, dtype, filename, prefetching) {
     buffer_sizes_ = buffer_sizes;
     device_ = device;
+    bool log_startup_timing = startup_timing_enabled();
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] begin device={} capacity={} partition_size={} dim={} total_embeddings={} buffer_sizes={}",
+                    device_.str(), capacity_, partition_size_, embedding_size_, total_embeddings_, buffer_sizes_);
+    }
 
     // if (posix_memalign(&buff_mem_, 4096, capacity_ * partition_size_ * embedding_size_ * dtype_size_)) {
     //     SPDLOG_ERROR("Unable to allocate buffer memory\nError: {}", errno);
@@ -1103,11 +1108,22 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     torch::TensorOptions options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU).pinned_memory(true);
     buffer_tensor_view_ = torch::zeros({capacity_ * partition_size_, embedding_size_}, options);
     buff_mem_ = buffer_tensor_view_.data_ptr();
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] pinned host buffer ready device={} rows={} dim={}",
+                    device_.str(), capacity_ * partition_size_, embedding_size_);
+    }
     buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, dtype_).to(device_);
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] device buffer ready device={} rows={} dim={}",
+                    device_.str(), capacity_ * partition_size_, embedding_size_);
+    }
     // buffer_tensor_gpu_view_ = buffer_tensor_view_.to(device_);
     perm_ = torch::arange(0, total_embeddings_, torch::kInt64);
     pos_  = torch::arange(0, total_embeddings_, torch::kInt64);
     refreshHostPartitionRanges_();
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] end device={}", device_.str());
+    }
 }
 
 MemPartitionBuffer::~MemPartitionBuffer() {

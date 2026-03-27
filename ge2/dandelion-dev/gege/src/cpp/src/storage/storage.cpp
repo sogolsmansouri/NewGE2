@@ -478,10 +478,24 @@ MemPartitionBufferStorage::MemPartitionBufferStorage(string filename, int64_t di
     int64_t partition_size = ceil((double)dim0_size_ / options_->num_partitions);
     device_ = torch::kCUDA;
     devices_ = devices;
+    bool log_startup_timing = startup_timing_enabled();
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::ctor] begin filename={} dim0={} dim1={} devices={} partition_size={} capacity={}",
+                    filename_, dim0_size_, dim1_size_, devices_.size(), partition_size, options_->buffer_capacity);
+    }
     for (int i = 0; i < devices_.size(); i ++) {
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::ctor] begin buffer_idx={} device={}", i, devices_[i].str());
+        }
         MemPartitionBuffer* buffer = new MemPartitionBuffer(options_->buffer_capacity, options_->num_partitions, options_->fine_to_coarse_ratio, partition_size, dim1_size_, dim0_size_,
                                   dtype_, filename_, options_->prefetching, devices_[i], devices_.size());
         buffers_.emplace_back(buffer);
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::ctor] end buffer_idx={} device={}", i, devices_[i].str());
+        }
+    }
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::ctor] end filename={} buffers={}", filename_, buffers_.size());
     }
 }
 

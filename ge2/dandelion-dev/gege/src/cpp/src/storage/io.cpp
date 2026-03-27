@@ -1,11 +1,48 @@
 #include "storage/io.h"
 
+#include <cstdlib>
 #include <fstream>
+#include <string>
 #include "configuration/constants.h"
 #include "nn/initialization.h"
 #include "nn/model.h"
 #include "reporting/logger.h"
 #include "configuration/util.h"
+
+namespace {
+
+bool startup_timing_enabled() {
+    const char *raw = std::getenv("GEGE_STARTUP_TIMING");
+    if (raw == nullptr) {
+        return false;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+
+    return value == "1" || value == "true" || value == "True" || value == "TRUE";
+}
+
+const char *storage_backend_name(StorageBackend backend) {
+    switch (backend) {
+        case StorageBackend::PARTITION_BUFFER:
+            return "partition_buffer";
+        case StorageBackend::MEM_PARTITION_BUFFER:
+            return "mem_partition_buffer";
+        case StorageBackend::FLAT_FILE:
+            return "flat_file";
+        case StorageBackend::HOST_MEMORY:
+            return "host_memory";
+        case StorageBackend::DEVICE_MEMORY:
+            return "device_memory";
+        default:
+            return "unknown";
+    }
+}
+
+}  // namespace
 
 std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>> initializeEdges(shared_ptr<StorageConfig> storage_config,
                                                                                           LearningTask learning_task) {
@@ -168,6 +205,12 @@ std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>, shared
     int64_t num_nodes = storage_config->dataset->num_nodes;
     int embedding_dim = model->get_base_embedding_dim();
     torch::Dtype dtype = storage_config->embeddings->options->dtype;
+    bool log_startup_timing = startup_timing_enabled();
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][initializeNodeEmbeddings] begin backend={} num_nodes={} embedding_dim={} train={} reinitialize={} devices={}",
+                    storage_backend_name(storage_config->embeddings->type), num_nodes, embedding_dim, train, reinitialize,
+                    devices_from_config(storage_config).size());
+    }
 
     if (reinitialize) {
         shared_ptr<FlatFile> init_node_embeddings = std::make_shared<FlatFile>(node_embedding_filename, dtype);
@@ -215,16 +258,28 @@ std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>, shared
 
     switch (storage_config->embeddings->type) {
         case StorageBackend::MEM_PARTITION_BUFFER: {
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][initializeNodeEmbeddings] creating node_embeddings backend=mem_partition_buffer devices={}", devices.size());
+            }
             node_embeddings = std::make_shared<MemPartitionBufferStorage>(node_embedding_filename, num_nodes, embedding_dim,
                                                                         std::dynamic_pointer_cast<PartitionBufferOptions>(storage_config->embeddings->options), devices);
             if (nsm == NegativeSamplingMethod::GAN) {
+                if (log_startup_timing) {
+                    SPDLOG_INFO("[startup-timing][initializeNodeEmbeddings] creating node_embeddings_g backend=mem_partition_buffer devices={}", devices.size());
+                }
                 node_embeddings_g = std::make_shared<MemPartitionBufferStorage>(node_embedding_g_filename, num_nodes, embedding_dim,
                                                                         std::dynamic_pointer_cast<PartitionBufferOptions>(storage_config->embeddings->options), devices);
             }
             if (train) {
+                if (log_startup_timing) {
+                    SPDLOG_INFO("[startup-timing][initializeNodeEmbeddings] creating optimizer_state backend=mem_partition_buffer devices={}", devices.size());
+                }
                 optimizer_state_storage = std::make_shared<MemPartitionBufferStorage>(
                     optimizer_state_filename, num_nodes, embedding_dim, std::dynamic_pointer_cast<PartitionBufferOptions>(storage_config->embeddings->options), devices);
                 if (nsm == NegativeSamplingMethod::GAN) {
+                    if (log_startup_timing) {
+                        SPDLOG_INFO("[startup-timing][initializeNodeEmbeddings] creating optimizer_state_g backend=mem_partition_buffer devices={}", devices.size());
+                    }
                     optimizer_state_storage_g = std::make_shared<MemPartitionBufferStorage>(
                         optimizer_state_g_filename, num_nodes, embedding_dim, std::dynamic_pointer_cast<PartitionBufferOptions>(storage_config->embeddings->options), devices);
                 }
@@ -274,6 +329,11 @@ std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>, shared
             }
             break;
         }
+    }
+
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][initializeNodeEmbeddings] end backend={} train={} reinitialize={}",
+                    storage_backend_name(storage_config->embeddings->type), train, reinitialize);
     }
 
     return std::forward_as_tuple(node_embeddings, optimizer_state_storage, node_embeddings_g, optimizer_state_storage_g);
@@ -433,9 +493,20 @@ shared_ptr<Storage> initializeNodeLabels(shared_ptr<Model> model, shared_ptr<Sto
 
 shared_ptr<GraphModelStorage> initializeStorageLinkPrediction(shared_ptr<Model> model, shared_ptr<StorageConfig> storage_config, bool reinitialize, bool train,
                                                               NegativeSamplingMethod nsm, shared_ptr<InitConfig> init_config) {                                                            
+    bool log_startup_timing = startup_timing_enabled();
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][initializeStorageLinkPrediction] begin train={} reinitialize={} nsm={}",
+                    train, reinitialize, static_cast<int>(nsm));
+    }
     std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>> edge_storages = initializeEdges(storage_config, model->learning_task_);
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][initializeStorageLinkPrediction] edges initialized");
+    }
     std::tuple<shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>, shared_ptr<Storage>> node_embeddings =
             initializeNodeEmbeddings(model, storage_config, reinitialize, train, nsm, init_config);
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][initializeStorageLinkPrediction] node embeddings initialized");
+    }
 
     GraphModelStoragePtrs storage_ptrs = {};
 
@@ -491,6 +562,9 @@ shared_ptr<GraphModelStorage> initializeStorageLinkPrediction(shared_ptr<Model> 
     }
 
     shared_ptr<GraphModelStorage> graph_model_storage = std::make_shared<GraphModelStorage>(storage_ptrs, storage_config);
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][initializeStorageLinkPrediction] graph model storage created");
+    }
 
     return graph_model_storage;
 }

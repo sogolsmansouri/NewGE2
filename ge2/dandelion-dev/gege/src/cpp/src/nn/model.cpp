@@ -65,6 +65,11 @@ bool emulate_dot_single_relation_enabled() {
     return enabled;
 }
 
+bool startup_timing_enabled() {
+    static bool enabled = parse_env_flag("GEGE_STARTUP_TIMING", false);
+    return enabled;
+}
+
 int64_t eval_negative_chunk_size() {
     static int64_t chunk_size = std::max<int64_t>(parse_env_int("GEGE_EVAL_NEGATIVE_CHUNK_SIZE", 131072), 1);
     return chunk_size;
@@ -742,22 +747,45 @@ void Model::evaluate_batch(shared_ptr<Batch> batch) {
 }
 
 void Model::broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig> model_config) {
+    bool log_startup_timing = startup_timing_enabled();
     int i = 0;
     for (auto device : devices) {
         SPDLOG_INFO("Broadcast to GPU {}", device.index());
         if (device != device_) {
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][Model::broadcast] begin clone slot={} device={}", i, device.str());
+            }
             shared_ptr<GeneralEncoder> encoder = encoder_clone_helper(encoder_, device);
             shared_ptr<Decoder> decoder = decoder_clone_helper(decoder_, device);
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][Model::broadcast] cloned encoder/decoder slot={} device={}", i, device.str());
+            }
             device_models_[i] = std::make_shared<Model>(encoder, decoder, loss_function_, reporter_);
             device_models_[i]->device_ = device;
             device_models_[i]->negative_sampling_method_ = negative_sampling_method_;
             device_models_[i]->negative_sampling_selected_ratio_ = negative_sampling_selected_ratio_;
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][Model::broadcast] model wrapper created slot={} device={}", i, device.str());
+            }
             if (!optimizers_.empty()) {
+                if (log_startup_timing) {
+                    SPDLOG_INFO("[startup-timing][Model::broadcast] setup_optimizers begin slot={} device={}", i, device.str());
+                }
                 device_models_[i]->setup_optimizers(model_config);
+                if (log_startup_timing) {
+                    SPDLOG_INFO("[startup-timing][Model::broadcast] setup_optimizers end slot={} device={} optimizers={}",
+                                i, device.str(), device_models_[i]->optimizers_.size());
+                }
             }
             device_models_[i]->sparse_lr_ = sparse_lr_;
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][Model::broadcast] clone ready slot={} device={}", i, device.str());
+            }
         } else {
             device_models_[i] = std::dynamic_pointer_cast<Model>(shared_from_this());
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][Model::broadcast] reused primary model slot={} device={}", i, device.str());
+            }
         }
         // SPDLOG_INFO("Broadcast: device_models_[{}]->optimizers_ size {}, devices {}", i, device_models_[i]->optimizers_.size(), device.index());
         i++;
@@ -766,6 +794,7 @@ void Model::broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig
 }
 
 shared_ptr<Model> initModelFromConfig(shared_ptr<ModelConfig> model_config, std::vector<torch::Device> devices, int num_relations, bool train, NegativeSamplingMethod nsm, float nsmr) {
+    bool log_startup_timing = startup_timing_enabled();
     shared_ptr<GeneralEncoder> encoder = nullptr;
     shared_ptr<Decoder> decoder = nullptr;
     shared_ptr<LossFunction> loss = nullptr;
@@ -825,7 +854,14 @@ shared_ptr<Model> initModelFromConfig(shared_ptr<ModelConfig> model_config, std:
     }
 
     if (train) {
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][initModelFromConfig] base setup_optimizers begin device={}", devices[0].str());
+        }
         model->setup_optimizers(model_config);
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][initModelFromConfig] base setup_optimizers end device={} optimizers={}",
+                        devices[0].str(), model->optimizers_.size());
+        }
 
         if (model_config->sparse_optimizer != nullptr) {
             model->sparse_lr_ = model_config->sparse_optimizer->options->learning_rate;
@@ -837,13 +873,23 @@ shared_ptr<Model> initModelFromConfig(shared_ptr<ModelConfig> model_config, std:
     if (devices.size() > 1) {
         SPDLOG_INFO("Broadcasting model to: {} GPUs", devices.size());
         model->broadcast(devices, model_config);
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][initModelFromConfig] broadcast returned devices={}", devices.size());
+        }
 
         for (int i = 1; i < devices.size(); i++) {
           model->device_models_[i]->negative_sampling_method_ = nsm;
           model->device_models_[i]->negative_sampling_selected_ratio_ = nsmr;
         }
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][initModelFromConfig] device negative sampling metadata assigned devices={}", devices.size());
+        }
     } else {
         model->device_models_[0] = model;
+    }
+
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][initModelFromConfig] return devices={} train={}", devices.size(), train);
     }
 
     return model;

@@ -121,7 +121,7 @@ class PartitionBuffer {
     int dtype_size_;
 
     void *buff_mem_, *buff_mem_unload_;
-    void* tensor_mem_;
+    void *tensor_mem_;
     bool loaded_;
 
     Indices in_buffer_ids_;
@@ -184,18 +184,17 @@ class PartitionBuffer {
 
     void sync();
 
-    int64_t getNumInMemory() { return buffer_tensor_view_.size(0); }
+    int64_t getNumInMemory() { return buffer_tensor_view_.defined() ? buffer_tensor_view_.size(0) : capacity_ * partition_size_; }
 
     int64_t getPartitionSize() const { return partition_size_; }
 };
-
 
 class MemPartitionBuffer : public PartitionBuffer {
     friend class MemPartitionBufferStorage;
 
    public:
     MemPartitionBuffer(int capacity, int num_partitions, int fine_to_coarse_ratio, int64_t partition_size, int embedding_size, int64_t total_embeddings,
-                    torch::Dtype dtype, string filename, bool prefetching, torch::Device device, int buffer_sizes = 1);
+                       torch::Dtype dtype, string filename, bool prefetching, torch::Device device, int buffer_sizes = 1);
 
     ~MemPartitionBuffer();
 
@@ -206,7 +205,7 @@ class MemPartitionBuffer : public PartitionBuffer {
     void performNextSwap();
 
     void evict(std::vector<Partition *> evict_partitions);
-    
+
     void admit(std::vector<Partition *> admit_partitions, std::vector<int64_t> buffer_idxs);
 
     torch::Tensor getGlobalToLocalMap(bool get_current);
@@ -231,6 +230,7 @@ class MemPartitionBuffer : public PartitionBuffer {
     torch::Tensor pos_;
 
    private:
+    void ensureBackingTensorsAllocated_();
     void refreshHostPartitionRanges_();
     bool hasContiguousHostPartitionRange_(int partition_id) const;
     int64_t contiguousHostPartitionStart_(int partition_id) const;
@@ -238,6 +238,7 @@ class MemPartitionBuffer : public PartitionBuffer {
     void copyPartitionFromHostToPinned_(Partition *partition, torch::Tensor pinned_view);
     void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
 
+    bool use_pinned_host_buffer_ = true;
     std::vector<int64_t> partition_host_start_offsets_;
     std::vector<bool> partition_host_contiguous_;
 };

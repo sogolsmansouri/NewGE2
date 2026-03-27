@@ -1114,32 +1114,24 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     // }
     // memset_wrapper(buff_mem_, 0, capacity_ * partition_size_ * embedding_size_ * dtype_size_);
 
-    bool use_pinned_host_buffer = mem_partition_buffer_pinned_host_enabled();
-    if (!use_pinned_host_buffer && buffer_sizes_ > 1 && device_.is_cuda()) {
+    use_pinned_host_buffer_ = mem_partition_buffer_pinned_host_enabled();
+    if (!use_pinned_host_buffer_ && buffer_sizes_ > 1 && device_.is_cuda()) {
         static std::once_flag warned_once;
         std::call_once(warned_once, []() {
             SPDLOG_WARN("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=0 is unsupported for multi-GPU MEM_PARTITION_BUFFER; forcing pinned host buffers");
         });
-        use_pinned_host_buffer = true;
+        use_pinned_host_buffer_ = true;
     }
 
-    torch::TensorOptions options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
-    if (use_pinned_host_buffer) {
-        options = options.pinned_memory(true);
-    }
-    buffer_tensor_view_ = torch::zeros({capacity_ * partition_size_, embedding_size_}, options);
-    buff_mem_ = buffer_tensor_view_.data_ptr();
+    buff_mem_ = nullptr;
+    buffer_tensor_view_ = torch::Tensor();
+    buffer_tensor_gpu_view_ = torch::Tensor();
+
     if (log_startup_timing) {
-        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] host buffer ready device={} rows={} dim={} pinned={}",
-                    device_.str(), capacity_ * partition_size_, embedding_size_, use_pinned_host_buffer);
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] deferred backing allocation device={} rows={} dim={} pinned={}",
+                    device_.str(), capacity_ * partition_size_, embedding_size_, use_pinned_host_buffer_);
     }
-    torch::TensorOptions device_options = torch::TensorOptions().dtype(dtype_).device(device_);
-    buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, device_options);
-    if (log_startup_timing) {
-        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] device buffer ready device={} rows={} dim={}",
-                    device_.str(), capacity_ * partition_size_, embedding_size_);
-    }
-    // buffer_tensor_gpu_view_ = buffer_tensor_view_.to(device_);
+
     // The initial host ordering is identity. Materialize permutation tensors only
     // when repartitioning installs a non-trivial mapping.
     perm_ = torch::Tensor();
@@ -1155,6 +1147,48 @@ MemPartitionBuffer::~MemPartitionBuffer() {
     // free(buff_mem_);
     buffer_tensor_view_ = torch::Tensor();
     buffer_tensor_gpu_view_ = torch::Tensor();
+}
+
+void MemPartitionBuffer::ensureBackingTensorsAllocated_() {
+    if (buffer_tensor_view_.defined() && buffer_tensor_gpu_view_.defined()) {
+        buff_mem_ = buffer_tensor_view_.data_ptr();
+        return;
+    }
+
+    bool log_startup_timing = startup_timing_enabled();
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::allocate] begin device={} rows={} dim={} pinned={}",
+                    device_.str(), capacity_ * partition_size_, embedding_size_, use_pinned_host_buffer_);
+    }
+
+    torch::TensorOptions host_options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
+    if (use_pinned_host_buffer_) {
+        host_options = host_options.pinned_memory(true);
+    }
+    buffer_tensor_view_ = torch::zeros({capacity_ * partition_size_, embedding_size_}, host_options);
+    buff_mem_ = buffer_tensor_view_.data_ptr();
+
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::allocate] host buffer ready device={} rows={} dim={} pinned={}",
+                    device_.str(), capacity_ * partition_size_, embedding_size_, use_pinned_host_buffer_);
+    }
+
+    torch::TensorOptions device_options = torch::TensorOptions().dtype(dtype_).device(device_);
+#ifdef GEGE_CUDA
+    if (device_.is_cuda()) {
+        c10::cuda::CUDAGuard device_guard(device_);
+        buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, device_options);
+    } else {
+        buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, device_options);
+    }
+#else
+    buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, device_options);
+#endif
+
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::allocate] device buffer ready device={} rows={} dim={}",
+                    device_.str(), capacity_ * partition_size_, embedding_size_);
+    }
 }
 
 void MemPartitionBuffer::refreshHostPartitionRanges_() {
@@ -1271,6 +1305,7 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
         auto t1 = std::chrono::high_resolution_clock::now();
         int64_t num_nodes = 0;
         data_storage_ = data_storage;
+        ensureBackingTensorsAllocated_();
         int64_t active_slots = get_active_slot_count(buffer_state_, capacity_, "MemPartitionBuffer::load");
         if (log_startup_timing) {
             SPDLOG_INFO("[startup-timing][MemPartitionBuffer::load] begin device={} active_slots={} capacity={} partition_size={} dim={} total_embeddings={}",
@@ -1872,6 +1907,6 @@ torch::Tensor MemPartitionBuffer::indexRead(torch::Tensor indices) {
         // TODO: throw invalid input to func exception
         throw std::runtime_error("");
     }
-    
+
     return buffer_tensor_gpu_view_.index_select(0, indices);
 }

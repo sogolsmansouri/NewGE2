@@ -41,7 +41,8 @@ export REPO_ROOT=$PWD
 export BUILD_DIR=$REPO_ROOT/build_2gpu_runs
 
 cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+  -DLIBNVTOOLSEXT=
 cmake --build "$BUILD_DIR" -j --target gege_train gege_eval
 ```
 
@@ -51,6 +52,12 @@ If configure fails inside vendored `pybind11` with a message about compatibility
 
 ```bash
 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+```
+
+If link fails with `LIBNVTOOLSEXT-NOTFOUND`, rerun configure with:
+
+```bash
+-DLIBNVTOOLSEXT=
 ```
 
 If a previous failed configure left a partial build directory behind, remove it first:
@@ -74,6 +81,22 @@ Before running on a different machine, update these YAML fields for your environ
 - `storage.model_dir`
 - `evaluation.checkpoint_dir`
 
+Use these expected processed dataset directory names when locating the dataset on a new machine:
+
+| Dataset | Expected processed dataset directory |
+| --- | --- |
+| `livejournal_16p` | `livejournal_16p_10k_eval` |
+| `twitter_16p` | `twitter_16p_paper_10k_eval` |
+| `freebase86m_16p` | `freebase86m_16p_paper_10k_eval` |
+
+Find the real dataset path before patching the temporary YAML:
+
+```bash
+find /path/to/search/root -type d -name twitter_16p_paper_10k_eval 2>/dev/null
+```
+
+If the dataset directory does not exist on the machine, do not run the experiment yet. Copy or preprocess the dataset first.
+
 ### 2. Set Generic Environment Variables
 
 ```bash
@@ -91,13 +114,27 @@ mkdir -p "$LOG_DIR" "$REPO_ROOT/experiment_outputs"
 Examples:
 - `main` might use `BUILD_DIR=$REPO_ROOT/build_ge2env`
 - `baseline` might use `BUILD_DIR=$REPO_ROOT/build_gcc9`
-- if neither exists, create one with `cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_POLICY_VERSION_MINIMUM=3.5`
+- if neither exists, create one with `cmake -S "$REPO_ROOT" -B "$BUILD_DIR" -DCMAKE_POLICY_VERSION_MINIMUM=3.5 -DLIBNVTOOLSEXT=`
 
 ### 3. Reset Flags And Select Two GPUs
 
 ```bash
 for v in $(compgen -e | grep '^GEGE_'); do unset "$v"; done
 export CUDA_VISIBLE_DEVICES=0,1
+```
+
+Before launching training on a shared machine, check which GPUs are actually free:
+
+```bash
+nvidia-smi --query-gpu=index,name,memory.used,memory.free --format=csv,noheader,nounits
+```
+
+Pick the two GPUs with the most free memory, then set `CUDA_VISIBLE_DEVICES` to that physical pair.
+
+Example:
+
+```bash
+export CUDA_VISIBLE_DEVICES=1,2
 ```
 
 If you want to use a different physical pair, for example GPUs `2` and `3`, do this instead:
@@ -107,6 +144,8 @@ export CUDA_VISIBLE_DEVICES=2,3
 ```
 
 Keep the YAML `device_ids` at `[0, 1]`. `CUDA_VISIBLE_DEVICES` remaps the selected physical GPUs to logical devices `0` and `1` inside the process.
+
+If training fails immediately with `CUDA error: out of memory`, do not run evaluation or the summarizer on that attempt. Pick a different GPU pair, delete the failed train/eval logs, and rerun training first.
 
 For `livejournal_16p` and `twitter_16p`, enable paper-faithful social-dot emulation on branches that support it:
 
@@ -143,6 +182,8 @@ For one-flag and incremental rows, change only the flag or YAML knob listed in t
 ```bash
 cmake --build "$BUILD_DIR" -j --target gege_train gege_eval
 
+find "$BUILD_DIR" -type f \( -name gege_train -o -name gege_eval \) | sort
+
 "$BUILD_DIR/gege/gege_train" "$CONFIG" \
   |& tee "$LOG_DIR/${RUN_NAME}_train.log"
 
@@ -154,6 +195,10 @@ python "$REPO_ROOT/scripts/summarize_benchmark_logs.py" \
   --eval-log "$LOG_DIR/${RUN_NAME}_eval.log" \
   --epochs "$EPOCHS"
 ```
+
+Do not run the summarizer until both of these are true:
+- `find "$BUILD_DIR" ...` prints both `gege_train` and `gege_eval`
+- train and eval both completed without an early `ValueError` or linker/configure failure
 
 If exact filtered eval on a large graph runs out of GPU memory and your branch supports chunked eval, keep these on the eval command only:
 
@@ -184,7 +229,8 @@ export EPOCHS=15
 mkdir -p "$LOG_DIR" "$REPO_ROOT/experiment_outputs"
 
 cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+  -DLIBNVTOOLSEXT=
 cmake --build "$BUILD_DIR" -j --target gege_train gege_eval
 
 cp "$CONFIG_SRC" "$CONFIG_TMP"
@@ -254,6 +300,13 @@ s|checkpoint_dir: .*|checkpoint_dir: $RUN_ROOT|;" \
 ```
 
 Use `"$CONFIG_TMP"` for both `gege_train` and `gege_eval`.
+
+Verify the patched dataset path before starting the run:
+
+```bash
+grep -n "dataset_dir" "$CONFIG_TMP"
+test -d "$DATASET_DIR" && echo "dataset ok"
+```
 
 ### 5c. If The Current Checkout Does Not Have `summarize_benchmark_logs.py`
 

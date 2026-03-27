@@ -76,6 +76,11 @@ bool partition_buffer_peer_relay_enabled() {
     return enabled;
 }
 
+bool startup_timing_enabled() {
+    static bool enabled = parse_env_flag("GEGE_STARTUP_TIMING", false);
+    return enabled;
+}
+
 int64_t parse_env_int(const char *name, int64_t default_value) {
     const char *raw = std::getenv(name);
     if (raw == nullptr) {
@@ -656,6 +661,7 @@ void MemPartitionBufferStorage::ensureHostLoaded_() {
 void MemPartitionBufferStorage::load() {
     // SPDLOG_INFO("MemPartitionBufferStorage Loading {}", filename_);
     ensureHostLoaded_();
+    bool log_startup_timing = startup_timing_enabled();
 
     if (device_ != torch::kCUDA) {
         for (int i = 0; i < buffers_.size(); i ++) {
@@ -666,8 +672,20 @@ void MemPartitionBufferStorage::load() {
         return;
     }
 
-    for (int i = 0; i < buffers_.size(); i ++)
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::load] filename={} buffers={} dim0={} dim1={} host_loaded={}",
+                    filename_, buffers_.size(), dim0_size_, dim1_size_, loaded_);
+    }
+
+    for (int i = 0; i < buffers_.size(); i ++) {
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::load] begin buffer_idx={} device={}", i, buffers_[i]->device_.str());
+        }
         buffers_[i]->load(data_);
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::load] end buffer_idx={} device={}", i, buffers_[i]->device_.str());
+        }
+    }
 }
 
 void MemPartitionBufferStorage::write() {

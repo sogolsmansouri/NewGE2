@@ -79,6 +79,11 @@ bool single_gpu_gpu_aware_custom_enabled() {
     return enabled;
 }
 
+bool startup_timing_enabled() {
+    static bool enabled = parse_env_flag("GEGE_STARTUP_TIMING", false);
+    return enabled;
+}
+
 int64_t parse_env_int(const char *name, int64_t default_value);
 
 bool partition_buffer_swap_timing_enabled() {
@@ -1213,10 +1218,15 @@ torch::Tensor MemPartitionBuffer::getGlobalToLocalMap(bool get_current) {
 
 void MemPartitionBuffer::load(torch::Tensor data_storage) {
     if (!loaded_) {
+        bool log_startup_timing = startup_timing_enabled();
         auto t1 = std::chrono::high_resolution_clock::now();
         int64_t num_nodes = 0;
         data_storage_ = data_storage;
         int64_t active_slots = get_active_slot_count(buffer_state_, capacity_, "MemPartitionBuffer::load");
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][MemPartitionBuffer::load] begin device={} active_slots={} capacity={} partition_size={} dim={} total_embeddings={}",
+                        device_.str(), active_slots, capacity_, partition_size_, embedding_size_, total_embeddings_);
+        }
 
 #pragma omp parallel for
         for (int64_t i = 0; i < active_slots; i++) {
@@ -1245,7 +1255,10 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
         buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
 #endif
         auto t2 = std::chrono::high_resolution_clock::now();
-        // SPDLOG_INFO("Loaded {} nodes in {} ms", num_nodes, std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][MemPartitionBuffer::load] end device={} nodes={} total_ms={:.3f}",
+                        device_.str(), num_nodes, elapsed_ms(t1, t2));
+        }
     }
 }
 

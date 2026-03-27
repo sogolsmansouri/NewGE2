@@ -1024,6 +1024,7 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
 }
 
 void DataLoader::setBufferOrdering() {
+    bool log_startup_timing = startup_timing_enabled();
     int physical_devices = std::max<int>(devices_.size(), 1);
     int requested_active_devices = physical_devices;
     if (training_config_ != nullptr && training_config_->logical_active_devices > 0) {
@@ -1114,6 +1115,10 @@ void DataLoader::setBufferOrdering() {
 
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
         if (graph_storage_->useInMemorySubGraph()) {
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][DataLoader::setBufferOrdering] begin task=lp physical_devices={} requested_active_devices={}",
+                            physical_devices, requested_active_devices);
+            }
             bool access_aware_state_generation = false;
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", true);
             const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
@@ -1142,6 +1147,10 @@ void DataLoader::setBufferOrdering() {
             }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][DataLoader::setBufferOrdering] generated states={} buckets={} optimized_custom={} access_aware_state_generation={}",
+                            buffer_states_.size(), edge_buckets_per_buffer_.size(), used_optimized_custom_schedule, access_aware_state_generation);
+            }
             if (!used_optimized_custom_schedule && single_gpu_gpu_aware_custom_enabled() && requested_active_devices == 1 && physical_devices == 1 &&
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && !options->randomly_assign_edge_buckets &&
                 buffer_states_.size() > 1 && edge_buckets_per_buffer_.size() == buffer_states_.size()) {
@@ -1242,7 +1251,14 @@ void DataLoader::setBufferOrdering() {
                 edge_buckets_per_buffer_iterators_[i] = edge_buckets_per_buffer_iterator;
                 edge_buckets_per_buffer_iterator++;
             }
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][DataLoader::setBufferOrdering] applying buffer ordering to graph storage states={} devices={}",
+                            buffer_states_.size(), devices_.size());
+            }
             graph_storage_->setBufferOrdering(buffer_states_);
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][DataLoader::setBufferOrdering] graph storage ordering applied");
+            }
         }
     } else {
         if (graph_storage_->useInMemorySubGraph()) {
@@ -1963,27 +1979,42 @@ void DataLoader::loadStorage() {
         auto now = std::chrono::high_resolution_clock::now();
         plan_reset_ms = elapsed_ms(phase_start, now);
         phase_start = now;
+        SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] plan cache reset complete ms={:.3f}", plan_reset_ms);
     }
     loaded_subgraphs = 0;
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] entering setBufferOrdering");
+    }
     setBufferOrdering();
     if (log_startup_timing) {
         auto now = std::chrono::high_resolution_clock::now();
         ordering_ms = elapsed_ms(phase_start, now);
         phase_start = now;
+        SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] setBufferOrdering complete ms={:.3f}", ordering_ms);
+    }
+    if (log_startup_timing) {
+        SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] entering graph_storage.load");
     }
     graph_storage_->load();
     if (log_startup_timing) {
         auto now = std::chrono::high_resolution_clock::now();
         storage_load_ms = elapsed_ms(phase_start, now);
         phase_start = now;
+        SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] graph_storage.load complete ms={:.3f}", storage_load_ms);
     }
     if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] entering graph_storage.load_g");
+        }
         graph_storage_->load_g();
     }
     if (log_startup_timing) {
         auto now = std::chrono::high_resolution_clock::now();
         gan_load_ms = elapsed_ms(phase_start, now);
         phase_start = now;
+        if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {
+            SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] graph_storage.load_g complete ms={:.3f}", gan_load_ms);
+        }
     }
 
     batch_id_offset_ = 0;
@@ -2002,13 +2033,21 @@ void DataLoader::loadStorage() {
         auto now = std::chrono::high_resolution_clock::now();
         batch_state_reset_ms = elapsed_ms(phase_start, now);
         phase_start = now;
+        SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] batch state reset complete ms={:.3f}", batch_state_reset_ms);
     }
 
     if (!buffer_states_.empty()) {
         for(int device_idx = 0; device_idx < devices_.size(); device_idx ++) {
+            if (log_startup_timing) {
+                SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] initializing in-memory subgraph device_idx={} state_idx={}",
+                            device_idx, loaded_subgraphs);
+            }
             graph_storage_->initializeInMemorySubGraph(buffer_states_[loaded_subgraphs ++], devices_[device_idx], device_idx);
         }
     } else {
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][DataLoader::loadStorage] initializing empty in-memory subgraph");
+        }
         graph_storage_->initializeInMemorySubGraph(torch::empty({}));
     }
     if (log_startup_timing) {

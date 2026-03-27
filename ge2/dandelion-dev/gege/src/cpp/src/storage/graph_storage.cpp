@@ -437,6 +437,10 @@ void GraphModelStorage::load() {
             return;
         }
 
+        if (log_startup_timing) {
+            SPDLOG_INFO("[startup-timing][GraphModelStorage::load] begin label={} backend={} device={} dim0={} dim1={}",
+                        label, graph_storage_backend_name(storage), storage->device_.str(), storage->dim0_size_, storage->dim1_size_);
+        }
         auto start = std::chrono::high_resolution_clock::now();
         _load(storage);
         if (log_startup_timing) {

@@ -316,9 +316,9 @@ class InMemory : public Storage {
         auto src_partitions = trunc_div(permutation.index_select(0, data_.select(1, 0).squeeze()));
         auto dst_partitions = trunc_div(permutation.index_select(0, data_.select(1, -1).squeeze()));
 
-        auto tup = torch::sort(dst_partitions, true, -1, false);
+        auto tup = torch::sort(dst_partitions, -1, false);
         torch::Tensor dst_args = std::get<1>(tup);
-        tup = torch::sort(src_partitions.index_select(0, dst_args), true, -1, false);
+        tup = torch::sort(src_partitions.index_select(0, dst_args), -1, false);
         torch::Tensor src_args = std::get<1>(tup);
         data_.copy_(data_.index_select(0, dst_args.index_select(0, src_args)));
 

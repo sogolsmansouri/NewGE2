@@ -84,6 +84,11 @@ bool startup_timing_enabled() {
     return enabled;
 }
 
+bool mem_partition_buffer_pinned_host_enabled() {
+    static bool enabled = parse_env_flag("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST", true);
+    return enabled;
+}
+
 int64_t parse_env_int(const char *name, int64_t default_value);
 
 bool partition_buffer_swap_timing_enabled() {
@@ -1105,12 +1110,15 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     // }
     // memset_wrapper(buff_mem_, 0, capacity_ * partition_size_ * embedding_size_ * dtype_size_);
 
-    torch::TensorOptions options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU).pinned_memory(true);
+    torch::TensorOptions options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
+    if (mem_partition_buffer_pinned_host_enabled()) {
+        options = options.pinned_memory(true);
+    }
     buffer_tensor_view_ = torch::zeros({capacity_ * partition_size_, embedding_size_}, options);
     buff_mem_ = buffer_tensor_view_.data_ptr();
     if (log_startup_timing) {
-        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] pinned host buffer ready device={} rows={} dim={}",
-                    device_.str(), capacity_ * partition_size_, embedding_size_);
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] host buffer ready device={} rows={} dim={} pinned={}",
+                    device_.str(), capacity_ * partition_size_, embedding_size_, mem_partition_buffer_pinned_host_enabled());
     }
     torch::TensorOptions device_options = torch::TensorOptions().dtype(dtype_).device(device_);
     buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, device_options);

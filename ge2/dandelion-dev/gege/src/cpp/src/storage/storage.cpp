@@ -188,85 +188,6 @@ double elapsed_ms(std::chrono::high_resolution_clock::time_point start, std::chr
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
-std::string format_state_group(const std::vector<int64_t> &partitions) {
-    std::ostringstream oss;
-    oss << "[";
-    for (std::size_t i = 0; i < partitions.size(); i++) {
-        if (i > 0) {
-            oss << ",";
-        }
-        oss << partitions[i];
-    }
-    oss << "]";
-    return oss.str();
-}
-
-bool peer_relay_schedule_compatible(const std::vector<torch::Tensor> &buffer_states, int devices_per_step, int num_partitions, std::string *reason) {
-    if (devices_per_step <= 1 || buffer_states.size() <= static_cast<std::size_t>(devices_per_step)) {
-        return true;
-    }
-
-    if (num_partitions <= 0) {
-        if (reason != nullptr) {
-            *reason = "invalid partition count";
-        }
-        return false;
-    }
-
-    for (std::size_t group_start = 0; group_start + static_cast<std::size_t>(devices_per_step) < buffer_states.size();
-         group_start += static_cast<std::size_t>(devices_per_step)) {
-        std::vector<bool> resident(num_partitions, false);
-        std::vector<int64_t> current_union;
-        current_union.reserve(static_cast<std::size_t>(devices_per_step) * 8);
-
-        for (int lane = 0; lane < devices_per_step; lane++) {
-            auto current_state = buffer_states[group_start + static_cast<std::size_t>(lane)].to(torch::kCPU).to(torch::kInt64).contiguous();
-            auto *state_ptr = current_state.data_ptr<int64_t>();
-            for (int64_t idx = 0; idx < current_state.numel(); idx++) {
-                int64_t partition_id = state_ptr[idx];
-                if (partition_id < 0 || partition_id >= num_partitions) {
-                    if (reason != nullptr) {
-                        *reason = fmt::format("state {} contains invalid partition {}", group_start + static_cast<std::size_t>(lane), partition_id);
-                    }
-                    return false;
-                }
-                if (!resident[partition_id]) {
-                    resident[partition_id] = true;
-                    current_union.emplace_back(partition_id);
-                }
-            }
-        }
-
-        std::sort(current_union.begin(), current_union.end());
-
-        std::size_t next_group_start = group_start + static_cast<std::size_t>(devices_per_step);
-        std::size_t next_group_end = std::min(next_group_start + static_cast<std::size_t>(devices_per_step), buffer_states.size());
-        for (std::size_t next_idx = next_group_start; next_idx < next_group_end; next_idx++) {
-            auto next_state = buffer_states[next_idx].to(torch::kCPU).to(torch::kInt64).contiguous();
-            auto *next_ptr = next_state.data_ptr<int64_t>();
-            for (int64_t slot = 0; slot < next_state.numel(); slot++) {
-                int64_t partition_id = next_ptr[slot];
-                if (partition_id < 0 || partition_id >= num_partitions) {
-                    if (reason != nullptr) {
-                        *reason = fmt::format("state {} contains invalid partition {}", next_idx, partition_id);
-                    }
-                    return false;
-                }
-                if (!resident[partition_id]) {
-                    if (reason != nullptr) {
-                        *reason = fmt::format("state {} needs partition {} but current superstep {} only has {}",
-                                              next_idx, partition_id, group_start / static_cast<std::size_t>(devices_per_step),
-                                              format_state_group(current_union));
-                    }
-                    return false;
-                }
-            }
-        }
-    }
-
-    return true;
-}
-
 void checked_cpu_index_add_(const char *context, torch::Tensor &target, torch::Tensor indices, torch::Tensor values) {
     if (!target.device().is_cpu() || !indices.device().is_cpu() || !values.device().is_cpu()) {
         throw GegeRuntimeException(std::string(context) + " expects CPU tensors on the CPU update path");
@@ -601,18 +522,6 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
 
     if (options_ != nullptr && options_->edge_bucket_ordering != EdgeBucketOrdering::CUSTOM) {
         SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY currently supports CUSTOM edge-bucket ordering only; falling back to CPU-backed swaps");
-        return;
-    }
-
-    if (buffers_.empty() || buffers_[0] == nullptr || buffers_[0]->buffer_states_.empty()) {
-        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: buffer ordering is unavailable at relay initialization time");
-        return;
-    }
-
-    std::string relay_schedule_reason;
-    if (!peer_relay_schedule_compatible(buffers_[0]->buffer_states_, static_cast<int>(devices_.size()), options_->num_partitions, &relay_schedule_reason)) {
-        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: buffer-state schedule is not relay-compatible ({}); falling back to CPU-backed swaps",
-                    relay_schedule_reason);
         return;
     }
 

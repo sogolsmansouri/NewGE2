@@ -89,6 +89,10 @@ bool mem_partition_buffer_pinned_host_enabled() {
     return enabled;
 }
 
+bool tensor_supports_non_blocking_host_copy(const torch::Tensor &tensor) {
+    return tensor.defined() && tensor.is_pinned();
+}
+
 int64_t parse_env_int(const char *name, int64_t default_value);
 
 bool partition_buffer_swap_timing_enabled() {
@@ -1110,15 +1114,24 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     // }
     // memset_wrapper(buff_mem_, 0, capacity_ * partition_size_ * embedding_size_ * dtype_size_);
 
+    bool use_pinned_host_buffer = mem_partition_buffer_pinned_host_enabled();
+    if (!use_pinned_host_buffer && buffer_sizes_ > 1 && device_.is_cuda()) {
+        static std::once_flag warned_once;
+        std::call_once(warned_once, []() {
+            SPDLOG_WARN("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=0 is unsupported for multi-GPU MEM_PARTITION_BUFFER; forcing pinned host buffers");
+        });
+        use_pinned_host_buffer = true;
+    }
+
     torch::TensorOptions options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
-    if (mem_partition_buffer_pinned_host_enabled()) {
+    if (use_pinned_host_buffer) {
         options = options.pinned_memory(true);
     }
     buffer_tensor_view_ = torch::zeros({capacity_ * partition_size_, embedding_size_}, options);
     buff_mem_ = buffer_tensor_view_.data_ptr();
     if (log_startup_timing) {
         SPDLOG_INFO("[startup-timing][MemPartitionBuffer::ctor] host buffer ready device={} rows={} dim={} pinned={}",
-                    device_.str(), capacity_ * partition_size_, embedding_size_, mem_partition_buffer_pinned_host_enabled());
+                    device_.str(), capacity_ * partition_size_, embedding_size_, use_pinned_host_buffer);
     }
     torch::TensorOptions device_options = torch::TensorOptions().dtype(dtype_).device(device_);
     buffer_tensor_gpu_view_ = torch::empty({capacity_ * partition_size_, embedding_size_}, device_options);
@@ -1280,10 +1293,15 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
 #ifdef GEGE_CUDA
         if (device_.is_cuda()) {
             c10::cuda::CUDAGuard device_guard(device_);
-            auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
-            c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
-            buffer_tensor_gpu_view_.copy_(buffer_tensor_view_, true);
-            cudaStreamSynchronize(copy_stream.stream());
+            bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
+            if (non_blocking_host_copy) {
+                auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                buffer_tensor_gpu_view_.copy_(buffer_tensor_view_, true);
+                cudaStreamSynchronize(copy_stream.stream());
+            } else {
+                buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
+            }
         } else {
             buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
         }
@@ -1446,18 +1464,35 @@ void MemPartitionBuffer::performNextSwap() {
         {
 #ifdef GEGE_CUDA
             c10::cuda::CUDAGuard device_guard(device_);
-            auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
-            c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
-#endif
+            bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
+            if (non_blocking_host_copy) {
+                auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                    Partition *partition = partition_table_[evict_ids[idx]];
+                    int64_t buffer_offset = evict_slots[idx] * partition_size_;
+                    torch::Tensor cpu_view = buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    cpu_view.copy_(gpu_view.detach(), true);
+                }
+                cudaStreamSynchronize(copy_stream.stream());
+            } else {
+                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                    Partition *partition = partition_table_[evict_ids[idx]];
+                    int64_t buffer_offset = evict_slots[idx] * partition_size_;
+                    torch::Tensor cpu_view = buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    cpu_view.copy_(gpu_view.detach());
+                }
+            }
+#else
             for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                 Partition *partition = partition_table_[evict_ids[idx]];
                 int64_t buffer_offset = evict_slots[idx] * partition_size_;
                 torch::Tensor cpu_view = buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
                 torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
-                cpu_view.copy_(gpu_view.detach(), true);
+                cpu_view.copy_(gpu_view.detach());
             }
-#ifdef GEGE_CUDA
-            cudaStreamSynchronize(copy_stream.stream());
 #endif
         }
         if (log_timing) {
@@ -1496,18 +1531,35 @@ void MemPartitionBuffer::performNextSwap() {
         {
 #ifdef GEGE_CUDA
             c10::cuda::CUDAGuard device_guard(device_);
-            auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
-            c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
-#endif
+            bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
+            if (non_blocking_host_copy) {
+                auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                for (std::size_t idx = 0; idx < admit_ids.size(); idx++) {
+                    Partition *partition = partition_table_[admit_ids[idx]];
+                    int64_t buffer_offset = evict_slots[idx] * partition_size_;
+                    torch::Tensor cpu_view = buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    gpu_view.copy_(cpu_view, true);
+                }
+                cudaStreamSynchronize(copy_stream.stream());
+            } else {
+                for (std::size_t idx = 0; idx < admit_ids.size(); idx++) {
+                    Partition *partition = partition_table_[admit_ids[idx]];
+                    int64_t buffer_offset = evict_slots[idx] * partition_size_;
+                    torch::Tensor cpu_view = buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                    gpu_view.copy_(cpu_view);
+                }
+            }
+#else
             for (std::size_t idx = 0; idx < admit_ids.size(); idx++) {
                 Partition *partition = partition_table_[admit_ids[idx]];
                 int64_t buffer_offset = evict_slots[idx] * partition_size_;
                 torch::Tensor cpu_view = buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
                 torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
-                gpu_view.copy_(cpu_view, true);
+                gpu_view.copy_(cpu_view);
             }
-#ifdef GEGE_CUDA
-            cudaStreamSynchronize(copy_stream.stream());
 #endif
         }
         if (log_timing) {
@@ -1698,10 +1750,15 @@ void MemPartitionBuffer::unload(bool write) {
         if (write && buffer_tensor_gpu_view_.device().is_cuda()) {
 #ifdef GEGE_CUDA
             c10::cuda::CUDAGuard device_guard(device_);
-            auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
-            c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
-            buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach(), true);
-            cudaStreamSynchronize(copy_stream.stream());
+            bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
+            if (non_blocking_host_copy) {
+                auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach(), true);
+                cudaStreamSynchronize(copy_stream.stream());
+            } else {
+                buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
+            }
 #else
             buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
 #endif

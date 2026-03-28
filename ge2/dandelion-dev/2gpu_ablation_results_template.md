@@ -18,10 +18,72 @@ Rules:
 - Use `scripts/summarize_benchmark_logs.py` to extract averaged metrics from the train/eval logs.
 - Use the standardized 2-GPU configs under `gege/configs/2gpu/` on both branches.
 - Do not assume `rg` exists on the target machine; every command in this file should work with standard `grep`.
+- `scripts/run_lj_2gpu_stack_ablation.sh` is the canonical train-only runner for the LiveJournal 2-GPU stack and auto-updates this markdown after each completed row.
 
 ## How To Run These Experiments
 
 Use this procedure on any machine. Do not assume the YAMLs are ready as-is for a new environment.
+
+### ARC Quick Start: LiveJournal 2-GPU Stack, 5 Epochs, Train Only
+
+This is the shortest path for the current ARC workflow. It assumes:
+- the checkout is on `main`
+- `datasets/livejournal_16p_10k_eval` already exists
+- two clean GPUs are available
+
+```bash
+cd /mnt/beegfs/smansou2/repos/ge2New/NewGE2/ge2/dandelion-dev
+conda activate /mnt/beegfs/smansou2/conda_envs/distkge-py38-clean
+
+git switch main
+git pull --ff-only origin main
+
+export REPO_ROOT=$PWD
+export BUILD_DIR=$REPO_ROOT/build_2gpu_runs
+export DATASET_DIR=$REPO_ROOT/datasets/livejournal_16p_10k_eval
+
+cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+  -DLIBNVTOOLSEXT=
+cmake --build "$BUILD_DIR" -j --target gege_train
+
+nvidia-smi --query-gpu=index,name,memory.used,memory.free --format=csv,noheader,nounits
+
+tmux new -s lj_2gpu_5ep
+```
+
+Inside `tmux`:
+
+```bash
+cd /mnt/beegfs/smansou2/repos/ge2New/NewGE2/ge2/dandelion-dev
+conda activate /mnt/beegfs/smansou2/conda_envs/distkge-py38-clean
+
+CUDA_VISIBLE_DEVICES=0,1 \
+BUILD_DIR=$PWD/build_2gpu_runs \
+DATASET_DIR=$PWD/datasets/livejournal_16p_10k_eval \
+EPOCHS=5 \
+bash scripts/run_lj_2gpu_stack_ablation.sh \
+  |& tee experiment_logs/lj_2gpu_stack_ablation_5ep_arc.log
+```
+
+The runner will:
+- patch a temp YAML from `gege/configs/2gpu/livejournal_16p.yaml`
+- force `save_model: false` and `save_state: false`
+- run the LJ 2-GPU stack in the corrected order
+- summarize each completed case
+- write the results back into this markdown file
+
+To monitor it later:
+
+```bash
+tmux attach -t lj_2gpu_5ep
+```
+
+or:
+
+```bash
+tail -f /mnt/beegfs/smansou2/repos/ge2New/NewGE2/ge2/dandelion-dev/experiment_logs/lj_2gpu_stack_ablation_5ep_arc.log
+```
 
 ### 0. Sync The Checkout And Do Not Assume A Build Directory Already Exists
 
@@ -212,73 +274,7 @@ GEGE_EVAL_NEGATIVE_CHUNK_SIZE=32768 \
   |& tee "$LOG_DIR/${RUN_NAME}_eval.log"
 ```
 
-### 5a. Exact Example: `main` LiveJournal One-Flag Run For 15 Epochs
-
-This example runs `livejournal_16p` on `main` with exactly one optimization flag enabled: `GEGE_FAST_MAP_TENSORS=1`.
-
-```bash
-cd "$REPO_ROOT"
-
-git switch main
-
-export BUILD_DIR=$REPO_ROOT/build_2gpu_runs
-export CONFIG_SRC=$REPO_ROOT/gege/configs/2gpu/livejournal_16p.yaml
-export CONFIG_TMP=${TMPDIR:-/tmp}/livejournal_16p_main_2gpu_fast_map_tensors_15ep.yaml
-export LOG_DIR=$REPO_ROOT/experiment_logs
-export RUN_NAME=livejournal_16p_main_2gpu_fast_map_tensors_15ep
-export RUN_ROOT=$REPO_ROOT/experiment_outputs/$RUN_NAME
-export EPOCHS=15
-
-mkdir -p "$LOG_DIR" "$REPO_ROOT/experiment_outputs"
-
-cmake -S "$REPO_ROOT" -B "$BUILD_DIR" \
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  -DLIBNVTOOLSEXT=
-cmake --build "$BUILD_DIR" -j --target gege_train gege_eval
-
-cp "$CONFIG_SRC" "$CONFIG_TMP"
-
-perl -0pi -e "s/num_epochs: 30/num_epochs: 15/;
-s|model_dir: .*|model_dir: $RUN_ROOT|;
-s|checkpoint_dir: .*|checkpoint_dir: $RUN_ROOT|;" \
-"$CONFIG_TMP"
-
-for v in \$(compgen -e | grep '^GEGE_'); do unset \"\$v\"; done
-export CUDA_VISIBLE_DEVICES=0,1
-export GEGE_EMULATE_DOT_SINGLE_RELATION=1
-
-export GEGE_CSR_DEBUG=0
-export GEGE_BUCKET_STREAMING_LP=0
-export GEGE_OPTIMIZED_CUSTOM_SCHEDULE=0
-export GEGE_PARTITION_BUFFER_LP_FAST_PATH=0
-export GEGE_FAST_MAP_TENSORS=1
-export GEGE_GPU_ACTIVE_EDGE_SHUFFLE=0
-export GEGE_CSR_GATHER=0
-export GEGE_CSR_UPDATE=0
-export GEGE_DEG_CHUNK_EXCLUSION=0
-export GEGE_PARTITION_BUFFER_PEER_RELAY=0
-unset GEGE_GLOBAL_DEGREE_SAMPLING
-
-rm -rf "$RUN_ROOT"
-
-"$BUILD_DIR/gege/gege_train" "$CONFIG_TMP" \
-  |& tee "$LOG_DIR/${RUN_NAME}_train.log"
-
-GEGE_EMULATE_DOT_SINGLE_RELATION=1 \
-GEGE_EVAL_CHUNKED_RANKS=1 \
-GEGE_EVAL_NEGATIVE_CHUNK_SIZE=32768 \
-"$BUILD_DIR/gege/gege_eval" "$CONFIG_TMP" \
-  |& tee "$LOG_DIR/${RUN_NAME}_eval.log"
-
-python "$REPO_ROOT/scripts/summarize_benchmark_logs.py" \
-  --train-log "$LOG_DIR/${RUN_NAME}_train.log" \
-  --eval-log "$LOG_DIR/${RUN_NAME}_eval.log" \
-  --epochs "$EPOCHS"
-```
-
-To run a different one-flag LJ experiment, keep the same command block and change only one `export GEGE_...=` line.
-
-### 5b. Required YAML Updates On A New Machine
+### 5a. Required YAML Updates On A New Machine
 
 The standardized configs are portable only after these fields are updated for the machine where you run:
 
@@ -311,7 +307,7 @@ grep -n "dataset_dir" "$CONFIG_TMP"
 test -d "$DATASET_DIR" && echo "dataset ok"
 ```
 
-### 5c. If The Current Checkout Does Not Have `summarize_benchmark_logs.py`
+### 5b. If The Current Checkout Does Not Have `summarize_benchmark_logs.py`
 
 The summarizer lives in:
 
@@ -356,7 +352,6 @@ Recommended 2-GPU candidate flags and knobs:
 - `dense_sync_batches` as a YAML sweep
 
 Important notes:
-- `GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM` is not part of the 2-GPU ladder.
 - `GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM` is single-GPU-only in the code path; do not add it to real 2-GPU experiments.
 - `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS` is shared with multi-GPU and is valid to test on 2 GPUs; it mainly affects inter-epoch gap and disk I/O rather than in-epoch compute.
 - `GEGE_PARTITION_BUFFER_PEER_RELAY` is the main 2-GPU/4-GPU-specific probe.
@@ -406,6 +401,28 @@ Column definitions:
 
 ## Twitter 16p
 
+Active Twitter plan: use the same 2-GPU cumulative stack style as LiveJournal. For every Twitter stack run, hold these fixed:
+- `GEGE_EMULATE_DOT_SINGLE_RELATION=1`
+- `GEGE_BUCKET_STREAMING_LP=0`
+- `GEGE_CSR_GATHER=0`
+- `GEGE_CSR_UPDATE=0`
+- `GEGE_CSR_DEBUG=0`
+
+| Row | Branch | Config | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | MRR | Hits@1 | Hits@3 | Hits@10 | Eval Notes | Train Log | Eval Log | Notes |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
+| `control_main_all_flags_off` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; all optional stack flags off; fixed off env block above` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_01_deg_chunk_exclusion` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; previous_stack=control + GEGE_DEG_CHUNK_EXCLUSION=1` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_02_active_edge_shuffle` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_03_lp_fast_path` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_04_fast_map_tensors` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_05_unique_backend_bitmap` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=41652230` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_06_optimized_custom_schedule` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_07_keep_storage_hot_between_epochs` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| `incremental_08_partition_buffer_peer_relay` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `5` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+
+<!--
+Legacy partial Twitter 2-GPU table retained for reference:
+
 | Row | Branch | Config | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | MRR | Hits@1 | Hits@3 | Hits@10 | Eval Notes | Train Log | Eval Log | Notes |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
 | `control_main_all_flags_off` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `explicit all-flags-off env block; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `8` | `253358.88 ms` | `10526483.00` | `36483.71 ms` | `18.0` | `13632.9055` | `39277.3015` | `37147.2601` | `12516.8674` | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` | `experiment_logs/twitter_16p_main_2gpu_control_train.log` | `n/a` | `ARC partial run on CUDA_VISIBLE_DEVICES=1,2; averaged over epochs 1..8 only, with epochs 9 and 10 excluded` |
@@ -424,6 +441,7 @@ Column definitions:
 | `yaml_dense_sync_batches_2` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `dense_sync_batches=2` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `yaml_dense_sync_batches_4` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `dense_sync_batches=4` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
 | `yaml_dense_sync_batches_8` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `dense_sync_batches=8` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+-->
 
 ## Freebase86M 16p
 

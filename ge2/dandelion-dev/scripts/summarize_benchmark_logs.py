@@ -91,7 +91,11 @@ def parse_eval_metrics(eval_log_text: str):
 def main():
     parser = argparse.ArgumentParser(description="Summarize GEGE benchmark train/eval logs.")
     parser.add_argument("--train-log", required=True, help="Path to the gege_train log")
-    parser.add_argument("--eval-log", required=True, help="Path to the gege_eval log")
+    parser.add_argument(
+        "--eval-log",
+        default=None,
+        help="Path to the gege_eval log. Optional for train-only runs.",
+    )
     parser.add_argument("--epochs", type=int, required=True, help="Number of leading epochs to average")
     parser.add_argument(
         "--format",
@@ -102,11 +106,16 @@ def main():
     args = parser.parse_args()
 
     train_log = Path(args.train_log).read_text(encoding="utf-8")
-    eval_log = Path(args.eval_log).read_text(encoding="utf-8")
+    eval_log_path = Path(args.eval_log) if args.eval_log else None
+    eval_log = (
+        eval_log_path.read_text(encoding="utf-8")
+        if eval_log_path is not None and eval_log_path.exists()
+        else ""
+    )
 
     summary = {
         "train_log": str(Path(args.train_log).resolve()),
-        "eval_log": str(Path(args.eval_log).resolve()),
+        "eval_log": str(eval_log_path.resolve()) if eval_log_path is not None and eval_log_path.exists() else "n/a",
         "train": parse_epoch_metrics(train_log, args.epochs),
         "eval": parse_eval_metrics(eval_log),
     }

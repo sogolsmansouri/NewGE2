@@ -368,36 +368,36 @@ Column definitions:
 - `Flags Enabled / YAML Overrides`: explicit env vars and any YAML override for that run.
 - `Epochs`: epoch count used for the averaged training metrics in that row.
 - `Avg Inter-Epoch Gap`: average time between epoch end and the next epoch start.
-- `Eval Notes`: `exact filtered`, `approximate sampled negatives`, or any failure/protocol caveat.
+- `Notes`: record any important eval or protocol caveat for that row.
 
 ## LiveJournal 16p
 
-| Row | Branch | Config | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | MRR | Hits@1 | Hits@3 | Hits@10 | Eval Notes | Train Log | Eval Log | Notes |
-| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
-| `control_main_all_flags_off` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `explicit all-flags-off env block; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `5` | 12717.60 ms | 9790046.00 | 2047.50 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_control_main_all_flags_off_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `control_baseline_matched` | `baseline` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_deg_chunk_exclusion` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_gpu_active_edge_shuffle` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_partition_buffer_lp_fast_path` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_fast_map_tensors` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_FAST_MAP_TENSORS=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_unique_backend_bitmap` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=4847571` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_optimized_custom_schedule` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_keep_storage_hot_between_epochs` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_partition_buffer_peer_relay` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_csr_gather` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_CSR_GATHER=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_csr_update` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_CSR_UPDATE=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_bucket_streaming_lp` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_BUCKET_STREAMING_LP=1` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `yaml_dense_sync_batches_2` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `dense_sync_batches=2` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `yaml_dense_sync_batches_4` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `dense_sync_batches=4` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `yaml_dense_sync_batches_8` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `dense_sync_batches=8` | `30` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `incremental_01_deg_chunk_exclusion` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `5` | 9673.40 ms | 12867017.60 | 2034.25 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_01_deg_chunk_exclusion_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `incremental_02_active_edge_shuffle` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `5` | 9138.60 ms | 13620249.40 | 1963.75 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_02_active_edge_shuffle_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `incremental_03_lp_fast_path` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `5` | 9341.80 ms | 13324354.80 | 1907.00 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_03_lp_fast_path_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `incremental_04_fast_map_tensors` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `5` | 9366.20 ms | 13289916.80 | 1941.25 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_04_fast_map_tensors_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `incremental_05_unique_backend_bitmap` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=4847571` | `5` | 9335.40 ms | 13334114.80 | 1915.50 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_05_unique_backend_bitmap_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `incremental_06_optimized_custom_schedule` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `5` | 9124.60 ms | 13640734.00 | 2034.00 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_06_optimized_custom_schedule_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `incremental_07_keep_storage_hot_between_epochs` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `5` | 9121.80 ms | 13645050.00 | 593.75 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_07_keep_storage_hot_between_epochs_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| `incremental_08_partition_buffer_peer_relay` | `main` | `gege/configs/2gpu/livejournal_16p.yaml` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `5` | 8921.60 ms | 13951342.60 | 591.75 ms | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | train only; eval skipped | `experiment_logs/livejournal_16p_main_incremental_08_partition_buffer_peer_relay_5ep_trainonly_train.log` | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
+| Branch | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| <!-- row: control_main_all_flags_off --> `main` | `explicit all-flags-off env block; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: control_baseline_matched --> `baseline` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_deg_chunk_exclusion --> `main` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_gpu_active_edge_shuffle --> `main` | `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_partition_buffer_lp_fast_path --> `main` | `GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_fast_map_tensors --> `main` | `GEGE_FAST_MAP_TENSORS=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_unique_backend_bitmap --> `main` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=4847571` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_optimized_custom_schedule --> `main` | `GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_keep_storage_hot_between_epochs --> `main` | `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_partition_buffer_peer_relay --> `main` | `GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_csr_gather --> `main` | `GEGE_CSR_GATHER=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_csr_update --> `main` | `GEGE_CSR_UPDATE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_bucket_streaming_lp --> `main` | `GEGE_BUCKET_STREAMING_LP=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: yaml_dense_sync_batches_2 --> `main` | `dense_sync_batches=2` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: yaml_dense_sync_batches_4 --> `main` | `dense_sync_batches=4` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: yaml_dense_sync_batches_8 --> `main` | `dense_sync_batches=8` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_01_deg_chunk_exclusion --> `main` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_02_active_edge_shuffle --> `main` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_03_lp_fast_path --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_04_fast_map_tensors --> `main` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_05_unique_backend_bitmap --> `main` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=4847571` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_06_optimized_custom_schedule --> `main` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_07_keep_storage_hot_between_epochs --> `main` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: incremental_08_partition_buffer_peer_relay --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `30` |  |  |  |  |  |  |  |  |  |  |
 
 ## Twitter 16p
 
@@ -408,17 +408,17 @@ Active Twitter plan: use the same 2-GPU cumulative stack style as LiveJournal. F
 - `GEGE_CSR_UPDATE=0`
 - `GEGE_CSR_DEBUG=0`
 
-| Row | Branch | Config | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | MRR | Hits@1 | Hits@3 | Hits@10 | Eval Notes | Train Log | Eval Log | Notes |
-| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
-| `control_main_all_flags_off` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; all optional stack flags off; fixed off env block above` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_01_deg_chunk_exclusion` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; previous_stack=control + GEGE_DEG_CHUNK_EXCLUSION=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_02_active_edge_shuffle` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_03_lp_fast_path` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_04_fast_map_tensors` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_05_unique_backend_bitmap` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=41652230` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_06_optimized_custom_schedule` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_07_keep_storage_hot_between_epochs` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| `incremental_08_partition_buffer_peer_relay` | `main` | `gege/configs/2gpu/twitter_16p.yaml` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `n/a` | `n/a` | `n/a` | `train only; eval skipped` |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| Branch | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| <!-- row: control_main_all_flags_off --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; all optional stack flags off; fixed off env block above` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_01_deg_chunk_exclusion --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; previous_stack=control + GEGE_DEG_CHUNK_EXCLUSION=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_02_active_edge_shuffle --> `main` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_03_lp_fast_path --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_04_fast_map_tensors --> `main` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_05_unique_backend_bitmap --> `main` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=41652230` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_06_optimized_custom_schedule --> `main` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_07_keep_storage_hot_between_epochs --> `main` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_08_partition_buffer_peer_relay --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
 
 <!--
 Legacy partial Twitter 2-GPU table retained for reference:
@@ -445,24 +445,24 @@ Legacy partial Twitter 2-GPU table retained for reference:
 
 ## Freebase86M 16p
 
-| Row | Branch | Config | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | MRR | Hits@1 | Hits@3 | Hits@10 | Eval Notes | Train Log | Eval Log | Notes |
-| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- | --- | --- |
-| `control_main_all_flags_off` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `explicit all-flags-off env block; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `control_baseline_matched` | `baseline` | `gege/configs/2gpu/freebase86m_16p.yaml` | `none` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_fast_map_tensors` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_FAST_MAP_TENSORS=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_partition_buffer_lp_fast_path` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_gpu_active_edge_shuffle` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_optimized_custom_schedule` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_keep_storage_hot_between_epochs` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_deg_chunk_exclusion` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_partition_buffer_peer_relay` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_unique_backend_bitmap` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=86054151` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_csr_gather` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_CSR_GATHER=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_csr_update` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_CSR_UPDATE=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `oneflag_bucket_streaming_lp` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `GEGE_BUCKET_STREAMING_LP=1` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `yaml_dense_sync_batches_2` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `dense_sync_batches=2` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `yaml_dense_sync_batches_4` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `dense_sync_batches=4` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
-| `yaml_dense_sync_batches_8` | `main` | `gege/configs/2gpu/freebase86m_16p.yaml` | `dense_sync_batches=8` | `10` |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| Branch | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| <!-- row: control_main_all_flags_off --> `main` | `explicit all-flags-off env block; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: control_baseline_matched --> `baseline` | `none` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_fast_map_tensors --> `main` | `GEGE_FAST_MAP_TENSORS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_partition_buffer_lp_fast_path --> `main` | `GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_gpu_active_edge_shuffle --> `main` | `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_optimized_custom_schedule --> `main` | `GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_keep_storage_hot_between_epochs --> `main` | `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_deg_chunk_exclusion --> `main` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_partition_buffer_peer_relay --> `main` | `GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_unique_backend_bitmap --> `main` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=86054151` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_csr_gather --> `main` | `GEGE_CSR_GATHER=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_csr_update --> `main` | `GEGE_CSR_UPDATE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: oneflag_bucket_streaming_lp --> `main` | `GEGE_BUCKET_STREAMING_LP=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: yaml_dense_sync_batches_2 --> `main` | `dense_sync_batches=2` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: yaml_dense_sync_batches_4 --> `main` | `dense_sync_batches=4` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: yaml_dense_sync_batches_8 --> `main` | `dense_sync_batches=8` | `10` |  |  |  |  |  |  |  |  |  |  |
 
 ## Parsing Command
 

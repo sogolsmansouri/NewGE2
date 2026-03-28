@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import re
 from pathlib import Path
 
 
@@ -77,8 +78,15 @@ def update_row(cells, summary, args):
         "Eval Log": f"`{args.eval_log}`" if args.eval_log != "n/a" else "`n/a`",
         "Notes": args.notes,
     }
+    new_cells = [metrics.get(header, value) for header, value in zip(args.headers, cells)]
 
-    return [metrics.get(header, value) for header, value in zip(args.headers, cells)]
+    if "Branch" in args.headers:
+        branch_idx = args.headers.index("Branch")
+        marker_match = re.match(r"(<!--\s*row:\s*.*?-->\s*)", cells[branch_idx])
+        marker = marker_match.group(1) if marker_match else f"<!-- row: {args.row} --> "
+        new_cells[branch_idx] = marker + new_cells[branch_idx].lstrip()
+
+    return new_cells
 
 
 def main():
@@ -115,7 +123,7 @@ def main():
 
     header_idx = None
     for idx in range(section_start + 1, section_end):
-        if lines[idx].startswith("| Row |"):
+        if lines[idx].startswith("| ") and "Branch" in lines[idx] and "Avg Epoch Runtime" in lines[idx]:
             header_idx = idx
             break
     if header_idx is None:
@@ -124,9 +132,10 @@ def main():
     args.headers = parse_table_row(lines[header_idx])
 
     row_idx = None
+    marker = f"<!-- row: {args.row} -->"
     needle = f"| `{args.row}` |"
     for idx in range(header_idx + 2, section_end):
-        if lines[idx].startswith(needle):
+        if marker in lines[idx] or lines[idx].startswith(needle):
             row_idx = idx
             break
     if row_idx is None:

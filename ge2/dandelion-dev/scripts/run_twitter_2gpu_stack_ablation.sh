@@ -188,17 +188,28 @@ for idx in range(start + 1, len(lines)):
         end = idx
         break
 
-needle = f"| `{row}` |"
+header_idx = None
 for idx in range(start + 1, end):
+    if lines[idx].startswith("| ") and "Branch" in lines[idx] and "Avg Epoch Runtime" in lines[idx]:
+        header_idx = idx
+        break
+
+if header_idx is None:
+    print("0")
+    raise SystemExit(0)
+
+headers = [p.strip() for p in lines[header_idx].split("|")[1:-1]]
+marker = f"<!-- row: {row} -->"
+needle = f"| `{row}` |"
+for idx in range(header_idx + 2, end):
     line = lines[idx]
-    if line.startswith(needle):
+    if marker in line or line.startswith(needle):
         parts = [p.strip() for p in line.split("|")[1:-1]]
-        if len(parts) < 20:
+        if "Avg Epoch Runtime" not in headers:
             print("0")
             raise SystemExit(0)
-        avg_epoch = parts[5].replace("`", "").strip()
-        train_log = parts[18].replace("`", "").strip()
-        filled = avg_epoch not in {"", "n/a"} and train_log not in {"", "n/a"}
+        avg_epoch = parts[headers.index("Avg Epoch Runtime")].replace("`", "").strip().lower()
+        filled = avg_epoch not in {"", "n/a"}
         print("1" if filled else "0")
         raise SystemExit(0)
 

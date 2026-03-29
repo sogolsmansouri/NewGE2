@@ -22,9 +22,8 @@ These checked-in scripts are the preferred way to run and update this markdown:
 | Dataset | Script | Config | Default epochs | Mode | Auto-updates `.md` |
 | --- | --- | --- | ---: | --- | --- |
 | `livejournal_16p` | [run_lj_single_gpu_stack_ablation.sh](/home/smansou2/newCode/ge2/dandelion-dev/scripts/run_lj_single_gpu_stack_ablation.sh) | `gege/configs/single_gpu/livejournal_16p.yaml` | `5` | train only | yes |
+| `twitter_16p` | [run_twitter_single_gpu_stack_ablation.sh](/home/smansou2/newCode/ge2/dandelion-dev/scripts/run_twitter_single_gpu_stack_ablation.sh) | `gege/configs/single_gpu/twitter_16p.yaml` | `3` | train only | yes |
 | `freebase86m_16p` | [run_fb86m_single_gpu_stack_ablation.sh](/home/smansou2/newCode/ge2/dandelion-dev/scripts/run_fb86m_single_gpu_stack_ablation.sh) | `gege/configs/single_gpu/freebase86m_16p.yaml` | `3` | train only | yes |
-
-Twitter currently has historical rows and placeholders in this file, but no committed dedicated stack runner yet.
 
 **Quick start**
 
@@ -54,6 +53,13 @@ Run the FB86M stack study:
 ```bash
 cd "$REPO_ROOT"
 bash scripts/run_fb86m_single_gpu_stack_ablation.sh
+```
+
+Run the Twitter stack study:
+
+```bash
+cd "$REPO_ROOT"
+bash scripts/run_twitter_single_gpu_stack_ablation.sh
 ```
 
 Both runners:
@@ -167,34 +173,24 @@ LJ marginal importance summary, ranked by epoch-time improvement in the cumulati
 
 ## Twitter 16p
 
+Active Twitter plan: use the same cumulative single-GPU stack structure as LJ. For every Twitter stack run, hold these fixed:
+- `GEGE_BUCKET_STREAMING_LP=0`
+- `GEGE_CSR_GATHER=0`
+- `GEGE_CSR_UPDATE=0`
+- `GEGE_CSR_DEBUG=0`
+
 | Branch | Flags Enabled | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| <!-- row: control_main_all_flags_off --> `main` | `explicit all-flags-off env block; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `3` | 506444.33 ms | 6026260.33 | 35162.50 ms | 19.0 | 0.0060 | 85572.0913 | 85771.0893 | 0.0240 | `n/a` | 3-epoch twitter_16p single-GPU train-only overnight run via run_single_gpu_train_only_ablation_matrix.sh (2026-03-28) |
-| <!-- row: control_baseline_matched --> `baseline` | `branch-compatible social baseline; not exact DOT unless patched` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_fast_map_tensors --> `main` | `GEGE_FAST_MAP_TENSORS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_partition_buffer_lp_fast_path --> `main` | `GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_gpu_active_edge_shuffle --> `main` | `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_keep_storage_hot_between_epochs --> `main` | `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_single_gpu_gpu_aware_custom --> `main` | `GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_optimized_custom_schedule --> `main` | `GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_deg_chunk_exclusion --> `main` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_global_degree_sampling --> `main` | `GEGE_GLOBAL_DEGREE_SAMPLING=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_csr_gather --> `main` | `GEGE_CSR_GATHER=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_csr_update --> `main` | `GEGE_CSR_UPDATE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_bucket_streaming_lp --> `main` | `GEGE_BUCKET_STREAMING_LP=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_mem_partition_buffer_pinned_host --> `main` | `GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_unique_backend_bitmap --> `main` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=41652230` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_emulate_dot_single_relation --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_01_fast_map_tensors --> `main` | `GEGE_FAST_MAP_TENSORS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_02_lp_fast_path --> `main` | `GEGE_FAST_MAP_TENSORS=1, GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_03_active_edge_shuffle --> `main` | `GEGE_FAST_MAP_TENSORS=1, GEGE_PARTITION_BUFFER_LP_FAST_PATH=1, GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_04_keep_hot --> `main` | `GEGE_FAST_MAP_TENSORS=1, GEGE_PARTITION_BUFFER_LP_FAST_PATH=1, GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1, GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_05a_scheduler_gpu_aware_custom --> `main` | `GEGE_FAST_MAP_TENSORS=1, GEGE_PARTITION_BUFFER_LP_FAST_PATH=1, GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1, GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1, GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_05b_scheduler_optimized_custom --> `main` | `GEGE_FAST_MAP_TENSORS=1, GEGE_PARTITION_BUFFER_LP_FAST_PATH=1, GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1, GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1, GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_06_deg_chunk_exclusion --> `main` | `previous_stack + GEGE_DEG_CHUNK_EXCLUSION=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_07_csr_gather --> `main` | `previous_stack + GEGE_CSR_GATHER=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_08_csr_update --> `main` | `previous_stack + GEGE_CSR_UPDATE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: incremental_09_bucket_streaming_lp --> `main` | `previous_stack + GEGE_BUCKET_STREAMING_LP=1` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: stack_00_control --> `main` | `all stack flags off; fixed off env block above` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_01_bitmap_unique --> `main` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=41652230` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_02_plus_emulate_dot_single_relation --> `main` | `previous_stack + GEGE_EMULATE_DOT_SINGLE_RELATION=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_03_plus_mem_partition_buffer_pinned_host --> `main` | `previous_stack + GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_04_plus_fast_map_tensors --> `main` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_05_plus_partition_buffer_lp_fast_path --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_06_plus_single_gpu_gpu_aware_custom --> `main` | `previous_stack + GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_07_plus_keep_storage_hot_between_epochs --> `main` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_08_plus_gpu_active_edge_shuffle --> `main` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
+| <!-- row: stack_09_plus_deg_chunk_exclusion --> `main` | `previous_stack + GEGE_DEG_CHUNK_EXCLUSION=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | 3-epoch Twitter single-GPU train-only stack run via run_twitter_single_gpu_stack_ablation.sh |
 
 ## Freebase86M 16p
 

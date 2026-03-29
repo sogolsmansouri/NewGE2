@@ -20,7 +20,8 @@ def parse_epoch_metrics(train_log_text: str, epochs: int):
     edges_per_second = [float(value) for value in re.findall(r"Edges per Second:\s+([0-9.]+)", train_log_text)[:epochs]]
 
     perf_matches = re.findall(
-        r"\[perf\]\[epoch (\d+)\] swap_count=(\d+) "
+        r"\[perf\]\[epoch (\d+)\].*?"
+        r"swap_count=(\d+) "
         r"swap_barrier_wait_ms=([0-9.]+) "
         r"swap_update_ms=([0-9.]+) "
         r"swap_rebuild_ms=([0-9.]+) "

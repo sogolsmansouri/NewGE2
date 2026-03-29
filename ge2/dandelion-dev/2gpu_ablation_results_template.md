@@ -422,24 +422,23 @@ Active Twitter plan: use the same 2-GPU cumulative stack style as LiveJournal. F
 
 ## Freebase86M 16p
 
+Active Freebase86M plan: use the same 2-GPU cumulative stack style as LiveJournal and Twitter. For every Freebase86M stack run, hold these fixed:
+- `GEGE_BUCKET_STREAMING_LP=0`
+- `GEGE_CSR_GATHER=0`
+- `GEGE_CSR_UPDATE=0`
+- `GEGE_CSR_DEBUG=0`
+
 | Branch | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| <!-- row: control_main_all_flags_off --> `main` | `explicit all-flags-off env block; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: control_baseline_matched --> `baseline` | `none` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_fast_map_tensors --> `main` | `GEGE_FAST_MAP_TENSORS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_partition_buffer_lp_fast_path --> `main` | `GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_gpu_active_edge_shuffle --> `main` | `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_optimized_custom_schedule --> `main` | `GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_keep_storage_hot_between_epochs --> `main` | `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_deg_chunk_exclusion --> `main` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_partition_buffer_peer_relay --> `main` | `GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_unique_backend_bitmap --> `main` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=86054151` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_csr_gather --> `main` | `GEGE_CSR_GATHER=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_csr_update --> `main` | `GEGE_CSR_UPDATE=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_bucket_streaming_lp --> `main` | `GEGE_BUCKET_STREAMING_LP=1` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: yaml_dense_sync_batches_2 --> `main` | `dense_sync_batches=2` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: yaml_dense_sync_batches_4 --> `main` | `dense_sync_batches=4` | `10` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: yaml_dense_sync_batches_8 --> `main` | `dense_sync_batches=8` | `10` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: control_main_all_flags_off --> `main` | `all optional stack flags off; fixed off env block above; unset GEGE_GLOBAL_DEGREE_SAMPLING` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_01_deg_chunk_exclusion --> `main` | `previous_stack=control + GEGE_DEG_CHUNK_EXCLUSION=1` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_02_active_edge_shuffle --> `main` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_03_lp_fast_path --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_04_fast_map_tensors --> `main` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_05_unique_backend_bitmap --> `main` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=86054151` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_06_optimized_custom_schedule --> `main` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_07_keep_storage_hot_between_epochs --> `main` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_08_partition_buffer_peer_relay --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `10` |  |  |  |  |  |  |  |  | `n/a` | `Freebase86M 2-GPU importance stack run via run_fb86m_2gpu_stack_ablation.sh` |
 
 ## Parsing Command
 

@@ -245,6 +245,47 @@ void log_eval_tensor_if_non_finite(const char *stage, int batch_id, const torch:
                  log_id, stage, batch_id, invalid_values, invalid_rows, tensor_shape_string(tensor), tensor.device().str());
 }
 
+void copy_named_tensors_to_device(torch::OrderedDict<std::string, torch::Tensor> src, torch::OrderedDict<std::string, torch::Tensor> dst,
+                                  torch::Device device) {
+    torch::NoGradGuard no_grad;
+    for (auto &item : src) {
+        dst[item.key()].copy_(item.value().to(device));
+    }
+}
+
+shared_ptr<GeneralEncoder> clone_encoder_for_device(const shared_ptr<GeneralEncoder> &encoder, torch::Device device) {
+    auto cloned = std::make_shared<GeneralEncoder>(encoder->encoder_config_, device, encoder->num_relations_);
+    copy_named_tensors_to_device(std::dynamic_pointer_cast<torch::nn::Module>(encoder)->named_parameters(/*recurse=*/true),
+                                 std::dynamic_pointer_cast<torch::nn::Module>(cloned)->named_parameters(/*recurse=*/true), device);
+    copy_named_tensors_to_device(std::dynamic_pointer_cast<torch::nn::Module>(encoder)->named_buffers(/*recurse=*/true),
+                                 std::dynamic_pointer_cast<torch::nn::Module>(cloned)->named_buffers(/*recurse=*/true), device);
+    return cloned;
+}
+
+void align_broadcast_model_to_device(const shared_ptr<GeneralEncoder> &encoder, const shared_ptr<Decoder> &decoder, torch::Device device) {
+    if (encoder != nullptr) {
+        encoder->to(device);
+        encoder->device_ = device;
+        for (auto &stage : encoder->layers_) {
+            for (auto &layer : stage) {
+                if (layer != nullptr) {
+                    layer->device_ = device;
+                }
+            }
+        }
+    }
+
+    auto decoder_module = std::dynamic_pointer_cast<torch::nn::Module>(decoder);
+    if (decoder_module != nullptr) {
+        decoder_module->to(device);
+    }
+
+    auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder);
+    if (edge_decoder != nullptr) {
+        edge_decoder->tensor_options_ = edge_decoder->tensor_options_.device(device);
+    }
+}
+
 }  // namespace
 
 Model::Model(shared_ptr<GeneralEncoder> encoder, shared_ptr<Decoder> decoder, shared_ptr<LossFunction> loss, shared_ptr<Reporter> reporter,
@@ -755,8 +796,9 @@ void Model::broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig
             if (log_startup_timing) {
                 SPDLOG_INFO("[startup-timing][Model::broadcast] begin clone slot={} device={}", i, device.str());
             }
-            shared_ptr<GeneralEncoder> encoder = encoder_clone_helper(encoder_, device);
+            shared_ptr<GeneralEncoder> encoder = clone_encoder_for_device(encoder_, device);
             shared_ptr<Decoder> decoder = decoder_clone_helper(decoder_, device);
+            align_broadcast_model_to_device(encoder, decoder, device);
             if (log_startup_timing) {
                 SPDLOG_INFO("[startup-timing][Model::broadcast] cloned encoder/decoder slot={} device={}", i, device.str());
             }

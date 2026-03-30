@@ -349,13 +349,11 @@ Recommended 2-GPU candidate flags and knobs:
 - `GEGE_CSR_GATHER`
 - `GEGE_CSR_UPDATE`
 - `GEGE_BUCKET_STREAMING_LP`
-- `dense_sync_batches` as a YAML sweep
 
 Important notes:
 - `GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM` is single-GPU-only in the code path; do not add it to real 2-GPU experiments.
 - `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS` is shared with multi-GPU and is valid to test on 2 GPUs; it mainly affects inter-epoch gap and disk I/O rather than in-epoch compute.
 - `GEGE_PARTITION_BUFFER_PEER_RELAY` is the main 2-GPU/4-GPU-specific probe.
-- `dense_sync_batches` is a config knob, not an env flag.
 - `GEGE_MEM_PARTITION_BUFFER_PINNED_HOST` is not a useful 2-GPU sweep knob: the code forces pinned host buffers on for multi-GPU MEM_PARTITION_BUFFER.
 - `GEGE_UNIQUE_BACKEND=bitmap` is shared, not single-GPU-only. It is valid on 2 GPUs when the node-ID domain is known and dense.
 - For the LJ 2-GPU stack below, order the shared flags by the single-GPU importance signal where it transfers cleanly, then place the multi-GPU-specific knobs afterward.
@@ -375,21 +373,7 @@ Column definitions:
 | Branch | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | <!-- row: control_main_all_flags_off --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; all optional stack flags off; fixed off env block above` | `5` | 12717.60 ms | 9790046.00 | 2047.50 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
-| <!-- row: control_baseline_matched --> `baseline` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_deg_chunk_exclusion --> `main` | `GEGE_DEG_CHUNK_EXCLUSION=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_gpu_active_edge_shuffle --> `main` | `GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_partition_buffer_lp_fast_path --> `main` | `GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_fast_map_tensors --> `main` | `GEGE_FAST_MAP_TENSORS=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_unique_backend_bitmap --> `main` | `GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=4847571` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_optimized_custom_schedule --> `main` | `GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_keep_storage_hot_between_epochs --> `main` | `GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_partition_buffer_peer_relay --> `main` | `GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_csr_gather --> `main` | `GEGE_CSR_GATHER=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_csr_update --> `main` | `GEGE_CSR_UPDATE=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: oneflag_bucket_streaming_lp --> `main` | `GEGE_BUCKET_STREAMING_LP=1` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: yaml_dense_sync_batches_2 --> `main` | `dense_sync_batches=2` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: yaml_dense_sync_batches_4 --> `main` | `dense_sync_batches=4` | `30` |  |  |  |  |  |  |  |  |  |  |
-| <!-- row: yaml_dense_sync_batches_8 --> `main` | `dense_sync_batches=8` | `30` |  |  |  |  |  |  |  |  |  |  |
+| <!-- row: control_baseline_matched --> `baseline` | `none; baseline/ge2_original paper config adapted to device_ids=[0,1]` | `5` | 15591.20 ms | 3982952.12 | 510.75 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | LJ 2-GPU baseline/ge2_original paper-style train-only run with num_epochs=5 and no GEGE_* flags |
 | <!-- row: incremental_01_deg_chunk_exclusion --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; previous_stack=control + GEGE_DEG_CHUNK_EXCLUSION=1` | `5` | 9673.40 ms | 12867017.60 | 2034.25 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
 | <!-- row: incremental_02_active_edge_shuffle --> `main` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `5` | 9138.60 ms | 13620249.40 | 1963.75 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
 | <!-- row: incremental_03_lp_fast_path --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `5` | 9341.80 ms | 13324354.80 | 1907.00 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | LJ 2-GPU importance stack run via run_lj_2gpu_stack_ablation.sh with GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed across runs |
@@ -410,15 +394,16 @@ Active Twitter plan: use the same 2-GPU cumulative stack style as LiveJournal. F
 
 | Branch | Flags Enabled / YAML Overrides | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
-| <!-- row: control_main_all_flags_off --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; all optional stack flags off; fixed off env block above` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_01_deg_chunk_exclusion --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; previous_stack=control + GEGE_DEG_CHUNK_EXCLUSION=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_02_active_edge_shuffle --> `main` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_03_lp_fast_path --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_04_fast_map_tensors --> `main` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_05_unique_backend_bitmap --> `main` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=41652230` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_06_optimized_custom_schedule --> `main` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_07_keep_storage_hot_between_epochs --> `main` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
-| <!-- row: incremental_08_partition_buffer_peer_relay --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `3` |  |  |  |  |  |  |  |  | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: control_main_all_flags_off --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; all optional stack flags off; fixed off env block above` | `3` | 266794.33 ms | 9996549.33 | 21331.00 ms | 12.0 | 13843.4517 | 26422.6973 | 24752.3777 | 8351.0613 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: control_baseline_matched --> `baseline` | `none; baseline/ge2_original paper config adapted to device_ids=[0,1]` | `3` | 327021.67 ms | 4041169.50 | 8479.50 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | Twitter 2-GPU baseline/ge2_original paper-style train-only run with num_epochs=3 and no GEGE_* flags |
+| <!-- row: incremental_01_deg_chunk_exclusion --> `main` | `GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; previous_stack=control + GEGE_DEG_CHUNK_EXCLUSION=1` | `3` | 203923.00 ms | 13078506.67 | 21080.50 ms | 12.0 | 12491.9573 | 26415.7173 | 24824.3380 | 8317.8440 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_02_active_edge_shuffle --> `main` | `previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1` | `3` | 181012.33 ms | 14734472.33 | 17829.00 ms | 12.0 | 12533.0727 | 26462.2947 | 104.2147 | 295.0040 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_03_lp_fast_path --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_LP_FAST_PATH=1` | `3` | 177327.00 ms | 15040818.33 | 16142.50 ms | 12.0 | 12434.2740 | 21105.3733 | 120.3920 | 401.5340 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_04_fast_map_tensors --> `main` | `previous_stack + GEGE_FAST_MAP_TENSORS=1` | `3` | 177245.00 ms | 15047571.00 | 16272.50 ms | 12.0 | 12360.5167 | 21246.9633 | 110.3387 | 480.0100 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_05_unique_backend_bitmap --> `main` | `previous_stack + GEGE_UNIQUE_BACKEND=bitmap, GEGE_UNIQUE_BITMAP_NUM_NODES=41652230` | `3` | 176247.67 ms | 15132845.67 | 16267.00 ms | 12.0 | 11814.1060 | 21276.1333 | 119.6703 | 480.2393 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_06_optimized_custom_schedule --> `main` | `previous_stack + GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1` | `3` | 171786.00 ms | 15524881.33 | 16314.00 ms | 12.0 | 8369.5680 | 21061.2967 | 130.9653 | 329.2420 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_07_keep_storage_hot_between_epochs --> `main` | `previous_stack + GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1` | `3` | 171540.00 ms | 15547154.00 | 6299.00 ms | 12.0 | 8371.7257 | 21062.3640 | 150.1827 | 311.7953 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
+| <!-- row: incremental_08_partition_buffer_peer_relay --> `main` | `previous_stack + GEGE_PARTITION_BUFFER_PEER_RELAY=1` | `3` | 170088.33 ms | 15679838.33 | 6247.00 ms | 12.0 | 8426.5467 | 18644.4140 | 143.4427 | 493.5453 | `n/a` | `Twitter 2-GPU importance stack run via run_twitter_2gpu_stack_ablation.sh` |
 
 <!--
 Legacy partial Twitter 2-GPU table retained for reference:

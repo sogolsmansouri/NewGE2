@@ -8,7 +8,10 @@
 #include <sstream>
 #include <string>
 #ifdef GEGE_CUDA
+#include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime_api.h>
 #endif
 
 #include "configuration/util.h"
@@ -16,6 +19,18 @@
 #include "reporting/logger.h"
 
 namespace {
+
+#ifdef GEGE_CUDA
+void empty_cache_for_graph_storage_device(const torch::Device &device) {
+    if (!device.is_cuda()) {
+        return;
+    }
+
+    c10::cuda::CUDAGuard device_guard(device);
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+    c10::cuda::CUDACachingAllocator::emptyCache();
+}
+#endif
 
 bool parse_graph_storage_env_flag(const char *name, bool default_value) {
     const char *raw = std::getenv(name);
@@ -1027,7 +1042,7 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
             torch::Tensor mapped_edges_src_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
             mapped_edges_dst_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
 #ifdef GEGE_CUDA
-            c10::cuda::CUDACachingAllocator::emptyCache();
+            empty_cache_for_graph_storage_device(device);
 #endif
 
             mapped_edges_src_sort = mapped_edges_src_sort.to(torch::kInt64);
@@ -1138,7 +1153,7 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         auto t2 = std::chrono::high_resolution_clock::now();
         // SPDLOG_INFO("performSwap time {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
 #ifdef GEGE_CUDA
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        empty_cache_for_graph_storage_device(devices_[device_idx]);
 #endif
         // SPDLOG_INFO("updateInMemorySubGraph_");
         t1 = std::chrono::high_resolution_clock::now();
@@ -1495,14 +1510,14 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             phase_start = now;
         }
 #ifdef GEGE_CUDA
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        empty_cache_for_graph_storage_device(devices_[device_idx]);
 #endif
 
         torch::Tensor mapped_edges_src_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, true);
         mapped_edges_dst_sort = merge_sorted_edge_buckets(bucket_layout_mapped_edges, in_mem_edge_bucket_starts, buffer_size, false);
         
 #ifdef GEGE_CUDA
-        c10::cuda::CUDACachingAllocator::emptyCache();
+        empty_cache_for_graph_storage_device(devices_[device_idx]);
 #endif
 
         mapped_edges_src_sort = mapped_edges_src_sort.to(torch::kInt64);

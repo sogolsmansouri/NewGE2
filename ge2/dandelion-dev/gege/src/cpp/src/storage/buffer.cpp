@@ -16,9 +16,11 @@
 #include <future>
 #include <shared_mutex>
 #ifdef GEGE_CUDA
+#include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime_api.h>
 #include "pytorch_scatter/segment_sum.h"
 #endif
 
@@ -231,6 +233,22 @@ int64_t partition_rows_for_ids(const std::vector<int> &partition_ids, const std:
 }
 
 double bytes_to_mib(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
+
+#ifdef GEGE_CUDA
+void synchronize_cuda_storage_device(const torch::Device &device) {
+    if (!device.is_cuda()) {
+        return;
+    }
+
+    c10::cuda::CUDAGuard device_guard(device);
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void empty_cache_for_storage_device(const torch::Device &device) {
+    synchronize_cuda_storage_device(device);
+    c10::cuda::CUDACachingAllocator::emptyCache();
+}
+#endif
 
 void log_non_finite_rows_if_any(const char *stage, int64_t log_id, const torch::Device &device, int partition_id, const torch::Tensor &tensor) {
     if (!tensor.defined() || tensor.numel() == 0) {
@@ -1448,6 +1466,10 @@ void MemPartitionBuffer::performNextSwap() {
         return;
     }
 
+#ifdef GEGE_CUDA
+    synchronize_cuda_storage_device(device_);
+#endif
+
     if (single_gpu_gpu_aware_custom_enabled() && buffer_sizes_ == 1 && device_.is_cuda()) {
         int64_t timing_id = -1;
         bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
@@ -1672,7 +1694,7 @@ void MemPartitionBuffer::performNextSwap() {
     auto t2 = std::chrono::high_resolution_clock::now();
     unload_ms = elapsed_ms(t1, t2);
 #ifdef GEGE_CUDA
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    empty_cache_for_storage_device(device_);
 #endif
     
     buffer_state_ = *buffer_state_iterator_;
@@ -1688,7 +1710,7 @@ void MemPartitionBuffer::performNextSwap() {
     t2 = std::chrono::high_resolution_clock::now();
     load_ms = elapsed_ms(t1, t2);
 #ifdef GEGE_CUDA
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    empty_cache_for_storage_device(device_);
 #endif
 
     int64_t num_nodes = 0;
@@ -1775,6 +1797,9 @@ void MemPartitionBuffer::setBufferOrdering(std::vector<torch::Tensor> buffer_sta
 void MemPartitionBuffer::unload(bool write) {
 
     if (loaded_) {
+#ifdef GEGE_CUDA
+        synchronize_cuda_storage_device(device_);
+#endif
         int64_t timing_id = -1;
         bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
         int64_t eval_finite_log_id = -1;

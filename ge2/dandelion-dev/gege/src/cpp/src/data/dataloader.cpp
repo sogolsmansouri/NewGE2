@@ -9,10 +9,29 @@
 #include <sstream>
 #include <string>
 #ifdef GEGE_CUDA
+#include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <cuda_runtime_api.h>
 #endif
 
 namespace {
+
+#ifdef GEGE_CUDA
+void synchronize_cuda_swap_device(const torch::Device &device) {
+    if (!device.is_cuda()) {
+        return;
+    }
+
+    c10::cuda::CUDAGuard device_guard(device);
+    AT_CUDA_CHECK(cudaDeviceSynchronize());
+}
+
+void empty_cache_for_swap_device(const torch::Device &device) {
+    synchronize_cuda_swap_device(device);
+    c10::cuda::CUDACachingAllocator::emptyCache();
+}
+#endif
 
 bool parse_env_flag(const char *name, bool default_value) {
     const char *raw = std::getenv(name);
@@ -1354,7 +1373,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 }
 
 #ifdef GEGE_CUDA
-                c10::cuda::CUDACachingAllocator::emptyCache();
+                empty_cache_for_swap_device(devices_[device_idx]);
 #endif
                 // SPDLOG_INFO("Swapping subgraph for device {}", device_idx);
                 // auto t1 = std::chrono::high_resolution_clock::now();
@@ -1367,7 +1386,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 }
                 // SPDLOG_INFO("graph_storage_->updateInMemorySubGraph");
 #ifdef GEGE_CUDA
-                c10::cuda::CUDACachingAllocator::emptyCache();
+                empty_cache_for_swap_device(devices_[device_idx]);
 #endif
                 // auto t11 = std::chrono::high_resolution_clock::now();
                 // SPDLOG_INFO("Time to updateInMemorySubGraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t11 - t1).count());
@@ -1394,7 +1413,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                     //     static_cast<double>(swap_rebuild_elapsed) / 1'000'000.0);
                 }
 #ifdef GEGE_CUDA
-                c10::cuda::CUDACachingAllocator::emptyCache();
+                empty_cache_for_swap_device(devices_[device_idx]);
 #endif
 
                 activate_devices_ ++;

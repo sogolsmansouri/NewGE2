@@ -7,7 +7,7 @@ model:
     layers:
       - - type: EMBEDDING
           output_dim: 100
-          bias: true
+          bias: false
           init:
             type: GLOROT_NORMAL
   decoder:

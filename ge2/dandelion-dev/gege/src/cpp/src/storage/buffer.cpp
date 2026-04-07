@@ -102,6 +102,11 @@ bool single_gpu_async_evict_source_verify_enabled() {
     return enabled;
 }
 
+bool mem_partition_buffer_dirty_profile_enabled() {
+    static bool enabled = parse_env_flag("GEGE_MEM_PARTITION_BUFFER_DIRTY_PROFILE", false);
+    return enabled;
+}
+
 bool fixed_buffer_masked_update_verify_enabled() {
     static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY", false);
     return enabled;
@@ -1338,6 +1343,74 @@ int64_t MemPartitionBuffer::contiguousHostPartitionStart_(int partition_id) cons
     return partition_host_start_offsets_[partition_id];
 }
 
+void MemPartitionBuffer::ensureDirtyRowMaskAllocated_() {
+    if (!mem_partition_buffer_dirty_profile_enabled()) {
+        return;
+    }
+    if (dirty_row_mask_.defined()) {
+        return;
+    }
+    torch::TensorOptions mask_options = torch::TensorOptions().dtype(torch::kUInt8).device(device_);
+#ifdef GEGE_CUDA
+    if (device_.is_cuda()) {
+        c10::cuda::CUDAGuard device_guard(device_);
+        dirty_row_mask_ = torch::zeros({capacity_ * partition_size_}, mask_options);
+    } else {
+        dirty_row_mask_ = torch::zeros({capacity_ * partition_size_}, mask_options);
+    }
+#else
+    dirty_row_mask_ = torch::zeros({capacity_ * partition_size_}, mask_options);
+#endif
+}
+
+void MemPartitionBuffer::markDirtyRows_(torch::Tensor indices, torch::Tensor active_mask) {
+    if (!mem_partition_buffer_dirty_profile_enabled()) {
+        return;
+    }
+    if (!indices.defined() || indices.numel() == 0) {
+        return;
+    }
+    ensureDirtyRowMaskAllocated_();
+    if (!dirty_row_mask_.defined()) {
+        return;
+    }
+
+    torch::Tensor dirty_indices = indices.to(torch::kInt64);
+    if (active_mask.defined() && active_mask.numel() == dirty_indices.numel()) {
+        torch::Tensor mask = active_mask.to(dirty_indices.device()).to(torch::kBool);
+        dirty_indices = dirty_indices.masked_select(mask);
+        if (dirty_indices.numel() == 0) {
+            return;
+        }
+    }
+    dirty_indices = dirty_indices.to(dirty_row_mask_.device());
+    dirty_row_mask_.index_fill_(0, dirty_indices, 1);
+}
+
+void MemPartitionBuffer::clearDirtyRowsForSlots_(const std::vector<int64_t> &slots, const std::vector<int> &partition_ids) {
+    if (!dirty_row_mask_.defined()) {
+        return;
+    }
+    for (std::size_t idx = 0; idx < slots.size() && idx < partition_ids.size(); idx++) {
+        Partition *partition = partition_table_[partition_ids[idx]];
+        int64_t buffer_offset = slots[idx] * partition_size_;
+        dirty_row_mask_.slice(0, buffer_offset, buffer_offset + partition->partition_size_).zero_();
+    }
+}
+
+int64_t MemPartitionBuffer::countDirtyRowsForSlots_(const std::vector<int64_t> &slots, const std::vector<int> &partition_ids) {
+    if (!dirty_row_mask_.defined()) {
+        return -1;
+    }
+    int64_t dirty_rows = 0;
+    for (std::size_t idx = 0; idx < slots.size() && idx < partition_ids.size(); idx++) {
+        Partition *partition = partition_table_[partition_ids[idx]];
+        int64_t buffer_offset = slots[idx] * partition_size_;
+        dirty_rows += dirty_row_mask_.slice(0, buffer_offset, buffer_offset + partition->partition_size_).sum().item<int64_t>();
+    }
+    return dirty_rows;
+}
+
 torch::Tensor MemPartitionBuffer::hostPartitionRows_(Partition *partition) {
     if (hasContiguousHostPartitionRange_(partition->partition_id_)) {
         return data_storage_.narrow(0, contiguousHostPartitionStart_(partition->partition_id_), partition->partition_size_);
@@ -1810,6 +1883,10 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
 #else
         buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
 #endif
+        ensureDirtyRowMaskAllocated_();
+        if (dirty_row_mask_.defined()) {
+            dirty_row_mask_.zero_();
+        }
         auto t2 = std::chrono::high_resolution_clock::now();
         if (log_startup_timing) {
             SPDLOG_INFO("[startup-timing][MemPartitionBuffer::load] end device={} nodes={} total_ms={:.3f}",
@@ -1823,6 +1900,7 @@ void MemPartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
         // TODO: throw invalid input to func exception
         throw std::runtime_error("");
     }
+    markDirtyRows_(indices);
     int64_t debug_update_id = -1;
     bool run_stage_debug = should_run_stage_debug(debug_update_id);
     bool run_eval_finite_debug = eval_finite_debug_enabled();
@@ -1938,6 +2016,7 @@ void MemPartitionBuffer::indexAddMasked(torch::Tensor indices, torch::Tensor val
                 expected_values = buffer_tensor_gpu_view_.index_select(0, active_indices).clone() + active_values;
             }
         }
+        markDirtyRows_(indices, active_mask);
         active_masked_index_add_cuda(buffer_tensor_gpu_view_, indices, values, active_mask);
         if (verify_index_add && active_rows.numel() > 0) {
             torch::Tensor actual_values = buffer_tensor_gpu_view_.index_select(0, active_indices);
@@ -2036,6 +2115,34 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         int64_t retained_bytes = retained_rows * bytes_per_row;
         int64_t evict_bytes = evict_rows * bytes_per_row;
         int64_t admit_bytes = admit_rows * bytes_per_row;
+        int64_t full_async_stage_bytes = evict_bytes + admit_bytes;
+        int64_t evict_dirty_rows = -1;
+        double evict_dirty_ratio = -1.0;
+        int64_t evict_dirty_bytes = -1;
+        double dirty_profile_ms = 0.0;
+        int64_t cuda_free_bytes = -1;
+        int64_t cuda_total_bytes = -1;
+        if (log_timing) {
+#ifdef GEGE_CUDA
+            if (device_.is_cuda()) {
+                c10::cuda::CUDAGuard device_guard(device_);
+                size_t free_bytes = 0;
+                size_t total_bytes = 0;
+                AT_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+                cuda_free_bytes = static_cast<int64_t>(free_bytes);
+                cuda_total_bytes = static_cast<int64_t>(total_bytes);
+            }
+#endif
+            if (mem_partition_buffer_dirty_profile_enabled()) {
+                auto dirty_start = std::chrono::high_resolution_clock::now();
+                evict_dirty_rows = countDirtyRowsForSlots_(evict_slots, evict_ids);
+                if (evict_dirty_rows >= 0 && evict_rows > 0) {
+                    evict_dirty_ratio = static_cast<double>(evict_dirty_rows) / static_cast<double>(evict_rows);
+                    evict_dirty_bytes = evict_dirty_rows * bytes_per_row;
+                }
+                dirty_profile_ms = elapsed_ms(dirty_start, std::chrono::high_resolution_clock::now());
+            }
+        }
         bool async_evict_writeback = single_gpu_async_evict_writeback_enabled() && evict_rows > 0;
         std::vector<int64_t> evict_row_offsets;
         torch::Tensor async_evict_gpu_stage;
@@ -2199,6 +2306,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             partition->present_ = false;
             partition->buffer_idx_ = -1;
         }
+        clearDirtyRowsForSlots_(evict_slots, evict_ids);
         if (log_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             evict_metadata_ms = elapsed_ms(phase_start, now);
@@ -2347,17 +2455,23 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             SPDLOG_INFO(
                 "[partition-buffer-swap][swap {}] storage={} this={} device={} active_parts={} retained_parts={} evict_parts={} admit_parts={} nodes={} "
                 "retained_ids={} evict_ids={} admit_ids={} evict_slots={} retained_mib={:.3f} gpu_to_cpu_mib={:.3f} cpu_to_gpu_mib={:.3f} "
+                "full_async_stage_mib={:.3f} cuda_free_mib={:.3f} cuda_total_mib={:.3f} full_async_stage_fits={} "
+                "evict_dirty_rows={} evict_dirty_ratio={:.6f} dirty_writeback_mib={:.3f} dirty_profile_ms={:.3f} "
                 "gpu_to_cpu_ms={:.3f} host_sync_ms={:.3f} host_load_ms={:.3f} cpu_to_gpu_ms={:.3f} preload_wait_ms={:.3f} preloaded_admit={} async_evict_writeback={} "
                 "setup_ms={:.3f} evict_stage_alloc_ms={:.3f} evict_stage_copy_submit_ms={:.3f} evict_stage_sync_ms={:.3f} evict_verify_ms={:.3f} "
                 "evict_writeback_submit_ms={:.3f} evict_metadata_ms={:.3f} admit_preload_consume_ms={:.3f} admit_fallback_evict_join_ms={:.3f} "
                 "admit_fallback_host_load_ms={:.3f} admit_gpu_copy_submit_ms={:.3f} admit_gpu_copy_sync_ms={:.3f} state_bookkeeping_ms={:.3f} total_ms={:.3f}",
                 timing_id, basename_string(filename_), fmt::ptr(this), device_.str(), buffer_state_.size(0), retained_parts, evict_ids.size(), admit_ids.size(),
                 num_nodes, vector_prefix_string(retained_ids), vector_prefix_string(evict_ids), vector_prefix_string(admit_ids),
-                vector_prefix_string(evict_slots), bytes_to_mib(retained_bytes), bytes_to_mib(evict_bytes), bytes_to_mib(admit_bytes), gpu_to_cpu_ms,
-                host_sync_ms, host_load_ms, cpu_to_gpu_ms, preload_wait_ms, preloaded_admit, async_evict_writeback, setup_ms, evict_stage_alloc_ms,
-                evict_stage_copy_submit_ms, evict_stage_sync_ms, evict_verify_ms, evict_writeback_submit_ms, evict_metadata_ms, admit_preload_consume_ms,
-                admit_fallback_evict_join_ms, admit_fallback_host_load_ms, admit_gpu_copy_submit_ms, admit_gpu_copy_sync_ms, state_bookkeeping_ms,
-                elapsed_ms(total_start, total_end));
+                vector_prefix_string(evict_slots), bytes_to_mib(retained_bytes), bytes_to_mib(evict_bytes), bytes_to_mib(admit_bytes),
+                bytes_to_mib(full_async_stage_bytes), cuda_free_bytes >= 0 ? bytes_to_mib(cuda_free_bytes) : -1.0,
+                cuda_total_bytes >= 0 ? bytes_to_mib(cuda_total_bytes) : -1.0,
+                cuda_free_bytes >= 0 ? full_async_stage_bytes < cuda_free_bytes : false, evict_dirty_rows, evict_dirty_ratio,
+                evict_dirty_bytes >= 0 ? bytes_to_mib(evict_dirty_bytes) : -1.0, dirty_profile_ms, gpu_to_cpu_ms, host_sync_ms, host_load_ms,
+                cpu_to_gpu_ms, preload_wait_ms, preloaded_admit, async_evict_writeback, setup_ms, evict_stage_alloc_ms, evict_stage_copy_submit_ms,
+                evict_stage_sync_ms, evict_verify_ms, evict_writeback_submit_ms, evict_metadata_ms, admit_preload_consume_ms,
+                admit_fallback_evict_join_ms, admit_fallback_host_load_ms, admit_gpu_copy_submit_ms, admit_gpu_copy_sync_ms,
+                state_bookkeeping_ms, elapsed_ms(total_start, total_end));
         }
         return;
     }

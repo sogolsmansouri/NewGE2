@@ -252,10 +252,15 @@ class MemPartitionBuffer : public PartitionBuffer {
     void joinAsyncEvictWritebackForPartitions_(const std::vector<int> &partition_ids);
     void startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
                                    torch::Tensor expected_host_stage = torch::Tensor());
+    void ensureDirtyRowMaskAllocated_();
+    void markDirtyRows_(torch::Tensor indices, torch::Tensor active_mask = torch::Tensor());
+    void clearDirtyRowsForSlots_(const std::vector<int64_t> &slots, const std::vector<int> &partition_ids);
+    int64_t countDirtyRowsForSlots_(const std::vector<int64_t> &slots, const std::vector<int> &partition_ids);
 
     bool use_pinned_host_buffer_ = true;
     std::vector<int64_t> partition_host_start_offsets_;
     std::vector<bool> partition_host_contiguous_;
+    torch::Tensor dirty_row_mask_;
 
     std::mutex async_admit_preload_lock_;
     std::thread async_admit_preload_thread_;

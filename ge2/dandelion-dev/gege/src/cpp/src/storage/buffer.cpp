@@ -62,6 +62,8 @@ bool parse_env_flag(const char *name, bool default_value) {
     return default_value;
 }
 
+int64_t parse_env_int(const char *name, int64_t default_value);
+
 bool csr_update_enabled() {
     static bool enabled = parse_env_flag("GEGE_CSR_UPDATE", false);
     return enabled;
@@ -105,6 +107,26 @@ bool single_gpu_async_evict_source_verify_enabled() {
 bool mem_partition_buffer_dirty_profile_enabled() {
     static bool enabled = parse_env_flag("GEGE_MEM_PARTITION_BUFFER_DIRTY_PROFILE", false);
     return enabled;
+}
+
+bool single_gpu_async_stage_memory_guard_enabled() {
+    static bool enabled = parse_env_flag("GEGE_SINGLE_GPU_ASYNC_STAGE_MEMORY_GUARD", true);
+    return enabled;
+}
+
+bool single_gpu_async_admit_host_stage_enabled() {
+    static bool enabled = parse_env_flag("GEGE_SINGLE_GPU_ASYNC_ADMIT_HOST_STAGE", false);
+    return enabled;
+}
+
+int64_t single_gpu_async_stage_memory_margin_bytes() {
+    static int64_t margin_mib = std::max<int64_t>(parse_env_int("GEGE_SINGLE_GPU_ASYNC_STAGE_MEMORY_MARGIN_MIB", 1024), 0);
+    return margin_mib * 1024LL * 1024LL;
+}
+
+std::mutex &single_gpu_async_stage_allocation_mutex() {
+    static std::mutex mutex;
+    return mutex;
 }
 
 bool fixed_buffer_masked_update_verify_enabled() {
@@ -178,6 +200,44 @@ int64_t parse_env_int(const char *name, int64_t default_value) {
         return default_value;
     }
 }
+
+#ifdef GEGE_CUDA
+bool try_allocate_async_cuda_stage(int64_t rows, int64_t embedding_size, torch::Dtype dtype, torch::Device device, int64_t bytes_per_row,
+                                   torch::Tensor &stage, int64_t *free_bytes_out, int64_t *required_bytes_out) {
+    if (free_bytes_out != nullptr) {
+        *free_bytes_out = -1;
+    }
+    if (required_bytes_out != nullptr) {
+        *required_bytes_out = -1;
+    }
+    if (rows <= 0) {
+        return false;
+    }
+
+    int64_t allocation_bytes = rows * bytes_per_row;
+    int64_t required_bytes = allocation_bytes + single_gpu_async_stage_memory_margin_bytes();
+    if (required_bytes_out != nullptr) {
+        *required_bytes_out = required_bytes;
+    }
+
+    std::lock_guard<std::mutex> allocation_lock(single_gpu_async_stage_allocation_mutex());
+    c10::cuda::CUDAGuard device_guard(device);
+    if (single_gpu_async_stage_memory_guard_enabled()) {
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        AT_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        if (free_bytes_out != nullptr) {
+            *free_bytes_out = static_cast<int64_t>(free_bytes);
+        }
+        if (static_cast<int64_t>(free_bytes) < required_bytes) {
+            return false;
+        }
+    }
+
+    stage = torch::empty({rows, embedding_size}, torch::TensorOptions().dtype(dtype).device(device));
+    return true;
+}
+#endif
 
 bool eval_finite_debug_enabled() {
     static bool enabled = parse_env_flag("GEGE_EVAL_FINITE_DEBUG", false);
@@ -1709,7 +1769,49 @@ void MemPartitionBuffer::startAsyncAdmitPreload() {
 #ifdef GEGE_CUDA
             {
                 c10::cuda::CUDAGuard device_guard(device_);
-                gpu_stage = torch::empty({admit_rows, embedding_size_}, torch::TensorOptions().dtype(dtype_).device(device_));
+                int64_t stage_free_bytes = -1;
+                int64_t stage_required_bytes = -1;
+                bool stage_allocated =
+                    try_allocate_async_cuda_stage(admit_rows, embedding_size_, dtype_, device_,
+                                                  static_cast<int64_t>(embedding_size_) * static_cast<int64_t>(dtype_size_),
+                                                  gpu_stage, &stage_free_bytes, &stage_required_bytes);
+                if (!stage_allocated) {
+                    if (single_gpu_async_admit_host_stage_enabled()) {
+                        {
+                            std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
+                            async_admit_preload_admit_ids_ = admit_ids;
+                            async_admit_preload_evict_slots_ = evict_slots;
+                            async_admit_preload_row_offsets_ = std::move(row_offsets);
+                            async_admit_preload_gpu_tensor_ = host_stage;
+                            async_admit_preload_host_load_ms_ = host_load_ms;
+                            async_admit_preload_cpu_to_gpu_ms_ = 0.0;
+                            async_admit_preload_total_ms_ = elapsed_ms(total_start, std::chrono::high_resolution_clock::now());
+                            async_admit_preload_valid_ = true;
+                            async_admit_preload_in_flight_ = false;
+                            async_admit_preload_exception_ = nullptr;
+                        }
+                        if (partition_buffer_swap_timing_enabled()) {
+                            SPDLOG_INFO(
+                                "[partition-buffer-preload-host-stage] storage={} this={} device={} admit_ids={} rows={} required_mib={:.3f} free_mib={:.3f}",
+                                basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(admit_ids), admit_rows,
+                                bytes_to_mib(stage_required_bytes), stage_free_bytes >= 0 ? bytes_to_mib(stage_free_bytes) : -1.0);
+                        }
+                        return;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
+                        async_admit_preload_valid_ = false;
+                        async_admit_preload_in_flight_ = false;
+                        async_admit_preload_exception_ = nullptr;
+                    }
+                    if (partition_buffer_swap_timing_enabled()) {
+                        SPDLOG_INFO(
+                            "[partition-buffer-preload-skip] storage={} this={} device={} admit_ids={} rows={} required_mib={:.3f} free_mib={:.3f}",
+                            basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(admit_ids), admit_rows,
+                            bytes_to_mib(stage_required_bytes), stage_free_bytes >= 0 ? bytes_to_mib(stage_free_bytes) : -1.0);
+                    }
+                    return;
+                }
                 bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(host_stage);
                 if (non_blocking_host_copy) {
                     auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
@@ -2144,6 +2246,9 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             }
         }
         bool async_evict_writeback = single_gpu_async_evict_writeback_enabled() && evict_rows > 0;
+        bool async_evict_memory_fallback = false;
+        int64_t async_evict_stage_free_bytes = -1;
+        int64_t async_evict_stage_required_bytes = -1;
         std::vector<int64_t> evict_row_offsets;
         torch::Tensor async_evict_gpu_stage;
         torch::Tensor async_evict_expected_host_stage;
@@ -2170,31 +2275,39 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                     auto ready_event = reinterpret_cast<cudaEvent_t>(swap_ready_event);
                     AT_CUDA_CHECK(cudaStreamWaitEvent(copy_stream.stream(), ready_event, 0));
                 }
-                async_evict_gpu_stage = torch::empty({evict_rows, embedding_size_}, torch::TensorOptions().dtype(dtype_).device(device_));
+                bool stage_allocated =
+                    try_allocate_async_cuda_stage(evict_rows, embedding_size_, dtype_, device_, bytes_per_row, async_evict_gpu_stage,
+                                                  &async_evict_stage_free_bytes, &async_evict_stage_required_bytes);
                 if (log_timing) {
                     auto now = std::chrono::high_resolution_clock::now();
                     evict_stage_alloc_ms = elapsed_ms(phase_start, now);
                     phase_start = now;
                 }
-                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
-                    Partition *partition = partition_table_[evict_ids[idx]];
-                    int64_t buffer_offset = evict_slots[idx] * partition_size_;
-                    torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
-                    torch::Tensor stage_view = async_evict_gpu_stage.slice(0, evict_row_offsets[idx], evict_row_offsets[idx + 1]);
-                    stage_view.copy_(gpu_view.detach(), true);
+                if (!stage_allocated) {
+                    async_evict_writeback = false;
+                    async_evict_memory_fallback = true;
+                } else {
+                    for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                        Partition *partition = partition_table_[evict_ids[idx]];
+                        int64_t buffer_offset = evict_slots[idx] * partition_size_;
+                        torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                        torch::Tensor stage_view = async_evict_gpu_stage.slice(0, evict_row_offsets[idx], evict_row_offsets[idx + 1]);
+                        stage_view.copy_(gpu_view.detach(), true);
+                    }
+                    if (log_timing) {
+                        auto now = std::chrono::high_resolution_clock::now();
+                        evict_stage_copy_submit_ms = elapsed_ms(phase_start, now);
+                        phase_start = now;
+                    }
+                    cudaStreamSynchronize(copy_stream.stream());
+                    if (log_timing) {
+                        auto now = std::chrono::high_resolution_clock::now();
+                        evict_stage_sync_ms = elapsed_ms(phase_start, now);
+                        phase_start = now;
+                    }
                 }
-                if (log_timing) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    evict_stage_copy_submit_ms = elapsed_ms(phase_start, now);
-                    phase_start = now;
-                }
-                cudaStreamSynchronize(copy_stream.stream());
-                if (log_timing) {
-                    auto now = std::chrono::high_resolution_clock::now();
-                    evict_stage_sync_ms = elapsed_ms(phase_start, now);
-                    phase_start = now;
-                }
-            } else {
+            }
+            if (!async_evict_writeback) {
                 bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
                 if (non_blocking_host_copy) {
                     auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
@@ -2456,6 +2569,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 "[partition-buffer-swap][swap {}] storage={} this={} device={} active_parts={} retained_parts={} evict_parts={} admit_parts={} nodes={} "
                 "retained_ids={} evict_ids={} admit_ids={} evict_slots={} retained_mib={:.3f} gpu_to_cpu_mib={:.3f} cpu_to_gpu_mib={:.3f} "
                 "full_async_stage_mib={:.3f} cuda_free_mib={:.3f} cuda_total_mib={:.3f} full_async_stage_fits={} "
+                "async_evict_required_mib={:.3f} async_evict_free_mib={:.3f} async_evict_memory_fallback={} "
                 "evict_dirty_rows={} evict_dirty_ratio={:.6f} dirty_writeback_mib={:.3f} dirty_profile_ms={:.3f} "
                 "gpu_to_cpu_ms={:.3f} host_sync_ms={:.3f} host_load_ms={:.3f} cpu_to_gpu_ms={:.3f} preload_wait_ms={:.3f} preloaded_admit={} async_evict_writeback={} "
                 "setup_ms={:.3f} evict_stage_alloc_ms={:.3f} evict_stage_copy_submit_ms={:.3f} evict_stage_sync_ms={:.3f} evict_verify_ms={:.3f} "
@@ -2466,9 +2580,12 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 vector_prefix_string(evict_slots), bytes_to_mib(retained_bytes), bytes_to_mib(evict_bytes), bytes_to_mib(admit_bytes),
                 bytes_to_mib(full_async_stage_bytes), cuda_free_bytes >= 0 ? bytes_to_mib(cuda_free_bytes) : -1.0,
                 cuda_total_bytes >= 0 ? bytes_to_mib(cuda_total_bytes) : -1.0,
-                cuda_free_bytes >= 0 ? full_async_stage_bytes < cuda_free_bytes : false, evict_dirty_rows, evict_dirty_ratio,
-                evict_dirty_bytes >= 0 ? bytes_to_mib(evict_dirty_bytes) : -1.0, dirty_profile_ms, gpu_to_cpu_ms, host_sync_ms, host_load_ms,
-                cpu_to_gpu_ms, preload_wait_ms, preloaded_admit, async_evict_writeback, setup_ms, evict_stage_alloc_ms, evict_stage_copy_submit_ms,
+                cuda_free_bytes >= 0 ? full_async_stage_bytes < cuda_free_bytes : false,
+                async_evict_stage_required_bytes >= 0 ? bytes_to_mib(async_evict_stage_required_bytes) : -1.0,
+                async_evict_stage_free_bytes >= 0 ? bytes_to_mib(async_evict_stage_free_bytes) : -1.0,
+                async_evict_memory_fallback, evict_dirty_rows, evict_dirty_ratio, evict_dirty_bytes >= 0 ? bytes_to_mib(evict_dirty_bytes) : -1.0,
+                dirty_profile_ms, gpu_to_cpu_ms, host_sync_ms, host_load_ms, cpu_to_gpu_ms, preload_wait_ms, preloaded_admit,
+                async_evict_writeback, setup_ms, evict_stage_alloc_ms, evict_stage_copy_submit_ms,
                 evict_stage_sync_ms, evict_verify_ms, evict_writeback_submit_ms, evict_metadata_ms, admit_preload_consume_ms,
                 admit_fallback_evict_join_ms, admit_fallback_host_load_ms, admit_gpu_copy_submit_ms, admit_gpu_copy_sync_ms,
                 state_bookkeeping_ms, elapsed_ms(total_start, total_end));

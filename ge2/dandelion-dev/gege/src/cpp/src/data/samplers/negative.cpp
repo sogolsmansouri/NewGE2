@@ -1,6 +1,10 @@
 #include "data/samplers/negative.h"
+#ifdef GEGE_CUDA
+#include "data/samplers/negative_cuda.h"
+#endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 
 namespace {
@@ -91,6 +95,36 @@ struct NegativeFilterBreakdown {
 };
 
 thread_local NegativeFilterBreakdown *active_negative_filter_breakdown = nullptr;
+
+bool deg_local_filter_padded_enabled() {
+    static bool enabled = parse_negative_env_flag("GEGE_DEG_LOCAL_FILTER_PADDED", false);
+    return enabled;
+}
+
+bool score_filter_cuda_enabled() {
+    static bool enabled = parse_negative_env_flag("GEGE_SCORE_FILTER_CUDA", false);
+    return enabled;
+}
+
+bool deg_local_filter_verify_enabled() {
+    static bool enabled = parse_negative_env_flag("GEGE_DEG_LOCAL_FILTER_VERIFY", false);
+    return enabled;
+}
+
+bool deg_local_filter_padded_verify_enabled() {
+    static bool enabled = parse_negative_env_flag("GEGE_DEG_LOCAL_FILTER_PADDED_VERIFY", false);
+    return enabled;
+}
+
+int deg_local_filter_verify_max_calls() {
+    static int max_calls = std::max(parse_negative_env_int("GEGE_DEG_LOCAL_FILTER_VERIFY_MAX_CALLS", 16), 0);
+    return max_calls;
+}
+
+std::atomic<int64_t> &deg_local_filter_verify_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
 
 class ScopedNegativeFilterBreakdownCapture {
    public:
@@ -267,25 +301,7 @@ void record_negative_perf_call(std::atomic<int64_t> &aggregate_total_ns,
     }
 }
 
-}  // namespace
-
-std::tuple<torch::Tensor, torch::Tensor> batch_sample(torch::Tensor edges, int num_negatives, bool inverse) {
-    auto device = edges.device();
-    int64_t batch_size = edges.size(0);
-    Indices sample_edge_id;
-    sample_edge_id = torch::randint(0, batch_size, {num_negatives}, device).to(torch::kInt64);
-    torch::Tensor edge_sample;
-
-    if (inverse) {
-        edge_sample = edges.index_select(0, sample_edge_id).select(1, 0);
-    } else {
-        edge_sample = edges.index_select(0, sample_edge_id).select(1, -1);
-    }
-    return std::forward_as_tuple(edge_sample, sample_edge_id);
-}
-
-torch::Tensor deg_negative_local_filter(torch::Tensor deg_sample_indices, torch::Tensor edges) {
-
+torch::Tensor deg_negative_local_filter_reference(torch::Tensor deg_sample_indices, torch::Tensor edges, bool record_breakdown) {
     if (!deg_sample_indices.defined()) {
         torch::TensorOptions ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
         return torch::empty({0, 2}, ind_opts);
@@ -320,7 +336,7 @@ torch::Tensor deg_negative_local_filter(torch::Tensor deg_sample_indices, torch:
     torch::Tensor filter = torch::stack({id_offsets, temp_idx.select(1, 1)}).transpose(0, 1);
     int64_t finalize_elapsed =
         std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - finalize_start).count();
-    if (active_negative_filter_breakdown != nullptr) {
+    if (record_breakdown && active_negative_filter_breakdown != nullptr) {
         active_negative_filter_breakdown->deg_chunk_ids_ns += chunk_ids_elapsed;
         active_negative_filter_breakdown->deg_mask_ns += mask_elapsed;
         active_negative_filter_breakdown->deg_nonzero_ns += nonzero_elapsed;
@@ -328,6 +344,49 @@ torch::Tensor deg_negative_local_filter(torch::Tensor deg_sample_indices, torch:
         active_negative_filter_breakdown->deg_finalize_ns += finalize_elapsed;
     }
     return filter;
+}
+
+}  // namespace
+
+std::tuple<torch::Tensor, torch::Tensor> batch_sample(torch::Tensor edges, int num_negatives, bool inverse) {
+    auto device = edges.device();
+    int64_t batch_size = edges.size(0);
+    Indices sample_edge_id;
+    sample_edge_id = torch::randint(0, batch_size, {num_negatives}, device).to(torch::kInt64);
+    torch::Tensor edge_sample;
+
+    if (inverse) {
+        edge_sample = edges.index_select(0, sample_edge_id).select(1, 0);
+    } else {
+        edge_sample = edges.index_select(0, sample_edge_id).select(1, -1);
+    }
+    return std::forward_as_tuple(edge_sample, sample_edge_id);
+}
+
+torch::Tensor deg_negative_local_filter(torch::Tensor deg_sample_indices, torch::Tensor edges) {
+#ifdef GEGE_CUDA
+    if (deg_local_filter_padded_enabled() && deg_sample_indices.defined() && deg_sample_indices.is_cuda()) {
+        torch::Tensor filter = deg_negative_local_filter_padded_cuda(deg_sample_indices, edges.size(0));
+        if (deg_local_filter_padded_verify_enabled() || deg_local_filter_verify_enabled()) {
+            int64_t verify_id = deg_local_filter_verify_counter().fetch_add(1);
+            if (verify_id < deg_local_filter_verify_max_calls()) {
+                torch::Tensor rows = filter.select(1, 0);
+                torch::Tensor valid = rows >= 0;
+                torch::Tensor selected = torch::nonzero(valid).flatten();
+                torch::Tensor compact = filter.index_select(0, selected);
+                torch::Tensor reference = deg_negative_local_filter_reference(deg_sample_indices, edges, false);
+                if (!compact.equal(reference)) {
+                    SPDLOG_ERROR("GEGE_DEG_LOCAL_FILTER_PADDED verifier failed call={} padded_rows={} compact_rows={} reference_rows={}",
+                                 verify_id, filter.size(0), compact.size(0), reference.size(0));
+                    throw GegeRuntimeException("GEGE_DEG_LOCAL_FILTER_PADDED verifier failed");
+                }
+            }
+        }
+        return filter;
+    }
+#endif
+
+    return deg_negative_local_filter_reference(deg_sample_indices, edges, true);
 }
 
 torch::Tensor compute_filter_corruption(shared_ptr<GegeGraph> graph, torch::Tensor edges, torch::Tensor corruption_nodes, bool inverse, bool global,
@@ -637,7 +696,25 @@ torch::Tensor compute_filter_corruption_gpu(shared_ptr<GegeGraph> graph, torch::
 
 torch::Tensor apply_score_filter(torch::Tensor scores, torch::Tensor filter) {
     if (filter.defined() && filter.size(0) > 0) {
-        scores.index_put_({filter.select(1, 0), filter.select(1, 1)}, -1e9);
+#ifdef GEGE_CUDA
+        bool use_cuda_filter = scores.is_cuda() && filter.is_cuda() && scores.dim() == 2 && filter.dim() == 2 &&
+                               filter.size(1) == 2 && scores.is_contiguous() && filter.is_contiguous() &&
+                               (score_filter_cuda_enabled() || deg_local_filter_padded_enabled());
+        if (use_cuda_filter) {
+            apply_score_filter_cuda(scores, filter);
+            return scores;
+        }
+#endif
+        if (deg_local_filter_padded_enabled()) {
+            torch::Tensor rows = filter.select(1, 0);
+            torch::Tensor valid = rows >= 0;
+            torch::Tensor selected = torch::nonzero(valid).flatten();
+            if (selected.numel() > 0) {
+                scores.index_put_({rows.index_select(0, selected), filter.select(1, 1).index_select(0, selected)}, -1e9);
+            }
+        } else {
+            scores.index_put_({filter.select(1, 0), filter.select(1, 1)}, -1e9);
+        }
     }
     return scores;
 }

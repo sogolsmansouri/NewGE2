@@ -22,6 +22,9 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getTwoLevelBetaOrdering
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomEdgeBucketOrdering(int num_partitions = 4, int buffer_capacity = 1, bool randomly_assign_edge_buckets = false);
 
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getGreedyCoverEdgeBucketOrdering(int num_partitions,
+                                                                                          int buffer_capacity);
+
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getOptimizedCustomEdgeBucketOrdering(
     int num_partitions,
     int buffer_capacity,

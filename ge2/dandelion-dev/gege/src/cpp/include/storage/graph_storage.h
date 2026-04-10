@@ -135,6 +135,13 @@ class GraphModelStorage {
         return current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.narrow(0, start, size);
     }
 
+    EdgeList getMappedEdgesRangeForState(const shared_ptr<InMemorySubgraphState> &state, int64_t start, int64_t size) {
+        if (state == nullptr || !state->all_in_memory_mapped_edges_.defined()) {
+            return torch::Tensor();
+        }
+        return state->all_in_memory_mapped_edges_.narrow(0, start, size);
+    }
+
     Indices getRandomNodeIds(int64_t size);
 
     Indices getNodeIdsRange(int64_t start, int64_t size);

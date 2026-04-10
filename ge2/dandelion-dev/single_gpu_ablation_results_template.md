@@ -227,6 +227,12 @@ Active Twitter plan: use the same cumulative single-GPU stack structure as LJ. F
 - `GEGE_CSR_UPDATE=0`
 - `GEGE_CSR_DEBUG=0`
 
+Validated q4 prefetch baseline on current code:
+- Log: `experiment_logs/twitter_prefetch_baseline_rerun_3e_20260410/train.log`
+- Avg epoch over epochs 1-3: `203548.67 ms`
+- Avg epoch excluding epoch 1: `203453.50 ms`
+- This is the current Twitter single-GPU q4 target path
+
 | Branch | Flags Enabled | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | <!-- row: baseline_paper_control --> `baseline` | `none; baseline/ge2_original paper config on single GPU` | `3` | 604825.67 ms | 2427717.57 | 12109.50 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | 3-epoch Twitter baseline single-GPU run via baseline `run_baseline_single_gpu_paper.sh` |

@@ -23,9 +23,10 @@ class Partition {
     int dtype_size_;         /**< Size in bytes of the datatype */
     int64_t total_size_;     /**< Total size in bytes of the partition */
 
-    int64_t idx_offset_;  /**< Embedding ID offset of the partition */
-    int64_t file_offset_; /**< Offset in bytes of the partition in the embedding file */
-    int buffer_idx_;      /**< Buffer entry ID of the partition in the buffer */
+    int64_t idx_offset_;         /**< Embedding ID offset of the partition */
+    int64_t file_offset_;        /**< Offset in bytes of the partition in the embedding file */
+    int buffer_idx_;             /**< Buffer entry ID of the partition in the buffer */
+    int physical_frame_idx_;     /**< Physical frame backing the logical slot when frame-cache is enabled */
 
     torch::Tensor tensor_; /**< Tensor view of the partition */
 
@@ -49,13 +50,10 @@ class PartitionedFile {
     string filename_;          /**< Name of the backing file */
     int fd_;                   /**< File descriptor for the backing file */
 
-    /** Constructor */
     PartitionedFile(string filename, int num_partitions, int64_t partition_size, int embedding_size, int64_t total_embeddings, torch::Dtype dtype);
 
-    /** Loads a partition of the specified id into addr, assumes that addr has been allocated with sufficient memory */
     void readPartition(void *addr, Partition *partition);
 
-    /** Writes a partition from memory to the file */
     void writePartition(Partition *partition, bool clear_mem = true);
 };
 
@@ -117,12 +115,12 @@ class PartitionBuffer {
    protected:
     std::atomic<int64_t> size_;
     int capacity_;
-    int num_partitions_;     /**< Number of partitions in the file */
-    int64_t partition_size_; /**< Number of embeddings in each partition, the last partition may have fewer embeddings than this */
-    int embedding_size_;     /**< Number of elements in each embedding */
+    int num_partitions_;
+    int64_t partition_size_;
+    int embedding_size_;
     int fine_to_coarse_ratio_;
     int64_t total_embeddings_;
-    torch::Dtype dtype_; /**< Datatype of the embeddings */
+    torch::Dtype dtype_;
     int dtype_size_;
 
     void *buff_mem_, *buff_mem_unload_;
@@ -140,7 +138,6 @@ class PartitionBuffer {
     string filename_;
     PartitionedFile *partitioned_file_;
 
-    // order in which data is accessed
     torch::Tensor buffer_state_;
     std::vector<torch::Tensor> buffer_states_;
     std::vector<torch::Tensor>::iterator buffer_state_iterator_;
@@ -239,7 +236,22 @@ class MemPartitionBuffer : public PartitionBuffer {
     torch::Tensor pos_;
 
    private:
+    void performNextSwapLegacy_(std::uintptr_t swap_ready_event);
+
+    struct HiddenFramePublish {
+        int partition_id = -1;
+        int64_t logical_slot = -1;
+        int64_t frame = -1;
+    };
+
     void ensureBackingTensorsAllocated_();
+    void resetFrameCacheState_();
+    void refreshFrameCacheTensors_();
+    bool frameCacheEnabled_() const;
+    int64_t logicalSlotToPhysicalFrame_(int64_t logical_slot) const;
+    int64_t logicalSlotRowOffset_(int64_t logical_slot) const;
+    int64_t partitionRowOffset_(const Partition *partition) const;
+    torch::Tensor translateLogicalIndicesToPhysical_(torch::Tensor indices, const char *context = "buffer") const;
     void refreshHostPartitionRanges_();
     bool hasContiguousHostPartitionRange_(int partition_id) const;
     int64_t contiguousHostPartitionStart_(int partition_id) const;
@@ -247,17 +259,27 @@ class MemPartitionBuffer : public PartitionBuffer {
     void copyPartitionFromHostToPinned_(Partition *partition, torch::Tensor pinned_view);
     void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
     void joinAsyncAdmitPreload_();
-    bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms);
+    bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
+                                   int64_t *visible_install_rows = nullptr, int64_t *hidden_publish_rows = nullptr);
     void joinAsyncEvictWriteback_();
     void joinAsyncEvictWritebackForPartitions_(const std::vector<int> &partition_ids);
     void startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
-                                   torch::Tensor expected_host_stage = torch::Tensor());
+                                   torch::Tensor expected_host_stage = torch::Tensor(),
+                                   std::vector<int64_t> release_frames = {},
+                                   std::vector<int64_t> source_frame_offsets = {});
     void ensureDirtyRowMaskAllocated_();
     void markDirtyRows_(torch::Tensor indices, torch::Tensor active_mask = torch::Tensor());
     void clearDirtyRowsForSlots_(const std::vector<int64_t> &slots, const std::vector<int> &partition_ids);
     int64_t countDirtyRowsForSlots_(const std::vector<int64_t> &slots, const std::vector<int> &partition_ids);
 
     bool use_pinned_host_buffer_ = true;
+    int physical_frame_capacity_ = 0;
+    int hidden_frame_capacity_ = 0;
+    std::vector<int64_t> logical_to_physical_frames_;
+    std::vector<int64_t> free_physical_frames_;
+    std::mutex free_physical_frames_lock_;
+    torch::Tensor logical_to_physical_frame_cpu_;
+    torch::Tensor logical_to_physical_frame_device_;
     std::vector<int64_t> partition_host_start_offsets_;
     std::vector<bool> partition_host_contiguous_;
     torch::Tensor dirty_row_mask_;
@@ -271,6 +293,8 @@ class MemPartitionBuffer : public PartitionBuffer {
     std::vector<int64_t> async_admit_preload_evict_slots_;
     std::vector<int64_t> async_admit_preload_row_offsets_;
     torch::Tensor async_admit_preload_gpu_tensor_;
+    std::vector<HiddenFramePublish> async_admit_preload_hidden_publishes_;
+    std::vector<HiddenFramePublish> pending_hidden_publishes_;
     double async_admit_preload_host_load_ms_ = 0.0;
     double async_admit_preload_cpu_to_gpu_ms_ = 0.0;
     double async_admit_preload_total_ms_ = 0.0;

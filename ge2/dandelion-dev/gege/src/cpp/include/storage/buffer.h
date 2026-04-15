@@ -3,6 +3,11 @@
 #include "common/datatypes.h"
 #include "data/batch.h"
 
+#include <cstdint>
+#include <exception>
+#include <mutex>
+#include <thread>
+
 class Partition {
    public:
     std::mutex *lock_;            /**< Mutex lock to prevent race conditions */
@@ -202,7 +207,11 @@ class MemPartitionBuffer : public PartitionBuffer {
 
     void indexAdd(torch::Tensor indices, torch::Tensor values);
 
-    void performNextSwap();
+    void indexAddMasked(torch::Tensor indices, torch::Tensor values, torch::Tensor active_mask);
+
+    void performNextSwap(std::uintptr_t swap_ready_event = 0);
+
+    void startAsyncAdmitPreload();
 
     void evict(std::vector<Partition *> evict_partitions);
 
@@ -237,8 +246,34 @@ class MemPartitionBuffer : public PartitionBuffer {
     torch::Tensor hostPartitionRows_(Partition *partition);
     void copyPartitionFromHostToPinned_(Partition *partition, torch::Tensor pinned_view);
     void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
+    void joinAsyncAdmitPreload_();
+    bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms);
+    void joinAsyncEvictWriteback_();
+    void joinAsyncEvictWritebackForPartitions_(const std::vector<int> &partition_ids);
+    void startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
+                                   torch::Tensor expected_host_stage = torch::Tensor());
 
     bool use_pinned_host_buffer_ = true;
     std::vector<int64_t> partition_host_start_offsets_;
     std::vector<bool> partition_host_contiguous_;
+
+    std::mutex async_admit_preload_lock_;
+    std::thread async_admit_preload_thread_;
+    bool async_admit_preload_in_flight_ = false;
+    bool async_admit_preload_valid_ = false;
+    std::exception_ptr async_admit_preload_exception_ = nullptr;
+    std::vector<int> async_admit_preload_admit_ids_;
+    std::vector<int64_t> async_admit_preload_evict_slots_;
+    std::vector<int64_t> async_admit_preload_row_offsets_;
+    torch::Tensor async_admit_preload_gpu_tensor_;
+    double async_admit_preload_host_load_ms_ = 0.0;
+    double async_admit_preload_cpu_to_gpu_ms_ = 0.0;
+    double async_admit_preload_total_ms_ = 0.0;
+
+    std::mutex host_storage_lock_;
+    std::mutex async_evict_writeback_lock_;
+    std::thread async_evict_writeback_thread_;
+    bool async_evict_writeback_in_flight_ = false;
+    std::exception_ptr async_evict_writeback_exception_ = nullptr;
+    std::vector<int> async_evict_writeback_partition_ids_;
 };

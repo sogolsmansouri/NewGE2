@@ -113,6 +113,53 @@ Active LJ plan: use only the recovered fast-stack study. For every LJ stack run,
 
 These are already default-off in the current code, so the stack table below focuses only on the flags being added. The old LJ control/one-flag/incremental table is preserved below as a comment for reference.
 
+**Validated LJ 8.5s train+eval stack**
+
+Validated run: `/dev/shm/smansou2_ge2/lj_streamwait_rerun_30e_eval_20260407`. This is the stable accuracy-preserving result to reproduce:
+- Avg epoch excluding epoch 1: `8499.10 ms`
+- Last 10 epochs: `8525.00 ms`
+- Exact eval: `MRR=0.129537`, `Hits@10=0.3108`
+
+Training flags:
+
+```bash
+CUDA_VISIBLE_DEVICES=0
+GEGE_UNIQUE_BACKEND=bitmap
+GEGE_UNIQUE_BITMAP_NUM_NODES=4847571
+GEGE_EMULATE_DOT_SINGLE_RELATION=1
+GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=1
+GEGE_FAST_MAP_TENSORS=1
+GEGE_PARTITION_BUFFER_LP_FAST_PATH=1
+GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM=1
+GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=1
+GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1
+GEGE_DEG_CHUNK_EXCLUSION=1
+GEGE_BUCKET_STREAMING_LP=1
+GEGE_BUCKET_BLOCK_EXECUTOR=1
+GEGE_OPTIMIZED_CUSTOM_SCHEDULE=1
+GEGE_CSR_GATHER=0
+GEGE_CSR_UPDATE=0
+GEGE_EMPTY_CACHE_AROUND_SWAP=0
+GEGE_SYNC_BEFORE_SWAP=0
+GEGE_MEM_SWAP_EVENT_SYNC=1
+GEGE_PROFILE_LOGICAL_LANE=0
+GEGE_FIXED_BUFFER_BITMAP_MAP=1
+GEGE_FIXED_BUFFER_MASKED_UPDATE=1
+GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=1
+GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD=1
+GEGE_SINGLE_GPU_ASYNC_EVICT_WRITEBACK=1
+LD_PRELOAD=/lib/x86_64-linux-gnu/libtcmalloc_minimal.so.4
+```
+
+Eval-only additions for exact filtered LJ eval:
+
+```bash
+GEGE_EVAL_CHUNKED_RANKS=1
+GEGE_EVAL_NEGATIVE_CHUNK_SIZE=32768
+```
+
+Do not enable `GEGE_DEG_CHUNK_FAST_INT_EXCLUSION` or `GEGE_DEG_CHUNK_TEMPLATE_CACHE` for this result. That experiment kept epoch time near `8.5s`, but exact eval dropped to `MRR=0.050544`, `Hits@10=0.1181`.
+
 | Branch | Flags Enabled | Epochs | Avg Epoch Runtime | Avg Edges per Second | Avg Inter-Epoch Gap | Avg swap_count | Avg swap_barrier_wait_ms | Avg swap_update_ms | Avg swap_rebuild_ms | Avg swap_sync_wait_ms | Eval Log | Notes |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | <!-- row: baseline_paper_control --> `baseline` | `none; baseline/ge2_original paper config on single GPU` | `5` | 28431.60 ms | 2184045.44 | 794.25 ms | n/a | n/a | n/a | n/a | n/a | `n/a` | 5-epoch LJ baseline single-GPU run via baseline `run_baseline_single_gpu_paper.sh` |

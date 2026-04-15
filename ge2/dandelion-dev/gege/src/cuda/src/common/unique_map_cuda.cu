@@ -76,6 +76,16 @@ struct UniqueMapBitmapTempCache {
     ByteBufferCache scan_tmp;
 };
 
+struct UniqueMapBitmapPaddedOutputCache {
+    torch::Tensor unique_ids;           // int64
+    torch::Tensor inverse;              // int64
+    torch::Tensor active_mask;          // uint8
+    torch::Tensor invalid_flag;         // int32[1]
+    torch::Tensor inverse_invalid_flag; // int32[1]
+    int64_t capacity = 0;
+    torch::Device device = torch::Device(torch::kCPU);
+};
+
 struct BackendTimingAccumulator {
     explicit BackendTimingAccumulator(bool enabled_) : enabled(enabled_) {
         if (!enabled) return;
@@ -120,6 +130,7 @@ thread_local UniqueMapSortTempCache sort_temp_cache;
 thread_local UniqueMapHashWorkspaceCache hash_workspace_cache;
 thread_local UniqueMapBitmapWorkspaceCache bitmap_workspace_cache;
 thread_local UniqueMapBitmapTempCache bitmap_temp_cache;
+thread_local UniqueMapBitmapPaddedOutputCache bitmap_padded_output_cache;
 std::atomic<int64_t> unique_backend_call_counter{0};
 std::atomic<int64_t> unique_backend_fallback_counter{0};
 
@@ -154,6 +165,11 @@ int64_t parse_env_int64(const char* name, int64_t default_value) {
 
 bool hash_unique_enabled() {
     static bool enabled = parse_env_flag("GEGE_UNIQUE_HASH", false);
+    return enabled;
+}
+
+bool fixed_buffer_bitmap_reuse_outputs_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_BITMAP_REUSE_OUTPUTS", false);
     return enabled;
 }
 
@@ -212,6 +228,14 @@ void initialize_debug_info(UniqueMapCudaDebugInfo* debug_info, bool sorted, Uniq
     debug_info->total_calls = total_calls;
     debug_info->total_fallbacks = unique_backend_fallback_counter.load();
     debug_info->device_unique_ms = 0.0;
+    debug_info->device_bitmap_zero_ms = 0.0;
+    debug_info->device_bitmap_output_init_ms = 0.0;
+    debug_info->device_bitmap_mark_ms = 0.0;
+    debug_info->device_bitmap_count_ms = 0.0;
+    debug_info->device_bitmap_scan_ms = 0.0;
+    debug_info->device_bitmap_extract_ms = 0.0;
+    debug_info->device_bitmap_mask_ms = 0.0;
+    debug_info->device_bitmap_inverse_ms = 0.0;
     debug_info->used_fallback = false;
     debug_info->cuco_compiled = GEGE_HAS_CUCO != 0;
     debug_info->device_unique_timing_valid = false;
@@ -309,6 +333,25 @@ void ensure_bitmap_workspace(const torch::Tensor& all_ids, int64_t word_capacity
         bitmap_workspace_cache.word_offsets = torch::empty({next_capacity}, count_opts);
         bitmap_workspace_cache.word_capacity = next_capacity;
         bitmap_workspace_cache.device = device;
+    }
+}
+
+void ensure_bitmap_padded_output_workspace(const torch::Tensor& all_ids, int64_t n) {
+    auto device = all_ids.device();
+    if (!bitmap_padded_output_cache.unique_ids.defined() || bitmap_padded_output_cache.device != device ||
+        bitmap_padded_output_cache.capacity < n) {
+        int64_t next_capacity = std::max<int64_t>(n, std::max<int64_t>(bitmap_padded_output_cache.capacity * 2, int64_t{4096}));
+        auto id_opts = all_ids.options().dtype(torch::kInt64);
+        auto mask_opts = all_ids.options().dtype(torch::kUInt8);
+        auto flag_opts = all_ids.options().dtype(torch::kInt32);
+
+        bitmap_padded_output_cache.unique_ids = torch::empty({next_capacity}, id_opts);
+        bitmap_padded_output_cache.inverse = torch::empty({next_capacity}, id_opts);
+        bitmap_padded_output_cache.active_mask = torch::empty({next_capacity}, mask_opts);
+        bitmap_padded_output_cache.invalid_flag = torch::empty({1}, flag_opts);
+        bitmap_padded_output_cache.inverse_invalid_flag = torch::empty({1}, flag_opts);
+        bitmap_padded_output_cache.capacity = next_capacity;
+        bitmap_padded_output_cache.device = device;
     }
 }
 
@@ -465,6 +508,26 @@ __global__ void mark_bitmap_presence_kernel(const int64_t* input_keys, int64_t n
     atomicOr(reinterpret_cast<unsigned long long*>(&bitset_words[word_idx]), static_cast<unsigned long long>(bit_mask));
 }
 
+__global__ void mark_bitmap_presence_strided_kernel(const int64_t* input_keys,
+                                                    int64_t n,
+                                                    int64_t stride0,
+                                                    int64_t value_domain_size,
+                                                    uint64_t* bitset_words,
+                                                    int32_t* invalid_flag) {
+    int64_t i = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (i >= n) return;
+
+    int64_t key = input_keys[i * stride0];
+    if (key < 0 || key >= value_domain_size) {
+        atomicExch(invalid_flag, 1);
+        return;
+    }
+
+    uint64_t word_idx = static_cast<uint64_t>(key) >> 6;
+    uint64_t bit_mask = 1ULL << (static_cast<uint64_t>(key) & 63ULL);
+    atomicOr(reinterpret_cast<unsigned long long*>(&bitset_words[word_idx]), static_cast<unsigned long long>(bit_mask));
+}
+
 __global__ void count_bitmap_words_kernel(const uint64_t* bitset_words, int64_t num_words, int32_t* word_counts) {
     int64_t word_idx = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
     if (word_idx >= num_words) return;
@@ -485,6 +548,63 @@ __global__ void extract_bitmap_unique_ids_kernel(const uint64_t* bitset_words, c
     }
 }
 
+__global__ void mark_bitmap_unique_active_mask_kernel(const int32_t* word_counts, const int32_t* word_offsets, int64_t num_words, uint8_t* active_mask) {
+    int64_t word_idx = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (word_idx >= num_words) return;
+
+    int32_t count = word_counts[word_idx];
+    int32_t offset = word_offsets[word_idx];
+    for (int32_t idx = 0; idx < count; idx++) {
+        active_mask[offset + idx] = uint8_t{1};
+    }
+}
+
+__global__ void active_masked_adagrad_kernel(float* gradients,
+                                             float* state,
+                                             float* state_update,
+                                             const uint8_t* active_mask,
+                                             int64_t rows,
+                                             int64_t dim,
+                                             float learning_rate) {
+    int64_t linear = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    int64_t total = rows * dim;
+    if (linear >= total) return;
+
+    int64_t row = linear / dim;
+    if (active_mask[row] == 0) {
+        gradients[linear] = 0.0f;
+        state_update[linear] = 0.0f;
+        return;
+    }
+
+    float grad = gradients[linear];
+    float update = grad * grad;
+    float new_state = state[linear] + update;
+    state[linear] = new_state;
+    state_update[linear] = update;
+    gradients[linear] = -learning_rate * (grad / (sqrtf(new_state) + 1e-10f));
+}
+
+__global__ void active_masked_index_add_kernel(float* target,
+                                               const int64_t* indices,
+                                               const float* values,
+                                               const uint8_t* active_mask,
+                                               int64_t rows,
+                                               int64_t dim,
+                                               int64_t target_rows) {
+    int64_t linear = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    int64_t total = rows * dim;
+    if (linear >= total) return;
+
+    int64_t row = linear / dim;
+    if (active_mask[row] == 0) return;
+
+    int64_t dst_row = indices[row];
+    if (dst_row < 0 || dst_row >= target_rows) return;
+    int64_t col = linear - row * dim;
+    target[dst_row * dim + col] += values[linear];
+}
+
 __global__ void build_bitmap_inverse_kernel(const int64_t* input_keys,
                                             int64_t n,
                                             int64_t value_domain_size,
@@ -497,6 +617,45 @@ __global__ void build_bitmap_inverse_kernel(const int64_t* input_keys,
     if (i >= n) return;
 
     int64_t key = input_keys[i];
+    if (key < 0 || key >= value_domain_size) {
+        atomicExch(invalid_flag, 1);
+        inverse[i] = int64_t{-1};
+        return;
+    }
+
+    int64_t word_idx = key >> 6;
+    int bit = static_cast<int>(key & 63LL);
+    uint64_t bits = bitset_words[word_idx];
+    if (((bits >> bit) & 1ULL) == 0ULL) {
+        atomicExch(invalid_flag, 1);
+        inverse[i] = int64_t{-1};
+        return;
+    }
+
+    uint64_t lower_mask = (bit == 0) ? 0ULL : ((1ULL << bit) - 1ULL);
+    int64_t uid = static_cast<int64_t>(word_offsets[word_idx]) + static_cast<int64_t>(__popcll(static_cast<unsigned long long>(bits & lower_mask)));
+    if (uid < 0 || uid >= unique_count) {
+        atomicExch(invalid_flag, 1);
+        inverse[i] = int64_t{-1};
+        return;
+    }
+
+    inverse[i] = uid;
+}
+
+__global__ void build_bitmap_inverse_strided_kernel(const int64_t* input_keys,
+                                                    int64_t n,
+                                                    int64_t stride0,
+                                                    int64_t value_domain_size,
+                                                    const uint64_t* bitset_words,
+                                                    const int32_t* word_offsets,
+                                                    int32_t unique_count,
+                                                    int32_t* invalid_flag,
+                                                    int64_t* inverse) {
+    int64_t i = (int64_t)blockIdx.x * (int64_t)blockDim.x + (int64_t)threadIdx.x;
+    if (i >= n) return;
+
+    int64_t key = input_keys[i * stride0];
     if (key < 0 || key >= value_domain_size) {
         atomicExch(invalid_flag, 1);
         inverse[i] = int64_t{-1};
@@ -888,6 +1047,152 @@ std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda_bitmap(
     return std::make_tuple(unique_ids, inverse);
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda_bitmap_padded_impl(torch::Tensor all_ids,
+                                                                                                           UniqueMapCudaDebugInfo* debug_info,
+                                                                                                           int64_t value_domain_size) {
+    TORCH_CHECK(all_ids.is_cuda(), "map_tensors_unique_inverse_cuda_bitmap_padded expects a CUDA tensor");
+    TORCH_CHECK(all_ids.scalar_type() == torch::kInt64, "bitmap padded unique supports int64 tensors");
+    TORCH_CHECK(all_ids.dim() == 1, "bitmap padded unique expects a 1D tensor");
+    mark_executed_backend(debug_info, "bitmap_padded");
+
+    int64_t n = all_ids.numel();
+    auto index_opts = all_ids.options().dtype(torch::kInt64);
+    if (n == 0) {
+        return std::make_tuple(torch::empty({0}, all_ids.options()),
+                               torch::empty({0}, index_opts),
+                               torch::empty({0}, all_ids.options().dtype(torch::kUInt8)));
+    }
+    TORCH_CHECK(n <= std::numeric_limits<int32_t>::max(), "bitmap padded unique supports up to INT32_MAX elements");
+
+    int64_t domain_size = resolve_bitmap_domain_size(value_domain_size);
+    TORCH_CHECK(domain_size > 0, "GEGE_FIXED_BUFFER_BITMAP_MAP requires GEGE_UNIQUE_BITMAP_NUM_NODES or a positive value domain");
+    TORCH_CHECK(domain_size <= std::numeric_limits<int64_t>::max() - 63, "bitmap padded unique domain size is too large");
+
+    int64_t num_words = (domain_size + 63) >> 6;
+    TORCH_CHECK(num_words >= 1, "bitmap padded unique requires a positive domain size");
+    TORCH_CHECK(num_words <= std::numeric_limits<int>::max(), "bitmap padded unique supports up to INT_MAX 64-bit words");
+
+    c10::cuda::CUDAGuard guard(all_ids.device());
+    auto stream = at::cuda::getCurrentCUDAStream(all_ids.device().index()).stream();
+    bool measure_device_timing = debug_info != nullptr && debug_info->measure_device_timing;
+    BackendTimingAccumulator zero_timing(measure_device_timing);
+    BackendTimingAccumulator output_init_timing(measure_device_timing);
+    BackendTimingAccumulator mark_timing(measure_device_timing);
+    BackendTimingAccumulator count_timing(measure_device_timing);
+    BackendTimingAccumulator scan_timing(measure_device_timing);
+    BackendTimingAccumulator extract_timing(measure_device_timing);
+    BackendTimingAccumulator mask_timing(measure_device_timing);
+    BackendTimingAccumulator inverse_timing(measure_device_timing);
+
+    ensure_bitmap_workspace(all_ids, num_words);
+
+    auto bitset_words = bitmap_workspace_cache.bitset_words.narrow(0, 0, num_words);
+    auto word_counts = bitmap_workspace_cache.word_counts.narrow(0, 0, num_words);
+    auto word_offsets = bitmap_workspace_cache.word_offsets.narrow(0, 0, num_words);
+
+    zero_timing.start_timing(stream);
+    AT_CUDA_CHECK(cudaMemsetAsync(bitset_words.data_ptr<int64_t>(), 0, static_cast<size_t>(num_words) * sizeof(int64_t), stream));
+    zero_timing.stop_timing(stream);
+
+    torch::Tensor unique_ids;
+    torch::Tensor inverse;
+    torch::Tensor active_mask;
+    torch::Tensor invalid_flag;
+    torch::Tensor inverse_invalid_flag;
+    if (fixed_buffer_bitmap_reuse_outputs_enabled()) {
+        ensure_bitmap_padded_output_workspace(all_ids, n);
+        unique_ids = bitmap_padded_output_cache.unique_ids.narrow(0, 0, n);
+        inverse = bitmap_padded_output_cache.inverse.narrow(0, 0, n);
+        active_mask = bitmap_padded_output_cache.active_mask.narrow(0, 0, n);
+        invalid_flag = bitmap_padded_output_cache.invalid_flag;
+        inverse_invalid_flag = bitmap_padded_output_cache.inverse_invalid_flag;
+        output_init_timing.start_timing(stream);
+        AT_CUDA_CHECK(cudaMemsetAsync(invalid_flag.data_ptr<int32_t>(), 0, sizeof(int32_t), stream));
+        AT_CUDA_CHECK(cudaMemsetAsync(inverse_invalid_flag.data_ptr<int32_t>(), 0, sizeof(int32_t), stream));
+        output_init_timing.stop_timing(stream);
+    } else {
+        auto flag_opts = all_ids.options().dtype(torch::kInt32);
+        unique_ids = torch::empty({n}, all_ids.options());
+        inverse = torch::empty({n}, index_opts);
+        active_mask = torch::empty({n}, all_ids.options().dtype(torch::kUInt8));
+        invalid_flag = torch::zeros({1}, flag_opts);
+        inverse_invalid_flag = torch::zeros({1}, flag_opts);
+    }
+
+    constexpr int kThreads = 256;
+    int input_blocks = (int)((n + kThreads - 1) / kThreads);
+    int word_blocks = (int)((num_words + kThreads - 1) / kThreads);
+
+    mark_timing.start_timing(stream);
+    mark_bitmap_presence_kernel<<<input_blocks, kThreads, 0, stream>>>(
+        all_ids.data_ptr<int64_t>(), n, domain_size, reinterpret_cast<uint64_t*>(bitset_words.data_ptr<int64_t>()), invalid_flag.data_ptr<int32_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    mark_timing.stop_timing(stream);
+
+    count_timing.start_timing(stream);
+    count_bitmap_words_kernel<<<word_blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<const uint64_t*>(bitset_words.data_ptr<int64_t>()), num_words, word_counts.data_ptr<int32_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    count_timing.stop_timing(stream);
+
+    size_t scan_tmp_bytes = 0;
+    AT_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, scan_tmp_bytes, word_counts.data_ptr<int32_t>(), word_offsets.data_ptr<int32_t>(), (int)num_words, stream));
+
+    auto scan_tmp = reserve_byte_buffer(bitmap_temp_cache.scan_tmp, all_ids.device(), static_cast<int64_t>(scan_tmp_bytes));
+    scan_timing.start_timing(stream);
+    AT_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        scan_tmp.data_ptr<uint8_t>(), scan_tmp_bytes, word_counts.data_ptr<int32_t>(), word_offsets.data_ptr<int32_t>(), (int)num_words, stream));
+    scan_timing.stop_timing(stream);
+
+    output_init_timing.start_timing(stream);
+    AT_CUDA_CHECK(cudaMemsetAsync(unique_ids.data_ptr<int64_t>(), 0, static_cast<size_t>(n) * sizeof(int64_t), stream));
+    output_init_timing.stop_timing(stream);
+    extract_timing.start_timing(stream);
+    extract_bitmap_unique_ids_kernel<<<word_blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<const uint64_t*>(bitset_words.data_ptr<int64_t>()), word_offsets.data_ptr<int32_t>(), num_words, unique_ids.data_ptr<int64_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    extract_timing.stop_timing(stream);
+
+    output_init_timing.start_timing(stream);
+    AT_CUDA_CHECK(cudaMemsetAsync(active_mask.data_ptr<uint8_t>(), 0, static_cast<size_t>(n) * sizeof(uint8_t), stream));
+    output_init_timing.stop_timing(stream);
+    mask_timing.start_timing(stream);
+    mark_bitmap_unique_active_mask_kernel<<<word_blocks, kThreads, 0, stream>>>(
+        word_counts.data_ptr<int32_t>(), word_offsets.data_ptr<int32_t>(), num_words, active_mask.data_ptr<uint8_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    mask_timing.stop_timing(stream);
+
+    inverse_timing.start_timing(stream);
+    build_bitmap_inverse_kernel<<<input_blocks, kThreads, 0, stream>>>(
+        all_ids.data_ptr<int64_t>(),
+        n,
+        domain_size,
+        reinterpret_cast<const uint64_t*>(bitset_words.data_ptr<int64_t>()),
+        word_offsets.data_ptr<int32_t>(),
+        static_cast<int32_t>(n),
+        inverse_invalid_flag.data_ptr<int32_t>(),
+        inverse.data_ptr<int64_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    inverse_timing.stop_timing(stream);
+
+    if (debug_info != nullptr) {
+        debug_info->device_bitmap_zero_ms = zero_timing.elapsed_ms;
+        debug_info->device_bitmap_output_init_ms = output_init_timing.elapsed_ms;
+        debug_info->device_bitmap_mark_ms = mark_timing.elapsed_ms;
+        debug_info->device_bitmap_count_ms = count_timing.elapsed_ms;
+        debug_info->device_bitmap_scan_ms = scan_timing.elapsed_ms;
+        debug_info->device_bitmap_extract_ms = extract_timing.elapsed_ms;
+        debug_info->device_bitmap_mask_ms = mask_timing.elapsed_ms;
+        debug_info->device_bitmap_inverse_ms = inverse_timing.elapsed_ms;
+        debug_info->device_unique_ms = zero_timing.elapsed_ms + output_init_timing.elapsed_ms + mark_timing.elapsed_ms +
+                                       count_timing.elapsed_ms + scan_timing.elapsed_ms + extract_timing.elapsed_ms +
+                                       mask_timing.elapsed_ms + inverse_timing.elapsed_ms;
+        debug_info->device_unique_timing_valid = measure_device_timing;
+    }
+    return std::make_tuple(unique_ids, inverse, active_mask);
+}
+
 std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda_cuco(torch::Tensor all_ids, UniqueMapCudaDebugInfo* debug_info) {
     TORCH_CHECK(all_ids.is_cuda(), "map_tensors_unique_inverse_cuda_cuco expects a CUDA tensor");
     TORCH_CHECK(all_ids.scalar_type() == torch::kInt64, "cuco unique supports int64 tensors");
@@ -1005,6 +1310,274 @@ std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda_cuco(to
 }
 
 } // namespace
+
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda_bitmap_padded(torch::Tensor all_ids,
+                                                                                                      UniqueMapCudaDebugInfo* debug_info,
+                                                                                                      int64_t value_domain_size) {
+    initialize_debug_info(debug_info, false, UniqueBackend::kBitmap);
+    return map_tensors_unique_inverse_cuda_bitmap_padded_impl(all_ids, debug_info, value_domain_size);
+}
+
+std::tuple<torch::Tensor, std::vector<torch::Tensor>, torch::Tensor> map_tensors_unique_inverse_cuda_bitmap_padded_multi(
+    const std::vector<torch::Tensor>& ids,
+    UniqueMapCudaDebugInfo* debug_info,
+    int64_t value_domain_size) {
+    initialize_debug_info(debug_info, false, UniqueBackend::kBitmap);
+    mark_executed_backend(debug_info, "bitmap_padded_multi");
+    TORCH_CHECK(!ids.empty(), "bitmap padded multi unique expects at least one input tensor");
+
+    const torch::Tensor& base = ids.front();
+    TORCH_CHECK(base.is_cuda(), "bitmap padded multi unique expects CUDA tensors");
+    TORCH_CHECK(base.scalar_type() == torch::kInt64, "bitmap padded multi unique supports int64 tensors");
+    TORCH_CHECK(base.dim() == 1, "bitmap padded multi unique expects 1D tensors");
+
+    int64_t total_n = 0;
+    for (const auto& tensor : ids) {
+        TORCH_CHECK(tensor.is_cuda(), "bitmap padded multi unique expects CUDA tensors");
+        TORCH_CHECK(tensor.scalar_type() == torch::kInt64, "bitmap padded multi unique supports int64 tensors");
+        TORCH_CHECK(tensor.dim() == 1, "bitmap padded multi unique expects 1D tensors");
+        TORCH_CHECK(tensor.device() == base.device(), "bitmap padded multi unique expects all tensors on the same device");
+        TORCH_CHECK(tensor.stride(0) > 0, "bitmap padded multi unique expects positive 1D strides");
+        total_n += tensor.numel();
+    }
+
+    auto index_opts = base.options().dtype(torch::kInt64);
+    if (total_n == 0) {
+        std::vector<torch::Tensor> mapped;
+        mapped.reserve(ids.size());
+        for (size_t i = 0; i < ids.size(); i++) {
+            mapped.emplace_back(torch::empty({0}, index_opts));
+        }
+        return std::make_tuple(torch::empty({0}, base.options()), mapped, torch::empty({0}, base.options().dtype(torch::kUInt8)));
+    }
+    TORCH_CHECK(total_n <= std::numeric_limits<int32_t>::max(), "bitmap padded multi unique supports up to INT32_MAX elements");
+
+    int64_t domain_size = resolve_bitmap_domain_size(value_domain_size);
+    TORCH_CHECK(domain_size > 0, "GEGE_FIXED_BUFFER_BITMAP_MAP requires GEGE_UNIQUE_BITMAP_NUM_NODES or a positive value domain");
+    TORCH_CHECK(domain_size <= std::numeric_limits<int64_t>::max() - 63, "bitmap padded multi unique domain size is too large");
+
+    int64_t num_words = (domain_size + 63) >> 6;
+    TORCH_CHECK(num_words >= 1, "bitmap padded multi unique requires a positive domain size");
+    TORCH_CHECK(num_words <= std::numeric_limits<int>::max(), "bitmap padded multi unique supports up to INT_MAX 64-bit words");
+
+    c10::cuda::CUDAGuard guard(base.device());
+    auto stream = at::cuda::getCurrentCUDAStream(base.device().index()).stream();
+    bool measure_device_timing = debug_info != nullptr && debug_info->measure_device_timing;
+    BackendTimingAccumulator zero_timing(measure_device_timing);
+    BackendTimingAccumulator output_init_timing(measure_device_timing);
+    BackendTimingAccumulator mark_timing(measure_device_timing);
+    BackendTimingAccumulator count_timing(measure_device_timing);
+    BackendTimingAccumulator scan_timing(measure_device_timing);
+    BackendTimingAccumulator extract_timing(measure_device_timing);
+    BackendTimingAccumulator mask_timing(measure_device_timing);
+    BackendTimingAccumulator inverse_timing(measure_device_timing);
+
+    ensure_bitmap_workspace(base, num_words);
+
+    auto bitset_words = bitmap_workspace_cache.bitset_words.narrow(0, 0, num_words);
+    auto word_counts = bitmap_workspace_cache.word_counts.narrow(0, 0, num_words);
+    auto word_offsets = bitmap_workspace_cache.word_offsets.narrow(0, 0, num_words);
+
+    torch::Tensor unique_ids;
+    torch::Tensor inverse;
+    torch::Tensor active_mask;
+    torch::Tensor invalid_flag;
+    torch::Tensor inverse_invalid_flag;
+    if (fixed_buffer_bitmap_reuse_outputs_enabled()) {
+        ensure_bitmap_padded_output_workspace(base, total_n);
+        unique_ids = bitmap_padded_output_cache.unique_ids.narrow(0, 0, total_n);
+        inverse = bitmap_padded_output_cache.inverse.narrow(0, 0, total_n);
+        active_mask = bitmap_padded_output_cache.active_mask.narrow(0, 0, total_n);
+        invalid_flag = bitmap_padded_output_cache.invalid_flag;
+        inverse_invalid_flag = bitmap_padded_output_cache.inverse_invalid_flag;
+        output_init_timing.start_timing(stream);
+        AT_CUDA_CHECK(cudaMemsetAsync(invalid_flag.data_ptr<int32_t>(), 0, sizeof(int32_t), stream));
+        AT_CUDA_CHECK(cudaMemsetAsync(inverse_invalid_flag.data_ptr<int32_t>(), 0, sizeof(int32_t), stream));
+        output_init_timing.stop_timing(stream);
+    } else {
+        auto flag_opts = base.options().dtype(torch::kInt32);
+        unique_ids = torch::empty({total_n}, base.options());
+        inverse = torch::empty({total_n}, index_opts);
+        active_mask = torch::empty({total_n}, base.options().dtype(torch::kUInt8));
+        invalid_flag = torch::zeros({1}, flag_opts);
+        inverse_invalid_flag = torch::zeros({1}, flag_opts);
+    }
+
+    constexpr int kThreads = 256;
+    int word_blocks = (int)((num_words + kThreads - 1) / kThreads);
+    zero_timing.start_timing(stream);
+    AT_CUDA_CHECK(cudaMemsetAsync(bitset_words.data_ptr<int64_t>(), 0, static_cast<size_t>(num_words) * sizeof(int64_t), stream));
+    zero_timing.stop_timing(stream);
+
+    mark_timing.start_timing(stream);
+    for (const auto& tensor : ids) {
+        int64_t n = tensor.numel();
+        if (n == 0) continue;
+        int input_blocks = (int)((n + kThreads - 1) / kThreads);
+        mark_bitmap_presence_strided_kernel<<<input_blocks, kThreads, 0, stream>>>(
+            tensor.data_ptr<int64_t>(),
+            n,
+            tensor.stride(0),
+            domain_size,
+            reinterpret_cast<uint64_t*>(bitset_words.data_ptr<int64_t>()),
+            invalid_flag.data_ptr<int32_t>());
+        AT_CUDA_CHECK(cudaGetLastError());
+    }
+    mark_timing.stop_timing(stream);
+
+    count_timing.start_timing(stream);
+    count_bitmap_words_kernel<<<word_blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<const uint64_t*>(bitset_words.data_ptr<int64_t>()), num_words, word_counts.data_ptr<int32_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    count_timing.stop_timing(stream);
+
+    size_t scan_tmp_bytes = 0;
+    AT_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        nullptr, scan_tmp_bytes, word_counts.data_ptr<int32_t>(), word_offsets.data_ptr<int32_t>(), (int)num_words, stream));
+    auto scan_tmp = reserve_byte_buffer(bitmap_temp_cache.scan_tmp, base.device(), static_cast<int64_t>(scan_tmp_bytes));
+    scan_timing.start_timing(stream);
+    AT_CUDA_CHECK(cub::DeviceScan::ExclusiveSum(
+        scan_tmp.data_ptr<uint8_t>(), scan_tmp_bytes, word_counts.data_ptr<int32_t>(), word_offsets.data_ptr<int32_t>(), (int)num_words, stream));
+    scan_timing.stop_timing(stream);
+
+    output_init_timing.start_timing(stream);
+    AT_CUDA_CHECK(cudaMemsetAsync(unique_ids.data_ptr<int64_t>(), 0, static_cast<size_t>(total_n) * sizeof(int64_t), stream));
+    output_init_timing.stop_timing(stream);
+    extract_timing.start_timing(stream);
+    extract_bitmap_unique_ids_kernel<<<word_blocks, kThreads, 0, stream>>>(
+        reinterpret_cast<const uint64_t*>(bitset_words.data_ptr<int64_t>()), word_offsets.data_ptr<int32_t>(), num_words, unique_ids.data_ptr<int64_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    extract_timing.stop_timing(stream);
+
+    output_init_timing.start_timing(stream);
+    AT_CUDA_CHECK(cudaMemsetAsync(active_mask.data_ptr<uint8_t>(), 0, static_cast<size_t>(total_n) * sizeof(uint8_t), stream));
+    output_init_timing.stop_timing(stream);
+    mask_timing.start_timing(stream);
+    mark_bitmap_unique_active_mask_kernel<<<word_blocks, kThreads, 0, stream>>>(
+        word_counts.data_ptr<int32_t>(), word_offsets.data_ptr<int32_t>(), num_words, active_mask.data_ptr<uint8_t>());
+    AT_CUDA_CHECK(cudaGetLastError());
+    mask_timing.stop_timing(stream);
+
+    std::vector<torch::Tensor> mapped;
+    mapped.reserve(ids.size());
+    int64_t offset = 0;
+    inverse_timing.start_timing(stream);
+    for (const auto& tensor : ids) {
+        int64_t n = tensor.numel();
+        torch::Tensor mapped_tensor = inverse.narrow(0, offset, n);
+        mapped.emplace_back(mapped_tensor);
+        if (n > 0) {
+            int input_blocks = (int)((n + kThreads - 1) / kThreads);
+            build_bitmap_inverse_strided_kernel<<<input_blocks, kThreads, 0, stream>>>(
+                tensor.data_ptr<int64_t>(),
+                n,
+                tensor.stride(0),
+                domain_size,
+                reinterpret_cast<const uint64_t*>(bitset_words.data_ptr<int64_t>()),
+                word_offsets.data_ptr<int32_t>(),
+                static_cast<int32_t>(total_n),
+                inverse_invalid_flag.data_ptr<int32_t>(),
+                mapped_tensor.data_ptr<int64_t>());
+            AT_CUDA_CHECK(cudaGetLastError());
+        }
+        offset += n;
+    }
+    inverse_timing.stop_timing(stream);
+
+    if (debug_info != nullptr) {
+        debug_info->device_bitmap_zero_ms = zero_timing.elapsed_ms;
+        debug_info->device_bitmap_output_init_ms = output_init_timing.elapsed_ms;
+        debug_info->device_bitmap_mark_ms = mark_timing.elapsed_ms;
+        debug_info->device_bitmap_count_ms = count_timing.elapsed_ms;
+        debug_info->device_bitmap_scan_ms = scan_timing.elapsed_ms;
+        debug_info->device_bitmap_extract_ms = extract_timing.elapsed_ms;
+        debug_info->device_bitmap_mask_ms = mask_timing.elapsed_ms;
+        debug_info->device_bitmap_inverse_ms = inverse_timing.elapsed_ms;
+        debug_info->device_unique_ms = zero_timing.elapsed_ms + output_init_timing.elapsed_ms + mark_timing.elapsed_ms +
+                                       count_timing.elapsed_ms + scan_timing.elapsed_ms + extract_timing.elapsed_ms +
+                                       mask_timing.elapsed_ms + inverse_timing.elapsed_ms;
+        debug_info->device_unique_timing_valid = measure_device_timing;
+    }
+    return std::make_tuple(unique_ids, mapped, active_mask);
+}
+
+std::tuple<torch::Tensor, torch::Tensor> active_masked_adagrad_cuda(torch::Tensor gradients,
+                                                                    torch::Tensor optimizer_state,
+                                                                    torch::Tensor active_mask,
+                                                                    double learning_rate) {
+    TORCH_CHECK(gradients.is_cuda(), "active_masked_adagrad_cuda expects CUDA gradients");
+    TORCH_CHECK(optimizer_state.is_cuda(), "active_masked_adagrad_cuda expects CUDA optimizer state");
+    TORCH_CHECK(active_mask.is_cuda(), "active_masked_adagrad_cuda expects a CUDA active mask");
+    TORCH_CHECK(gradients.scalar_type() == torch::kFloat32, "active_masked_adagrad_cuda supports float32 gradients");
+    TORCH_CHECK(optimizer_state.scalar_type() == torch::kFloat32, "active_masked_adagrad_cuda supports float32 optimizer state");
+    TORCH_CHECK(active_mask.scalar_type() == torch::kUInt8, "active_masked_adagrad_cuda expects uint8 active mask");
+    TORCH_CHECK(gradients.dim() == 2 && optimizer_state.sizes() == gradients.sizes(), "active_masked_adagrad_cuda requires matching 2D gradient/state tensors");
+    TORCH_CHECK(active_mask.dim() == 1 && active_mask.size(0) == gradients.size(0), "active_masked_adagrad_cuda active mask must match gradient rows");
+
+    c10::cuda::CUDAGuard guard(gradients.device());
+    auto stream = at::cuda::getCurrentCUDAStream(gradients.device().index()).stream();
+    auto grad_contig = gradients.contiguous();
+    auto state_contig = optimizer_state.contiguous();
+    auto mask_contig = active_mask.contiguous();
+    auto state_update = torch::empty_like(grad_contig);
+
+    int64_t rows = grad_contig.size(0);
+    int64_t dim = grad_contig.size(1);
+    int64_t total = rows * dim;
+    constexpr int kThreads = 256;
+    int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    active_masked_adagrad_kernel<<<blocks, kThreads, 0, stream>>>(
+        grad_contig.data_ptr<float>(),
+        state_contig.data_ptr<float>(),
+        state_update.data_ptr<float>(),
+        mask_contig.data_ptr<uint8_t>(),
+        rows,
+        dim,
+        static_cast<float>(learning_rate));
+    AT_CUDA_CHECK(cudaGetLastError());
+    return std::make_tuple(grad_contig, state_update);
+}
+
+void active_masked_index_add_cuda(torch::Tensor target,
+                                  torch::Tensor indices,
+                                  torch::Tensor values,
+                                  torch::Tensor active_mask) {
+    TORCH_CHECK(target.is_cuda(), "active_masked_index_add_cuda expects a CUDA target");
+    TORCH_CHECK(indices.is_cuda(), "active_masked_index_add_cuda expects CUDA indices");
+    TORCH_CHECK(values.is_cuda(), "active_masked_index_add_cuda expects CUDA values");
+    TORCH_CHECK(active_mask.is_cuda(), "active_masked_index_add_cuda expects a CUDA active mask");
+    TORCH_CHECK(target.scalar_type() == torch::kFloat32, "active_masked_index_add_cuda supports float32 target");
+    TORCH_CHECK(values.scalar_type() == torch::kFloat32, "active_masked_index_add_cuda supports float32 values");
+    TORCH_CHECK(indices.scalar_type() == torch::kInt64, "active_masked_index_add_cuda expects int64 indices");
+    TORCH_CHECK(active_mask.scalar_type() == torch::kUInt8, "active_masked_index_add_cuda expects uint8 active mask");
+    TORCH_CHECK(target.dim() == 2 && values.dim() == 2, "active_masked_index_add_cuda requires 2D target/values tensors");
+    TORCH_CHECK(indices.dim() == 1 && active_mask.dim() == 1, "active_masked_index_add_cuda requires 1D indices/mask tensors");
+    TORCH_CHECK(indices.size(0) == values.size(0) && active_mask.size(0) == values.size(0), "active_masked_index_add_cuda row counts must match");
+    TORCH_CHECK(target.size(1) == values.size(1), "active_masked_index_add_cuda embedding dimensions must match");
+
+    c10::cuda::CUDAGuard guard(target.device());
+    auto stream = at::cuda::getCurrentCUDAStream(target.device().index()).stream();
+    auto target_contig = target.contiguous();
+    TORCH_CHECK(target_contig.data_ptr<float>() == target.data_ptr<float>(), "active_masked_index_add_cuda target must be contiguous");
+    auto indices_contig = indices.contiguous();
+    auto values_contig = values.contiguous();
+    auto mask_contig = active_mask.contiguous();
+
+    int64_t rows = values_contig.size(0);
+    int64_t dim = values_contig.size(1);
+    int64_t total = rows * dim;
+    constexpr int kThreads = 256;
+    int blocks = static_cast<int>((total + kThreads - 1) / kThreads);
+    active_masked_index_add_kernel<<<blocks, kThreads, 0, stream>>>(
+        target_contig.data_ptr<float>(),
+        indices_contig.data_ptr<int64_t>(),
+        values_contig.data_ptr<float>(),
+        mask_contig.data_ptr<uint8_t>(),
+        rows,
+        dim,
+        target_contig.size(0));
+    AT_CUDA_CHECK(cudaGetLastError());
+}
 
 std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda(torch::Tensor all_ids, bool sorted,
                                                                          UniqueMapCudaDebugInfo* debug_info) {

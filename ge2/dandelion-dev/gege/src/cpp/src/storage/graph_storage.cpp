@@ -7,6 +7,7 @@
 #include <random>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 #ifdef GEGE_CUDA
 #include <ATen/cuda/Exceptions.h>
 #include <c10/cuda/CUDACachingAllocator.h>
@@ -21,14 +22,40 @@
 namespace {
 
 #ifdef GEGE_CUDA
+bool parse_graph_storage_cuda_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+    return default_value;
+}
+
 void empty_cache_for_graph_storage_device(const torch::Device &device) {
     if (!device.is_cuda()) {
         return;
     }
 
+    static bool sync_enabled = parse_graph_storage_cuda_env_flag("GEGE_SYNC_BEFORE_SWAP", true);
+    static bool empty_cache_enabled = parse_graph_storage_cuda_env_flag("GEGE_EMPTY_CACHE_AROUND_SWAP", true);
+    if (!sync_enabled && !empty_cache_enabled) {
+        return;
+    }
+
     c10::cuda::CUDAGuard device_guard(device);
-    AT_CUDA_CHECK(cudaDeviceSynchronize());
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    if (sync_enabled || empty_cache_enabled) {
+        AT_CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    if (empty_cache_enabled) {
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
 }
 #endif
 
@@ -113,6 +140,23 @@ std::string vector_prefix_string(const std::vector<T> &values, std::size_t limit
     }
     oss << "]";
     return oss.str();
+}
+
+torch::Tensor build_partition_to_buffer_slot_map_from_state(const torch::Tensor &partition_ids,
+                                                            int64_t num_partitions,
+                                                            torch::Device device) {
+    torch::Tensor cpu_partition_ids = partition_ids.to(torch::kCPU).to(torch::kInt64).contiguous();
+    torch::Tensor slot_map = torch::full({num_partitions}, -1, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+    auto partition_accessor = cpu_partition_ids.accessor<int64_t, 1>();
+    auto slot_accessor = slot_map.accessor<int64_t, 1>();
+    for (int64_t slot = 0; slot < cpu_partition_ids.numel(); slot++) {
+        int64_t partition_id = partition_accessor[slot];
+        if (partition_id < 0 || partition_id >= num_partitions) {
+            throw GegeRuntimeException("Invalid partition id while building partition-to-buffer slot map");
+        }
+        slot_accessor[partition_id] = slot;
+    }
+    return slot_map;
 }
 
 EdgeList merge_sorted_edges_with_additional(const EdgeList &base_sorted_edges, const EdgeList &additional_edges, int sort_dim) {
@@ -288,7 +332,7 @@ GraphModelStorage::~GraphModelStorage() {
 }
 
 bool GraphModelStorage::shouldUsePartitionBufferLPFastPath_() {
-    return partition_buffer_lp_fast_path_enabled_ && !prefetch_ && useInMemorySubGraph();
+    return partition_buffer_lp_fast_path_enabled_ && useInMemorySubGraph();
 }
 
 torch::Tensor GraphModelStorage::getPartitionToBufferSlotMap_(int32_t device_idx) {
@@ -349,6 +393,15 @@ torch::Tensor GraphModelStorage::getGlobalToLocalMapForValidation_(bool get_curr
     throw GegeRuntimeException("Dense global-to-local map unavailable for current storage backend");
 }
 
+void GraphModelStorage::startAsyncAdmitPreload_(int32_t device_idx) {
+    if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+        std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->startAsyncAdmitPreload(device_idx);
+    }
+    if (storage_ptrs_.node_optimizer_state != nullptr && train_ && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)) {
+        std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)->startAsyncAdmitPreload(device_idx);
+    }
+}
+
 torch::Tensor GraphModelStorage::mapEdgesWithDenseMap_(torch::Tensor edges, torch::Tensor global_to_local_index_map, torch::Device device) {
     if (!edges.defined()) {
         return torch::Tensor();
@@ -393,9 +446,11 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
         return torch::Tensor();
     }
 
-    torch::Tensor src = edges.select(1, 0);
+    torch::Device map_device = partition_to_buffer_slot.device();
+    torch::Tensor edges_for_map = edges.to(map_device);
+    torch::Tensor src = edges_for_map.select(1, 0);
     // For arity-3/4 [src, rel, dst, ...], dst is col 2, not the last column
-    torch::Tensor dst = (storage_ptrs_.edges->dim1_size_ >= 4) ? edges.select(1, 2) : edges.select(1, -1);
+    torch::Tensor dst = (storage_ptrs_.edges->dim1_size_ >= 4) ? edges_for_map.select(1, 2) : edges_for_map.select(1, -1);
     torch::Tensor src_partitions = torch::floor(src.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
     torch::Tensor dst_partitions = torch::floor(dst.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
     torch::Tensor src_slots = partition_to_buffer_slot.index_select(0, src_partitions);
@@ -412,17 +467,17 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
 
     torch::Tensor mapped_edges;
     if (storage_ptrs_.edges->dim1_size_ == 3) {
-        mapped_edges = torch::stack({src_local, edges.select(1, 1), dst_local}).transpose(0, 1);
+        mapped_edges = torch::stack({src_local, edges_for_map.select(1, 1), dst_local}).transpose(0, 1);
     } else if (storage_ptrs_.edges->dim1_size_ == 2) {
         mapped_edges = torch::stack({src_local, dst_local}).transpose(0, 1);
     } else if (storage_ptrs_.edges->dim1_size_ == 4) {
         // Arity-3: preserve rel (col 1), qval (col 3); remap src and dst
-        mapped_edges = torch::stack({src_local, edges.select(1, 1), dst_local,
-                                     edges.select(1, 3)}).transpose(0, 1);
+        mapped_edges = torch::stack({src_local, edges_for_map.select(1, 1), dst_local,
+                                     edges_for_map.select(1, 3)}).transpose(0, 1);
     } else if (storage_ptrs_.edges->dim1_size_ == 5) {
         // Arity-4: preserve rel (col 1), qrel (col 3), qval (col 4); remap src and dst
-        mapped_edges = torch::stack({src_local, edges.select(1, 1), dst_local,
-                                     edges.select(1, 3), edges.select(1, 4)}).transpose(0, 1);
+        mapped_edges = torch::stack({src_local, edges_for_map.select(1, 1), dst_local,
+                                     edges_for_map.select(1, 3), edges_for_map.select(1, 4)}).transpose(0, 1);
     } else {
         SPDLOG_ERROR("Unexpected number of edge columns");
         throw GegeRuntimeException("Unexpected number of edge columns");
@@ -430,6 +485,23 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
 
     return mapped_edges.to(device);
 }
+
+namespace {
+
+std::shared_ptr<GegeGraph> build_materialized_subgraph_from_mapped_edges(const torch::Tensor &mapped_edges,
+                                                                         int64_t num_nodes_in_memory) {
+    if (!mapped_edges.defined()) {
+        return std::make_shared<GegeGraph>();
+    }
+
+    torch::Tensor mapped_i64 = mapped_edges.to(torch::kInt64);
+    int dst_dim = mapped_i64.size(1) >= 4 ? 2 : mapped_i64.size(1) - 1;
+    torch::Tensor src_sorted = mapped_i64.index_select(0, torch::argsort(mapped_i64.select(1, 0), 0, false));
+    torch::Tensor dst_sorted = mapped_i64.index_select(0, torch::argsort(mapped_i64.select(1, dst_dim), 0, false));
+    return std::make_shared<GegeGraph>(src_sorted, dst_sorted, num_nodes_in_memory);
+}
+
+}  // namespace
 
 void GraphModelStorage::_load(shared_ptr<Storage> storage) {
     if (storage != nullptr) {
@@ -754,6 +826,14 @@ void GraphModelStorage::updateAddNodeEmbeddings(Indices indices, torch::Tensor v
     }
 }
 
+void GraphModelStorage::updateAddNodeEmbeddingsMasked(Indices indices, torch::Tensor values, torch::Tensor active_mask, int32_t device_idx) {
+    if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+        std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->indexAddMasked(indices, values, active_mask, device_idx);
+    } else {
+        storage_ptrs_.node_embeddings->indexAdd(indices, values * active_mask.to(values.device()).to(values.dtype()).reshape({-1, 1}));
+    }
+}
+
 void GraphModelStorage::updateAddNodeEmbeddingsG(Indices indices, torch::Tensor values, int32_t device_idx) {
     // add multi-gpu training mode
     if (devices_.size() == 1) {
@@ -819,6 +899,14 @@ void GraphModelStorage::updateAddNodeEmbeddingState(Indices indices, torch::Tens
         storage_ptrs_.node_optimizer_state->indexAdd(indices, values); 
     } else {
         std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)->indexAdd(indices, values, device_idx);
+    }
+}
+
+void GraphModelStorage::updateAddNodeEmbeddingStateMasked(Indices indices, torch::Tensor values, torch::Tensor active_mask, int32_t device_idx) {
+    if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)) {
+        std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)->indexAddMasked(indices, values, active_mask, device_idx);
+    } else {
+        storage_ptrs_.node_optimizer_state->indexAdd(indices, values * active_mask.to(values.device()).to(values.dtype()).reshape({-1, 1}));
     }
 }
 
@@ -1086,6 +1174,9 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
             }
         }
         current_subgraph_states_[device_idx] = current_subgraph_state_;
+        if (hasSwap(device_idx)) {
+            startAsyncAdmitPreload_(device_idx);
+        }
     } else {
         current_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
         current_subgraph_states_[0] = current_subgraph_state_;
@@ -1124,33 +1215,83 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
 }
 
 void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
+    int64_t outer_timing_id = -1;
+    bool log_outer_timing = should_log_partition_buffer_pipeline_timing(outer_timing_id);
+    auto outer_total_start = std::chrono::high_resolution_clock::now();
+    auto outer_phase_start = outer_total_start;
+    double prefetch_wait_ms = 0.0;
+    double get_swap_ids_ms = 0.0;
+    double perform_swap_ms = 0.0;
+    double subgraph_update_ms = 0.0;
+    double state_publish_ms = 0.0;
+    double next_prefetch_start_ms = 0.0;
+    double admit_preload_start_ms = 0.0;
+
     if (prefetch_) {
         // wait until the prefetching has been completed
         std::unique_lock lock(*subgraph_lock_);
         subgraph_cv_->wait(lock, [this] { return prefetch_complete_ == true; });
+        if (log_outer_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            prefetch_wait_ms = elapsed_graph_storage_ms(outer_phase_start, now);
+            outer_phase_start = now;
+        }
         // need to wait for the subgraph to be prefetched to perform the swap, otherwise the prefetched buffer_index_map may be incorrect
         auto t1 = std::chrono::high_resolution_clock::now();
         performSwap();
         auto t2 = std::chrono::high_resolution_clock::now();
-        SPDLOG_INFO("performSwap time {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
+        perform_swap_ms = elapsed_graph_storage_ms(t1, t2);
+        outer_phase_start = t2;
         // free previous subgraph
         current_subgraph_state_->in_memory_subgraph_ = nullptr;
         current_subgraph_state_ = nullptr;
 
         current_subgraph_state_ = next_subgraph_state_;
+        current_subgraph_states_[device_idx] = current_subgraph_state_;
         next_subgraph_state_ = nullptr;
         prefetch_complete_ = false;
+        if (log_outer_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            state_publish_ms = elapsed_graph_storage_ms(outer_phase_start, now);
+            outer_phase_start = now;
+        }
 
         if (hasSwap()) {
             // update next_subgraph_state_ in background
             getNextSubGraph();
         }
+        if (log_outer_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            next_prefetch_start_ms = elapsed_graph_storage_ms(outer_phase_start, now);
+            outer_phase_start = now;
+        }
+        if (hasSwap()) {
+            startAsyncAdmitPreload_(device_idx);
+        }
+        if (log_outer_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            admit_preload_start_ms = elapsed_graph_storage_ms(outer_phase_start, now);
+            SPDLOG_INFO(
+                "[partition-buffer-pipeline][outer-update {}] device={} prefetch={} prefetch_wait_ms={:.3f} get_swap_ids_ms={:.3f} "
+                "perform_swap_ms={:.3f} subgraph_update_ms={:.3f} state_publish_ms={:.3f} next_prefetch_start_ms={:.3f} "
+                "admit_preload_start_ms={:.3f} total_ms={:.3f}",
+                outer_timing_id, device_idx, prefetch_, prefetch_wait_ms, get_swap_ids_ms, perform_swap_ms, subgraph_update_ms,
+                state_publish_ms, next_prefetch_start_ms, admit_preload_start_ms, elapsed_graph_storage_ms(outer_total_start, now));
+        }
     } else {
+        auto get_swap_ids_start = std::chrono::high_resolution_clock::now();
         std::pair<std::vector<int>, std::vector<int>> current_swap_ids = getNextSwapIds(device_idx);
+        if (log_outer_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            get_swap_ids_ms = elapsed_graph_storage_ms(get_swap_ids_start, now);
+            outer_phase_start = now;
+        }
         // SPDLOG_INFO("performSwap");
         auto t1 = std::chrono::high_resolution_clock::now();
         performSwap(device_idx);
         auto t2 = std::chrono::high_resolution_clock::now();
+        perform_swap_ms = elapsed_graph_storage_ms(t1, t2);
+        outer_phase_start = t2;
         // SPDLOG_INFO("performSwap time {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
 #ifdef GEGE_CUDA
         empty_cache_for_graph_storage_device(devices_[device_idx]);
@@ -1159,6 +1300,21 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         t1 = std::chrono::high_resolution_clock::now();
         updateInMemorySubGraph_(current_subgraph_states_[device_idx], current_swap_ids, device_idx);
         t2 = std::chrono::high_resolution_clock::now();
+        subgraph_update_ms = elapsed_graph_storage_ms(t1, t2);
+        outer_phase_start = t2;
+        if (hasSwap(device_idx)) {
+            startAsyncAdmitPreload_(device_idx);
+        }
+        if (log_outer_timing) {
+            auto now = std::chrono::high_resolution_clock::now();
+            admit_preload_start_ms = elapsed_graph_storage_ms(outer_phase_start, now);
+            SPDLOG_INFO(
+                "[partition-buffer-pipeline][outer-update {}] device={} prefetch={} prefetch_wait_ms={:.3f} get_swap_ids_ms={:.3f} "
+                "perform_swap_ms={:.3f} subgraph_update_ms={:.3f} state_publish_ms={:.3f} next_prefetch_start_ms={:.3f} "
+                "admit_preload_start_ms={:.3f} total_ms={:.3f}",
+                outer_timing_id, device_idx, prefetch_, prefetch_wait_ms, get_swap_ids_ms, perform_swap_ms, subgraph_update_ms,
+                state_publish_ms, next_prefetch_start_ms, admit_preload_start_ms, elapsed_graph_storage_ms(outer_total_start, now));
+        }
         // SPDLOG_INFO("updateInMemorySubGraph_ time {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
         // SPDLOG_INFO("performSwap time {}, updateInMemorySubGraph_ {}", duration, duration2);
         // for (int device_idx = 0; device_idx < current_subgraph_states_.size(); device_idx ++) {
@@ -1265,9 +1421,28 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     }
 
     torch::Tensor old_in_mem_partition_ids = current_subgraph_states_[device_idx]->in_memory_partition_ids_.masked_select(keep_mask);
-    torch::Tensor new_in_mem_partition_ids = current_subgraph_states_[device_idx]->in_memory_partition_ids_.masked_scatter(~keep_mask, admit_ids_tensor);
-    auto old_in_mem_partition_ids_accessor = old_in_mem_partition_ids.accessor<int64_t, 1>();
+    torch::Tensor new_in_mem_partition_ids = current_subgraph_states_[device_idx]->in_memory_partition_ids_.clone();
     auto new_in_mem_partition_ids_accessor = new_in_mem_partition_ids.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < buffer_size; i++) {
+        if (accessor_keep_mask[i]) {
+            continue;
+        }
+
+        int64_t evicted_partition = accessor_in_memory_partition_ids_[i];
+        bool assigned = false;
+        for (int j = 0; j < num_swap_partitions; j++) {
+            if (evicted_partition == evict_partition_ids[j]) {
+                new_in_mem_partition_ids_accessor[i] = admit_partition_ids[j];
+                assigned = true;
+                break;
+            }
+        }
+
+        if (!assigned) {
+            throw GegeRuntimeException("Unable to map evicted partition to admitted partition slot");
+        }
+    }
+    auto old_in_mem_partition_ids_accessor = old_in_mem_partition_ids.accessor<int64_t, 1>();
     std::vector<int> retained_partition_ids;
     retained_partition_ids.reserve(static_cast<std::size_t>(old_in_mem_partition_ids.numel()));
     for (int64_t i = 0; i < old_in_mem_partition_ids.numel(); i++) {
@@ -1349,9 +1524,29 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
         }
     }
 
-    // TODO: all these argsorts can be done with one omp for loop, probably faster, same with masked_selects above
-    torch::Tensor arg_sort = torch::argsort(in_mem_edge_bucket_ids);
-    arg_sort = (arg_sort.index_select(0, torch::argsort(torch::argsort(src_ids_order))));
+    // The active bucket set is small (buffer_size^2). Build the permutation by
+    // bucket id directly instead of relying on matching argsort domains.
+    torch::Tensor combined_bucket_ids_cpu = in_mem_edge_bucket_ids.to(torch::kCPU).to(torch::kInt64).contiguous();
+    torch::Tensor desired_bucket_ids_cpu = src_ids_order.to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto combined_bucket_ids_accessor = combined_bucket_ids_cpu.accessor<int64_t, 1>();
+    auto desired_bucket_ids_accessor = desired_bucket_ids_cpu.accessor<int64_t, 1>();
+    std::unordered_map<int64_t, int64_t> bucket_position;
+    bucket_position.reserve(static_cast<std::size_t>(combined_bucket_ids_cpu.numel()));
+    for (int64_t i = 0; i < combined_bucket_ids_cpu.numel(); i++) {
+        auto inserted = bucket_position.emplace(combined_bucket_ids_accessor[i], i);
+        if (!inserted.second) {
+            throw GegeRuntimeException(fmt::format("Duplicate edge bucket {} during in-memory subgraph update", combined_bucket_ids_accessor[i]));
+        }
+    }
+    std::vector<int64_t> bucket_order_indices(static_cast<std::size_t>(desired_bucket_ids_cpu.numel()));
+    for (int64_t i = 0; i < desired_bucket_ids_cpu.numel(); i++) {
+        auto iter = bucket_position.find(desired_bucket_ids_accessor[i]);
+        if (iter == bucket_position.end()) {
+            throw GegeRuntimeException(fmt::format("Missing edge bucket {} during in-memory subgraph update", desired_bucket_ids_accessor[i]));
+        }
+        bucket_order_indices[static_cast<std::size_t>(i)] = iter->second;
+    }
+    torch::Tensor arg_sort = torch::from_blob(bucket_order_indices.data(), {static_cast<int64_t>(bucket_order_indices.size())}, torch::kInt64).clone();
     in_mem_edge_bucket_ids = (in_mem_edge_bucket_ids.index_select(0, arg_sort));
     in_mem_edge_bucket_sizes = (in_mem_edge_bucket_sizes.index_select(0, arg_sort));
     local_or_global_edge_bucket_starts = (local_or_global_edge_bucket_starts.index_select(0, arg_sort));
@@ -1403,7 +1598,8 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     torch::Tensor bucket_layout_mapped_edges;
     subgraph->global_to_local_index_map_ = torch::Tensor();
     if (shouldUsePartitionBufferLPFastPath_()) {
-        torch::Tensor partition_to_buffer_slot = getPartitionToBufferSlotMap_(device_idx);
+        torch::Tensor partition_to_buffer_slot =
+            build_partition_to_buffer_slot_map_from_state(new_in_mem_partition_ids, num_partitions, devices_[device_idx]);
         int64_t partition_size = getPartitionSize_(device_idx);
         auto previous_state = current_subgraph_states_[device_idx];
         bool can_reuse_mapped_buckets = previous_state != nullptr && previous_state->all_in_memory_mapped_edges_.defined();
@@ -1675,6 +1871,23 @@ void GraphModelStorage::sortAllEdges(int32_t device_idx) {
         }
 
     } else {
-        current_subgraph_states_[device_idx]->in_memory_subgraph_->sortAllEdges(current_subgraph_states_[device_idx]->in_memory_subgraph_->src_sorted_edges_);
+        auto state = current_subgraph_states_[device_idx];
+        auto in_memory_graph = state->in_memory_subgraph_;
+        if (in_memory_graph == nullptr) {
+            return;
+        }
+
+        if ((!in_memory_graph->src_sorted_edges_.defined() || !in_memory_graph->dst_sorted_edges_.defined()) &&
+            state->all_in_memory_mapped_edges_.defined() && state->all_in_memory_mapped_edges_.numel() > 0) {
+            state->in_memory_subgraph_ =
+                build_materialized_subgraph_from_mapped_edges(state->all_in_memory_mapped_edges_, getNumNodesInMemory(device_idx));
+            in_memory_graph = state->in_memory_subgraph_;
+        }
+
+        if (!in_memory_graph->src_sorted_edges_.defined() || !in_memory_graph->dst_sorted_edges_.defined()) {
+            return;
+        }
+
+        in_memory_graph->sortAllEdges(in_memory_graph->src_sorted_edges_);
     }
 }

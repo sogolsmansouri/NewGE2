@@ -1,6 +1,11 @@
 #pragma once
 
+#include <cstdint>
+#include <cstdlib>
 #include <exception>
+#ifdef GEGE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
 #include "configuration/constants.h"
 #include "storage/storage.h"
@@ -58,6 +63,8 @@ class GraphModelStorage {
 
     torch::Tensor mapEdgesWithPartitionSlots_(torch::Tensor edges, torch::Tensor partition_to_buffer_slot, int64_t partition_size,
                                               torch::Device device);
+
+    void startAsyncAdmitPreload_(int32_t device_idx = 0);
 
     int64_t num_nodes_;
     int64_t num_edges_;
@@ -156,6 +163,8 @@ class GraphModelStorage {
 
     void updateAddNodeEmbeddings(Indices indices, torch::Tensor values, int32_t device_idx = 0);
 
+    void updateAddNodeEmbeddingsMasked(Indices indices, torch::Tensor values, torch::Tensor active_mask, int32_t device_idx = 0);
+
     void updateAddNodeEmbeddingsG(Indices indices, torch::Tensor values, int32_t device_idx = 0);
 
     void updatePutEncodedNodes(Indices indices, torch::Tensor values);
@@ -171,6 +180,8 @@ class GraphModelStorage {
     void updatePutNodeEmbeddingState(Indices indices, OptimizerState state);
 
     void updateAddNodeEmbeddingState(Indices indices, torch::Tensor values, int32_t device_idx = 0);
+
+    void updateAddNodeEmbeddingStateMasked(Indices indices, torch::Tensor values, torch::Tensor active_mask, int32_t device_idx = 0);
 
     void updateAddNodeEmbeddingStateG(Indices indices, torch::Tensor values, int32_t device_idx = 0);
 
@@ -268,12 +279,39 @@ class GraphModelStorage {
         }
 
         if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            std::uintptr_t swap_ready_event_handle = 0;
+#ifdef GEGE_CUDA
+            cudaEvent_t swap_ready_event = nullptr;
+            auto read_env_flag = [](const char *name, bool default_value) {
+                const char *raw = std::getenv(name);
+                if (raw == nullptr) {
+                    return default_value;
+                }
+                std::string value(raw);
+                if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+                    return false;
+                }
+                if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+                    return true;
+                }
+                return default_value;
+            };
+            bool swap_event_sync = read_env_flag("GEGE_MEM_SWAP_EVENT_SYNC", true);
+            bool global_swap_sync = read_env_flag("GEGE_SYNC_BEFORE_SWAP", true);
+            if (swap_event_sync && !global_swap_sync && device_idx >= 0 &&
+                static_cast<std::size_t>(device_idx) < devices_.size() && devices_[device_idx].is_cuda()) {
+                c10::cuda::CUDAGuard guard(devices_[device_idx]);
+                AT_CUDA_CHECK(cudaEventCreateWithFlags(&swap_ready_event, cudaEventDisableTiming));
+                AT_CUDA_CHECK(cudaEventRecord(swap_ready_event, c10::cuda::getCurrentCUDAStream(devices_[device_idx].index()).stream()));
+                swap_ready_event_handle = reinterpret_cast<std::uintptr_t>(swap_ready_event);
+            }
+#endif
             std::vector<std::thread> threads;
             std::exception_ptr thread_exception = nullptr;
             std::mutex thread_exception_lock;
             auto run_mem_swap = [&](std::shared_ptr<MemPartitionBufferStorage> storage) {
                 try {
-                    storage->performNextSwap(device_idx);
+                    storage->performNextSwap(device_idx, swap_ready_event_handle);
                 } catch (...) {
                     std::lock_guard<std::mutex> lock(thread_exception_lock);
                     if (thread_exception == nullptr) {
@@ -289,6 +327,11 @@ class GraphModelStorage {
             for(auto& thread : threads) {
                 thread.join();
             }
+#ifdef GEGE_CUDA
+            if (swap_ready_event != nullptr) {
+                AT_CUDA_CHECK(cudaEventDestroy(swap_ready_event));
+            }
+#endif
             if (thread_exception != nullptr) {
                 std::rethrow_exception(thread_exception);
             }

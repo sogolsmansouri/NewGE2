@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <fstream>
 #include <string>
 #include <tuple>
@@ -156,11 +157,15 @@ class MemPartitionBufferStorage : public Storage {
 
     void indexAdd(Indices indices, torch::Tensor values, int32_t device_idx);
 
+    void indexAddMasked(Indices indices, torch::Tensor values, torch::Tensor active_mask, int32_t device_idx);
+
     Indices getRandomIds(int64_t size, int32_t device_idx = 0) { return buffers_[device_idx]->getRandomIds(size); }
 
     bool hasSwap(int32_t device_idx = 0) { return buffers_[device_idx]->hasSwap(); }
 
-    void performNextSwap(int32_t device_idx);
+    void performNextSwap(int32_t device_idx, std::uintptr_t swap_ready_event = 0);
+
+    void startAsyncAdmitPreload(int32_t device_idx);
 
     torch::Tensor getGlobalToLocalMap(bool get_current, int32_t device_idx = 0) { return buffers_[device_idx]->getGlobalToLocalMap(get_current); }
 

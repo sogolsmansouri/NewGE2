@@ -18,6 +18,22 @@
 namespace {
 
 #ifdef GEGE_CUDA
+bool parse_cuda_swap_env_flag(const char *name, bool default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr) {
+        return default_value;
+    }
+
+    std::string value(raw);
+    if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+        return false;
+    }
+    if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+        return true;
+    }
+    return default_value;
+}
+
 void synchronize_cuda_swap_device(const torch::Device &device) {
     if (!device.is_cuda()) {
         return;
@@ -28,8 +44,18 @@ void synchronize_cuda_swap_device(const torch::Device &device) {
 }
 
 void empty_cache_for_swap_device(const torch::Device &device) {
-    synchronize_cuda_swap_device(device);
-    c10::cuda::CUDACachingAllocator::emptyCache();
+    static bool sync_enabled = parse_cuda_swap_env_flag("GEGE_SYNC_BEFORE_SWAP", true);
+    static bool empty_cache_enabled = parse_cuda_swap_env_flag("GEGE_EMPTY_CACHE_AROUND_SWAP", true);
+    if (!sync_enabled && !empty_cache_enabled) {
+        return;
+    }
+
+    if (sync_enabled || empty_cache_enabled) {
+        synchronize_cuda_swap_device(device);
+    }
+    if (empty_cache_enabled) {
+        c10::cuda::CUDACachingAllocator::emptyCache();
+    }
 }
 #endif
 
@@ -74,6 +100,31 @@ bool stage_debug_enabled() {
 
 bool fast_map_tensors_enabled() {
     static bool enabled = parse_env_flag("GEGE_FAST_MAP_TENSORS", false);
+    return enabled;
+}
+
+bool fixed_buffer_masked_update_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MASKED_UPDATE", false);
+    return enabled;
+}
+
+bool fixed_buffer_compact_active_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_COMPACT_ACTIVE", false);
+    return enabled;
+}
+
+bool fixed_buffer_compact_active_prefix_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_COMPACT_ACTIVE_PREFIX", false);
+    return enabled;
+}
+
+bool map_tensor_breakdown_enabled() {
+    static bool enabled = parse_env_flag("GEGE_MAP_TENSOR_BREAKDOWN", false);
+    return enabled;
+}
+
+bool resident_local_lp_direct_enabled() {
+    static bool enabled = parse_env_flag("GEGE_RESIDENT_LOCAL_LP_DIRECT", false);
     return enabled;
 }
 
@@ -323,6 +374,10 @@ int64_t elapsed_ns(std::chrono::high_resolution_clock::time_point start, std::ch
     return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 }
 
+int64_t ms_to_ns(double ms) {
+    return static_cast<int64_t>(ms * 1000000.0);
+}
+
 void initialize_perf_vector(std::vector<int64_t> &values, std::size_t size) {
     values.assign(size, 0);
 }
@@ -519,6 +574,9 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     initialize_perf_vector(device_swap_sync_wait_ns_, devices_.size());
     initialize_perf_vector(device_swap_count_, devices_.size());
     initialize_perf_vector(device_get_next_batch_ns_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_direct_ns_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_swap_path_ns_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_swap_overhead_ns_, devices_.size());
     initialize_perf_vector(device_edge_sample_ns_, devices_.size());
     initialize_perf_vector(device_edge_get_edges_ns_, devices_.size());
     initialize_perf_vector(device_edge_negative_sample_ns_, devices_.size());
@@ -526,7 +584,9 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     initialize_perf_vector(device_edge_map_lookup_ns_, devices_.size());
     initialize_perf_vector(device_edge_map_verify_ns_, devices_.size());
     initialize_perf_vector(device_edge_remap_assign_ns_, devices_.size());
+    initialize_perf_vector(device_edge_compact_active_ns_, devices_.size());
     initialize_perf_vector(device_edge_finalize_ns_, devices_.size());
+    initialize_perf_vector(device_edge_unaccounted_ns_, devices_.size());
     initialize_perf_vector(device_node_sample_ns_, devices_.size());
     initialize_perf_vector(device_load_cpu_parameters_ns_, devices_.size());
     initialize_perf_vector(device_get_batch_device_prepare_ns_, devices_.size());
@@ -646,6 +706,9 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     initialize_perf_vector(device_swap_sync_wait_ns_, devices_.size());
     initialize_perf_vector(device_swap_count_, devices_.size());
     initialize_perf_vector(device_get_next_batch_ns_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_direct_ns_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_swap_path_ns_, devices_.size());
+    initialize_perf_vector(device_get_next_batch_swap_overhead_ns_, devices_.size());
     initialize_perf_vector(device_edge_sample_ns_, devices_.size());
     initialize_perf_vector(device_edge_get_edges_ns_, devices_.size());
     initialize_perf_vector(device_edge_negative_sample_ns_, devices_.size());
@@ -653,7 +716,9 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     initialize_perf_vector(device_edge_map_lookup_ns_, devices_.size());
     initialize_perf_vector(device_edge_map_verify_ns_, devices_.size());
     initialize_perf_vector(device_edge_remap_assign_ns_, devices_.size());
+    initialize_perf_vector(device_edge_compact_active_ns_, devices_.size());
     initialize_perf_vector(device_edge_finalize_ns_, devices_.size());
+    initialize_perf_vector(device_edge_unaccounted_ns_, devices_.size());
     initialize_perf_vector(device_node_sample_ns_, devices_.size());
     initialize_perf_vector(device_load_cpu_parameters_ns_, devices_.size());
     initialize_perf_vector(device_get_batch_device_prepare_ns_, devices_.size());
@@ -716,6 +781,9 @@ void DataLoader::resetPerfStats() {
     swap_sync_wait_ns_.store(0);
     swap_count_.store(0);
     get_next_batch_ns_.store(0);
+    get_next_batch_direct_ns_.store(0);
+    get_next_batch_swap_path_ns_.store(0);
+    get_next_batch_swap_overhead_ns_.store(0);
     edge_sample_ns_.store(0);
     edge_get_edges_ns_.store(0);
     edge_negative_sample_ns_.store(0);
@@ -723,7 +791,23 @@ void DataLoader::resetPerfStats() {
     edge_map_lookup_ns_.store(0);
     edge_map_verify_ns_.store(0);
     edge_remap_assign_ns_.store(0);
+    edge_compact_active_ns_.store(0);
     edge_finalize_ns_.store(0);
+    edge_unaccounted_ns_.store(0);
+    map_tensor_calls_.store(0);
+    map_tensor_validate_ns_.store(0);
+    map_tensor_cat_ns_.store(0);
+    map_tensor_unique_ns_.store(0);
+    map_tensor_bitmap_zero_ns_.store(0);
+    map_tensor_bitmap_output_init_ns_.store(0);
+    map_tensor_bitmap_mark_ns_.store(0);
+    map_tensor_bitmap_count_ns_.store(0);
+    map_tensor_bitmap_scan_ns_.store(0);
+    map_tensor_bitmap_extract_ns_.store(0);
+    map_tensor_bitmap_mask_ns_.store(0);
+    map_tensor_bitmap_inverse_ns_.store(0);
+    map_tensor_split_ns_.store(0);
+    map_tensor_total_ns_.store(0);
     node_sample_ns_.store(0);
     load_cpu_parameters_ns_.store(0);
     get_batch_device_prepare_ns_.store(0);
@@ -735,6 +819,9 @@ void DataLoader::resetPerfStats() {
     std::fill(device_swap_sync_wait_ns_.begin(), device_swap_sync_wait_ns_.end(), 0);
     std::fill(device_swap_count_.begin(), device_swap_count_.end(), 0);
     std::fill(device_get_next_batch_ns_.begin(), device_get_next_batch_ns_.end(), 0);
+    std::fill(device_get_next_batch_direct_ns_.begin(), device_get_next_batch_direct_ns_.end(), 0);
+    std::fill(device_get_next_batch_swap_path_ns_.begin(), device_get_next_batch_swap_path_ns_.end(), 0);
+    std::fill(device_get_next_batch_swap_overhead_ns_.begin(), device_get_next_batch_swap_overhead_ns_.end(), 0);
     std::fill(device_edge_sample_ns_.begin(), device_edge_sample_ns_.end(), 0);
     std::fill(device_edge_get_edges_ns_.begin(), device_edge_get_edges_ns_.end(), 0);
     std::fill(device_edge_negative_sample_ns_.begin(), device_edge_negative_sample_ns_.end(), 0);
@@ -742,7 +829,9 @@ void DataLoader::resetPerfStats() {
     std::fill(device_edge_map_lookup_ns_.begin(), device_edge_map_lookup_ns_.end(), 0);
     std::fill(device_edge_map_verify_ns_.begin(), device_edge_map_verify_ns_.end(), 0);
     std::fill(device_edge_remap_assign_ns_.begin(), device_edge_remap_assign_ns_.end(), 0);
+    std::fill(device_edge_compact_active_ns_.begin(), device_edge_compact_active_ns_.end(), 0);
     std::fill(device_edge_finalize_ns_.begin(), device_edge_finalize_ns_.end(), 0);
+    std::fill(device_edge_unaccounted_ns_.begin(), device_edge_unaccounted_ns_.end(), 0);
     std::fill(device_node_sample_ns_.begin(), device_node_sample_ns_.end(), 0);
     std::fill(device_load_cpu_parameters_ns_.begin(), device_load_cpu_parameters_ns_.end(), 0);
     std::fill(device_get_batch_device_prepare_ns_.begin(), device_get_batch_device_prepare_ns_.end(), 0);
@@ -778,6 +867,9 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.swap_sync_wait_ns = swap_sync_wait_ns_.load();
     stats.swap_count = swap_count_.load();
     stats.get_next_batch_ns = get_next_batch_ns_.load();
+    stats.get_next_batch_direct_ns = get_next_batch_direct_ns_.load();
+    stats.get_next_batch_swap_path_ns = get_next_batch_swap_path_ns_.load();
+    stats.get_next_batch_swap_overhead_ns = get_next_batch_swap_overhead_ns_.load();
     stats.edge_sample_ns = edge_sample_ns_.load();
     stats.edge_get_edges_ns = edge_get_edges_ns_.load();
     stats.edge_negative_sample_ns = edge_negative_sample_ns_.load();
@@ -785,7 +877,23 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.edge_map_lookup_ns = edge_map_lookup_ns_.load();
     stats.edge_map_verify_ns = edge_map_verify_ns_.load();
     stats.edge_remap_assign_ns = edge_remap_assign_ns_.load();
+    stats.edge_compact_active_ns = edge_compact_active_ns_.load();
     stats.edge_finalize_ns = edge_finalize_ns_.load();
+    stats.edge_unaccounted_ns = edge_unaccounted_ns_.load();
+    stats.map_tensor_calls = map_tensor_calls_.load();
+    stats.map_tensor_validate_ns = map_tensor_validate_ns_.load();
+    stats.map_tensor_cat_ns = map_tensor_cat_ns_.load();
+    stats.map_tensor_unique_ns = map_tensor_unique_ns_.load();
+    stats.map_tensor_bitmap_zero_ns = map_tensor_bitmap_zero_ns_.load();
+    stats.map_tensor_bitmap_output_init_ns = map_tensor_bitmap_output_init_ns_.load();
+    stats.map_tensor_bitmap_mark_ns = map_tensor_bitmap_mark_ns_.load();
+    stats.map_tensor_bitmap_count_ns = map_tensor_bitmap_count_ns_.load();
+    stats.map_tensor_bitmap_scan_ns = map_tensor_bitmap_scan_ns_.load();
+    stats.map_tensor_bitmap_extract_ns = map_tensor_bitmap_extract_ns_.load();
+    stats.map_tensor_bitmap_mask_ns = map_tensor_bitmap_mask_ns_.load();
+    stats.map_tensor_bitmap_inverse_ns = map_tensor_bitmap_inverse_ns_.load();
+    stats.map_tensor_split_ns = map_tensor_split_ns_.load();
+    stats.map_tensor_total_ns = map_tensor_total_ns_.load();
     stats.node_sample_ns = node_sample_ns_.load();
     stats.load_cpu_parameters_ns = load_cpu_parameters_ns_.load();
     stats.get_batch_device_prepare_ns = get_batch_device_prepare_ns_.load();
@@ -797,6 +905,9 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.device_swap_sync_wait_ns = device_swap_sync_wait_ns_;
     stats.device_swap_count = device_swap_count_;
     stats.device_get_next_batch_ns = device_get_next_batch_ns_;
+    stats.device_get_next_batch_direct_ns = device_get_next_batch_direct_ns_;
+    stats.device_get_next_batch_swap_path_ns = device_get_next_batch_swap_path_ns_;
+    stats.device_get_next_batch_swap_overhead_ns = device_get_next_batch_swap_overhead_ns_;
     stats.device_edge_sample_ns = device_edge_sample_ns_;
     stats.device_edge_get_edges_ns = device_edge_get_edges_ns_;
     stats.device_edge_negative_sample_ns = device_edge_negative_sample_ns_;
@@ -804,7 +915,9 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.device_edge_map_lookup_ns = device_edge_map_lookup_ns_;
     stats.device_edge_map_verify_ns = device_edge_map_verify_ns_;
     stats.device_edge_remap_assign_ns = device_edge_remap_assign_ns_;
+    stats.device_edge_compact_active_ns = device_edge_compact_active_ns_;
     stats.device_edge_finalize_ns = device_edge_finalize_ns_;
+    stats.device_edge_unaccounted_ns = device_edge_unaccounted_ns_;
     stats.device_node_sample_ns = device_node_sample_ns_;
     stats.device_load_cpu_parameters_ns = device_load_cpu_parameters_ns_;
     stats.device_get_batch_device_prepare_ns = device_get_batch_device_prepare_ns_;
@@ -1345,6 +1458,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
     // std::unique_lock batch_lock(*batch_lock_);
     // // batch_cv_->wait(batch_lock, [this] { return !waiting_for_batches_; });
 
+    auto get_next_batch_start = std::chrono::high_resolution_clock::now();
     shared_ptr<Batch> batch;
     if (batch_iterators_[device_idx] != all_batches_[device_idx].end()) {
         batch = *batch_iterators_[device_idx];
@@ -1359,10 +1473,13 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 all_reads_[device_idx] = true;
             }
         }
+        int64_t direct_elapsed = elapsed_ns(get_next_batch_start, std::chrono::high_resolution_clock::now());
+        add_perf_stat(get_next_batch_direct_ns_, device_get_next_batch_direct_ns_, device_idx, direct_elapsed);
     } else {
         batch = nullptr;
         if (graph_storage_->useInMemorySubGraph()) {
             if (graph_storage_->hasSwap(device_idx)) {
+                auto swap_path_start = std::chrono::high_resolution_clock::now();
                 // wait for all batches to finish before swapping
                 auto swap_barrier_start = std::chrono::high_resolution_clock::now();
                 waitForSwapReadBarrier(static_cast<int32_t>(all_batches_.size()));
@@ -1455,6 +1572,11 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                         all_reads_[device_idx] = true;
                     }
                 }
+                int64_t swap_path_elapsed = elapsed_ns(swap_path_start, std::chrono::high_resolution_clock::now());
+                int64_t swap_accounted_elapsed = swap_barrier_elapsed + swap_update_elapsed + swap_rebuild_elapsed + swap_sync_elapsed;
+                int64_t swap_overhead_elapsed = std::max<int64_t>(swap_path_elapsed - swap_accounted_elapsed, 0LL);
+                add_perf_stat(get_next_batch_swap_path_ns_, device_get_next_batch_swap_path_ns_, device_idx, swap_path_elapsed);
+                add_perf_stat(get_next_batch_swap_overhead_ns_, device_get_next_batch_swap_overhead_ns_, device_idx, swap_overhead_elapsed);
             } else {
                 all_reads_[device_idx] = true;
             }
@@ -1556,6 +1678,7 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     int64_t map_lookup_elapsed = 0;
     int64_t map_verify_elapsed = 0;
     int64_t remap_assign_elapsed = 0;
+    int64_t compact_active_elapsed = 0;
     int64_t finalize_elapsed = 0;
 
     if (!batch->edges_.defined()) {
@@ -1634,6 +1757,33 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     double remap_assign_ms = 0.0;
     MapTensorTiming map_tensor_timing;
     bool has_map_tensor_timing = false;
+    bool collect_map_tensor_breakdown = map_tensor_breakdown_enabled() || run_stage_debug;
+
+    if (resident_local_lp_direct_enabled() && neighbor_sampler_ == nullptr && batch->streamed_edge_size_ > 0 &&
+        graph_storage_->storage_ptrs_.node_embeddings != nullptr &&
+        graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA &&
+        (batch->edges_.size(1) == 2 || batch->edges_.size(1) == 3)) {
+        auto finalize_start = std::chrono::high_resolution_clock::now();
+        batch->resident_local_lp_direct_ = true;
+        batch->src_neg_indices_mapping_ = batch->src_neg_indices_;
+        batch->dst_neg_indices_mapping_ = batch->dst_neg_indices_;
+        finalize_elapsed = elapsed_ns(finalize_start, std::chrono::high_resolution_clock::now());
+
+        add_perf_stat(edge_get_edges_ns_, device_edge_get_edges_ns_, device_idx, get_edges_elapsed);
+        add_perf_stat(edge_negative_sample_ns_, device_edge_negative_sample_ns_, device_idx, negative_sample_elapsed);
+        add_perf_stat(edge_map_collect_ids_ns_, device_edge_map_collect_ids_ns_, device_idx, map_collect_elapsed);
+        add_perf_stat(edge_map_lookup_ns_, device_edge_map_lookup_ns_, device_idx, 0);
+        add_perf_stat(edge_map_verify_ns_, device_edge_map_verify_ns_, device_idx, 0);
+        add_perf_stat(edge_remap_assign_ns_, device_edge_remap_assign_ns_, device_idx, 0);
+        add_perf_stat(edge_compact_active_ns_, device_edge_compact_active_ns_, device_idx, 0);
+        add_perf_stat(edge_finalize_ns_, device_edge_finalize_ns_, device_idx, finalize_elapsed);
+        add_perf_stat(edge_unaccounted_ns_, device_edge_unaccounted_ns_, device_idx, 0);
+        if (run_stage_debug) {
+            SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 3] resident_local_lp_direct=1 input_ids={}",
+                        debug_batch_id, edge_src.numel() + edge_dst.numel());
+        }
+        return;
+    }
 
     if (neighbor_sampler_ != nullptr) {
         auto map_lookup_start = std::chrono::high_resolution_clock::now();
@@ -1676,14 +1826,45 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     } else {
         // map edges and negatives to their corresponding index in unique_node_indices_
         auto map_lookup_start = std::chrono::high_resolution_clock::now();
-        auto tup = map_tensors(all_ids, !fast_map_tensors_enabled(), run_stage_debug ? &map_tensor_timing : nullptr);
+        torch::Tensor active_unique_mask;
+        auto tup = map_tensors(all_ids, !fast_map_tensors_enabled(), collect_map_tensor_breakdown ? &map_tensor_timing : nullptr, &active_unique_mask);
         auto map_lookup_end = std::chrono::high_resolution_clock::now();
         map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
         map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
-        has_map_tensor_timing = run_stage_debug;
+        has_map_tensor_timing = collect_map_tensor_breakdown;
+        if (collect_map_tensor_breakdown) {
+            map_tensor_calls_.fetch_add(1);
+            map_tensor_validate_ns_.fetch_add(ms_to_ns(map_tensor_timing.validate_ms));
+            map_tensor_cat_ns_.fetch_add(ms_to_ns(map_tensor_timing.cat_ms));
+            map_tensor_unique_ns_.fetch_add(ms_to_ns(map_tensor_timing.unique_wall_ms));
+            map_tensor_bitmap_zero_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_zero_ms));
+            map_tensor_bitmap_output_init_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_output_init_ms));
+            map_tensor_bitmap_mark_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_mark_ms));
+            map_tensor_bitmap_count_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_count_ms));
+            map_tensor_bitmap_scan_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_scan_ms));
+            map_tensor_bitmap_extract_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_extract_ms));
+            map_tensor_bitmap_mask_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_mask_ms));
+            map_tensor_bitmap_inverse_ns_.fetch_add(ms_to_ns(map_tensor_timing.bitmap_inverse_ms));
+            map_tensor_split_ns_.fetch_add(ms_to_ns(map_tensor_timing.split_ms));
+            map_tensor_total_ns_.fetch_add(ms_to_ns(map_tensor_timing.total_ms));
+        }
     
 
         batch->unique_node_indices_ = std::get<0>(tup);
+        batch->unique_node_active_mask_ = active_unique_mask;
+        if (fixed_buffer_compact_active_enabled() && active_unique_mask.defined() &&
+            active_unique_mask.numel() == batch->unique_node_indices_.numel()) {
+            auto compact_active_start = std::chrono::high_resolution_clock::now();
+            if (fixed_buffer_compact_active_prefix_enabled()) {
+                int64_t active_rows = active_unique_mask.sum().item<int64_t>();
+                batch->unique_node_indices_ = batch->unique_node_indices_.narrow(0, 0, active_rows);
+            } else {
+                batch->unique_node_indices_ =
+                    batch->unique_node_indices_.masked_select(active_unique_mask.to(batch->unique_node_indices_.device()).to(torch::kBool));
+            }
+            batch->unique_node_active_mask_ = torch::Tensor();
+            compact_active_elapsed = elapsed_ns(compact_active_start, std::chrono::high_resolution_clock::now());
+        }
 
         auto map_verify_start = std::chrono::high_resolution_clock::now();
         if (verify_node_mapping_enabled()) {
@@ -1730,8 +1911,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
             debug_batch_id, elapsed_ms(step_start, now), unique_numel, input_ids_numel, duplicate_count, duplicate_ratio,
             neighbor_sampler_ != nullptr, fast_map_tensors_enabled(), verify_node_mapping_enabled());
         SPDLOG_INFO(
-            "[stage-debug][edgeSample][batch {}][step 3 breakdown] collect_ids_ms={:.3f} map_lookup_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f}",
-            debug_batch_id, elapsed_ms(map_collect_start, map_collect_end), map_lookup_ms, map_verify_ms, remap_assign_ms);
+            "[stage-debug][edgeSample][batch {}][step 3 breakdown] collect_ids_ms={:.3f} map_lookup_ms={:.3f} compact_active_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f}",
+            debug_batch_id, elapsed_ms(map_collect_start, map_collect_end), map_lookup_ms,
+            static_cast<double>(compact_active_elapsed) / 1'000'000.0, map_verify_ms, remap_assign_ms);
         if (has_map_tensor_timing) {
             SPDLOG_INFO(
                 "[stage-debug][edgeSample][batch {}][step 3 map_tensors] validate_ms={:.3f} cat_ms={:.3f} unique_ms={:.3f} unique_wall_ms={:.3f} split_ms={:.3f} total_ms={:.3f}",
@@ -1776,6 +1958,11 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     batch->src_neg_indices_mapping_ = src_neg_mapping;
     batch->dst_neg_indices_mapping_ = dst_neg_mapping;
     finalize_elapsed = elapsed_ns(finalize_start, std::chrono::high_resolution_clock::now());
+    int64_t edge_sample_inner_elapsed = elapsed_ns(edge_sample_start, std::chrono::high_resolution_clock::now());
+    int64_t edge_sample_accounted_elapsed =
+        get_edges_elapsed + negative_sample_elapsed + map_collect_elapsed + map_lookup_elapsed + compact_active_elapsed +
+        map_verify_elapsed + remap_assign_elapsed + finalize_elapsed;
+    int64_t edge_sample_unaccounted_elapsed = std::max<int64_t>(edge_sample_inner_elapsed - edge_sample_accounted_elapsed, 0LL);
 
     add_perf_stat(edge_get_edges_ns_, device_edge_get_edges_ns_, device_idx, get_edges_elapsed);
     add_perf_stat(edge_negative_sample_ns_, device_edge_negative_sample_ns_, device_idx, negative_sample_elapsed);
@@ -1783,12 +1970,15 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     add_perf_stat(edge_map_lookup_ns_, device_edge_map_lookup_ns_, device_idx, map_lookup_elapsed);
     add_perf_stat(edge_map_verify_ns_, device_edge_map_verify_ns_, device_idx, map_verify_elapsed);
     add_perf_stat(edge_remap_assign_ns_, device_edge_remap_assign_ns_, device_idx, remap_assign_elapsed);
+    add_perf_stat(edge_compact_active_ns_, device_edge_compact_active_ns_, device_idx, compact_active_elapsed);
     add_perf_stat(edge_finalize_ns_, device_edge_finalize_ns_, device_idx, finalize_elapsed);
+    add_perf_stat(edge_unaccounted_ns_, device_edge_unaccounted_ns_, device_idx, edge_sample_unaccounted_elapsed);
 
     if (run_stage_debug) {
         auto now = std::chrono::high_resolution_clock::now();
-        SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 4] finalize ms={:.3f} total_ms={:.3f}",
-                    debug_batch_id, elapsed_ms(step_start, now), elapsed_ms(edge_sample_start, now));
+        SPDLOG_INFO("[stage-debug][edgeSample][batch {}][step 4] finalize ms={:.3f} total_ms={:.3f} unaccounted_ms={:.3f}",
+                    debug_batch_id, elapsed_ms(step_start, now), elapsed_ms(edge_sample_start, now),
+                    static_cast<double>(edge_sample_unaccounted_elapsed) / 1'000'000.0);
     }
 }
 
@@ -1866,6 +2056,48 @@ void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {
 }
 
 void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) {
+    if (batch->resident_local_lp_direct_) {
+        torch::Tensor src_ids = batch->edges_.select(1, 0).to(torch::kInt64);
+        torch::Tensor dst_ids = (batch->edges_.size(1) >= 4)
+                                    ? batch->edges_.select(1, 2).to(torch::kInt64)
+                                    : batch->edges_.select(1, -1).to(torch::kInt64);
+
+        batch->resident_src_embeddings_ = graph_storage_->getNodeEmbeddings(src_ids, device_idx);
+        batch->resident_dst_embeddings_ = graph_storage_->getNodeEmbeddings(dst_ids, device_idx);
+        if (train_) {
+            batch->resident_src_embeddings_state_ = graph_storage_->getNodeEmbeddingState(src_ids, device_idx);
+            batch->resident_dst_embeddings_state_ = graph_storage_->getNodeEmbeddingState(dst_ids, device_idx);
+        }
+
+        auto reshape_neg = [](torch::Tensor flat_embeddings, torch::Tensor neg_ids) {
+            if (!flat_embeddings.defined() || !neg_ids.defined()) {
+                return torch::Tensor();
+            }
+            std::vector<int64_t> sizes = neg_ids.sizes().vec();
+            sizes.emplace_back(flat_embeddings.size(-1));
+            return flat_embeddings.reshape(sizes);
+        };
+
+        if (batch->dst_neg_indices_.defined()) {
+            torch::Tensor dst_flat = batch->dst_neg_indices_.reshape({-1}).to(torch::kInt64);
+            batch->resident_dst_neg_embeddings_ = reshape_neg(graph_storage_->getNodeEmbeddings(dst_flat, device_idx), batch->dst_neg_indices_);
+            if (train_) {
+                batch->resident_dst_neg_embeddings_state_ =
+                    reshape_neg(graph_storage_->getNodeEmbeddingState(dst_flat, device_idx), batch->dst_neg_indices_);
+            }
+        }
+
+        if (batch->src_neg_indices_.defined()) {
+            torch::Tensor src_flat = batch->src_neg_indices_.reshape({-1}).to(torch::kInt64);
+            batch->resident_src_neg_embeddings_ = reshape_neg(graph_storage_->getNodeEmbeddings(src_flat, device_idx), batch->src_neg_indices_);
+            if (train_) {
+                batch->resident_src_neg_embeddings_state_ =
+                    reshape_neg(graph_storage_->getNodeEmbeddingState(src_flat, device_idx), batch->src_neg_indices_);
+            }
+        }
+        return;
+    }
+
     if (graph_storage_->storage_ptrs_.node_embeddings != nullptr) {
         if (graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA) {
 
@@ -1908,8 +2140,22 @@ void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) 
 void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t device_idx) {
     if (gpu) {
         if (graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA) {
-            graph_storage_->updateAddNodeEmbeddings(batch->unique_node_indices_, batch->node_gradients_, device_idx);
-            graph_storage_->updateAddNodeEmbeddingState(batch->unique_node_indices_, batch->node_state_update_, device_idx);
+            bool use_masked_update = fixed_buffer_masked_update_enabled() &&
+                                     batch->unique_node_active_mask_.defined() &&
+                                     batch->unique_node_active_mask_.numel() == batch->unique_node_indices_.numel() &&
+                                     batch->node_gradients_.defined() &&
+                                     batch->node_state_update_.defined() &&
+                                     batch->node_gradients_.device().is_cuda() &&
+                                     batch->node_state_update_.device().is_cuda();
+            if (use_masked_update) {
+                graph_storage_->updateAddNodeEmbeddingsMasked(batch->unique_node_indices_, batch->node_gradients_,
+                                                              batch->unique_node_active_mask_, device_idx);
+                graph_storage_->updateAddNodeEmbeddingStateMasked(batch->unique_node_indices_, batch->node_state_update_,
+                                                                  batch->unique_node_active_mask_, device_idx);
+            } else {
+                graph_storage_->updateAddNodeEmbeddings(batch->unique_node_indices_, batch->node_gradients_, device_idx);
+                graph_storage_->updateAddNodeEmbeddingState(batch->unique_node_indices_, batch->node_state_update_, device_idx);
+            }
         }
         // Arity-4: write back qualifier value embedding gradients to always-resident GPU table
         if (graph_storage_->storage_ptrs_.qual_embeddings != nullptr

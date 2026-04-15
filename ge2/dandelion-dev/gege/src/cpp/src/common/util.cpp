@@ -12,10 +12,8 @@
 #include <mutex>
 #include <sstream>
 
-#include "reporting/logger.h"
-#ifdef GEGE_CUDA
 #include "common/unique_map_cuda.h"
-#endif
+#include "reporting/logger.h"
 
 namespace {
 
@@ -73,6 +71,36 @@ int64_t unique_capture_max_batches() {
 bool unique_backend_log_enabled() {
     static bool enabled = parse_env_flag("GEGE_UNIQUE_LOG", false);
     return enabled;
+}
+
+bool fixed_buffer_bitmap_map_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_BITMAP_MAP", false);
+    return enabled;
+}
+
+bool fixed_buffer_bitmap_direct_multi_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_BITMAP_DIRECT_MULTI", false);
+    return enabled;
+}
+
+bool fixed_buffer_bitmap_verify_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_BITMAP_VERIFY", false);
+    return enabled;
+}
+
+bool map_tensor_device_timing_enabled() {
+    static bool enabled = parse_env_flag("GEGE_MAP_TENSOR_DEVICE_TIMING", false);
+    return enabled;
+}
+
+int64_t fixed_buffer_bitmap_verify_max_calls() {
+    static int64_t max_calls = std::max<int64_t>(parse_env_int("GEGE_FIXED_BUFFER_BITMAP_VERIFY_MAX_CALLS", 8), 0);
+    return max_calls;
+}
+
+std::atomic<int64_t> &fixed_buffer_bitmap_verify_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
 }
 
 int64_t unique_fallback_log_max() {
@@ -367,7 +395,8 @@ std::string get_directory(std::string filename) {
     return directory;
 }
 
-std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted, MapTensorTiming *timing) {
+std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted, MapTensorTiming *timing,
+                                                                  torch::Tensor *active_unique_mask) {
     auto total_start = std::chrono::high_resolution_clock::now();
     auto step_start = total_start;
 
@@ -382,8 +411,22 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
         step_start = now;
     }
 
-    torch::Tensor all_ids = pack_ids_into_cached_buffer(unmapped_tensors);
-    std::string capture_path = capture_unique_input_batch(all_ids);
+    bool use_direct_multi = false;
+#ifdef GEGE_CUDA
+    if (fixed_buffer_bitmap_map_enabled() && fixed_buffer_bitmap_direct_multi_enabled() && !sorted && !unmapped_tensors.empty()) {
+        use_direct_multi = true;
+        for (const auto &tensor : unmapped_tensors) {
+            use_direct_multi = use_direct_multi && tensor.is_cuda() && tensor.scalar_type() == torch::kInt64;
+        }
+    }
+#endif
+
+    torch::Tensor all_ids;
+    std::string capture_path;
+    if (!use_direct_multi) {
+        all_ids = pack_ids_into_cached_buffer(unmapped_tensors);
+        capture_path = capture_unique_input_batch(all_ids);
+    }
     if (timing != nullptr) {
         auto now = std::chrono::high_resolution_clock::now();
         timing->cat_ms = std::chrono::duration<double, std::milli>(now - step_start).count();
@@ -392,29 +435,96 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
 
     torch::Tensor map;
     torch::Tensor mapped_all_ids;
+    torch::Tensor fixed_active_mask;
+    std::vector<torch::Tensor> mapped_tensors;
+    bool mapped_tensors_ready = false;
     UniqueMapCudaDebugInfo unique_debug_info;
-    unique_debug_info.measure_device_timing = timing != nullptr;
+    unique_debug_info.measure_device_timing = timing != nullptr && map_tensor_device_timing_enabled();
 #ifdef GEGE_CUDA
-    if (all_ids.is_cuda() && all_ids.scalar_type() == torch::kInt64) {
-        auto unique_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &unique_debug_info);
+    if (use_direct_multi) {
+        auto unique_tup = map_tensors_unique_inverse_cuda_bitmap_padded_multi(unmapped_tensors, &unique_debug_info);
         map = std::get<0>(unique_tup);
-        mapped_all_ids = std::get<1>(unique_tup);
+        mapped_tensors = std::get<1>(unique_tup);
+        fixed_active_mask = std::get<2>(unique_tup);
+        mapped_tensors_ready = true;
+        if (fixed_buffer_bitmap_verify_enabled() &&
+            fixed_buffer_bitmap_verify_counter().fetch_add(1) < fixed_buffer_bitmap_verify_max_calls()) {
+            all_ids = pack_ids_into_cached_buffer(unmapped_tensors);
+            UniqueMapCudaDebugInfo reference_debug_info;
+            auto reference_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &reference_debug_info);
+            torch::Tensor reference_map = std::get<0>(reference_tup);
+            torch::Tensor reference_inverse = std::get<1>(reference_tup);
+            torch::Tensor active_map = map.narrow(0, 0, reference_map.numel());
+            torch::Tensor fixed_inverse = torch::cat(mapped_tensors);
+            if (!active_map.equal(reference_map) || !fixed_inverse.equal(reference_inverse)) {
+                SPDLOG_ERROR("GEGE_FIXED_BUFFER_BITMAP_MAP verification failed: active_map_equal={} inverse_equal={} padded_rows={} ref_rows={}",
+                             active_map.equal(reference_map), fixed_inverse.equal(reference_inverse), map.numel(), reference_map.numel());
+                throw GegeRuntimeException("Fixed-buffer bitmap map verification failed");
+            }
+        }
+        if (active_unique_mask != nullptr) {
+            *active_unique_mask = fixed_active_mask;
+        }
+        maybe_log_unique_backend_banner(unique_debug_info);
+        maybe_log_unique_backend_fallback(unique_debug_info, unmapped_tensors.front());
+    } else if (all_ids.is_cuda() && all_ids.scalar_type() == torch::kInt64) {
+        bool use_fixed_bitmap = fixed_buffer_bitmap_map_enabled() && !sorted;
+        if (use_fixed_bitmap) {
+            auto unique_tup = map_tensors_unique_inverse_cuda_bitmap_padded(all_ids, &unique_debug_info);
+            map = std::get<0>(unique_tup);
+            mapped_all_ids = std::get<1>(unique_tup);
+            fixed_active_mask = std::get<2>(unique_tup);
+        } else {
+            auto unique_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &unique_debug_info);
+            map = std::get<0>(unique_tup);
+            mapped_all_ids = std::get<1>(unique_tup);
+        }
+        if (use_fixed_bitmap && fixed_buffer_bitmap_verify_enabled() &&
+            fixed_buffer_bitmap_verify_counter().fetch_add(1) < fixed_buffer_bitmap_verify_max_calls()) {
+            UniqueMapCudaDebugInfo reference_debug_info;
+            auto reference_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &reference_debug_info);
+            torch::Tensor reference_map = std::get<0>(reference_tup);
+            torch::Tensor reference_inverse = std::get<1>(reference_tup);
+            torch::Tensor active_map = map.narrow(0, 0, reference_map.numel());
+            if (!active_map.equal(reference_map) || !mapped_all_ids.equal(reference_inverse)) {
+                SPDLOG_ERROR("GEGE_FIXED_BUFFER_BITMAP_MAP verification failed: active_map_equal={} inverse_equal={} padded_rows={} ref_rows={}",
+                             active_map.equal(reference_map), mapped_all_ids.equal(reference_inverse), map.numel(), reference_map.numel());
+                throw GegeRuntimeException("Fixed-buffer bitmap map verification failed");
+            }
+        }
+        if (active_unique_mask != nullptr) {
+            *active_unique_mask = fixed_active_mask;
+        }
         maybe_log_unique_backend_banner(unique_debug_info);
         maybe_log_unique_backend_fallback(unique_debug_info, all_ids);
     } else {
         auto unique_tup = unique_with_inverse_compat(all_ids);
         map = std::get<0>(unique_tup);
         mapped_all_ids = std::get<1>(unique_tup);
+        if (active_unique_mask != nullptr) {
+            *active_unique_mask = torch::Tensor();
+        }
     }
 #else
     auto unique_tup = unique_with_inverse_compat(all_ids);
     map = std::get<0>(unique_tup);
     mapped_all_ids = std::get<1>(unique_tup);
+    if (active_unique_mask != nullptr) {
+        *active_unique_mask = torch::Tensor();
+    }
 #endif
     if (timing != nullptr) {
         auto now = std::chrono::high_resolution_clock::now();
         timing->unique_wall_ms = std::chrono::duration<double, std::milli>(now - step_start).count();
         timing->unique_ms = unique_debug_info.device_unique_timing_valid ? unique_debug_info.device_unique_ms : timing->unique_wall_ms;
+        timing->bitmap_zero_ms = unique_debug_info.device_bitmap_zero_ms;
+        timing->bitmap_output_init_ms = unique_debug_info.device_bitmap_output_init_ms;
+        timing->bitmap_mark_ms = unique_debug_info.device_bitmap_mark_ms;
+        timing->bitmap_count_ms = unique_debug_info.device_bitmap_count_ms;
+        timing->bitmap_scan_ms = unique_debug_info.device_bitmap_scan_ms;
+        timing->bitmap_extract_ms = unique_debug_info.device_bitmap_extract_ms;
+        timing->bitmap_mask_ms = unique_debug_info.device_bitmap_mask_ms;
+        timing->bitmap_inverse_ms = unique_debug_info.device_bitmap_inverse_ms;
         timing->unique_requested_backend = unique_debug_info.requested_backend;
         timing->unique_executed_backend = unique_debug_info.executed_backend;
         timing->unique_fallback_backend = unique_debug_info.fallback_backend;
@@ -424,17 +534,18 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
         timing->unique_total_fallbacks = unique_debug_info.total_fallbacks;
         timing->unique_used_fallback = unique_debug_info.used_fallback;
         timing->unique_cuco_compiled = unique_debug_info.cuco_compiled;
+        timing->device_timing_enabled = unique_debug_info.measure_device_timing;
         step_start = now;
     }
 
-    std::vector<torch::Tensor> mapped_tensors;
-
-    int64_t offset = 0;
-    int64_t size;
-    for (const auto &tensor : unmapped_tensors) {
-        size = tensor.size(0);
-        mapped_tensors.emplace_back(mapped_all_ids.narrow(0, offset, size));
-        offset += size;
+    if (!mapped_tensors_ready) {
+        int64_t offset = 0;
+        int64_t size;
+        for (const auto &tensor : unmapped_tensors) {
+            size = tensor.size(0);
+            mapped_tensors.emplace_back(mapped_all_ids.narrow(0, offset, size));
+            offset += size;
+        }
     }
     if (timing != nullptr) {
         auto now = std::chrono::high_resolution_clock::now();

@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <string>
 #ifdef GEGE_CUDA
+#include "common/unique_map_cuda.h"
 #include "pytorch_scatter/segment_sum.h"
 #endif
 
@@ -35,6 +36,31 @@ bool parse_env_flag(const char *name, bool default_value) {
 
 bool verify_unique_batch_indices_enabled() {
     static bool enabled = parse_env_flag("GEGE_VERIFY_UNIQUE_BATCH_INDICES", false);
+    return enabled;
+}
+
+bool fixed_buffer_masked_update_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MASKED_UPDATE", false);
+    return enabled;
+}
+
+bool fixed_buffer_masked_adagrad_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MASKED_ADAGRAD", true);
+    return enabled;
+}
+
+bool fixed_buffer_masked_update_verify_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY", false);
+    return enabled;
+}
+
+bool fixed_buffer_padded_grad_verify_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_PADDED_GRAD_VERIFY", false);
+    return enabled;
+}
+
+bool fixed_buffer_compact_update_verify_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_COMPACT_UPDATE_VERIFY", false);
     return enabled;
 }
 
@@ -67,6 +93,36 @@ int64_t stage_debug_max_batches() {
 }
 
 std::atomic<int64_t> &stage_debug_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+int64_t fixed_buffer_masked_update_verify_max() {
+    static int64_t max_checks = std::max<int64_t>(parse_env_int("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY_MAX", 8), 0);
+    return max_checks;
+}
+
+std::atomic<int64_t> &fixed_buffer_masked_update_verify_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+int64_t fixed_buffer_padded_grad_verify_max() {
+    static int64_t max_checks = std::max<int64_t>(parse_env_int("GEGE_FIXED_BUFFER_PADDED_GRAD_VERIFY_MAX", 8), 0);
+    return max_checks;
+}
+
+std::atomic<int64_t> &fixed_buffer_padded_grad_verify_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
+int64_t fixed_buffer_compact_update_verify_max() {
+    static int64_t max_checks = std::max<int64_t>(parse_env_int("GEGE_FIXED_BUFFER_COMPACT_UPDATE_VERIFY_MAX", 8), 0);
+    return max_checks;
+}
+
+std::atomic<int64_t> &fixed_buffer_compact_update_verify_counter() {
     static std::atomic<int64_t> counter{0};
     return counter;
 }
@@ -174,6 +230,10 @@ void Batch::to(torch::Device device) {
 
     if (unique_node_indices_.defined()) {
         unique_node_indices_ = unique_node_indices_.to(device);
+    }
+
+    if (unique_node_active_mask_.defined()) {
+        unique_node_active_mask_ = unique_node_active_mask_.to(device);
     }
 
     if (node_labels_.defined()) {
@@ -290,6 +350,46 @@ void Batch::accumulateGradients(float learning_rate) {
 
     if (node_embeddings_.defined()) {
         node_gradients_ = node_embeddings_.grad();
+        bool use_masked_adagrad = false;
+#ifdef GEGE_CUDA
+        use_masked_adagrad = fixed_buffer_masked_update_enabled() &&
+                             fixed_buffer_masked_adagrad_enabled() &&
+                             unique_node_active_mask_.defined() &&
+                             unique_node_active_mask_.numel() == node_gradients_.size(0) &&
+                             node_gradients_.device().is_cuda() &&
+                             node_embeddings_state_.defined() &&
+                             node_embeddings_state_.device().is_cuda() &&
+                             node_gradients_.scalar_type() == torch::kFloat32 &&
+                             node_embeddings_state_.scalar_type() == torch::kFloat32;
+#endif
+        if (fixed_buffer_padded_grad_verify_enabled() && unique_node_active_mask_.defined() &&
+            unique_node_active_mask_.numel() == node_gradients_.size(0)) {
+            int64_t verify_id = fixed_buffer_padded_grad_verify_counter().fetch_add(1);
+            if (verify_id < fixed_buffer_padded_grad_verify_max()) {
+                torch::NoGradGuard no_grad;
+                torch::Tensor mask_bool = unique_node_active_mask_.to(node_gradients_.device()).to(torch::kBool);
+                torch::Tensor inactive_rows = torch::nonzero(~mask_bool).flatten();
+                torch::Tensor active_rows = torch::nonzero(mask_bool).flatten();
+                double inactive_max = 0.0;
+                double active_max = 0.0;
+                int64_t inactive_nonzero = 0;
+                if (inactive_rows.numel() > 0) {
+                    torch::Tensor inactive_grad = node_gradients_.index_select(0, inactive_rows).abs();
+                    inactive_max = inactive_grad.max().item<double>();
+                    inactive_nonzero = (inactive_grad > 0).sum().item<int64_t>();
+                }
+                if (active_rows.numel() > 0) {
+                    active_max = node_gradients_.index_select(0, active_rows).abs().max().item<double>();
+                }
+                SPDLOG_INFO("GEGE_FIXED_BUFFER_PADDED_GRAD_VERIFY check={} batch={} rows={} active_rows={} inactive_rows={} inactive_nonzero={} inactive_max_abs={} active_max_abs={}",
+                            verify_id, batch_id_, node_gradients_.size(0), active_rows.numel(), inactive_rows.numel(),
+                            inactive_nonzero, inactive_max, active_max);
+            }
+        }
+        if (!use_masked_adagrad && unique_node_active_mask_.defined() && unique_node_active_mask_.numel() == node_gradients_.size(0)) {
+            torch::Tensor active_mask = unique_node_active_mask_.to(node_gradients_.device()).to(node_gradients_.dtype()).reshape({-1, 1});
+            node_gradients_ = node_gradients_ * active_mask;
+        }
         SPDLOG_TRACE("Batch: {} accumulated node gradients", batch_id_);
         if (run_stage_debug) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -315,9 +415,106 @@ void Batch::accumulateGradients(float learning_rate) {
         }
 #endif
 
-        node_state_update_ = node_gradients_.pow(2);
-        node_embeddings_state_.add_(node_state_update_);
-        node_gradients_ = -learning_rate * (node_gradients_ / (node_embeddings_state_.sqrt().add_(1e-10)));
+        bool verify_compact_update = false;
+        int64_t compact_verify_id = -1;
+        torch::Tensor compact_verify_active_rows;
+        torch::Tensor compact_verify_grad_input;
+        torch::Tensor compact_verify_state_input;
+        if (fixed_buffer_compact_update_verify_enabled() &&
+            unique_node_active_mask_.defined() &&
+            unique_node_active_mask_.numel() == node_gradients_.size(0) &&
+            node_embeddings_state_.defined() &&
+            node_embeddings_state_.sizes() == node_gradients_.sizes()) {
+            compact_verify_id = fixed_buffer_compact_update_verify_counter().fetch_add(1);
+            verify_compact_update = compact_verify_id < fixed_buffer_compact_update_verify_max();
+        }
+        if (verify_compact_update) {
+            torch::NoGradGuard no_grad;
+            torch::Tensor active_mask_bool = unique_node_active_mask_.to(node_gradients_.device()).to(torch::kBool);
+            compact_verify_active_rows = torch::nonzero(active_mask_bool).flatten();
+            compact_verify_grad_input = node_gradients_.detach().clone().index_select(0, compact_verify_active_rows);
+            compact_verify_state_input = node_embeddings_state_.detach().clone().index_select(0, compact_verify_active_rows);
+        }
+
+        if (use_masked_adagrad) {
+#ifdef GEGE_CUDA
+            bool verify_masked_adagrad = false;
+            int64_t verify_id = -1;
+            torch::Tensor ref_gradients;
+            torch::Tensor ref_state_update;
+            if (fixed_buffer_masked_update_verify_enabled()) {
+                verify_id = fixed_buffer_masked_update_verify_counter().fetch_add(1);
+                verify_masked_adagrad = verify_id < fixed_buffer_masked_update_verify_max();
+            }
+            if (verify_masked_adagrad) {
+                torch::NoGradGuard no_grad;
+                torch::Tensor active_mask = unique_node_active_mask_.to(node_gradients_.device()).to(node_gradients_.dtype()).reshape({-1, 1});
+                torch::Tensor grad_ref = node_gradients_.detach().clone() * active_mask;
+                torch::Tensor state_ref = node_embeddings_state_.detach().clone();
+                ref_state_update = grad_ref.pow(2);
+                state_ref.add_(ref_state_update);
+                ref_gradients = -learning_rate * (grad_ref / (state_ref.sqrt().add_(1e-10)));
+            }
+            std::tie(node_gradients_, node_state_update_) =
+                active_masked_adagrad_cuda(node_gradients_, node_embeddings_state_, unique_node_active_mask_, learning_rate);
+            if (verify_masked_adagrad) {
+                bool gradients_match = torch::allclose(node_gradients_, ref_gradients, 1e-5, 1e-6);
+                bool state_update_match = torch::allclose(node_state_update_, ref_state_update, 1e-5, 1e-6);
+                if (!gradients_match || !state_update_match) {
+                    double grad_max_abs = (node_gradients_ - ref_gradients).abs().max().item<double>();
+                    double state_max_abs = (node_state_update_ - ref_state_update).abs().max().item<double>();
+                    SPDLOG_ERROR("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY failed in Adagrad check {} batch={} gradients_match={} state_update_match={} grad_max_abs={} state_max_abs={}",
+                                 verify_id, batch_id_, gradients_match, state_update_match, grad_max_abs, state_max_abs);
+                    throw GegeRuntimeException("Masked Adagrad verifier failed");
+                }
+                SPDLOG_INFO("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY Adagrad check {} batch={} passed rows={}",
+                            verify_id, batch_id_, node_gradients_.size(0));
+            }
+#endif
+        } else {
+            node_state_update_ = node_gradients_.pow(2);
+            node_embeddings_state_.add_(node_state_update_);
+            node_gradients_ = -learning_rate * (node_gradients_ / (node_embeddings_state_.sqrt().add_(1e-10)));
+        }
+
+        if (verify_compact_update) {
+            torch::NoGradGuard no_grad;
+            torch::Tensor compact_state = compact_verify_state_input.clone();
+            torch::Tensor compact_state_update = compact_verify_grad_input.pow(2);
+            compact_state.add_(compact_state_update);
+            torch::Tensor compact_gradients =
+                -learning_rate * (compact_verify_grad_input / (compact_state.sqrt().add_(1e-10)));
+            torch::Tensor padded_active_gradients = node_gradients_.index_select(0, compact_verify_active_rows);
+            torch::Tensor padded_active_state_update = node_state_update_.index_select(0, compact_verify_active_rows);
+            bool gradients_match = torch::allclose(padded_active_gradients, compact_gradients, 1e-5, 1e-6);
+            bool state_update_match = torch::allclose(padded_active_state_update, compact_state_update, 1e-5, 1e-6);
+
+            torch::Tensor inactive_rows = torch::nonzero(~unique_node_active_mask_.to(node_gradients_.device()).to(torch::kBool)).flatten();
+            double inactive_grad_max_abs = 0.0;
+            double inactive_state_max_abs = 0.0;
+            int64_t inactive_grad_nonzero = 0;
+            int64_t inactive_state_nonzero = 0;
+            if (inactive_rows.numel() > 0) {
+                torch::Tensor inactive_grad_abs = node_gradients_.index_select(0, inactive_rows).abs();
+                torch::Tensor inactive_state_abs = node_state_update_.index_select(0, inactive_rows).abs();
+                inactive_grad_max_abs = inactive_grad_abs.max().item<double>();
+                inactive_state_max_abs = inactive_state_abs.max().item<double>();
+                inactive_grad_nonzero = (inactive_grad_abs > 0).sum().item<int64_t>();
+                inactive_state_nonzero = (inactive_state_abs > 0).sum().item<int64_t>();
+            }
+            bool inactive_match = inactive_grad_nonzero == 0 && inactive_state_nonzero == 0;
+            if (!gradients_match || !state_update_match || !inactive_match) {
+                double grad_max_abs = (padded_active_gradients - compact_gradients).abs().max().item<double>();
+                double state_max_abs = (padded_active_state_update - compact_state_update).abs().max().item<double>();
+                SPDLOG_ERROR("GEGE_FIXED_BUFFER_COMPACT_UPDATE_VERIFY failed check={} batch={} gradients_match={} state_update_match={} inactive_match={} active_rows={} inactive_rows={} grad_max_abs={} state_max_abs={} inactive_grad_nonzero={} inactive_state_nonzero={} inactive_grad_max_abs={} inactive_state_max_abs={}",
+                             compact_verify_id, batch_id_, gradients_match, state_update_match, inactive_match,
+                             compact_verify_active_rows.numel(), inactive_rows.numel(), grad_max_abs, state_max_abs,
+                             inactive_grad_nonzero, inactive_state_nonzero, inactive_grad_max_abs, inactive_state_max_abs);
+                throw GegeRuntimeException("Compact fixed-buffer update verifier failed");
+            }
+            SPDLOG_INFO("GEGE_FIXED_BUFFER_COMPACT_UPDATE_VERIFY check={} batch={} passed active_rows={} inactive_rows={}",
+                        compact_verify_id, batch_id_, compact_verify_active_rows.numel(), inactive_rows.numel());
+        }
 
         // Accumulate qualifier value embedding gradients (arity-4)
         if (qual_embeddings_.defined() && qual_embeddings_.grad().defined()) {
@@ -483,6 +680,7 @@ void Batch::clear() {
     resident_local_lp_direct_ = false;
     root_node_indices_ = torch::Tensor();
     unique_node_indices_ = torch::Tensor();
+    unique_node_active_mask_ = torch::Tensor();
     node_embeddings_ = torch::Tensor();
     node_embeddings_g_ = torch::Tensor();
     node_gradients_ = torch::Tensor();

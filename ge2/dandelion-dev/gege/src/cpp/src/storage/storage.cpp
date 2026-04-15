@@ -762,9 +762,9 @@ void MemPartitionBufferStorage::unload(bool perform_write, int32_t device_idx) {
     buffers_[device_idx]->unload(false);
 }
 
-void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
+void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr_t swap_ready_event) {
     if (!peerRelayEnabled_()) {
-        buffers_[device_idx]->performNextSwap();
+        buffers_[device_idx]->performNextSwap(swap_ready_event);
         return;
     }
 
@@ -958,6 +958,16 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx) {
 #endif
 }
 
+void MemPartitionBufferStorage::startAsyncAdmitPreload(int32_t device_idx) {
+    if (device_idx < 0 || device_idx >= static_cast<int32_t>(buffers_.size())) {
+        throw GegeRuntimeException("MemPartitionBufferStorage::startAsyncAdmitPreload received an invalid device index");
+    }
+    if (peerRelayEnabled_()) {
+        return;
+    }
+    buffers_[device_idx]->startAsyncAdmitPreload();
+}
+
 torch::Tensor MemPartitionBufferStorage::indexRead(Indices indices) { 
     if(device_ == torch::kCUDA) {
         return buffers_[0]->indexRead(indices);
@@ -999,6 +1009,10 @@ void MemPartitionBufferStorage::indexAdd(Indices indices, torch::Tensor values) 
 
 void MemPartitionBufferStorage::indexAdd(Indices indices, torch::Tensor values, int32_t device_idx) { 
     return buffers_[device_idx]->indexAdd(indices, values); 
+}
+
+void MemPartitionBufferStorage::indexAddMasked(Indices indices, torch::Tensor values, torch::Tensor active_mask, int32_t device_idx) {
+    return buffers_[device_idx]->indexAddMasked(indices, values, active_mask);
 }
 
 void MemPartitionBufferStorage::rangePut(int64_t offset, int64_t n, torch::Tensor values) {

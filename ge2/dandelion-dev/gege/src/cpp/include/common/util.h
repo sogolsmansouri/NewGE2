@@ -84,8 +84,17 @@ struct MapTensorTiming {
     double cat_ms = 0.0;
     double unique_ms = 0.0;
     double unique_wall_ms = 0.0;
+    double bitmap_zero_ms = 0.0;
+    double bitmap_output_init_ms = 0.0;
+    double bitmap_mark_ms = 0.0;
+    double bitmap_count_ms = 0.0;
+    double bitmap_scan_ms = 0.0;
+    double bitmap_extract_ms = 0.0;
+    double bitmap_mask_ms = 0.0;
+    double bitmap_inverse_ms = 0.0;
     double split_ms = 0.0;
     double total_ms = 0.0;
+    bool device_timing_enabled = false;
     std::string unique_requested_backend;
     std::string unique_executed_backend;
     std::string unique_fallback_backend;
@@ -98,6 +107,7 @@ struct MapTensorTiming {
 };
 
 std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted = true,
-                                                                   MapTensorTiming *timing = nullptr);
+                                                                   MapTensorTiming *timing = nullptr,
+                                                                   torch::Tensor *active_unique_mask = nullptr);
 
 std::vector<torch::Tensor> apply_tensor_map(torch::Tensor map, std::vector<torch::Tensor> unmapped_tensors);

@@ -31,6 +31,7 @@ class Batch {
 
     Indices root_node_indices_;
     Indices unique_node_indices_;         /**< Global node ids for each unique node in the batch. includes negative samples */
+    torch::Tensor unique_node_active_mask_; /**< Optional uint8 mask for active rows when unique_node_indices_ is fixed-size padded */
     torch::Tensor node_embeddings_;       /**< Embedding tensor for each unique node in the the batch.  */
     torch::Tensor node_gradients_;        /**< Gradients for each node embedding in the batch */
     torch::Tensor node_embeddings_state_; /**< Optimizer state for each node embedding in the batch */

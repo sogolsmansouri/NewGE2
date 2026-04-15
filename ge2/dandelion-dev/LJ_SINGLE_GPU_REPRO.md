@@ -69,6 +69,8 @@ GEGE_DEG_LOCAL_FILTER_PADDED=0
 GEGE_SCORE_FILTER_CUDA=0
 ```
 
+Leave `GEGE_DEG_LOCAL_FILTER_PADDED=0` on the paper-default LJ stack. The padded CUDA DEG local filter is safe to enable, but with `GEGE_DEG_CHUNK_EXCLUSION=1` it is usually neutral because the degree-local filter is often bypassed before the padded path can run. See [DEG_LOCAL_FILTER_PADDED.md](DEG_LOCAL_FILTER_PADDED.md) for the measured cases and the one workload where it helps.
+
 ## Expected outcome
 
 On a correct build, epoch 1 should land near `9.1s`, later epochs near `8.4s`, and the exact LJ evaluation after 30 epochs should stay close to:

@@ -242,6 +242,26 @@ class GraphModelStorage {
 
     bool partitionBufferLPFastPathEnabled() { return shouldUsePartitionBufferLPFastPath_(); }
 
+    void resetFrameCachePerfStats() {
+        if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->resetFrameCachePerfStats();
+        }
+    }
+
+    FrameCachePerfStats getFrameCachePerfStats(int32_t device_idx = 0) const {
+        if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getFrameCachePerfStats(device_idx);
+        }
+        return FrameCachePerfStats();
+    }
+
+    std::vector<FrameCachePerfStats> getFrameCachePerfStatsAll() const {
+        if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getFrameCachePerfStatsAll();
+        }
+        return {};
+    }
+
     bool hasSwap(int32_t device_idx = 0) {
         if (storage_ptrs_.node_embeddings != nullptr) {
             if (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings)) {

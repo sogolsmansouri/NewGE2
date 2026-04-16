@@ -48,6 +48,56 @@ The key separation is:
 
 The sampler-visible domain stays exactly as it is today. Only the storage/movement policy changes.
 
+## Paper Framing And Novelty Boundary
+
+The cleanest contribution is **not** "a better COVER" and **not** "general buffer management for KGE."
+
+The precise claim is:
+
+- `COVER` solves positive-bucket scheduling under a model where partition movement is still a visible state-boundary action.
+- The remaining large-system bottleneck is **residency management**, not the positive-bucket order itself.
+- `Versioned Frame Cache (VFC)` attacks that layer by separating:
+  - logical visible q-state
+  - physical frame residency
+  - publish
+  - commit
+
+So the right VLDB framing is:
+
+**GE² / COVER solves scheduling. VFC solves residency management under exact q-state semantics.**
+
+This is stronger and more defensible than saying GE² "does not have a buffer manager" in the abstract. The concrete point is that GE²'s current model still exposes partition movement at state boundaries, while VFC turns that into:
+
+- asynchronous prefetch into hidden capacity
+- publish-by-remap
+- deferred versioned commit
+
+without changing the sampler-visible domain.
+
+## Current-Main Reality Check
+
+The older `223s` Twitter q4 baseline is still useful for the first frame-cache design and simulator calibration, but the current `main` tree is already faster than that baseline.
+
+Controlled Twitter q4 ablation on current `main` (`947234e`, single GPU, same config, epoch-2 steady state) is:
+
+- `k=0`: `222.085 s`, `swap_update_ms=52.991 s`, `map_lookup_ms=43.113 s`
+- `k=1`: `213.398 s`, `swap_update_ms=43.828 s`, `map_lookup_ms=43.144 s`
+- `k=2`: `206.909 s`, `swap_update_ms=37.449 s`, `map_lookup_ms=42.902 s`
+
+This gives the clean current interpretation:
+
+- VFC is already a real net-positive runtime optimization on `main`.
+- `k=1` improves epoch time by about `8.687 s` versus `k=0`.
+- `k=2` improves epoch time by about `15.176 s` versus `k=0`, and by about `6.489 s` versus `k=1`.
+- The gain comes almost entirely from reduced `swap_update`.
+- `map_lookup` stays essentially flat at about `43 s`, so VFC alone is not the whole Twitter answer.
+
+So the honest end-to-end story on current code is:
+
+1. VFC already attacks exposed movement and boundary synchronization successfully.
+2. A separate state-local or descriptor-based mapping path is still needed to attack `map_lookup`.
+3. Only after those two layers move materially should further sampler/liveness changes be revisited.
+
 ## Core Idea
 
 Today:
@@ -256,6 +306,86 @@ This integrates naturally with the already-successful peer-relay direction.
 - barrier time can be attacked by making publish local and delaying commit
 - host traffic can be replaced with peer traffic where available
 
+### Concrete 2/4 GPU Extension Plan
+
+The 2/4 GPU version should not be "single-GPU hidden frames copied N times." The correct extension is a **distributed frame/version protocol**.
+
+Per partition or tile, maintain:
+
+- current logical owner set
+- physical owner (`host` or one GPU)
+- version id
+- clean / dirty state
+- commit destination
+
+Per GPU, maintain:
+
+- local visible logical slot table
+- local hidden frame pool
+- local stale-frame queue
+- relay eligibility for peer-owned clean versions
+
+#### 2 GPU path
+
+Primary goals:
+
+- reduce host-visible swap time
+- convert some host admits into peer relay
+- reduce barrier exposure by making publish cheap
+
+Execution shape:
+
+1. while state `S` trains, each GPU prefetches future local admits into hidden local frames when possible
+2. if the next needed version already exists clean on the peer, use peer relay rather than host fetch
+3. at publish, remap local logical slots to ready hidden frames or relayed frames
+4. old visible frames become stale and enter delayed commit
+5. commit drains to host or peer owner after publish, not before publish
+
+The first 2-GPU prototype should stay conservative:
+
+- only one hidden local frame per GPU
+- relay only clean peer frames
+- no mixed ownership of one logical slot at publish
+- fall back to the current synchronous path when readiness is incomplete
+
+#### 4 GPU path
+
+The 4-GPU extension should use the same metadata model, but the system objective shifts slightly:
+
+- barrier exposure matters more
+- peer relay matters more
+- host fallback should become less frequent on hot transitions
+
+Execution shape:
+
+1. prefetch locally where hidden capacity exists
+2. if a needed partition/tile exists clean on another GPU, relay from peer instead of host
+3. publish is still local remap, not barrier-sized install copy
+4. stale commit is decoupled and drains asynchronously after publish
+
+The key paper point at 4 GPUs is not only lower host traffic. It is that **publish becomes cheaper than the current state-boundary synchronization model**, so swap barriers shrink together with transfer exposure.
+
+#### Multi-GPU invariants
+
+The extra invariants beyond single GPU are:
+
+1. a published local frame must point to the newest ready version visible to that GPU
+2. peer relay may only consume a newer clean version, never an in-flight dirty one
+3. delayed commit must preserve optimizer-state consistency together with embedding values
+4. fallback must preserve the current logical q-state exactly when relay/prefetch readiness is incomplete
+
+#### Multi-GPU measurements to expose
+
+For 2/4 GPU evaluation, add:
+
+- local publish count
+- peer-relay publish count
+- host-fallback publish count
+- barrier wait before and after publish
+- stale backlog depth per GPU
+- hidden-frame occupancy per GPU
+- fallback rate when hidden capacity is exhausted
+
 ## Relationship To Prior Systems
 
 This is closest in spirit to:
@@ -271,6 +401,65 @@ What is different here:
 - the scheduled object is not only "future partition load" but a **versioned visible/invisible frame**
 - state publish happens by remap, not by install copy
 - commit is delayed and version-controlled, not forced at every state boundary
+
+## What We Already Have In Code
+
+This is not a greenfield design anymore. The current tree already contains a partial single-GPU frame-cache prototype:
+
+- hidden-frame flags and plumbing in `buffer.cpp`
+- logical-to-physical slot remap state
+- hidden publish bookkeeping
+- delayed stale-frame writeback
+- boundary instrumentation for `visible_install_rows` and `hidden_publish_rows`
+
+So the engineering task is no longer "invent frame cache." The task is:
+
+1. keep the hot path purely logical
+2. formalize frame/version/dirty metadata
+3. make publish a true remap-only boundary step
+4. make delayed commit a first-class bounded subsystem
+5. extend the same abstraction to multi-GPU relay/ownership
+
+## Memory Feasibility By Dataset
+
+The central memory fact is that each extra hidden full-partition frame is paid twice:
+
+- one extra partition for embeddings
+- one extra partition for optimizer state
+
+For `p=16`, `dim=100`, `float32`, the extra resident memory per hidden partition pair is approximately:
+
+- Twitter: `~1.94 GiB`
+- FB86M: `~4.01 GiB`
+
+The visible `q=4` resident pair memory is approximately:
+
+- Twitter: `~7.76 GiB`
+- FB86M: `~16.03 GiB`
+
+Implications:
+
+- Twitter full-partition hidden frames are plausible:
+  - `k=1`: about `9.70 GiB`
+  - `k=2`: about `11.64 GiB`
+  - `k=3`: about `13.58 GiB`
+  before activations, mapper workspace, allocator fragmentation, and other runtime buffers
+- FB86M full-partition hidden frames do **not** scale on 24 GB:
+  - `k=1`: about `20.04 GiB`
+  - `k=2`: about `24.04 GiB`
+  before other runtime memory
+
+This matches the runtime evidence:
+
+- FB86M full-partition `k=1` can be made useful in the lean path
+- FB86M full-partition `k=2` is a hard OOM on 24 GB
+
+Therefore the correct physical strategy is:
+
+- Twitter: full hidden partitions first
+- FB86M: tiled hidden capacity, not full hidden partitions, as the real path
+
+This is not a weakness of the architecture. It is the correct dataset-specific realization of the same VFC abstraction.
 
 ## Risks
 
@@ -296,13 +485,126 @@ Even if swap becomes mostly hidden, Twitter still has a large `map_lookup` wall.
 2. state-local or taped batch mapping to attack exposed remap/build
 3. only then revisit sampler/liveness improvements if needed
 
+## Updated Implementation Plan
+
+The practical implementation order on the current tree should be:
+
+### Phase 1: Lock down Twitter `k=1`
+
+Goal:
+
+- make the current hidden-only preload + delayed stale commit path reproducible, stable, and fully instrumented on current `main`
+
+Required properties:
+
+- no hidden-frame work in steady-state ordinary reads/updates
+- publish reduces exposed boundary work rather than shifting cost downstream
+- delayed stale commit has bounded backlog and explicit fallback
+
+Outputs to log per swap:
+
+- `visible_install_rows`
+- `hidden_publish_rows`
+- delayed stale rows / frames
+- backlog depth
+- fallback count / fallback rows
+
+Current status:
+
+- done for single-GPU Twitter q4 on `main`
+- measured epoch-2 result: `222.085 s (k=0) -> 213.398 s (k=1)`
+- measured frame-cache behavior:
+  - `hidden_publish_parts=19`
+  - `fallback_visible_admit_parts=38`
+  - `preload_miss_swaps=0`
+
+Interpretation:
+
+- `k=1` is mechanically correct and already materially useful
+- the path is capacity-limited rather than preload-limited
+- one hidden frame hides exactly 1 of 3 admits per swap on Twitter q4
+
+### Phase 2: Twitter `k=2/3`
+
+Goal:
+
+- turn the `k=1` correctness/storage prototype into a meaningful Twitter paper result
+
+Rules:
+
+- only continue past `k=1` if the hot path stays clean
+- add stronger frame reclamation / backlog control before scaling hidden depth
+- treat `k=2/3` as a storage-layer experiment, not a scheduler change
+
+Current status:
+
+- `k=2` is now validated on single-GPU Twitter q4 on `main`
+- measured epoch-2 result: `206.909 s`
+- measured swap result: `swap_update_ms=37.449 s`
+- measured frame-cache behavior:
+  - `hidden_publish_parts=38`
+  - `fallback_visible_admit_parts=19`
+  - `preload_miss_swaps=0`
+
+Interpretation:
+
+- VFC scales in the expected direction on Twitter
+- the main remaining independent wall is still `map_lookup ~= 43 s`
+- the next Twitter storage question is whether `k=3` keeps the same monotonic improvement without introducing new backlog or memory-pressure pathologies
+
+### Phase 3: FB86M bridge experiment with lean `k=1`
+
+Goal:
+
+- retain the evidence that even one hidden full-partition frame plus delayed stale commit moves FB materially
+
+This is a bridge experiment, not the final FB design.
+
+### Phase 4: FB86M tiled hidden frames
+
+Goal:
+
+- realize the same VFC abstraction under FB memory limits
+
+Requirements:
+
+- fixed tile size
+- pool allocator / pre-sized arena
+- tile-level dirty metadata
+- publish only when the required tile set for a logical slot is ready
+- no row-level steady-state indirection in ordinary batch execution
+
+### Phase 5: Pair VFC with the next map-layer system
+
+Goal:
+
+- attack the remaining large Twitter `map_lookup` wall
+
+The current recommendation remains:
+
+1. VFC for exposed movement
+2. then a state-local or descriptor-based mapping layer
+
+Twitter needs both layers. FB can still benefit materially even if only part of the current map bucket is removable.
+
+## Immediate Engineering Checklist
+
+Near-term work against the current tree:
+
+1. add explicit memory-budget logging and impossible-config guards at startup
+2. harden backlog / fallback accounting in the frame-cache swap path
+3. make Twitter `k=1` a stable reproducible path on current `main`
+4. add 2/4 GPU metrics for local publish, peer relay, host fallback, and barrier exposure
+5. reintroduce FB hidden-frame experiments only through the lean `k=1` path
+6. implement tiled hidden frames for FB before attempting larger FB hidden capacity
+
 ## Expected Impact
 
 For Twitter single GPU:
 
-- current: `223.1s`
-- swap-only lower bound: about `161.5s`
-- with publish-by-remap and delayed commit, the goal is to approach that bound materially better than the current ghost-admit prototype
+- current controlled `main` ablation: `222.085s (k=0) -> 213.398s (k=1) -> 206.909s (k=2)`
+- current remaining large walls at `k=2`: `swap_update ~= 37.4s`, `map_lookup ~= 42.9s`
+- immediate next Twitter target is to keep reducing exposed swap without polluting the hot path, then attack the still-flat `map_lookup` wall separately
 
 For FB86M single GPU:
 
@@ -339,8 +641,14 @@ Current calibrated takeaways:
   - second prototype after removing storage-hot-path translation: `225.546s`
 - The second prototype proves the first regression source was real: `edge_sample` dropped from `140.917s` to `15.210s`, `map_lookup` from `66.754s` to `4.119s`, and `negative_sample` back to `8.333s`.
 - But `swap_update` stayed flat at about `59.3s`, and total epoch time still did not improve. That means the architecture is plausible, but the prototype is still paying hidden-frame work somewhere outside the intended boundary paths.
+- Current runtime on latest `main` now validates the monotonic direction of the design, though with smaller gains than the optimistic simulator:
+  - `1 GPU measured`: `222.085s (k=0) -> 213.398s (k=1) -> 206.909s (k=2)`
+  - `swap_update measured`: `52.991s -> 43.828s -> 37.449s`
+  - `map_lookup measured`: stays roughly flat at `~43s`
 
 ## Concrete Implementation Plan
+
+The section below is the original simulator-first phase sketch and is kept for historical continuity. The **current** engineering priority order is the updated implementation plan above.
 
 ### Phase 0: Simulator
 

@@ -17,6 +17,26 @@
 
 namespace {
 
+void accumulate_frame_cache_perf_stats(FrameCachePerfStats &dst, const FrameCachePerfStats &src) {
+    dst.swap_samples += src.swap_samples;
+    dst.visible_install_parts += src.visible_install_parts;
+    dst.visible_install_rows += src.visible_install_rows;
+    dst.hidden_publish_parts += src.hidden_publish_parts;
+    dst.hidden_publish_rows += src.hidden_publish_rows;
+    dst.fallback_visible_admit_parts += src.fallback_visible_admit_parts;
+    dst.fallback_visible_admit_rows += src.fallback_visible_admit_rows;
+    dst.preload_miss_swap_count += src.preload_miss_swap_count;
+    dst.partial_preload_swap_count += src.partial_preload_swap_count;
+    dst.delayed_stale_writeback_swap_count += src.delayed_stale_writeback_swap_count;
+    dst.async_admit_valid_before_swap_count += src.async_admit_valid_before_swap_count;
+    dst.async_evict_in_flight_before_swap_count += src.async_evict_in_flight_before_swap_count;
+    dst.reserved_preload_frames_sum += src.reserved_preload_frames_sum;
+    dst.free_frames_before_swap_sum += src.free_frames_before_swap_sum;
+    dst.free_frames_after_publish_sum += src.free_frames_after_publish_sum;
+    dst.stale_backlog_before_swap_max = std::max(dst.stale_backlog_before_swap_max, src.stale_backlog_before_swap_max);
+    dst.stale_backlog_after_publish_max = std::max(dst.stale_backlog_after_publish_max, src.stale_backlog_after_publish_max);
+}
+
 #ifdef GEGE_CUDA
 bool parse_cuda_swap_env_flag(const char *name, bool default_value) {
     const char *raw = std::getenv(name);
@@ -857,6 +877,9 @@ void DataLoader::resetPerfStats() {
     reset_negative_sampler_perf(training_negative_sampler_);
     reset_negative_sampler_perf(evaluation_negative_sampler_);
     reset_negative_sampler_perf(negative_sampler_);
+    if (graph_storage_ != nullptr) {
+        graph_storage_->resetFrameCachePerfStats();
+    }
 }
 
 DataLoaderPerfStats DataLoader::getPerfStats() const {
@@ -923,6 +946,12 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
     stats.device_get_batch_device_prepare_ns = device_get_batch_device_prepare_ns_;
     stats.device_get_batch_perform_map_ns = device_get_batch_perform_map_ns_;
     stats.device_get_batch_overhead_ns = device_get_batch_overhead_ns_;
+    if (graph_storage_ != nullptr) {
+        stats.device_frame_cache = graph_storage_->getFrameCachePerfStatsAll();
+        for (const auto &device_stats : stats.device_frame_cache) {
+            accumulate_frame_cache_perf_stats(stats.frame_cache, device_stats);
+        }
+    }
     stats.device_swap_active_bucket_samples = device_swap_active_bucket_samples_;
     stats.device_swap_active_edge_samples = device_swap_active_edge_samples_;
     stats.device_swap_batch_count_samples = device_swap_batch_count_samples_;

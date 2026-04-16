@@ -192,6 +192,23 @@ class MemPartitionBufferStorage : public Storage {
     int64_t getNumInMemory(int32_t device_idx = 0) { return buffers_[device_idx]->getNumInMemory(); }
 
     int64_t getPartitionSize(int32_t device_idx = 0) { return buffers_[device_idx]->getPartitionSize(); }
+
+    FrameCachePerfStats getFrameCachePerfStats(int32_t device_idx = 0) const { return buffers_[device_idx]->getFrameCachePerfStats(); }
+
+    std::vector<FrameCachePerfStats> getFrameCachePerfStatsAll() const {
+        std::vector<FrameCachePerfStats> stats;
+        stats.reserve(buffers_.size());
+        for (auto *buffer : buffers_) {
+            stats.emplace_back(buffer->getFrameCachePerfStats());
+        }
+        return stats;
+    }
+
+    void resetFrameCachePerfStats() {
+        for (auto *buffer : buffers_) {
+            buffer->resetFrameCachePerfStats();
+        }
+    }
    private:
     int fd_;
     bool peer_relay_runtime_enabled_;

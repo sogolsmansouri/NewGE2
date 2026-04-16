@@ -2043,12 +2043,19 @@ void MemPartitionBuffer::startAsyncAdmitPreload() {
 }
 
 bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
-                                                   int64_t *visible_install_rows, int64_t *hidden_publish_rows) {
+                                                   int64_t *visible_install_rows, int64_t *hidden_publish_rows,
+                                                   int64_t *visible_install_parts, int64_t *hidden_publish_parts) {
     if (visible_install_rows != nullptr) {
         *visible_install_rows = 0;
     }
     if (hidden_publish_rows != nullptr) {
         *hidden_publish_rows = 0;
+    }
+    if (visible_install_parts != nullptr) {
+        *visible_install_parts = 0;
+    }
+    if (hidden_publish_parts != nullptr) {
+        *hidden_publish_parts = 0;
     }
     auto wait_start = std::chrono::high_resolution_clock::now();
     joinAsyncAdmitPreload_();
@@ -2121,6 +2128,12 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
     if (hidden_publish_rows != nullptr) {
         *hidden_publish_rows = hidden_rows;
     }
+    if (visible_install_parts != nullptr) {
+        *visible_install_parts = static_cast<int64_t>(stage_admit_ids.size());
+    }
+    if (hidden_publish_parts != nullptr) {
+        *hidden_publish_parts = static_cast<int64_t>(hidden_publishes.size());
+    }
 
     auto install_start = std::chrono::high_resolution_clock::now();
     if (gpu_stage.defined() && !row_offsets.empty()) {
@@ -2160,9 +2173,10 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
             hidden_slots.push_back(hidden_publish.logical_slot);
             hidden_frames.push_back(hidden_publish.frame);
         }
-        SPDLOG_INFO("[partition-buffer-preload-consume] storage={} this={} device={} admit_ids={} rows={} visible_install_rows={} hidden_publish_rows={} hidden_publish_partitions={} hidden_publish_slots={} hidden_publish_frames={} preload_host_load_ms={:.3f} preload_cpu_to_gpu_ms={:.3f} preload_total_ms={:.3f} preload_install_ms={:.3f}",
+        SPDLOG_INFO("[partition-buffer-preload-consume] storage={} this={} device={} admit_ids={} rows={} visible_install_parts={} visible_install_rows={} hidden_publish_parts={} hidden_publish_rows={} hidden_publish_partitions={} hidden_publish_slots={} hidden_publish_frames={} preload_host_load_ms={:.3f} preload_cpu_to_gpu_ms={:.3f} preload_total_ms={:.3f} preload_install_ms={:.3f}",
                     basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(admit_ids), gpu_stage.size(0),
-                    install_rows, hidden_rows, vector_prefix_string(hidden_ids), vector_prefix_string(hidden_slots), vector_prefix_string(hidden_frames),
+                    stage_admit_ids.size(), install_rows, hidden_publishes.size(), hidden_rows,
+                    vector_prefix_string(hidden_ids), vector_prefix_string(hidden_slots), vector_prefix_string(hidden_frames),
                     preload_host_load_ms, preload_cpu_to_gpu_ms, preload_total_ms, preload_install_ms);
     }
     return true;
@@ -2887,7 +2901,24 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         double state_bookkeeping_ms = 0.0;
         bool preloaded_admit = false;
         int64_t preload_visible_install_rows = 0;
+        int64_t preload_visible_install_parts = 0;
         int64_t hidden_publish_rows = 0;
+        int64_t hidden_publish_parts = 0;
+        bool async_admit_preload_in_flight_before_swap = false;
+        bool async_admit_preload_valid_before_swap = false;
+        int64_t reserved_preload_frames_before_swap = 0;
+        bool async_evict_in_flight_before_swap = false;
+        int64_t async_evict_in_flight_partitions_before_swap = 0;
+        int64_t free_frames_before_swap = -1;
+        int64_t stale_backlog_frames_before_swap = -1;
+        int64_t free_frames_before_publish = -1;
+        int64_t stale_backlog_frames_before_publish = -1;
+        int64_t free_frames_after_publish = -1;
+        int64_t stale_backlog_frames_after_publish = -1;
+        int64_t fallback_visible_admit_parts = 0;
+        int64_t fallback_visible_admit_rows = 0;
+        bool fallback_due_to_preload_miss = false;
+        bool fallback_due_to_partial_preload = false;
 
         std::vector<int> evict_ids = getNextEvict();
         std::vector<int> admit_ids = getNextAdmit();
@@ -2988,6 +3019,22 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         double dirty_profile_ms = 0.0;
         int64_t cuda_free_bytes = -1;
         int64_t cuda_total_bytes = -1;
+        if (frameCacheEnabled_()) {
+            std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+            free_frames_before_swap = static_cast<int64_t>(free_physical_frames_.size());
+            stale_backlog_frames_before_swap = static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_swap;
+        }
+        {
+            std::lock_guard<std::mutex> preload_lock(async_admit_preload_lock_);
+            async_admit_preload_in_flight_before_swap = async_admit_preload_in_flight_;
+            async_admit_preload_valid_before_swap = async_admit_preload_valid_;
+            reserved_preload_frames_before_swap = static_cast<int64_t>(async_admit_preload_hidden_publishes_.size());
+        }
+        {
+            std::lock_guard<std::mutex> evict_lock(async_evict_writeback_lock_);
+            async_evict_in_flight_before_swap = async_evict_writeback_in_flight_;
+            async_evict_in_flight_partitions_before_swap = static_cast<int64_t>(async_evict_writeback_partition_ids_.size());
+        }
         if (log_timing) {
 #ifdef GEGE_CUDA
             if (device_.is_cuda()) {
@@ -3203,10 +3250,17 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
 
         if (single_gpu_async_admit_preload_enabled()) {
             auto preload_consume_start = std::chrono::high_resolution_clock::now();
-            preloaded_admit = consumeAsyncAdmitPreload_(admit_ids, evict_slots, &preload_wait_ms, &preload_visible_install_rows, &hidden_publish_rows);
+            preloaded_admit = consumeAsyncAdmitPreload_(admit_ids, evict_slots, &preload_wait_ms,
+                                                        &preload_visible_install_rows, &hidden_publish_rows,
+                                                        &preload_visible_install_parts, &hidden_publish_parts);
             if (log_timing) {
                 admit_preload_consume_ms = elapsed_ms(preload_consume_start, std::chrono::high_resolution_clock::now());
             }
+        }
+        if (frameCacheEnabled_()) {
+            std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+            free_frames_before_publish = static_cast<int64_t>(free_physical_frames_.size());
+            stale_backlog_frames_before_publish = static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_publish;
         }
         std::vector<int> fallback_admit_ids = admit_ids;
         std::vector<int64_t> fallback_evict_slots = evict_slots;
@@ -3235,12 +3289,18 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             !preloaded_admit ||
             (preloaded_admit && (preload_visible_install_rows + hidden_publish_rows) < admit_rows && !fallback_admit_ids.empty());
         if (fallback_remaining_admits) {
+            fallback_due_to_preload_miss = !preloaded_admit;
+            fallback_due_to_partial_preload = preloaded_admit;
             if (!preloaded_admit) {
                 preload_visible_install_rows = admit_rows;
+                preload_visible_install_parts = static_cast<int64_t>(admit_ids.size());
                 hidden_publish_rows = 0;
+                hidden_publish_parts = 0;
                 fallback_admit_ids = admit_ids;
                 fallback_evict_slots = evict_slots;
             }
+            fallback_visible_admit_parts = static_cast<int64_t>(fallback_admit_ids.size());
+            fallback_visible_admit_rows = partition_rows_for_ids(fallback_admit_ids, partition_table_);
             auto join_start = std::chrono::high_resolution_clock::now();
             joinAsyncEvictWritebackForPartitions_(fallback_admit_ids);
             if (log_timing) {
@@ -3397,6 +3457,31 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             startAsyncEvictWriteback_(delayed_stale_partition_ids, delayed_stale_row_offsets, torch::Tensor(), torch::Tensor(),
                                       delayed_stale_old_frames, delayed_stale_source_offsets);
         }
+        if (frameCacheEnabled_()) {
+            std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+            free_frames_after_publish = static_cast<int64_t>(free_physical_frames_.size());
+            stale_backlog_frames_after_publish = static_cast<int64_t>(hidden_frame_capacity_) - free_frames_after_publish;
+        }
+
+        frame_cache_perf_stats_.swap_samples += 1;
+        frame_cache_perf_stats_.visible_install_parts += preload_visible_install_parts;
+        frame_cache_perf_stats_.visible_install_rows += preload_visible_install_rows;
+        frame_cache_perf_stats_.hidden_publish_parts += hidden_publish_parts;
+        frame_cache_perf_stats_.hidden_publish_rows += hidden_publish_rows;
+        frame_cache_perf_stats_.fallback_visible_admit_parts += fallback_visible_admit_parts;
+        frame_cache_perf_stats_.fallback_visible_admit_rows += fallback_visible_admit_rows;
+        frame_cache_perf_stats_.preload_miss_swap_count += fallback_due_to_preload_miss ? 1 : 0;
+        frame_cache_perf_stats_.partial_preload_swap_count += fallback_due_to_partial_preload ? 1 : 0;
+        frame_cache_perf_stats_.delayed_stale_writeback_swap_count += delayed_stale_writeback ? 1 : 0;
+        frame_cache_perf_stats_.async_admit_valid_before_swap_count += async_admit_preload_valid_before_swap ? 1 : 0;
+        frame_cache_perf_stats_.async_evict_in_flight_before_swap_count += async_evict_in_flight_before_swap ? 1 : 0;
+        frame_cache_perf_stats_.reserved_preload_frames_sum += std::max<int64_t>(reserved_preload_frames_before_swap, 0);
+        frame_cache_perf_stats_.free_frames_before_swap_sum += std::max<int64_t>(free_frames_before_swap, 0);
+        frame_cache_perf_stats_.free_frames_after_publish_sum += std::max<int64_t>(free_frames_after_publish, 0);
+        frame_cache_perf_stats_.stale_backlog_before_swap_max =
+            std::max(frame_cache_perf_stats_.stale_backlog_before_swap_max, std::max<int64_t>(stale_backlog_frames_before_swap, 0));
+        frame_cache_perf_stats_.stale_backlog_after_publish_max =
+            std::max(frame_cache_perf_stats_.stale_backlog_after_publish_max, std::max<int64_t>(stale_backlog_frames_after_publish, 0));
         pending_hidden_publishes_.clear();
 
         for (int retained_id : retained_ids) {
@@ -3422,7 +3507,12 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             SPDLOG_INFO(
                 "[partition-buffer-swap][swap {}] storage={} this={} device={} active_parts={} retained_parts={} evict_parts={} admit_parts={} nodes={} "
                 "retained_ids={} evict_ids={} admit_ids={} evict_slots={} retained_mib={:.3f} gpu_to_cpu_mib={:.3f} cpu_to_gpu_mib={:.3f} "
-                "visible_install_rows={} visible_install_mib={:.3f} hidden_publish_rows={} hidden_publish_mib={:.3f} hidden_publish_partitions={} hidden_publish_slots={} hidden_publish_frames={} "
+                "visible_install_parts={} visible_install_rows={} visible_install_mib={:.3f} hidden_publish_parts={} hidden_publish_rows={} hidden_publish_mib={:.3f} "
+                "fallback_visible_admit_parts={} fallback_visible_admit_mib={:.3f} fallback_due_to_preload_miss={} fallback_due_to_partial_preload={} "
+                "frame_cache_free_frames_before_swap={} reserved_preload_frames_before_swap={} stale_backlog_frames_before_swap={} "
+                "frame_cache_free_frames_before_publish={} stale_backlog_frames_before_publish={} frame_cache_free_frames_after_publish={} stale_backlog_frames_after_publish={} "
+                "async_admit_preload_in_flight_before_swap={} async_admit_preload_valid_before_swap={} async_evict_in_flight_before_swap={} async_evict_in_flight_partitions_before_swap={} "
+                "hidden_publish_partitions={} hidden_publish_slots={} hidden_publish_frames={} "
                 "deferred_stale_writeback={} deferred_stale_partitions={} deferred_stale_slots={} deferred_stale_frames={} deferred_stale_mib={:.3f} "
                 "full_async_stage_mib={:.3f} cuda_free_mib={:.3f} cuda_total_mib={:.3f} full_async_stage_fits={} "
                 "async_evict_required_mib={:.3f} async_evict_free_mib={:.3f} async_evict_memory_fallback={} "
@@ -3434,8 +3524,14 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 timing_id, basename_string(filename_), fmt::ptr(this), device_.str(), buffer_state_.size(0), retained_parts, evict_ids.size(), admit_ids.size(),
                 num_nodes, vector_prefix_string(retained_ids), vector_prefix_string(evict_ids), vector_prefix_string(admit_ids),
                 vector_prefix_string(evict_slots), bytes_to_mib(retained_bytes), bytes_to_mib(evict_bytes), bytes_to_mib(admit_bytes),
-                preload_visible_install_rows, bytes_to_mib(preload_visible_install_rows * bytes_per_row),
-                hidden_publish_rows, bytes_to_mib(hidden_publish_rows * bytes_per_row),
+                preload_visible_install_parts, preload_visible_install_rows, bytes_to_mib(preload_visible_install_rows * bytes_per_row),
+                hidden_publish_parts, hidden_publish_rows, bytes_to_mib(hidden_publish_rows * bytes_per_row),
+                fallback_visible_admit_parts, bytes_to_mib(fallback_visible_admit_rows * bytes_per_row),
+                fallback_due_to_preload_miss, fallback_due_to_partial_preload,
+                free_frames_before_swap, reserved_preload_frames_before_swap, stale_backlog_frames_before_swap,
+                free_frames_before_publish, stale_backlog_frames_before_publish, free_frames_after_publish, stale_backlog_frames_after_publish,
+                async_admit_preload_in_flight_before_swap, async_admit_preload_valid_before_swap,
+                async_evict_in_flight_before_swap, async_evict_in_flight_partitions_before_swap,
                 vector_prefix_string(logged_hidden_publish_partition_ids), vector_prefix_string(logged_hidden_publish_logical_slots),
                 vector_prefix_string(logged_hidden_publish_frames), delayed_stale_writeback,
                 vector_prefix_string(delayed_stale_partition_ids), vector_prefix_string(delayed_stale_logical_slots),

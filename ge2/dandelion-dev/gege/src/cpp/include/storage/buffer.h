@@ -191,6 +191,26 @@ class PartitionBuffer {
     int64_t getPartitionSize() const { return partition_size_; }
 };
 
+struct FrameCachePerfStats {
+    int64_t swap_samples = 0;
+    int64_t visible_install_parts = 0;
+    int64_t visible_install_rows = 0;
+    int64_t hidden_publish_parts = 0;
+    int64_t hidden_publish_rows = 0;
+    int64_t fallback_visible_admit_parts = 0;
+    int64_t fallback_visible_admit_rows = 0;
+    int64_t preload_miss_swap_count = 0;
+    int64_t partial_preload_swap_count = 0;
+    int64_t delayed_stale_writeback_swap_count = 0;
+    int64_t async_admit_valid_before_swap_count = 0;
+    int64_t async_evict_in_flight_before_swap_count = 0;
+    int64_t reserved_preload_frames_sum = 0;
+    int64_t free_frames_before_swap_sum = 0;
+    int64_t free_frames_after_publish_sum = 0;
+    int64_t stale_backlog_before_swap_max = 0;
+    int64_t stale_backlog_after_publish_max = 0;
+};
+
 class MemPartitionBuffer : public PartitionBuffer {
     friend class MemPartitionBufferStorage;
 
@@ -226,6 +246,10 @@ class MemPartitionBuffer : public PartitionBuffer {
 
     void sync();
 
+    void resetFrameCachePerfStats() { frame_cache_perf_stats_ = FrameCachePerfStats(); }
+
+    FrameCachePerfStats getFrameCachePerfStats() const { return frame_cache_perf_stats_; }
+
     torch::Tensor data_storage_;
 
     int buffer_sizes_;
@@ -260,7 +284,8 @@ class MemPartitionBuffer : public PartitionBuffer {
     void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
     void joinAsyncAdmitPreload_();
     bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
-                                   int64_t *visible_install_rows = nullptr, int64_t *hidden_publish_rows = nullptr);
+                                   int64_t *visible_install_rows = nullptr, int64_t *hidden_publish_rows = nullptr,
+                                   int64_t *visible_install_parts = nullptr, int64_t *hidden_publish_parts = nullptr);
     void joinAsyncEvictWriteback_();
     void joinAsyncEvictWritebackForPartitions_(const std::vector<int> &partition_ids);
     void startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
@@ -305,4 +330,5 @@ class MemPartitionBuffer : public PartitionBuffer {
     bool async_evict_writeback_in_flight_ = false;
     std::exception_ptr async_evict_writeback_exception_ = nullptr;
     std::vector<int> async_evict_writeback_partition_ids_;
+    FrameCachePerfStats frame_cache_perf_stats_;
 };

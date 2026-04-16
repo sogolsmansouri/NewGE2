@@ -57,6 +57,7 @@ struct DataLoaderPerfStats {
     int64_t get_batch_perform_map_ns = 0;
     int64_t get_batch_overhead_ns = 0;
     NegativeSamplerPerfStats negative_sampler;
+    FrameCachePerfStats frame_cache;
     std::vector<int64_t> device_swap_barrier_wait_ns;
     std::vector<int64_t> device_swap_update_ns;
     std::vector<int64_t> device_swap_rebuild_ns;
@@ -81,6 +82,7 @@ struct DataLoaderPerfStats {
     std::vector<int64_t> device_get_batch_device_prepare_ns;
     std::vector<int64_t> device_get_batch_perform_map_ns;
     std::vector<int64_t> device_get_batch_overhead_ns;
+    std::vector<FrameCachePerfStats> device_frame_cache;
     std::vector<std::vector<int64_t>> device_swap_active_bucket_samples;
     std::vector<std::vector<int64_t>> device_swap_active_edge_samples;
     std::vector<std::vector<int64_t>> device_swap_batch_count_samples;

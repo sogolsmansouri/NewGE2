@@ -146,6 +146,57 @@ SampleSummary summarize_samples(const std::vector<int64_t> &values) {
     return summary;
 }
 
+std::vector<int64_t> collect_frame_cache_stats(const std::vector<FrameCachePerfStats> &stats, int64_t FrameCachePerfStats::*member) {
+    std::vector<int64_t> values;
+    values.reserve(stats.size());
+    for (const auto &stat : stats) {
+        values.emplace_back(stat.*member);
+    }
+    return values;
+}
+
+double average_frame_cache_stat(const FrameCachePerfStats &stats, int64_t FrameCachePerfStats::*member) {
+    if (stats.swap_samples == 0) {
+        return 0.0;
+    }
+    return static_cast<double>(stats.*member) / static_cast<double>(stats.swap_samples);
+}
+
+void log_frame_cache_perf_stats(int64_t epoch, const DataLoaderPerfStats &perf_stats) {
+    if (perf_stats.frame_cache.swap_samples <= 0) {
+        return;
+    }
+
+    SPDLOG_INFO(
+        "[perf][epoch {}][frame_cache] swap_samples={} visible_install_parts={} visible_install_rows={} hidden_publish_parts={} hidden_publish_rows={} "
+        "fallback_visible_admit_parts={} fallback_visible_admit_rows={} preload_miss_swaps={} partial_preload_swaps={} delayed_stale_writeback_swaps={} "
+        "async_admit_valid_before_swap_swaps={} async_evict_in_flight_before_swap_swaps={} reserved_preload_frames_avg={:.2f} "
+        "free_frames_before_swap_avg={:.2f} free_frames_after_publish_avg={:.2f} stale_backlog_before_swap_max={} stale_backlog_after_publish_max={}",
+        epoch, perf_stats.frame_cache.swap_samples, perf_stats.frame_cache.visible_install_parts, perf_stats.frame_cache.visible_install_rows,
+        perf_stats.frame_cache.hidden_publish_parts, perf_stats.frame_cache.hidden_publish_rows,
+        perf_stats.frame_cache.fallback_visible_admit_parts, perf_stats.frame_cache.fallback_visible_admit_rows,
+        perf_stats.frame_cache.preload_miss_swap_count, perf_stats.frame_cache.partial_preload_swap_count,
+        perf_stats.frame_cache.delayed_stale_writeback_swap_count, perf_stats.frame_cache.async_admit_valid_before_swap_count,
+        perf_stats.frame_cache.async_evict_in_flight_before_swap_count,
+        average_frame_cache_stat(perf_stats.frame_cache, &FrameCachePerfStats::reserved_preload_frames_sum),
+        average_frame_cache_stat(perf_stats.frame_cache, &FrameCachePerfStats::free_frames_before_swap_sum),
+        average_frame_cache_stat(perf_stats.frame_cache, &FrameCachePerfStats::free_frames_after_publish_sum),
+        perf_stats.frame_cache.stale_backlog_before_swap_max, perf_stats.frame_cache.stale_backlog_after_publish_max);
+
+    if (!perf_stats.device_frame_cache.empty()) {
+        SPDLOG_INFO(
+            "[perf][epoch {}][frame_cache][device] swap_samples={} hidden_publish_parts={} fallback_visible_admit_parts={} preload_miss_swaps={} "
+            "partial_preload_swaps={} stale_backlog_after_publish_max={}",
+            epoch,
+            format_vector(collect_frame_cache_stats(perf_stats.device_frame_cache, &FrameCachePerfStats::swap_samples)),
+            format_vector(collect_frame_cache_stats(perf_stats.device_frame_cache, &FrameCachePerfStats::hidden_publish_parts)),
+            format_vector(collect_frame_cache_stats(perf_stats.device_frame_cache, &FrameCachePerfStats::fallback_visible_admit_parts)),
+            format_vector(collect_frame_cache_stats(perf_stats.device_frame_cache, &FrameCachePerfStats::preload_miss_swap_count)),
+            format_vector(collect_frame_cache_stats(perf_stats.device_frame_cache, &FrameCachePerfStats::partial_preload_swap_count)),
+            format_vector(collect_frame_cache_stats(perf_stats.device_frame_cache, &FrameCachePerfStats::stale_backlog_after_publish_max)));
+    }
+}
+
 }  // namespace
 
 SynchronousTrainer::SynchronousTrainer(shared_ptr<DataLoader> dataloader, shared_ptr<Model> model, int logs_per_epoch) {
@@ -418,6 +469,7 @@ void SynchronousTrainer::train(int num_epochs) {
                     spread_ms(perf_stats.device_swap_sync_wait_ns));
             }
         }
+        log_frame_cache_perf_stats(dataloader_->getEpochsProcessed(), perf_stats);
     }
 }
 
@@ -765,6 +817,7 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             ns_to_ms(perf_stats.negative_sampler.filter_gpu_neighbor_gather_ns),
             ns_to_ms(perf_stats.negative_sampler.filter_gpu_relation_filter_ns),
             ns_to_ms(perf_stats.negative_sampler.filter_gpu_finalize_ns));
+        log_frame_cache_perf_stats(dataloader_->getEpochsProcessed(), perf_stats);
         for (int32_t device_idx = 0; device_idx < static_cast<int32_t>(device_timings.size()); device_idx++) {
             const auto &timing = device_timings[device_idx];
             int64_t swap_count = have_device_swap_stats ? perf_stats.device_swap_count[device_idx] : 0;

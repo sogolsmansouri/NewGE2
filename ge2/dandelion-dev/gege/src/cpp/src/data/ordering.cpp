@@ -57,6 +57,16 @@ bool contrastive_greedy_cover_ordering_enabled() {
     return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
 }
 
+bool hybrid_cover_ordering_enabled() {
+    const char *raw = std::getenv("GEGE_HYBRID_COVER");
+    if (raw == nullptr) {
+        return false;
+    }
+
+    std::string value(raw);
+    return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
+}
+
 int64_t optimized_custom_schedule_restarts() {
     const char *raw = std::getenv("GEGE_CUSTOM_OPTIMIZER_RESTARTS");
     if (raw == nullptr) {
@@ -82,6 +92,8 @@ int64_t optimized_custom_schedule_seed() {
         return 12345;
     }
 }
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getHybridCoverEdgeBucketOrdering(int num_partitions, int buffer_capacity);
 
 struct CustomStateMetrics {
     std::vector<int> partitions;
@@ -1380,6 +1392,9 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(E
             return getTwoLevelBetaOrdering(num_partitions, buffer_capacity, fine_to_coarse_ratio, num_cache_partitions, randomly_assign_edge_buckets);
         case EdgeBucketOrdering::CUSTOM:
             SPDLOG_INFO("Generating CUSTOM Ordering");
+            if (hybrid_cover_ordering_enabled()) {
+                return getHybridCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
+            }
             if (contrastive_greedy_cover_ordering_enabled()) {
                 return getGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
             }
@@ -1555,6 +1570,131 @@ int state_overlap_count(const std::vector<int> &lhs, const std::vector<int> &rhs
         }
     }
     return overlap;
+}
+
+void append_directed_anchor_pairs(const std::vector<int> &anchors, std::vector<std::pair<int, int>> &buckets) {
+    for (auto src_part : anchors) {
+        for (auto dst_part : anchors) {
+            buckets.emplace_back(src_part, dst_part);
+        }
+    }
+}
+
+void append_directed_anchor_stream_pairs(const std::vector<int> &anchors,
+                                         int stream_partner,
+                                         std::vector<std::pair<int, int>> &buckets) {
+    for (auto anchor_part : anchors) {
+        buckets.emplace_back(anchor_part, stream_partner);
+        buckets.emplace_back(stream_partner, anchor_part);
+    }
+}
+
+std::vector<int> hybrid_cover_partner_order(const std::vector<int> &partners) {
+    if (partners.size() <= 1) {
+        return partners;
+    }
+
+    std::vector<int> ordered;
+    ordered.reserve(partners.size());
+    for (std::size_t idx = 1; idx < partners.size(); idx++) {
+        ordered.emplace_back(partners[idx]);
+    }
+    ordered.emplace_back(partners[0]);
+    return ordered;
+}
+
+void build_hybrid_cover_recursive(const std::vector<int> &remaining_partitions,
+                                  std::vector<std::vector<int>> &buffer_states,
+                                  std::vector<std::vector<std::pair<int, int>>> &edge_buckets_per_buffer,
+                                  int64_t &superstate_count) {
+    if (remaining_partitions.empty()) {
+        return;
+    }
+
+    if (remaining_partitions.size() < 4) {
+        throw std::runtime_error("Hybrid-Cover recursion expected at least four partitions");
+    }
+
+    if (remaining_partitions.size() == 4) {
+        std::vector<int> state = remaining_partitions;
+        std::vector<std::pair<int, int>> buckets;
+        buckets.reserve(16);
+        for (auto src_part : state) {
+            for (auto dst_part : state) {
+                buckets.emplace_back(src_part, dst_part);
+            }
+        }
+        buffer_states.emplace_back(std::move(state));
+        edge_buckets_per_buffer.emplace_back(std::move(buckets));
+        superstate_count++;
+        return;
+    }
+
+    std::vector<int> anchors(remaining_partitions.begin(), remaining_partitions.begin() + 3);
+    std::vector<int> partners(remaining_partitions.begin() + 3, remaining_partitions.end());
+    std::vector<int> partner_order = hybrid_cover_partner_order(partners);
+
+    for (std::size_t idx = 0; idx < partner_order.size(); idx++) {
+        int stream_partner = partner_order[idx];
+        std::vector<int> state = anchors;
+        state.emplace_back(stream_partner);
+
+        std::vector<std::pair<int, int>> buckets;
+        buckets.reserve(idx == 0 ? 15 : 6);
+        if (idx == 0) {
+            append_directed_anchor_pairs(anchors, buckets);
+        }
+        append_directed_anchor_stream_pairs(anchors, stream_partner, buckets);
+
+        buffer_states.emplace_back(std::move(state));
+        edge_buckets_per_buffer.emplace_back(std::move(buckets));
+    }
+
+    superstate_count++;
+    build_hybrid_cover_recursive(partners, buffer_states, edge_buckets_per_buffer, superstate_count);
+}
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getHybridCoverEdgeBucketOrdering(int num_partitions, int buffer_capacity) {
+    if (buffer_capacity != 4 || num_partitions < 4 || num_partitions % 3 != 1) {
+        SPDLOG_WARN("Hybrid-Cover ordering requires buffer_capacity=4 and num_partitions=3k+1; falling back to CUSTOM");
+        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+    }
+
+    std::vector<int> ordered_partitions(num_partitions);
+    std::iota(ordered_partitions.begin(), ordered_partitions.end(), 0);
+
+    std::vector<std::vector<int>> buffer_states;
+    std::vector<std::vector<std::pair<int, int>>> edge_buckets_per_buffer;
+    int64_t superstate_count = 0;
+    build_hybrid_cover_recursive(ordered_partitions, buffer_states, edge_buckets_per_buffer, superstate_count);
+
+    int64_t total_bucket_assignments = 0;
+    for (const auto &buckets : edge_buckets_per_buffer) {
+        total_bucket_assignments += static_cast<int64_t>(buckets.size());
+    }
+
+    int64_t total_partition_loads = buffer_states.empty() ? 0 : static_cast<int64_t>(buffer_states.front().size());
+    int64_t single_partition_rotations = 0;
+    int64_t boundary_rotations = 0;
+    int64_t max_overlap = 0;
+    for (std::size_t idx = 1; idx < buffer_states.size(); idx++) {
+        int overlap = state_overlap_count(buffer_states[idx - 1], buffer_states[idx]);
+        max_overlap = std::max<int64_t>(max_overlap, overlap);
+        total_partition_loads += static_cast<int64_t>(buffer_capacity - overlap);
+        if (overlap == buffer_capacity - 1) {
+            single_partition_rotations++;
+        } else {
+            boundary_rotations++;
+        }
+    }
+
+    SPDLOG_INFO(
+        "Generating Hybrid-Cover Ordering: superstates={} microstates={} directed_buckets={} total_partition_loads={} "
+        "single_partition_rotations={} boundary_rotations={} max_overlap={}",
+        superstate_count, buffer_states.size(), total_bucket_assignments, total_partition_loads, single_partition_rotations,
+        boundary_rotations, max_overlap);
+
+    return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
 }
 
 int64_t mark_state_buckets_covered(const std::vector<int> &state,

@@ -1282,6 +1282,11 @@ void DataLoader::setBufferOrdering() {
             }
             bool access_aware_state_generation = false;
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
+            bool hybrid_cover_schedule_requested = parse_env_flag("GEGE_HYBRID_COVER", false);
+            bool hybrid_cover_schedule_supported =
+                hybrid_cover_schedule_requested && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
+                !options->randomly_assign_edge_buckets && requested_active_devices == 1 && physical_devices == 1 &&
+                options->buffer_capacity == 4 && options->num_partitions >= 4 && options->num_partitions % 3 == 1;
             const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
             if (access_aware_state_generation_env != nullptr && access_aware_state_generation_env[0] != '\0' &&
                 std::string(access_aware_state_generation_env) != "0") {
@@ -1290,7 +1295,18 @@ void DataLoader::setBufferOrdering() {
 
             std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> tup;
             bool used_optimized_custom_schedule = false;
-            if (access_aware_state_generation && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM) {
+            bool used_hybrid_cover_schedule = false;
+            if (hybrid_cover_schedule_requested && !hybrid_cover_schedule_supported) {
+                SPDLOG_WARN(
+                    "Ignoring GEGE_HYBRID_COVER because it currently requires CUSTOM ordering, 1 physical/logical device, "
+                    "buffer_capacity=4, no random bucket assignment, and num_partitions=3k+1");
+            }
+            if (hybrid_cover_schedule_supported) {
+                tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity,
+                                            options->fine_to_coarse_ratio, options->num_cache_partitions,
+                                            options->randomly_assign_edge_buckets);
+                used_hybrid_cover_schedule = true;
+            } else if (access_aware_state_generation && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM) {
                 tup = getAccessAwareCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices);
                 SPDLOG_INFO("Using access-aware state generation for CUSTOM ordering with {} logical device(s)", requested_active_devices);
             } else if (optimized_custom_schedule && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
@@ -1309,10 +1325,13 @@ void DataLoader::setBufferOrdering() {
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
             if (log_startup_timing) {
-                SPDLOG_INFO("[startup-timing][DataLoader::setBufferOrdering] generated states={} buckets={} optimized_custom={} access_aware_state_generation={}",
-                            buffer_states_.size(), edge_buckets_per_buffer_.size(), used_optimized_custom_schedule, access_aware_state_generation);
+                SPDLOG_INFO(
+                    "[startup-timing][DataLoader::setBufferOrdering] generated states={} buckets={} optimized_custom={} hybrid_cover={} access_aware_state_generation={}",
+                    buffer_states_.size(), edge_buckets_per_buffer_.size(), used_optimized_custom_schedule, used_hybrid_cover_schedule,
+                    access_aware_state_generation);
             }
-            if (!used_optimized_custom_schedule && single_gpu_gpu_aware_custom_enabled() && requested_active_devices == 1 && physical_devices == 1 &&
+            if (!used_optimized_custom_schedule && !used_hybrid_cover_schedule && single_gpu_gpu_aware_custom_enabled() &&
+                requested_active_devices == 1 && physical_devices == 1 &&
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && !options->randomly_assign_edge_buckets &&
                 buffer_states_.size() > 1 && edge_buckets_per_buffer_.size() == buffer_states_.size()) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
@@ -1381,7 +1400,7 @@ void DataLoader::setBufferOrdering() {
                                 total_shared_hotness / 1000000.0);
                 }
             }
-            if (!access_aware_state_generation && !used_optimized_custom_schedule) {
+            if (!access_aware_state_generation && !used_optimized_custom_schedule && !used_hybrid_cover_schedule) {
                 reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
             }
             if (replay_logical_lane) {

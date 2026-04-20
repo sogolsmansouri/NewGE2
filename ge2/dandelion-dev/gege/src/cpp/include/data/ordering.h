@@ -1,8 +1,66 @@
 #pragma once
 
 #include "batch.h"
+#include <string>
+#include <tuple>
+#include <vector>
 
 using std::pair;
+
+enum class PlanFamily {
+    UNKNOWN = 0,
+    CUSTOM = 1,
+    HYBRID_COVER = 2,
+};
+
+struct MicrostatePlan {
+    int64_t microstate_id = -1;
+    int64_t superstate_id = -1;
+    std::vector<int> resident_partitions;
+    std::vector<std::pair<int, int>> edge_buckets;
+    int64_t overlap_with_prev = 0;
+    int64_t admitted_partitions = 0;
+};
+
+struct LanePlan {
+    int64_t lane_id = 0;
+    std::vector<MicrostatePlan> microstates;
+};
+
+struct StateflowPlan {
+    PlanFamily family = PlanFamily::UNKNOWN;
+    int64_t gpu_count = 1;
+    int64_t buffer_capacity = 0;
+    int64_t num_partitions = 0;
+    int64_t total_microstates = 0;
+    int64_t total_superstates = 0;
+    int64_t total_bucket_assignments = 0;
+    int64_t total_partition_loads = 0;
+    int64_t max_overlap = 0;
+    int64_t boundary_count = 0;
+    int64_t estimated_bucket_edges = 0;
+    double estimated_cost = 0.0;
+    std::vector<LanePlan> lanes;
+};
+
+std::string planFamilyName(PlanFamily family);
+
+StateflowPlan compileCustomStateflowPlan(int num_partitions, int buffer_capacity, bool randomly_assign_edge_buckets);
+
+StateflowPlan compileHybridCoverStateflowPlan(int num_partitions, int buffer_capacity);
+
+StateflowPlan compileSingleGpuStateflowPlan(int num_partitions,
+                                            int buffer_capacity,
+                                            bool randomly_assign_edge_buckets,
+                                            const std::vector<int64_t> &edge_bucket_sizes,
+                                            bool allow_hybrid_cover);
+
+StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_states,
+                                           const vector<torch::Tensor> &edge_buckets_per_buffer,
+                                           int active_devices,
+                                           const std::vector<int64_t> &edge_bucket_sizes);
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> stateflowPlanToTensorOrdering(const StateflowPlan &plan);
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(EdgeBucketOrdering edge_bucket_ordering, int num_partitions, int buffer_capacity,
                                                                                int fine_to_coarse_ratio, int num_cache_partitions,

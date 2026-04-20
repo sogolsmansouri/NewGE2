@@ -9,6 +9,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -1603,10 +1604,21 @@ std::vector<int> hybrid_cover_partner_order(const std::vector<int> &partners) {
     return ordered;
 }
 
-void build_hybrid_cover_recursive(const std::vector<int> &remaining_partitions,
-                                  std::vector<std::vector<int>> &buffer_states,
-                                  std::vector<std::vector<std::pair<int, int>>> &edge_buckets_per_buffer,
-                                  int64_t &superstate_count) {
+void append_hybrid_cover_microstate(LanePlan &lane,
+                                    int64_t superstate_id,
+                                    std::vector<int> state,
+                                    std::vector<std::pair<int, int>> buckets) {
+    MicrostatePlan microstate;
+    microstate.microstate_id = static_cast<int64_t>(lane.microstates.size());
+    microstate.superstate_id = superstate_id;
+    microstate.resident_partitions = std::move(state);
+    microstate.edge_buckets = std::move(buckets);
+    lane.microstates.emplace_back(std::move(microstate));
+}
+
+void build_hybrid_cover_plan_recursive(const std::vector<int> &remaining_partitions,
+                                       LanePlan &lane,
+                                       int64_t &superstate_count) {
     if (remaining_partitions.empty()) {
         return;
     }
@@ -1624,8 +1636,7 @@ void build_hybrid_cover_recursive(const std::vector<int> &remaining_partitions,
                 buckets.emplace_back(src_part, dst_part);
             }
         }
-        buffer_states.emplace_back(std::move(state));
-        edge_buckets_per_buffer.emplace_back(std::move(buckets));
+        append_hybrid_cover_microstate(lane, superstate_count, std::move(state), std::move(buckets));
         superstate_count++;
         return;
     }
@@ -1646,42 +1657,443 @@ void build_hybrid_cover_recursive(const std::vector<int> &remaining_partitions,
         }
         append_directed_anchor_stream_pairs(anchors, stream_partner, buckets);
 
-        buffer_states.emplace_back(std::move(state));
-        edge_buckets_per_buffer.emplace_back(std::move(buckets));
+        append_hybrid_cover_microstate(lane, superstate_count, std::move(state), std::move(buckets));
     }
 
     superstate_count++;
-    build_hybrid_cover_recursive(partners, buffer_states, edge_buckets_per_buffer, superstate_count);
+    build_hybrid_cover_plan_recursive(partners, lane, superstate_count);
 }
 
-std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getHybridCoverEdgeBucketOrdering(int num_partitions, int buffer_capacity) {
+void finalize_stateflow_plan(StateflowPlan &plan) {
+    plan.total_microstates = 0;
+    plan.total_bucket_assignments = 0;
+    plan.total_partition_loads = 0;
+    plan.max_overlap = 0;
+    plan.boundary_count = 0;
+
+    for (auto &lane : plan.lanes) {
+        for (std::size_t idx = 0; idx < lane.microstates.size(); idx++) {
+            auto &microstate = lane.microstates[idx];
+            plan.total_microstates++;
+            plan.total_bucket_assignments += static_cast<int64_t>(microstate.edge_buckets.size());
+            if (idx == 0) {
+                plan.total_partition_loads += static_cast<int64_t>(microstate.resident_partitions.size());
+                microstate.overlap_with_prev = 0;
+                microstate.admitted_partitions = static_cast<int64_t>(microstate.resident_partitions.size());
+            } else {
+                plan.boundary_count++;
+                int64_t overlap = state_overlap_count(lane.microstates[idx - 1].resident_partitions, microstate.resident_partitions);
+                microstate.overlap_with_prev = overlap;
+                microstate.admitted_partitions = static_cast<int64_t>(plan.buffer_capacity) - overlap;
+                plan.total_partition_loads += microstate.admitted_partitions;
+                plan.max_overlap = std::max<int64_t>(plan.max_overlap, overlap);
+            }
+        }
+    }
+}
+
+bool stateflow_plan_valid(const StateflowPlan &plan) {
+    if (plan.lanes.empty()) {
+        return false;
+    }
+    for (const auto &lane : plan.lanes) {
+        if (!lane.microstates.empty()) {
+            return true;
+        }
+    }
+    return false;
+}
+
+StateflowPlan tensor_ordering_to_stateflow_plan(const std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> &ordering,
+                                                PlanFamily family,
+                                                int num_partitions,
+                                                int buffer_capacity) {
+    StateflowPlan plan;
+    plan.family = family;
+    plan.gpu_count = 1;
+    plan.buffer_capacity = buffer_capacity;
+    plan.num_partitions = num_partitions;
+    plan.lanes.resize(1);
+    plan.lanes[0].lane_id = 0;
+
+    const auto &buffer_states = std::get<0>(ordering);
+    const auto &edge_buckets_per_buffer = std::get<1>(ordering);
+    if (buffer_states.size() != edge_buckets_per_buffer.size()) {
+        return plan;
+    }
+
+    for (std::size_t idx = 0; idx < buffer_states.size(); idx++) {
+        auto state_tensor = buffer_states[idx].to(torch::kCPU).to(torch::kInt64).contiguous();
+        auto bucket_tensor = edge_buckets_per_buffer[idx].to(torch::kCPU).to(torch::kInt64).contiguous();
+
+        auto *state_ptr = state_tensor.data_ptr<int64_t>();
+        std::vector<int> resident_partitions;
+        resident_partitions.reserve(state_tensor.numel());
+        for (int64_t offset = 0; offset < state_tensor.numel(); offset++) {
+            resident_partitions.emplace_back(static_cast<int>(state_ptr[offset]));
+        }
+
+        std::vector<std::pair<int, int>> edge_buckets;
+        if (bucket_tensor.numel() > 0) {
+            auto accessor = bucket_tensor.accessor<int64_t, 2>();
+            edge_buckets.reserve(bucket_tensor.size(0));
+            for (int64_t row = 0; row < bucket_tensor.size(0); row++) {
+                edge_buckets.emplace_back(static_cast<int>(accessor[row][0]), static_cast<int>(accessor[row][1]));
+            }
+        }
+
+        append_hybrid_cover_microstate(plan.lanes[0], static_cast<int64_t>(idx), std::move(resident_partitions), std::move(edge_buckets));
+    }
+
+    plan.total_superstates = static_cast<int64_t>(plan.lanes[0].microstates.size());
+    finalize_stateflow_plan(plan);
+    return plan;
+}
+
+int64_t estimate_plan_bucket_edges(const StateflowPlan &plan, const std::vector<int64_t> &edge_bucket_sizes) {
+    if (edge_bucket_sizes.size() != static_cast<std::size_t>(plan.num_partitions * plan.num_partitions)) {
+        return plan.total_bucket_assignments;
+    }
+
+    int64_t estimated_edges = 0;
+    for (const auto &lane : plan.lanes) {
+        for (const auto &microstate : lane.microstates) {
+            for (const auto &[src_part, dst_part] : microstate.edge_buckets) {
+                estimated_edges += edge_bucket_sizes[src_part * plan.num_partitions + dst_part];
+            }
+        }
+    }
+    return estimated_edges;
+}
+
+std::string overlap_histogram_string(const StateflowPlan &plan) {
+    std::unordered_map<int64_t, int64_t> histogram;
+    for (const auto &lane : plan.lanes) {
+        for (std::size_t idx = 1; idx < lane.microstates.size(); idx++) {
+            histogram[lane.microstates[idx].overlap_with_prev]++;
+        }
+    }
+
+    if (histogram.empty()) {
+        return "[]";
+    }
+
+    std::vector<std::pair<int64_t, int64_t>> sorted_histogram(histogram.begin(), histogram.end());
+    std::sort(sorted_histogram.begin(), sorted_histogram.end());
+    std::ostringstream oss;
+    oss << "[";
+    for (std::size_t idx = 0; idx < sorted_histogram.size(); idx++) {
+        if (idx > 0) {
+            oss << ", ";
+        }
+        oss << sorted_histogram[idx].first << ":" << sorted_histogram[idx].second;
+    }
+    oss << "]";
+    return oss.str();
+}
+
+double score_stateflow_plan(StateflowPlan &plan, const std::vector<int64_t> &edge_bucket_sizes) {
+    constexpr double alpha = 1.0;
+    constexpr double beta = 1e-8;
+    constexpr double gamma = 0.5;
+    constexpr double delta = 0.25;
+
+    plan.estimated_bucket_edges = estimate_plan_bucket_edges(plan, edge_bucket_sizes);
+
+    int64_t lane_min = std::numeric_limits<int64_t>::max();
+    int64_t lane_max = 0;
+    for (const auto &lane : plan.lanes) {
+        int64_t lane_edges = 0;
+        if (edge_bucket_sizes.size() == static_cast<std::size_t>(plan.num_partitions * plan.num_partitions)) {
+            for (const auto &microstate : lane.microstates) {
+                for (const auto &[src_part, dst_part] : microstate.edge_buckets) {
+                    lane_edges += edge_bucket_sizes[src_part * plan.num_partitions + dst_part];
+                }
+            }
+        } else {
+            for (const auto &microstate : lane.microstates) {
+                lane_edges += static_cast<int64_t>(microstate.edge_buckets.size());
+            }
+        }
+        lane_min = std::min(lane_min, lane_edges);
+        lane_max = std::max(lane_max, lane_edges);
+    }
+    int64_t lane_imbalance = lane_min == std::numeric_limits<int64_t>::max() ? 0 : lane_max - lane_min;
+
+    plan.estimated_cost =
+        alpha * static_cast<double>(plan.total_partition_loads) +
+        beta * static_cast<double>(plan.estimated_bucket_edges) +
+        gamma * static_cast<double>(plan.boundary_count) +
+        delta * static_cast<double>(lane_imbalance);
+    return plan.estimated_cost;
+}
+
+MicrostatePlan tensor_state_to_microstate(torch::Tensor state_tensor,
+                                          torch::Tensor bucket_tensor,
+                                          int64_t microstate_id,
+                                          int64_t superstate_id) {
+    MicrostatePlan microstate;
+    microstate.microstate_id = microstate_id;
+    microstate.superstate_id = superstate_id;
+
+    state_tensor = state_tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto *state_ptr = state_tensor.data_ptr<int64_t>();
+    microstate.resident_partitions.reserve(state_tensor.numel());
+    for (int64_t offset = 0; offset < state_tensor.numel(); offset++) {
+        microstate.resident_partitions.emplace_back(static_cast<int>(state_ptr[offset]));
+    }
+
+    bucket_tensor = bucket_tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
+    if (bucket_tensor.numel() > 0) {
+        auto accessor = bucket_tensor.accessor<int64_t, 2>();
+        microstate.edge_buckets.reserve(bucket_tensor.size(0));
+        for (int64_t row = 0; row < bucket_tensor.size(0); row++) {
+            microstate.edge_buckets.emplace_back(static_cast<int>(accessor[row][0]), static_cast<int>(accessor[row][1]));
+        }
+    }
+
+    return microstate;
+}
+
+StateflowPlan build_multi_gpu_stateflow_plan_from_permutation(const vector<torch::Tensor> &buffer_states,
+                                                              const vector<torch::Tensor> &edge_buckets_per_buffer,
+                                                              const std::vector<int64_t> &permutation,
+                                                              int active_devices) {
+    StateflowPlan plan;
+    if (buffer_states.empty() || edge_buckets_per_buffer.size() != buffer_states.size() || active_devices <= 1 ||
+        permutation.size() != buffer_states.size()) {
+        return plan;
+    }
+
+    plan.family = PlanFamily::CUSTOM;
+    plan.gpu_count = active_devices;
+    plan.buffer_capacity = buffer_states.front().numel();
+    plan.num_partitions = 0;
+    for (const auto &state : buffer_states) {
+        auto state_cpu = state.to(torch::kCPU).to(torch::kInt64).contiguous();
+        auto *data = state_cpu.data_ptr<int64_t>();
+        for (int64_t idx = 0; idx < state_cpu.numel(); idx++) {
+            plan.num_partitions = std::max<int64_t>(plan.num_partitions, data[idx] + 1);
+        }
+    }
+
+    plan.lanes.resize(active_devices);
+    for (int lane_idx = 0; lane_idx < active_devices; lane_idx++) {
+        plan.lanes[lane_idx].lane_id = lane_idx;
+    }
+
+    for (std::size_t ordered_idx = 0; ordered_idx < permutation.size(); ordered_idx++) {
+        int64_t state_idx = permutation[ordered_idx];
+        if (state_idx < 0 || state_idx >= static_cast<int64_t>(buffer_states.size())) {
+            return StateflowPlan{};
+        }
+        int lane_idx = static_cast<int>(ordered_idx % static_cast<std::size_t>(active_devices));
+        int64_t round_idx = static_cast<int64_t>(ordered_idx / static_cast<std::size_t>(active_devices));
+        plan.lanes[lane_idx].microstates.emplace_back(
+            tensor_state_to_microstate(buffer_states[state_idx], edge_buckets_per_buffer[state_idx],
+                                       static_cast<int64_t>(plan.lanes[lane_idx].microstates.size()), round_idx));
+    }
+
+    plan.total_superstates = (static_cast<int64_t>(permutation.size()) + active_devices - 1) / active_devices;
+    finalize_stateflow_plan(plan);
+    return plan;
+}
+
+}  // namespace
+
+std::string planFamilyName(PlanFamily family) {
+    switch (family) {
+        case PlanFamily::CUSTOM:
+            return "CUSTOM";
+        case PlanFamily::HYBRID_COVER:
+            return "HYBRID_COVER";
+        default:
+            return "UNKNOWN";
+    }
+}
+
+StateflowPlan compileHybridCoverStateflowPlan(int num_partitions, int buffer_capacity) {
+    StateflowPlan plan;
+    plan.family = PlanFamily::HYBRID_COVER;
+    plan.gpu_count = 1;
+    plan.buffer_capacity = buffer_capacity;
+    plan.num_partitions = num_partitions;
+
     if (buffer_capacity != 4 || num_partitions < 4 || num_partitions % 3 != 1) {
         SPDLOG_WARN("Hybrid-Cover ordering requires buffer_capacity=4 and num_partitions=3k+1; falling back to CUSTOM");
-        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+        return plan;
     }
 
     std::vector<int> ordered_partitions(num_partitions);
     std::iota(ordered_partitions.begin(), ordered_partitions.end(), 0);
 
-    std::vector<std::vector<int>> buffer_states;
-    std::vector<std::vector<std::pair<int, int>>> edge_buckets_per_buffer;
-    int64_t superstate_count = 0;
-    build_hybrid_cover_recursive(ordered_partitions, buffer_states, edge_buckets_per_buffer, superstate_count);
+    plan.lanes.resize(1);
+    plan.lanes[0].lane_id = 0;
+    build_hybrid_cover_plan_recursive(ordered_partitions, plan.lanes[0], plan.total_superstates);
+    finalize_stateflow_plan(plan);
+    return plan;
+}
 
-    int64_t total_bucket_assignments = 0;
-    for (const auto &buckets : edge_buckets_per_buffer) {
-        total_bucket_assignments += static_cast<int64_t>(buckets.size());
+StateflowPlan compileCustomStateflowPlan(int num_partitions, int buffer_capacity, bool randomly_assign_edge_buckets) {
+    auto ordering = getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, randomly_assign_edge_buckets);
+    return tensor_ordering_to_stateflow_plan(ordering, PlanFamily::CUSTOM, num_partitions, buffer_capacity);
+}
+
+StateflowPlan compileSingleGpuStateflowPlan(int num_partitions,
+                                            int buffer_capacity,
+                                            bool randomly_assign_edge_buckets,
+                                            const std::vector<int64_t> &edge_bucket_sizes,
+                                            bool allow_hybrid_cover) {
+    std::vector<StateflowPlan> candidates;
+
+    StateflowPlan custom_plan = compileCustomStateflowPlan(num_partitions, buffer_capacity, randomly_assign_edge_buckets);
+    if (stateflow_plan_valid(custom_plan)) {
+        score_stateflow_plan(custom_plan, edge_bucket_sizes);
+        SPDLOG_INFO(
+            "Stateflow planner candidate family={} cost={:.3f} loads={} boundaries={} directed_buckets={} "
+            "estimated_bucket_edges={} overlap_hist={}",
+            planFamilyName(custom_plan.family), custom_plan.estimated_cost, custom_plan.total_partition_loads,
+            custom_plan.boundary_count, custom_plan.total_bucket_assignments, custom_plan.estimated_bucket_edges,
+            overlap_histogram_string(custom_plan));
+        candidates.emplace_back(std::move(custom_plan));
     }
 
-    int64_t total_partition_loads = buffer_states.empty() ? 0 : static_cast<int64_t>(buffer_states.front().size());
+    if (allow_hybrid_cover) {
+        StateflowPlan hybrid_plan = compileHybridCoverStateflowPlan(num_partitions, buffer_capacity);
+        if (stateflow_plan_valid(hybrid_plan)) {
+            score_stateflow_plan(hybrid_plan, edge_bucket_sizes);
+            SPDLOG_INFO(
+                "Stateflow planner candidate family={} cost={:.3f} loads={} boundaries={} directed_buckets={} "
+                "estimated_bucket_edges={} overlap_hist={}",
+                planFamilyName(hybrid_plan.family), hybrid_plan.estimated_cost, hybrid_plan.total_partition_loads,
+                hybrid_plan.boundary_count, hybrid_plan.total_bucket_assignments, hybrid_plan.estimated_bucket_edges,
+                overlap_histogram_string(hybrid_plan));
+            candidates.emplace_back(std::move(hybrid_plan));
+        }
+    }
+
+    if (candidates.empty()) {
+        return StateflowPlan{};
+    }
+
+    auto best_it = std::min_element(candidates.begin(), candidates.end(), [](const StateflowPlan &lhs, const StateflowPlan &rhs) {
+        if (lhs.estimated_cost != rhs.estimated_cost) {
+            return lhs.estimated_cost < rhs.estimated_cost;
+        }
+        if (lhs.total_partition_loads != rhs.total_partition_loads) {
+            return lhs.total_partition_loads < rhs.total_partition_loads;
+        }
+        if (lhs.max_overlap != rhs.max_overlap) {
+            return lhs.max_overlap > rhs.max_overlap;
+        }
+        return static_cast<int>(lhs.family) < static_cast<int>(rhs.family);
+    });
+
+    SPDLOG_INFO("Stateflow planner selected family={} cost={:.3f} loads={} boundaries={} max_overlap={}",
+                planFamilyName(best_it->family), best_it->estimated_cost, best_it->total_partition_loads,
+                best_it->boundary_count, best_it->max_overlap);
+    return *best_it;
+}
+
+StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_states,
+                                           const vector<torch::Tensor> &edge_buckets_per_buffer,
+                                           int active_devices,
+                                           const std::vector<int64_t> &edge_bucket_sizes) {
+    if (active_devices <= 1 || buffer_states.empty() || edge_buckets_per_buffer.size() != buffer_states.size()) {
+        return StateflowPlan{};
+    }
+
+    std::vector<StateflowPlan> candidates;
+
+    auto grouped_permutation = getDisjointBufferStatePermutation(buffer_states, active_devices);
+    StateflowPlan grouped_plan =
+        build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, grouped_permutation, active_devices);
+    if (stateflow_plan_valid(grouped_plan)) {
+        score_stateflow_plan(grouped_plan, edge_bucket_sizes);
+        SPDLOG_INFO(
+            "Stateflow multi-GPU candidate policy=disjoint_rounds cost={:.3f} rounds={} loads={} boundaries={} "
+            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
+            grouped_plan.estimated_cost, grouped_plan.total_superstates, grouped_plan.total_partition_loads,
+            grouped_plan.boundary_count, grouped_plan.total_bucket_assignments, grouped_plan.estimated_bucket_edges,
+            overlap_histogram_string(grouped_plan));
+        candidates.emplace_back(std::move(grouped_plan));
+    }
+
+    auto lane_matched_permutation = getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, active_devices);
+    StateflowPlan lane_matched_plan = build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer,
+                                                                                      lane_matched_permutation, active_devices);
+    if (stateflow_plan_valid(lane_matched_plan)) {
+        score_stateflow_plan(lane_matched_plan, edge_bucket_sizes);
+        SPDLOG_INFO(
+            "Stateflow multi-GPU candidate policy=lane_matched cost={:.3f} rounds={} loads={} boundaries={} "
+            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
+            lane_matched_plan.estimated_cost, lane_matched_plan.total_superstates, lane_matched_plan.total_partition_loads,
+            lane_matched_plan.boundary_count, lane_matched_plan.total_bucket_assignments, lane_matched_plan.estimated_bucket_edges,
+            overlap_histogram_string(lane_matched_plan));
+        candidates.emplace_back(std::move(lane_matched_plan));
+    }
+
+    if (candidates.empty()) {
+        return StateflowPlan{};
+    }
+
+    auto best_it = std::min_element(candidates.begin(), candidates.end(), [](const StateflowPlan &lhs, const StateflowPlan &rhs) {
+        if (lhs.estimated_cost != rhs.estimated_cost) {
+            return lhs.estimated_cost < rhs.estimated_cost;
+        }
+        if (lhs.total_partition_loads != rhs.total_partition_loads) {
+            return lhs.total_partition_loads < rhs.total_partition_loads;
+        }
+        if (lhs.max_overlap != rhs.max_overlap) {
+            return lhs.max_overlap > rhs.max_overlap;
+        }
+        return lhs.total_superstates < rhs.total_superstates;
+    });
+
+    SPDLOG_INFO("Stateflow multi-GPU selected rounds={} cost={:.3f} loads={} boundaries={} max_overlap={} active_devices={}",
+                best_it->total_superstates, best_it->estimated_cost, best_it->total_partition_loads,
+                best_it->boundary_count, best_it->max_overlap, active_devices);
+    return *best_it;
+}
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> stateflowPlanToTensorOrdering(const StateflowPlan &plan) {
+    std::vector<std::vector<int>> buffer_states;
+    std::vector<std::vector<std::pair<int, int>>> edge_buckets_per_buffer;
+
+    std::size_t max_lane_microstates = 0;
+    for (const auto &lane : plan.lanes) {
+        max_lane_microstates = std::max(max_lane_microstates, lane.microstates.size());
+    }
+
+    for (std::size_t round_idx = 0; round_idx < max_lane_microstates; round_idx++) {
+        for (const auto &lane : plan.lanes) {
+            if (round_idx >= lane.microstates.size()) {
+                continue;
+            }
+            const auto &microstate = lane.microstates[round_idx];
+            buffer_states.emplace_back(microstate.resident_partitions);
+            edge_buckets_per_buffer.emplace_back(microstate.edge_buckets);
+        }
+    }
+
+    return convertEdgeBucketOrderToTensors(std::move(buffer_states), std::move(edge_buckets_per_buffer));
+}
+
+namespace {
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getHybridCoverEdgeBucketOrdering(int num_partitions, int buffer_capacity) {
+    StateflowPlan plan = compileHybridCoverStateflowPlan(num_partitions, buffer_capacity);
+    if (!stateflow_plan_valid(plan)) {
+        return getCustomEdgeBucketOrdering(num_partitions, buffer_capacity, false);
+    }
+
     int64_t single_partition_rotations = 0;
     int64_t boundary_rotations = 0;
-    int64_t max_overlap = 0;
-    for (std::size_t idx = 1; idx < buffer_states.size(); idx++) {
-        int overlap = state_overlap_count(buffer_states[idx - 1], buffer_states[idx]);
-        max_overlap = std::max<int64_t>(max_overlap, overlap);
-        total_partition_loads += static_cast<int64_t>(buffer_capacity - overlap);
-        if (overlap == buffer_capacity - 1) {
+    for (const auto &microstate : plan.lanes[0].microstates) {
+        if (microstate.microstate_id == 0) {
+            continue;
+        }
+        if (microstate.overlap_with_prev == plan.buffer_capacity - 1) {
             single_partition_rotations++;
         } else {
             boundary_rotations++;
@@ -1689,12 +2101,12 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getHybridCoverEdgeBucke
     }
 
     SPDLOG_INFO(
-        "Generating Hybrid-Cover Ordering: superstates={} microstates={} directed_buckets={} total_partition_loads={} "
+        "Generating {} Ordering: superstates={} microstates={} directed_buckets={} total_partition_loads={} "
         "single_partition_rotations={} boundary_rotations={} max_overlap={}",
-        superstate_count, buffer_states.size(), total_bucket_assignments, total_partition_loads, single_partition_rotations,
-        boundary_rotations, max_overlap);
+        planFamilyName(plan.family), plan.total_superstates, plan.total_microstates, plan.total_bucket_assignments,
+        plan.total_partition_loads, single_partition_rotations, boundary_rotations, plan.max_overlap);
 
-    return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
+    return stateflowPlanToTensorOrdering(plan);
 }
 
 int64_t mark_state_buckets_covered(const std::vector<int> &state,

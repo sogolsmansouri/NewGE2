@@ -1283,6 +1283,7 @@ void DataLoader::setBufferOrdering() {
             bool access_aware_state_generation = false;
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
             bool hybrid_cover_schedule_requested = parse_env_flag("GEGE_HYBRID_COVER", false);
+            bool stateflow_lane_matching_requested = parse_env_flag("GEGE_STATEFLOW_LANE_MATCHING", false);
             bool hybrid_cover_schedule_supported =
                 hybrid_cover_schedule_requested && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
                 !options->randomly_assign_edge_buckets && requested_active_devices == 1 && physical_devices == 1 &&
@@ -1296,16 +1297,26 @@ void DataLoader::setBufferOrdering() {
             std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> tup;
             bool used_optimized_custom_schedule = false;
             bool used_hybrid_cover_schedule = false;
+            bool used_stateflow_planner = false;
+            bool used_stateflow_lane_matching = false;
             if (hybrid_cover_schedule_requested && !hybrid_cover_schedule_supported) {
                 SPDLOG_WARN(
                     "Ignoring GEGE_HYBRID_COVER because it currently requires CUSTOM ordering, 1 physical/logical device, "
                     "buffer_capacity=4, no random bucket assignment, and num_partitions=3k+1");
             }
             if (hybrid_cover_schedule_supported) {
-                tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity,
-                                            options->fine_to_coarse_ratio, options->num_cache_partitions,
-                                            options->randomly_assign_edge_buckets);
-                used_hybrid_cover_schedule = true;
+                auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+                auto stateflow_plan = compileSingleGpuStateflowPlan(options->num_partitions, options->buffer_capacity,
+                                                                    options->randomly_assign_edge_buckets, edge_bucket_sizes, true);
+                if (stateflow_plan.family == PlanFamily::UNKNOWN) {
+                    tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity,
+                                                options->fine_to_coarse_ratio, options->num_cache_partitions,
+                                                options->randomly_assign_edge_buckets);
+                } else {
+                    tup = stateflowPlanToTensorOrdering(stateflow_plan);
+                    used_hybrid_cover_schedule = stateflow_plan.family == PlanFamily::HYBRID_COVER;
+                    used_stateflow_planner = true;
+                }
             } else if (access_aware_state_generation && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM) {
                 tup = getAccessAwareCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices);
                 SPDLOG_INFO("Using access-aware state generation for CUSTOM ordering with {} logical device(s)", requested_active_devices);
@@ -1324,12 +1335,6 @@ void DataLoader::setBufferOrdering() {
             }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
-            if (log_startup_timing) {
-                SPDLOG_INFO(
-                    "[startup-timing][DataLoader::setBufferOrdering] generated states={} buckets={} optimized_custom={} hybrid_cover={} access_aware_state_generation={}",
-                    buffer_states_.size(), edge_buckets_per_buffer_.size(), used_optimized_custom_schedule, used_hybrid_cover_schedule,
-                    access_aware_state_generation);
-            }
             if (!used_optimized_custom_schedule && !used_hybrid_cover_schedule && single_gpu_gpu_aware_custom_enabled() &&
                 requested_active_devices == 1 && physical_devices == 1 &&
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && !options->randomly_assign_edge_buckets &&
@@ -1400,8 +1405,31 @@ void DataLoader::setBufferOrdering() {
                                 total_shared_hotness / 1000000.0);
                 }
             }
-            if (!access_aware_state_generation && !used_optimized_custom_schedule && !used_hybrid_cover_schedule) {
+            bool stateflow_lane_matching_supported =
+                stateflow_lane_matching_requested && requested_active_devices > 1 && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
+                !options->randomly_assign_edge_buckets && !access_aware_state_generation && !used_optimized_custom_schedule &&
+                !used_hybrid_cover_schedule;
+            if (stateflow_lane_matching_supported) {
+                auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+                auto stateflow_plan =
+                    compileMultiGpuStateflowPlan(buffer_states_, edge_buckets_per_buffer_, requested_active_devices, edge_bucket_sizes);
+                if (!stateflow_plan.lanes.empty() && stateflow_plan.total_microstates > 0) {
+                    auto planned_ordering = stateflowPlanToTensorOrdering(stateflow_plan);
+                    buffer_states_ = std::get<0>(planned_ordering);
+                    edge_buckets_per_buffer_ = std::get<1>(planned_ordering);
+                    used_stateflow_planner = true;
+                    used_stateflow_lane_matching = true;
+                    SPDLOG_INFO("Using stateflow multi-GPU lane matching for {} logical device(s)", requested_active_devices);
+                }
+            }
+            if (!access_aware_state_generation && !used_optimized_custom_schedule && !used_hybrid_cover_schedule && !used_stateflow_lane_matching) {
                 reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
+            }
+            if (log_startup_timing) {
+                SPDLOG_INFO(
+                    "[startup-timing][DataLoader::setBufferOrdering] generated states={} buckets={} optimized_custom={} hybrid_cover={} stateflow_planner={} stateflow_lane_matching={} access_aware_state_generation={}",
+                    buffer_states_.size(), edge_buckets_per_buffer_.size(), used_optimized_custom_schedule, used_hybrid_cover_schedule,
+                    used_stateflow_planner, used_stateflow_lane_matching, access_aware_state_generation);
             }
             if (replay_logical_lane) {
                 if (profiled_logical_lane.value() >= requested_active_devices) {

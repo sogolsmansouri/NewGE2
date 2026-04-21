@@ -879,6 +879,7 @@ void DataLoader::resetPerfStats() {
     reset_negative_sampler_perf(negative_sampler_);
     if (graph_storage_ != nullptr) {
         graph_storage_->resetFrameCachePerfStats();
+        graph_storage_->resetPeerRelayPerfStats();
     }
 }
 
@@ -951,6 +952,7 @@ DataLoaderPerfStats DataLoader::getPerfStats() const {
         for (const auto &device_stats : stats.device_frame_cache) {
             accumulate_frame_cache_perf_stats(stats.frame_cache, device_stats);
         }
+        stats.peer_relay = graph_storage_->getPeerRelayPerfStats();
     }
     stats.device_swap_active_bucket_samples = device_swap_active_bucket_samples_;
     stats.device_swap_active_edge_samples = device_swap_active_edge_samples_;
@@ -971,6 +973,9 @@ void DataLoader::nextEpoch() {
         negative_sampler_->resetPlanCache();
     }
     buffer_states_.clear();
+    if (graph_storage_ != nullptr) {
+        graph_storage_->resetStateflowPeerRuntimeProgress();
+    }
     if (graph_storage_->useInMemorySubGraph()) {
         auto epoch_boundary_start = std::chrono::high_resolution_clock::now();
         bool keep_storage_hot = should_keep_storage_hot_between_epochs(graph_storage_, train_);
@@ -1040,21 +1045,48 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
     } else {
         active_edges = graph_storage_->storage_ptrs_.edges->range(0, graph_storage_->storage_ptrs_.edges->getDim0());
     }
+    std::string shuffle_backend = "disabled";
     bool use_device_shuffle = active_edges.defined() && !active_edges.device().is_cpu() && gpu_active_edge_shuffle_enabled();
-    auto opts = torch::TensorOptions()
-                    .dtype(torch::kInt64)
-                    .device(use_device_shuffle ? active_edges.device() : torch::Device(torch::kCPU));
-    auto perm = torch::randperm(active_edges.size(0), opts);
-    if (perm.device() != active_edges.device()) {
-        perm = perm.to(active_edges.device());
+    if (active_edges.defined() && active_edges.size(0) > 1) {
+        auto shuffle_once = [&](bool device_shuffle) {
+            auto opts = torch::TensorOptions()
+                            .dtype(torch::kInt64)
+                            .device(device_shuffle ? active_edges.device() : torch::Device(torch::kCPU));
+            auto perm = torch::randperm(active_edges.size(0), opts);
+            if (perm.device() != active_edges.device()) {
+                perm = perm.to(active_edges.device());
+            }
+            active_edges = active_edges.index_select(0, perm);
+        };
+
+#ifdef GEGE_CUDA
+        try {
+            shuffle_once(use_device_shuffle);
+            shuffle_backend = use_device_shuffle ? "device" : "cpu";
+        } catch (const c10::Error &err) {
+            std::string message = err.what();
+            bool cuda_oom = !active_edges.device().is_cpu() && message.find("out of memory") != std::string::npos;
+            if (!cuda_oom) {
+                throw;
+            }
+
+            c10::cuda::CUDACachingAllocator::emptyCache();
+            shuffle_backend = use_device_shuffle ? "device_oom_unshuffled" : "cpu_oom_unshuffled";
+            SPDLOG_WARN(
+                "Active-edge shuffle OOM on device {} for {} edges across {} active buckets; continuing without shuffle",
+                device_idx, active_edges.size(0), selection.num_active_buckets);
+        }
+#else
+        shuffle_once(use_device_shuffle);
+        shuffle_backend = use_device_shuffle ? "device" : "cpu";
+#endif
     }
-    active_edges = active_edges.index_select(0, perm);
     if (log_timing) {
         auto now = std::chrono::high_resolution_clock::now();
         shuffle_ms = elapsed_ms(phase_start, now);
         SPDLOG_INFO(
             "[partition-buffer-pipeline][setActiveEdges {}] device={} buckets={} edges={} shuffle_backend={} bucket_lookup_ms={:.3f} gather_ms={:.3f} shuffle_ms={:.3f} total_ms={:.3f}",
-            timing_id, device_idx, selection.num_active_buckets, active_edges.size(0), use_device_shuffle ? "device" : "cpu",
+            timing_id, device_idx, selection.num_active_buckets, active_edges.size(0), shuffle_backend,
             bucket_lookup_ms, gather_ms, shuffle_ms, elapsed_ms(total_start, now));
     }
     record_active_edge_state(this, device_idx, selection, active_edges.defined() ? active_edges.size(0) : 0);
@@ -1280,6 +1312,7 @@ void DataLoader::setBufferOrdering() {
                 SPDLOG_INFO("[startup-timing][DataLoader::setBufferOrdering] begin task=lp physical_devices={} requested_active_devices={}",
                             physical_devices, requested_active_devices);
             }
+            graph_storage_->clearStateflowPeerHandoffs();
             bool access_aware_state_generation = false;
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
             bool hybrid_cover_schedule_requested = parse_env_flag("GEGE_HYBRID_COVER", false);
@@ -1445,6 +1478,12 @@ void DataLoader::setBufferOrdering() {
                                                  partition_row_counts, embedding_layout);
                 if (!stateflow_plan.lanes.empty() && stateflow_plan.total_microstates > 0) {
                     auto multi_gpu_schedule = projectStateflowPlanToMultiGpuSchedule(stateflow_plan);
+                    if (static_cast<int64_t>(multi_gpu_schedule.peer_handoffs.size()) != stateflow_plan.total_cross_lane_handoffs) {
+                        throw GegeRuntimeException(fmt::format(
+                            "Stateflow peer-handoff projection mismatch: schedule={} plan={}",
+                            multi_gpu_schedule.peer_handoffs.size(), stateflow_plan.total_cross_lane_handoffs));
+                    }
+                    graph_storage_->setStateflowPeerHandoffs(multi_gpu_schedule.peer_handoffs);
                     for (const auto &handoff : multi_gpu_schedule.peer_handoffs) {
                         SPDLOG_INFO(
                             "[stateflow] round={} peer_handoff src_lane={} dst_lane={} src_state={} dst_state={} partition={} bytes={} slot_mapping=({}->{})",

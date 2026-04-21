@@ -76,6 +76,49 @@ bool partition_buffer_peer_relay_enabled() {
     return enabled;
 }
 
+enum class StateflowPeerRuntimeMode {
+    AUTO = 0,
+    ON = 1,
+    OFF = 2,
+};
+
+StateflowPeerRuntimeMode stateflow_peer_runtime_mode() {
+    static StateflowPeerRuntimeMode mode = []() {
+        const char *raw = std::getenv("GEGE_STATEFLOW_PEER_RUNTIME");
+        if (raw == nullptr) {
+            return StateflowPeerRuntimeMode::AUTO;
+        }
+        std::string value(raw);
+        if (value == "off" || value == "OFF" || value == "Off" || value == "0") {
+            return StateflowPeerRuntimeMode::OFF;
+        }
+        if (value == "on" || value == "ON" || value == "On" || value == "1") {
+            return StateflowPeerRuntimeMode::ON;
+        }
+        return StateflowPeerRuntimeMode::AUTO;
+    }();
+    return mode;
+}
+
+const char *stateflow_peer_runtime_mode_name(StateflowPeerRuntimeMode mode) {
+    switch (mode) {
+        case StateflowPeerRuntimeMode::AUTO:
+            return "auto";
+        case StateflowPeerRuntimeMode::ON:
+            return "on";
+        case StateflowPeerRuntimeMode::OFF:
+            return "off";
+    }
+    return "auto";
+}
+
+int64_t peer_handoff_lookup_key(int64_t round_idx, int partition_id) {
+    constexpr uint64_t kRoundMix = 0x9E3779B185EBCA87ULL;
+    uint64_t round_bits = static_cast<uint64_t>(round_idx);
+    uint64_t partition_bits = static_cast<uint32_t>(partition_id);
+    return static_cast<int64_t>((round_bits * kRoundMix) ^ partition_bits);
+}
+
 bool startup_timing_enabled() {
     static bool enabled = parse_env_flag("GEGE_STARTUP_TIMING", false);
     return enabled;
@@ -475,9 +518,19 @@ MemPartitionBufferStorage::MemPartitionBufferStorage(string filename, int64_t di
     initialized_ = true;
     loaded_ = false;
     peer_relay_runtime_enabled_ = false;
+    peer_relay_init_attempted_ = false;
     int64_t partition_size = ceil((double)dim0_size_ / options_->num_partitions);
     device_ = torch::kCUDA;
     devices_ = devices;
+    stateflow_peer_handoff_index_per_device_.resize(devices_.size());
+    stateflow_transition_counts_.assign(devices_.size(), 0);
+    device_peer_bytes_executed_.assign(devices_.size(), 0);
+    device_host_fallback_bytes_.assign(devices_.size(), 0);
+    device_peer_copy_count_.assign(devices_.size(), 0);
+    device_host_fallback_count_.assign(devices_.size(), 0);
+    device_descriptor_mismatch_count_.assign(devices_.size(), 0);
+    device_peer_sync_wait_ns_.assign(devices_.size(), 0);
+    stateflow_peer_mismatch_warned_keys_.resize(devices_.size());
     bool log_startup_timing = startup_timing_enabled();
     if (log_startup_timing) {
         SPDLOG_INFO("[startup-timing][MemPartitionBufferStorage::ctor] begin filename={} dim0={} dim1={} devices={} partition_size={} capacity={}",
@@ -499,35 +552,132 @@ MemPartitionBufferStorage::MemPartitionBufferStorage(string filename, int64_t di
     }
 }
 
+void MemPartitionBufferStorage::setStateflowPeerHandoffs(const std::vector<PeerHandoffDescriptor> &peer_handoffs) {
+    bool buffers_loaded = std::any_of(buffers_.begin(), buffers_.end(), [](const MemPartitionBuffer *buffer) { return buffer->loaded_; });
+    if (buffers_loaded) {
+        throw GegeRuntimeException(
+            "MemPartitionBufferStorage::setStateflowPeerHandoffs does not support mid-training schedule updates after buffers are loaded");
+    }
+
+    for (auto &index : stateflow_peer_handoff_index_per_device_) {
+        index.clear();
+    }
+    stateflow_peer_schedule_active_ = !peer_handoffs.empty();
+    resetStateflowTransitionCounts();
+
+    for (const auto &handoff : peer_handoffs) {
+        if (handoff.dst_lane_id < 0 || static_cast<std::size_t>(handoff.dst_lane_id) >= stateflow_peer_handoff_index_per_device_.size()) {
+            throw GegeRuntimeException(fmt::format("Stateflow peer handoff has invalid dst_lane_id={}", handoff.dst_lane_id));
+        }
+        if (handoff.round_idx < 0 || handoff.partition_id < 0) {
+            throw GegeRuntimeException("Stateflow peer handoff is missing round_idx or partition_id");
+        }
+        int64_t key = peer_handoff_lookup_key(handoff.round_idx, handoff.partition_id);
+        auto &index = stateflow_peer_handoff_index_per_device_[handoff.dst_lane_id];
+        if (!index.emplace(key, handoff).second) {
+            throw GegeRuntimeException(fmt::format(
+                "Duplicate Stateflow peer handoff for dst_lane={} round={} partition={}",
+                handoff.dst_lane_id, handoff.round_idx, handoff.partition_id));
+        }
+    }
+
+    resetPeerRelayPerfStats();
+    std::lock_guard<std::mutex> lock(peer_relay_init_lock_);
+    peer_relay_init_attempted_ = false;
+    peer_relay_runtime_enabled_ = false;
+}
+
+PeerRelayPerfStats MemPartitionBufferStorage::getPeerRelayPerfStats() const {
+    PeerRelayPerfStats stats;
+    stats.device_peer_bytes_executed = device_peer_bytes_executed_;
+    stats.device_host_fallback_bytes = device_host_fallback_bytes_;
+    stats.device_peer_copy_count = device_peer_copy_count_;
+    stats.device_host_fallback_count = device_host_fallback_count_;
+    stats.device_descriptor_mismatch_count = device_descriptor_mismatch_count_;
+    stats.device_peer_sync_wait_ns = device_peer_sync_wait_ns_;
+    for (std::size_t idx = 0; idx < device_peer_bytes_executed_.size(); idx++) {
+        stats.peer_bytes_executed += device_peer_bytes_executed_[idx];
+        stats.host_fallback_bytes += idx < device_host_fallback_bytes_.size() ? device_host_fallback_bytes_[idx] : 0;
+        stats.peer_copy_count += idx < device_peer_copy_count_.size() ? device_peer_copy_count_[idx] : 0;
+        stats.host_fallback_count += idx < device_host_fallback_count_.size() ? device_host_fallback_count_[idx] : 0;
+        stats.descriptor_mismatch_count += idx < device_descriptor_mismatch_count_.size() ? device_descriptor_mismatch_count_[idx] : 0;
+        stats.peer_sync_wait_ns += idx < device_peer_sync_wait_ns_.size() ? device_peer_sync_wait_ns_[idx] : 0;
+    }
+    return stats;
+}
+
+void MemPartitionBufferStorage::resetPeerRelayPerfStats() {
+    std::fill(device_peer_bytes_executed_.begin(), device_peer_bytes_executed_.end(), 0);
+    std::fill(device_host_fallback_bytes_.begin(), device_host_fallback_bytes_.end(), 0);
+    std::fill(device_peer_copy_count_.begin(), device_peer_copy_count_.end(), 0);
+    std::fill(device_host_fallback_count_.begin(), device_host_fallback_count_.end(), 0);
+    std::fill(device_descriptor_mismatch_count_.begin(), device_descriptor_mismatch_count_.end(), 0);
+    std::fill(device_peer_sync_wait_ns_.begin(), device_peer_sync_wait_ns_.end(), 0);
+    for (auto &warned_keys : stateflow_peer_mismatch_warned_keys_) {
+        warned_keys.clear();
+    }
+}
+
+void MemPartitionBufferStorage::resetStateflowTransitionCounts() {
+    std::fill(stateflow_transition_counts_.begin(), stateflow_transition_counts_.end(), 0);
+}
+
 void MemPartitionBufferStorage::initializePeerRelay_() {
     peer_relay_runtime_enabled_ = false;
+    peer_relay_ready_barrier_.reset();
+    peer_relay_build_barrier_.reset();
+    peer_relay_next_states_.clear();
+    peer_relay_staged_views_.clear();
 
-    if (!partition_buffer_peer_relay_enabled()) {
+    StateflowPeerRuntimeMode stateflow_mode = stateflow_peer_runtime_mode();
+    bool stateflow_runtime_requested = stateflow_peer_schedule_active_ && stateflow_mode != StateflowPeerRuntimeMode::OFF;
+    bool low_level_runtime_requested = partition_buffer_peer_relay_enabled();
+    bool force_peer_runtime = stateflow_peer_schedule_active_ && stateflow_mode == StateflowPeerRuntimeMode::ON;
+
+    auto fail_or_fallback = [&](const std::string &message, bool warn = true) {
+#if defined(GEGE_CUDA)
+        // Clear any sticky CUDA runtime status before falling back so later
+        // unrelated launch checks do not observe stale peer-relay failures.
+        cudaGetLastError();
+#endif
+        if (force_peer_runtime) {
+            throw GegeRuntimeException(message);
+        }
+        if (warn) {
+            SPDLOG_WARN("{}", message);
+        } else {
+            SPDLOG_INFO("{}", message);
+        }
+    };
+
+    if (!low_level_runtime_requested && !stateflow_runtime_requested) {
         return;
     }
 
 #if !defined(GEGE_CUDA)
-    SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY requested but GEGE_CUDA is not enabled; falling back to CPU-backed swaps");
+    fail_or_fallback("Stateflow/partition peer relay requested but GEGE_CUDA is not enabled; falling back to CPU-backed swaps");
     return;
 #else
     if (devices_.size() <= 1) {
-        SPDLOG_INFO("GEGE_PARTITION_BUFFER_PEER_RELAY requested but only {} physical CUDA device is active; falling back to CPU-backed swaps", devices_.size());
+        fail_or_fallback(fmt::format("Stateflow/partition peer relay requested but only {} physical CUDA device is active; falling back to CPU-backed swaps",
+                                     devices_.size()),
+                         false);
         return;
     }
 
     if (options_ != nullptr && options_->prefetching) {
-        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY does not support partition prefetching; falling back to CPU-backed swaps");
+        fail_or_fallback("Stateflow/partition peer relay does not support partition prefetching; falling back to CPU-backed swaps");
         return;
     }
 
     if (options_ != nullptr && options_->edge_bucket_ordering != EdgeBucketOrdering::CUSTOM) {
-        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY currently supports CUSTOM edge-bucket ordering only; falling back to CPU-backed swaps");
+        fail_or_fallback("Stateflow/partition peer relay currently supports CUSTOM edge-bucket ordering only; falling back to CPU-backed swaps");
         return;
     }
 
     for (std::size_t src = 0; src < devices_.size(); src++) {
         if (!devices_[src].is_cuda()) {
-            SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY requires CUDA devices only; falling back to CPU-backed swaps");
+            fail_or_fallback("Stateflow/partition peer relay requires CUDA devices only; falling back to CPU-backed swaps");
             return;
         }
         for (std::size_t dst = 0; dst < devices_.size(); dst++) {
@@ -537,8 +687,8 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
             int can_access = 0;
             cudaError_t status = cudaDeviceCanAccessPeer(&can_access, devices_[src].index(), devices_[dst].index());
             if (status != cudaSuccess || can_access == 0) {
-                SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: CUDA peer access unavailable between device {} and {}",
-                            devices_[src].index(), devices_[dst].index());
+                fail_or_fallback(fmt::format("Stateflow/partition peer relay disabled: CUDA peer access unavailable between device {} and {}",
+                                             devices_[src].index(), devices_[dst].index()));
                 return;
             }
         }
@@ -560,8 +710,8 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
                 continue;
             }
             if (status != cudaSuccess) {
-                SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: failed to enable peer access from device {} to {} ({})",
-                            devices_[src].index(), devices_[dst].index(), cudaGetErrorString(status));
+                fail_or_fallback(fmt::format("Stateflow/partition peer relay disabled: failed to enable peer access from device {} to {} ({})",
+                                             devices_[src].index(), devices_[dst].index(), cudaGetErrorString(status)));
                 return;
             }
         }
@@ -587,18 +737,25 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
         peer_relay_next_states_.clear();
         peer_relay_staged_views_.clear();
         cudaGetLastError();
-        SPDLOG_WARN("GEGE_PARTITION_BUFFER_PEER_RELAY disabled: unable to reserve relay staging buffers; falling back to CPU-backed swaps ({})",
-                    e.what());
+        fail_or_fallback(fmt::format(
+            "Stateflow/partition peer relay disabled: unable to reserve relay staging buffers; falling back to CPU-backed swaps ({})",
+            e.what()));
         return;
     }
 
     peer_relay_runtime_enabled_ = true;
-    SPDLOG_INFO("Enabled GEGE_PARTITION_BUFFER_PEER_RELAY for {} CUDA devices; CPU backing store will be synchronized at unload/eval boundaries", devices_.size());
+    SPDLOG_INFO(
+        "Enabled peer relay runtime for {} CUDA devices (stateflow_schedule_active={} stateflow_mode={} low_level_requested={}); CPU backing store will be synchronized at unload/eval boundaries",
+        devices_.size(), stateflow_peer_schedule_active_, stateflow_peer_runtime_mode_name(stateflow_mode), low_level_runtime_requested);
 #endif
 }
 
 bool MemPartitionBufferStorage::peerRelayEnabled_() {
-    std::call_once(peer_relay_init_once_, [this]() { initializePeerRelay_(); });
+    std::lock_guard<std::mutex> lock(peer_relay_init_lock_);
+    if (!peer_relay_init_attempted_) {
+        peer_relay_init_attempted_ = true;
+        initializePeerRelay_();
+    }
     return peer_relay_runtime_enabled_;
 }
 
@@ -778,10 +935,8 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
 
     {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
-        cudaDeviceSynchronize();
+        peer_relay_next_states_[device_idx] = (*buffer->buffer_state_iterator_).clone();
     }
-
-    peer_relay_next_states_[device_idx] = (*buffer->buffer_state_iterator_).clone();
     peer_relay_ready_barrier_->arrive_and_wait();
 
     std::vector<int> current_owner(options_->num_partitions, -1);
@@ -810,6 +965,13 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
     if (!staged_view.defined()) {
         throw GegeRuntimeException("Peer relay staging buffer is undefined after successful initialization");
     }
+    bool stateflow_runtime_controlling =
+        stateflow_peer_schedule_active_ && stateflow_peer_runtime_mode() != StateflowPeerRuntimeMode::OFF &&
+        device_idx >= 0 && static_cast<std::size_t>(device_idx) < stateflow_peer_handoff_index_per_device_.size();
+    int64_t transition_round_idx =
+        stateflow_runtime_controlling && static_cast<std::size_t>(device_idx) < stateflow_transition_counts_.size()
+            ? stateflow_transition_counts_[device_idx] + 1
+            : -1;
 
     auto load_partition_from_host = [&](Partition *partition, const torch::Tensor &cpu_view) {
         if (!buffer->pos_.defined()) {
@@ -833,8 +995,18 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         c10::cuda::CUDAGuard device_guard(buffer->device_);
         auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
         c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
+        if (swap_ready_event != 0) {
+            auto ready_event = reinterpret_cast<cudaEvent_t>(swap_ready_event);
+            AT_CUDA_CHECK(cudaStreamWaitEvent(comm_stream.stream(), ready_event, 0));
+        }
         std::vector<std::tuple<int, int, int64_t, int64_t>> relay_debug_slots;
         std::vector<int> host_evict_ids;
+        int64_t peer_bytes_executed = 0;
+        int64_t host_fallback_bytes = 0;
+        int64_t peer_copy_count = 0;
+        int64_t host_fallback_count = 0;
+        int64_t descriptor_mismatch_count = 0;
+        bool submitted_peer_copy = false;
 
         auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
         for (int64_t slot = 0; slot < previous_state.numel(); slot++) {
@@ -871,10 +1043,52 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             int64_t rows = dst_partition->partition_size_;
             int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
             int64_t dst_offset = slot * buffer->partition_size_;
+            int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
+            const PeerHandoffDescriptor *scheduled_handoff = nullptr;
+            if (stateflow_runtime_controlling) {
+                auto handoff_it = stateflow_peer_handoff_index_per_device_[device_idx].find(handoff_key);
+                if (handoff_it != stateflow_peer_handoff_index_per_device_[device_idx].end()) {
+                    scheduled_handoff = &handoff_it->second;
+                }
+            }
             if (src_dev >= 0) {
                 auto *src_buffer = buffers_[src_dev];
                 Partition *src_partition = src_buffer->partition_table_[partition_id];
                 int64_t src_slot = src_partition->buffer_idx_;
+                bool use_peer_copy = true;
+                if (src_dev != device_idx && stateflow_runtime_controlling) {
+                    bool handoff_matches =
+                        scheduled_handoff != nullptr && scheduled_handoff->src_lane_id == src_dev &&
+                        scheduled_handoff->dst_lane_id == device_idx && scheduled_handoff->src_slot_id == src_slot &&
+                        scheduled_handoff->dst_slot_id == slot;
+                    if (!handoff_matches) {
+                        use_peer_copy = false;
+                        descriptor_mismatch_count += 1;
+                        if (device_idx >= 0 &&
+                            static_cast<std::size_t>(device_idx) < stateflow_peer_mismatch_warned_keys_.size() &&
+                            stateflow_peer_mismatch_warned_keys_[device_idx].emplace(handoff_key).second) {
+                            if (scheduled_handoff == nullptr) {
+                                SPDLOG_WARN(
+                                    "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because no descriptor matched the runtime source lane/slot (actual src_lane={} src_slot={} dst_slot={})",
+                                    device_idx, transition_round_idx, partition_id, src_dev, src_slot, slot);
+                            } else {
+                                SPDLOG_WARN(
+                                    "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected descriptor does not match the runtime source lane/slot (expected src_lane={} src_slot={} dst_slot={}, actual src_lane={} src_slot={} dst_slot={})",
+                                    device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id,
+                                    scheduled_handoff->src_slot_id, scheduled_handoff->dst_slot_id, src_dev, src_slot, slot);
+                            }
+                        }
+                    }
+                }
+                if (!use_peer_copy) {
+                    torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
+                    load_partition_from_host(dst_partition, cpu_view);
+                    torch::Tensor gpu_view = staged_view.slice(0, dst_offset, dst_offset + rows);
+                    gpu_view.copy_(cpu_view, true);
+                    host_fallback_bytes += bytes;
+                    host_fallback_count += 1;
+                    continue;
+                }
 
                 void *dst_ptr = static_cast<char *>(staged_view.data_ptr()) + (dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
                 void *src_ptr = static_cast<char *>(src_buffer->buffer_tensor_gpu_view_.data_ptr()) +
@@ -892,10 +1106,27 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                                                           partition_id, src_buffer->device_.index(), buffer->device_.index(),
                                                           cudaGetErrorString(status)));
                 }
+                if (src_dev != device_idx) {
+                    submitted_peer_copy = true;
+                    peer_bytes_executed += bytes;
+                    peer_copy_count += 1;
+                }
                 if (eval_finite_debug_enabled()) {
                     relay_debug_slots.emplace_back(partition_id, src_dev, src_slot, slot);
                 }
                 continue;
+            }
+
+            if (stateflow_runtime_controlling && scheduled_handoff != nullptr) {
+                descriptor_mismatch_count += 1;
+                if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < stateflow_peer_mismatch_warned_keys_.size() &&
+                    stateflow_peer_mismatch_warned_keys_[device_idx].emplace(handoff_key).second) {
+                    SPDLOG_WARN(
+                        "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected source lane={} is not resident at runtime",
+                        device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id);
+                }
+                host_fallback_bytes += bytes;
+                host_fallback_count += 1;
             }
 
             torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
@@ -904,7 +1135,19 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             gpu_view.copy_(cpu_view, true);
         }
 
+        auto peer_sync_start = std::chrono::high_resolution_clock::now();
         cudaStreamSynchronize(comm_stream.stream());
+        if (submitted_peer_copy && device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_peer_sync_wait_ns_.size()) {
+            device_peer_sync_wait_ns_[device_idx] +=
+                std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - peer_sync_start).count();
+        }
+        if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_peer_bytes_executed_.size()) {
+            device_peer_bytes_executed_[device_idx] += peer_bytes_executed;
+            device_host_fallback_bytes_[device_idx] += host_fallback_bytes;
+            device_peer_copy_count_[device_idx] += peer_copy_count;
+            device_host_fallback_count_[device_idx] += host_fallback_count;
+            device_descriptor_mismatch_count_[device_idx] += descriptor_mismatch_count;
+        }
 
         if (eval_finite_debug_enabled()) {
             for (const auto &[partition_id, src_dev, src_slot, dst_slot] : relay_debug_slots) {
@@ -955,6 +1198,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
     }
     buffer->size_.store(num_rows);
     buffer->loaded_ = true;
+    if (stateflow_runtime_controlling && device_idx >= 0 && static_cast<std::size_t>(device_idx) < stateflow_transition_counts_.size()) {
+        stateflow_transition_counts_[device_idx] = transition_round_idx;
+    }
 #endif
 }
 

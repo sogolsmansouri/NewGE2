@@ -776,6 +776,14 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             ns_to_ms(sum_member(device_timings, &DeviceEpochTiming::finalize_region_ns)),
             perf_stats.swap_count, ns_to_ms(perf_stats.swap_barrier_wait_ns), ns_to_ms(perf_stats.swap_update_ns), ns_to_ms(perf_stats.swap_rebuild_ns),
             ns_to_ms(perf_stats.swap_sync_wait_ns));
+        if (perf_stats.peer_relay.peer_bytes_executed > 0 || perf_stats.peer_relay.host_fallback_bytes > 0) {
+            SPDLOG_INFO(
+                "[perf][epoch {}][peer_relay] peer_bytes_executed={} host_bytes_saved={} host_fallback_bytes={} peer_copy_count={} host_fallback_count={} descriptor_mismatch_count={} peer_sync_wait_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), perf_stats.peer_relay.peer_bytes_executed, perf_stats.peer_relay.peer_bytes_executed,
+                perf_stats.peer_relay.host_fallback_bytes, perf_stats.peer_relay.peer_copy_count, perf_stats.peer_relay.host_fallback_count,
+                perf_stats.peer_relay.descriptor_mismatch_count,
+                ns_to_ms(perf_stats.peer_relay.peer_sync_wait_ns));
+        }
         SPDLOG_INFO(
             "[perf][epoch {}][batch_fetch] total_ms={:.3f} get_next_batch_ms={:.3f} get_next_direct_ms={:.3f} get_next_swap_path_ms={:.3f} get_next_swap_overhead_ms={:.3f} edge_sample_ms={:.3f} node_sample_ms={:.3f} load_cpu_parameters_ms={:.3f} device_prepare_ms={:.3f} perform_map_ms={:.3f} overhead_ms={:.3f}",
             dataloader_->getEpochsProcessed(), ns_to_ms(sum_member(device_timings, &DeviceEpochTiming::batch_fetch_region_ns)),
@@ -974,6 +982,18 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                         format_ms_vector(perf_stats.device_swap_rebuild_ns));
             SPDLOG_INFO("[perf][epoch {}][device] swap_sync_wait_ms={}", dataloader_->getEpochsProcessed(),
                         format_ms_vector(perf_stats.device_swap_sync_wait_ns));
+            if (!perf_stats.peer_relay.device_peer_bytes_executed.empty()) {
+                SPDLOG_INFO("[perf][epoch {}][device] peer_bytes_executed={}", dataloader_->getEpochsProcessed(),
+                            format_vector(perf_stats.peer_relay.device_peer_bytes_executed));
+                SPDLOG_INFO("[perf][epoch {}][device] host_fallback_bytes={}", dataloader_->getEpochsProcessed(),
+                            format_vector(perf_stats.peer_relay.device_host_fallback_bytes));
+                if (!perf_stats.peer_relay.device_descriptor_mismatch_count.empty()) {
+                    SPDLOG_INFO("[perf][epoch {}][device] descriptor_mismatch_count={}", dataloader_->getEpochsProcessed(),
+                                format_vector(perf_stats.peer_relay.device_descriptor_mismatch_count));
+                }
+                SPDLOG_INFO("[perf][epoch {}][device] peer_sync_wait_ms={}", dataloader_->getEpochsProcessed(),
+                            format_ms_vector(perf_stats.peer_relay.device_peer_sync_wait_ns));
+            }
             SPDLOG_INFO(
                 "[perf][epoch {}][spread] swap_barrier_wait_ms={:.3f} swap_update_ms={:.3f} swap_rebuild_ms={:.3f} swap_sync_wait_ms={:.3f}",
                 dataloader_->getEpochsProcessed(), spread_ms(perf_stats.device_swap_barrier_wait_ns),

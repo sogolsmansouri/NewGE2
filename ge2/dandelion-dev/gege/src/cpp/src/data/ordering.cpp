@@ -2378,7 +2378,6 @@ void populate_cross_lane_handoffs(StateflowPlan &plan,
 
                 const LanePlan *src_lane = nullptr;
                 const MicrostatePlan *src_microstate = nullptr;
-                int64_t best_peer_bytes = -1;
                 for (const auto &other_lane : plan.lanes) {
                     if (other_lane.lane_id == lane.lane_id) {
                         continue;
@@ -2391,15 +2390,12 @@ void populate_cross_lane_handoffs(StateflowPlan &plan,
                         candidate_src->resident_partitions.end()) {
                         continue;
                     }
-                    int64_t candidate_peer_bytes = partition_transfer_bytes(partition_id, partition_row_counts, bytes_per_row);
-                    bool better_source = candidate_peer_bytes > best_peer_bytes;
-                    if (!better_source && candidate_peer_bytes == best_peer_bytes && src_lane != nullptr) {
-                        better_source = other_lane.lane_id < src_lane->lane_id;
-                    }
-                    if (better_source || src_lane == nullptr) {
+                    // All candidate sources relay the same partition payload, so
+                    // source selection is a deterministic lane-id tiebreak.
+                    bool better_source = src_lane == nullptr || other_lane.lane_id < src_lane->lane_id;
+                    if (better_source) {
                         src_lane = &other_lane;
                         src_microstate = candidate_src;
-                        best_peer_bytes = candidate_peer_bytes;
                     }
                 }
 

@@ -9,9 +9,11 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
 
 #include "common/datatypes.h"
 #include "data/batch.h"
+#include "data/ordering.h"
 #include "storage/buffer.h"
 
 using std::list;
@@ -111,6 +113,21 @@ class ReusableBarrier {
     std::condition_variable cv_;
 };
 
+struct PeerRelayPerfStats {
+    int64_t peer_bytes_executed = 0;
+    int64_t host_fallback_bytes = 0;
+    int64_t peer_copy_count = 0;
+    int64_t host_fallback_count = 0;
+    int64_t descriptor_mismatch_count = 0;
+    int64_t peer_sync_wait_ns = 0;
+    std::vector<int64_t> device_peer_bytes_executed;
+    std::vector<int64_t> device_host_fallback_bytes;
+    std::vector<int64_t> device_peer_copy_count;
+    std::vector<int64_t> device_host_fallback_count;
+    std::vector<int64_t> device_descriptor_mismatch_count;
+    std::vector<int64_t> device_peer_sync_wait_ns;
+};
+
 
 class MemPartitionBufferStorage : public Storage {
    public:
@@ -177,7 +194,18 @@ class MemPartitionBufferStorage : public Storage {
         for (int i = 0; i < devices_.size(); i ++) {
             buffers_[i]->setBufferOrdering(buffer_states); 
         }
+        std::fill(stateflow_transition_counts_.begin(), stateflow_transition_counts_.end(), 0);
     }
+
+    void setStateflowPeerHandoffs(const std::vector<PeerHandoffDescriptor> &peer_handoffs);
+
+    void clearStateflowPeerHandoffs() { setStateflowPeerHandoffs({}); }
+
+    PeerRelayPerfStats getPeerRelayPerfStats() const;
+
+    void resetPeerRelayPerfStats();
+
+    void resetStateflowTransitionCounts();
 
     void rePartition(torch::Tensor perm, torch::Tensor pos) {
         for(int i = 0; i < devices_.size(); i ++) {
@@ -212,11 +240,22 @@ class MemPartitionBufferStorage : public Storage {
    private:
     int fd_;
     bool peer_relay_runtime_enabled_;
-    std::once_flag peer_relay_init_once_;
+    std::mutex peer_relay_init_lock_;
+    bool peer_relay_init_attempted_;
     std::unique_ptr<ReusableBarrier> peer_relay_ready_barrier_;
     std::unique_ptr<ReusableBarrier> peer_relay_build_barrier_;
     std::vector<torch::Tensor> peer_relay_next_states_;
     std::vector<torch::Tensor> peer_relay_staged_views_;
+    bool stateflow_peer_schedule_active_ = false;
+    std::vector<std::unordered_map<int64_t, PeerHandoffDescriptor>> stateflow_peer_handoff_index_per_device_;
+    std::vector<int64_t> stateflow_transition_counts_;
+    std::vector<int64_t> device_peer_bytes_executed_;
+    std::vector<int64_t> device_host_fallback_bytes_;
+    std::vector<int64_t> device_peer_copy_count_;
+    std::vector<int64_t> device_host_fallback_count_;
+    std::vector<int64_t> device_descriptor_mismatch_count_;
+    std::vector<int64_t> device_peer_sync_wait_ns_;
+    std::vector<std::unordered_set<int64_t>> stateflow_peer_mismatch_warned_keys_;
     void ensureHostLoaded_();
     void initializePeerRelay_();
     bool peerRelayEnabled_();

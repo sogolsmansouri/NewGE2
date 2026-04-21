@@ -248,6 +248,98 @@ class GraphModelStorage {
         }
     }
 
+    void setStateflowPeerHandoffs(const std::vector<PeerHandoffDescriptor> &peer_handoffs) {
+        auto configure_storage = [&](const shared_ptr<Storage> &storage) {
+            if (storage != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage)) {
+                std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage)->setStateflowPeerHandoffs(peer_handoffs);
+            }
+        };
+        configure_storage(storage_ptrs_.node_embeddings);
+        if (train_) {
+            configure_storage(storage_ptrs_.node_optimizer_state);
+        }
+        configure_storage(storage_ptrs_.node_embeddings_g);
+        if (train_) {
+            configure_storage(storage_ptrs_.node_optimizer_state_g);
+        }
+    }
+
+    void clearStateflowPeerHandoffs() { setStateflowPeerHandoffs({}); }
+
+    void resetPeerRelayPerfStats() {
+        auto reset_storage = [&](const shared_ptr<Storage> &storage) {
+            if (storage != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage)) {
+                std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage)->resetPeerRelayPerfStats();
+            }
+        };
+        reset_storage(storage_ptrs_.node_embeddings);
+        if (train_) {
+            reset_storage(storage_ptrs_.node_optimizer_state);
+        }
+        reset_storage(storage_ptrs_.node_embeddings_g);
+        if (train_) {
+            reset_storage(storage_ptrs_.node_optimizer_state_g);
+        }
+    }
+
+    void resetStateflowPeerRuntimeProgress() {
+        auto reset_storage = [&](const shared_ptr<Storage> &storage) {
+            if (storage != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage)) {
+                std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage)->resetStateflowTransitionCounts();
+            }
+        };
+        reset_storage(storage_ptrs_.node_embeddings);
+        if (train_) {
+            reset_storage(storage_ptrs_.node_optimizer_state);
+        }
+        reset_storage(storage_ptrs_.node_embeddings_g);
+        if (train_) {
+            reset_storage(storage_ptrs_.node_optimizer_state_g);
+        }
+    }
+
+    PeerRelayPerfStats getPeerRelayPerfStats() const {
+        PeerRelayPerfStats stats;
+        auto accumulate_storage = [&](const shared_ptr<Storage> &storage) {
+            if (storage == nullptr || !instance_of<Storage, MemPartitionBufferStorage>(storage)) {
+                return;
+            }
+            auto current = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage)->getPeerRelayPerfStats();
+            auto accumulate_vector = [](std::vector<int64_t> &dst, const std::vector<int64_t> &src) {
+                if (src.empty()) {
+                    return;
+                }
+                if (dst.size() < src.size()) {
+                    dst.resize(src.size(), 0);
+                }
+                for (std::size_t idx = 0; idx < src.size(); idx++) {
+                    dst[idx] += src[idx];
+                }
+            };
+            stats.peer_bytes_executed += current.peer_bytes_executed;
+            stats.host_fallback_bytes += current.host_fallback_bytes;
+            stats.peer_copy_count += current.peer_copy_count;
+            stats.host_fallback_count += current.host_fallback_count;
+            stats.descriptor_mismatch_count += current.descriptor_mismatch_count;
+            stats.peer_sync_wait_ns += current.peer_sync_wait_ns;
+            accumulate_vector(stats.device_peer_bytes_executed, current.device_peer_bytes_executed);
+            accumulate_vector(stats.device_host_fallback_bytes, current.device_host_fallback_bytes);
+            accumulate_vector(stats.device_peer_copy_count, current.device_peer_copy_count);
+            accumulate_vector(stats.device_host_fallback_count, current.device_host_fallback_count);
+            accumulate_vector(stats.device_descriptor_mismatch_count, current.device_descriptor_mismatch_count);
+            accumulate_vector(stats.device_peer_sync_wait_ns, current.device_peer_sync_wait_ns);
+        };
+        accumulate_storage(storage_ptrs_.node_embeddings);
+        if (train_) {
+            accumulate_storage(storage_ptrs_.node_optimizer_state);
+        }
+        accumulate_storage(storage_ptrs_.node_embeddings_g);
+        if (train_) {
+            accumulate_storage(storage_ptrs_.node_optimizer_state_g);
+        }
+        return stats;
+    }
+
     FrameCachePerfStats getFrameCachePerfStats(int32_t device_idx = 0) const {
         if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
             return std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->getFrameCachePerfStats(device_idx);

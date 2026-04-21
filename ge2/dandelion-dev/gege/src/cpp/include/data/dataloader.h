@@ -58,6 +58,7 @@ struct DataLoaderPerfStats {
     int64_t get_batch_overhead_ns = 0;
     NegativeSamplerPerfStats negative_sampler;
     FrameCachePerfStats frame_cache;
+    PeerRelayPerfStats peer_relay;
     std::vector<int64_t> device_swap_barrier_wait_ns;
     std::vector<int64_t> device_swap_update_ns;
     std::vector<int64_t> device_swap_rebuild_ns;

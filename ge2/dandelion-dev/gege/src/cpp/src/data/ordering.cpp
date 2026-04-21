@@ -1914,15 +1914,26 @@ int64_t count_uncovered_buckets_for_state(const std::vector<int> &state,
 }
 
 int state_overlap_count(const std::vector<int> &lhs, const std::vector<int> &rhs) {
+    if (lhs.empty() || rhs.empty()) {
+        return 0;
+    }
+
+    // Some planner paths preserve slot order from tensors rather than sorting resident partitions.
+    // Overlap accounting is set-based, so normalize locally instead of assuming sorted inputs.
+    std::vector<int> lhs_sorted(lhs.begin(), lhs.end());
+    std::vector<int> rhs_sorted(rhs.begin(), rhs.end());
+    std::sort(lhs_sorted.begin(), lhs_sorted.end());
+    std::sort(rhs_sorted.begin(), rhs_sorted.end());
+
     int overlap = 0;
     std::size_t lhs_idx = 0;
     std::size_t rhs_idx = 0;
-    while (lhs_idx < lhs.size() && rhs_idx < rhs.size()) {
-        if (lhs[lhs_idx] == rhs[rhs_idx]) {
+    while (lhs_idx < lhs_sorted.size() && rhs_idx < rhs_sorted.size()) {
+        if (lhs_sorted[lhs_idx] == rhs_sorted[rhs_idx]) {
             overlap++;
             lhs_idx++;
             rhs_idx++;
-        } else if (lhs[lhs_idx] < rhs[rhs_idx]) {
+        } else if (lhs_sorted[lhs_idx] < rhs_sorted[rhs_idx]) {
             lhs_idx++;
         } else {
             rhs_idx++;

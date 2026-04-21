@@ -207,6 +207,8 @@ class MemPartitionBufferStorage : public Storage {
 
     void resetStateflowTransitionCounts();
 
+    bool peerRelayRuntimeEnabled() { return peerRelayEnabled_(); }
+
     void rePartition(torch::Tensor perm, torch::Tensor pos) {
         for(int i = 0; i < devices_.size(); i ++) {
             buffers_[i]->setPermutation(perm, pos);

@@ -1196,9 +1196,12 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         partition->data_ptr_ = nullptr;
     }
 
-    torch::Tensor previous_gpu_view = buffer->buffer_tensor_gpu_view_;
-    buffer->buffer_tensor_gpu_view_ = peer_relay_staged_views_[device_idx];
-    peer_relay_staged_views_[device_idx] = previous_gpu_view;
+    buffer->buffer_tensor_gpu_view_ = staged_view;
+    // Free the previous live buffer after each peer-relay swap. We reallocate
+    // the scratch buffer lazily on the next swap, which keeps steady-state
+    // memory at one live buffer per storage instead of a persistent ping-pong
+    // pair per storage.
+    peer_relay_staged_views_[device_idx] = torch::Tensor();
     buffer->buffer_state_ = *buffer->buffer_state_iterator_;
     for (int i = 0; i < buffer->buffer_sizes_; i++) {
         if (buffer->buffer_state_iterator_ != buffer->buffer_states_.end()) {

@@ -425,6 +425,16 @@ class GraphModelStorage {
                 swap_ready_event_handle = reinterpret_cast<std::uintptr_t>(swap_ready_event);
             }
 #endif
+            auto embedding_storage = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings);
+            std::shared_ptr<MemPartitionBufferStorage> optimizer_storage = nullptr;
+            if (storage_ptrs_.node_optimizer_state != nullptr && train_) {
+                optimizer_storage = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state);
+            }
+            bool serialize_mem_swaps = embedding_storage->peerRelayRuntimeEnabled();
+            if (optimizer_storage != nullptr) {
+                serialize_mem_swaps = serialize_mem_swaps || optimizer_storage->peerRelayRuntimeEnabled();
+            }
+
             std::vector<std::thread> threads;
             std::exception_ptr thread_exception = nullptr;
             std::mutex thread_exception_lock;
@@ -439,12 +449,19 @@ class GraphModelStorage {
                 }
             };
 
-            threads.push_back(std::thread(run_mem_swap, std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)));
-            if (storage_ptrs_.node_optimizer_state != nullptr && train_) {
-                threads.push_back(std::thread(run_mem_swap, std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)));
-            }
-            for(auto& thread : threads) {
-                thread.join();
+            if (serialize_mem_swaps) {
+                run_mem_swap(embedding_storage);
+                if (optimizer_storage != nullptr && thread_exception == nullptr) {
+                    run_mem_swap(optimizer_storage);
+                }
+            } else {
+                threads.push_back(std::thread(run_mem_swap, embedding_storage));
+                if (optimizer_storage != nullptr) {
+                    threads.push_back(std::thread(run_mem_swap, optimizer_storage));
+                }
+                for(auto& thread : threads) {
+                    thread.join();
+                }
             }
 #ifdef GEGE_CUDA
             if (swap_ready_event != nullptr) {

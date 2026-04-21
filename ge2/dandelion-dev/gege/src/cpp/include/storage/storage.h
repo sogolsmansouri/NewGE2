@@ -258,6 +258,7 @@ class MemPartitionBufferStorage : public Storage {
     std::vector<std::unordered_set<int64_t>> stateflow_peer_mismatch_warned_keys_;
     void ensureHostLoaded_();
     void initializePeerRelay_();
+    torch::Tensor ensurePeerRelayStagedView_(int32_t device_idx);
     bool peerRelayEnabled_();
 
 };

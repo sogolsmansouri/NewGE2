@@ -1284,10 +1284,11 @@ void DataLoader::setBufferOrdering() {
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
             bool hybrid_cover_schedule_requested = parse_env_flag("GEGE_HYBRID_COVER", false);
             bool stateflow_lane_matching_requested = parse_env_flag("GEGE_STATEFLOW_LANE_MATCHING", false);
-            bool hybrid_cover_schedule_supported =
-                hybrid_cover_schedule_requested && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
+            bool hybrid_cover_geometry_supported =
+                options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
                 !options->randomly_assign_edge_buckets && requested_active_devices == 1 && physical_devices == 1 &&
                 options->buffer_capacity == 4 && options->num_partitions >= 4 && options->num_partitions % 3 == 1;
+            bool hybrid_cover_schedule_supported = hybrid_cover_schedule_requested && hybrid_cover_geometry_supported;
             const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
             if (access_aware_state_generation_env != nullptr && access_aware_state_generation_env[0] != '\0' &&
                 std::string(access_aware_state_generation_env) != "0") {
@@ -1299,15 +1300,35 @@ void DataLoader::setBufferOrdering() {
             bool used_hybrid_cover_schedule = false;
             bool used_stateflow_planner = false;
             bool used_stateflow_lane_matching = false;
+            bool stateflow_single_gpu_planner_requested = parse_env_flag("GEGE_STATEFLOW_PLANNER", false);
             if (hybrid_cover_schedule_requested && !hybrid_cover_schedule_supported) {
                 SPDLOG_WARN(
                     "Ignoring GEGE_HYBRID_COVER because it currently requires CUSTOM ordering, 1 physical/logical device, "
                     "buffer_capacity=4, no random bucket assignment, and num_partitions=3k+1");
             }
-            if (hybrid_cover_schedule_supported) {
+            bool stateflow_single_gpu_planner_supported =
+                options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && requested_active_devices == 1 && physical_devices == 1;
+            if (stateflow_single_gpu_planner_requested && !stateflow_single_gpu_planner_supported) {
+                SPDLOG_WARN("Ignoring GEGE_STATEFLOW_PLANNER because it currently requires CUSTOM ordering and 1 physical/logical device");
+            }
+            if (hybrid_cover_schedule_supported || (stateflow_single_gpu_planner_requested && stateflow_single_gpu_planner_supported)) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+                auto partition_row_counts = computePartitionRowCounts(graph_storage_->getNumNodes(), options->num_partitions);
+                bool allow_hybrid_cover_in_planner = hybrid_cover_geometry_supported;
                 auto stateflow_plan = compileSingleGpuStateflowPlan(options->num_partitions, options->buffer_capacity,
-                                                                    options->randomly_assign_edge_buckets, edge_bucket_sizes, true);
+                                                                    options->randomly_assign_edge_buckets, edge_bucket_sizes,
+                                                                    allow_hybrid_cover_in_planner, partition_row_counts);
+                if (hybrid_cover_schedule_requested && hybrid_cover_geometry_supported &&
+                    stateflow_plan.family != PlanFamily::HYBRID_COVER) {
+                    auto hc_plan = compileHybridCoverStateflowPlan(options->num_partitions, options->buffer_capacity,
+                                                                   edge_bucket_sizes, partition_row_counts);
+                    if (hc_plan.family == PlanFamily::HYBRID_COVER) {
+                        SPDLOG_INFO(
+                            "Stateflow planner preferred family={} cost={:.3f}, but GEGE_HYBRID_COVER=1 forces HYBRID_COVER",
+                            planFamilyName(stateflow_plan.family), stateflow_plan.estimated_cost);
+                        stateflow_plan = std::move(hc_plan);
+                    }
+                }
                 if (stateflow_plan.family == PlanFamily::UNKNOWN) {
                     tup = getEdgeBucketOrdering(options->edge_bucket_ordering, options->num_partitions, options->buffer_capacity,
                                                 options->fine_to_coarse_ratio, options->num_cache_partitions,
@@ -1335,7 +1356,7 @@ void DataLoader::setBufferOrdering() {
             }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
-            if (!used_optimized_custom_schedule && !used_hybrid_cover_schedule && single_gpu_gpu_aware_custom_enabled() &&
+            if (!used_stateflow_planner && !used_optimized_custom_schedule && !used_hybrid_cover_schedule && single_gpu_gpu_aware_custom_enabled() &&
                 requested_active_devices == 1 && physical_devices == 1 &&
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && !options->randomly_assign_edge_buckets &&
                 buffer_states_.size() > 1 && edge_buckets_per_buffer_.size() == buffer_states_.size()) {
@@ -1411,8 +1432,10 @@ void DataLoader::setBufferOrdering() {
                 !used_hybrid_cover_schedule;
             if (stateflow_lane_matching_supported) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+                auto partition_row_counts = computePartitionRowCounts(graph_storage_->getNumNodes(), options->num_partitions);
                 auto stateflow_plan =
-                    compileMultiGpuStateflowPlan(buffer_states_, edge_buckets_per_buffer_, requested_active_devices, edge_bucket_sizes);
+                    compileMultiGpuStateflowPlan(buffer_states_, edge_buckets_per_buffer_, requested_active_devices, edge_bucket_sizes,
+                                                 partition_row_counts);
                 if (!stateflow_plan.lanes.empty() && stateflow_plan.total_microstates > 0) {
                     auto planned_ordering = stateflowPlanToTensorOrdering(stateflow_plan);
                     buffer_states_ = std::get<0>(planned_ordering);
@@ -1422,7 +1445,8 @@ void DataLoader::setBufferOrdering() {
                     SPDLOG_INFO("Using stateflow multi-GPU lane matching for {} logical device(s)", requested_active_devices);
                 }
             }
-            if (!access_aware_state_generation && !used_optimized_custom_schedule && !used_hybrid_cover_schedule && !used_stateflow_lane_matching) {
+            if (!used_stateflow_planner && !access_aware_state_generation && !used_optimized_custom_schedule &&
+                !used_hybrid_cover_schedule && !used_stateflow_lane_matching) {
                 reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
             }
             if (log_startup_timing) {

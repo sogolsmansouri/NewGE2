@@ -1167,13 +1167,14 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
                 device_idx, device.str(), num_partitions, buffer_size, num_edge_buckets_in_mem, total_size, bucket_meta_ms, edge_materialize_ms,
                 remap_ms, graph_build_ms, elapsed_graph_storage_ms(total_start, total_end));
         }
+        current_subgraph_states_[device_idx] = current_subgraph_state_;
         if (prefetch_) {
-            if (hasSwap()) {
-                // update next_subgraph_state_ in background
-                getNextSubGraph();
+            if (hasSwap(device_idx)) {
+                // Publish the current state before the background builder reads
+                // current_subgraph_states_[device_idx] as its source snapshot.
+                getNextSubGraph(device_idx);
             }
         }
-        current_subgraph_states_[device_idx] = current_subgraph_state_;
         if (hasSwap(device_idx)) {
             startAsyncAdmitPreload_(device_idx);
         }
@@ -1258,7 +1259,7 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
 
         if (hasSwap()) {
             // update next_subgraph_state_ in background
-            getNextSubGraph();
+            getNextSubGraph(device_idx);
         }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -1340,11 +1341,11 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
     }
 }
 
-void GraphModelStorage::getNextSubGraph() {
-    std::pair<std::vector<int>, std::vector<int>> next_swap_ids = getNextSwapIds();
+void GraphModelStorage::getNextSubGraph(int32_t device_idx) {
+    std::pair<std::vector<int>, std::vector<int>> next_swap_ids = getNextSwapIds(device_idx);
     next_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
     next_subgraph_state_->in_memory_subgraph_ = nullptr;
-    std::thread(&GraphModelStorage::updateInMemorySubGraph_, this, next_subgraph_state_, next_swap_ids, 0).detach();
+    std::thread(&GraphModelStorage::updateInMemorySubGraph_, this, next_subgraph_state_, next_swap_ids, device_idx).detach();
 }
 
 void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState> subgraph, std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx) {

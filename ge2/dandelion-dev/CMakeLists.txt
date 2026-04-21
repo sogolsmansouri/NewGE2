@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.20)
 
 project(gege VERSION 0.1 LANGUAGES CXX)
 
+include(CTest)
+
 # find python3
 find_package(Python3 3.6 COMPONENTS Interpreter Development)
 if (NOT Python3_FOUND)

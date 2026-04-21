@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 project(ge2 VERSION 1.0 LANGUAGES CXX)
 
+include(CTest)
+
 include(FindPackageHandleStandardArgs)
 
 if(DEFINED PYTHON_EXECUTABLE)
@@ -255,6 +257,9 @@ add_executable(gege_next_state_descriptor_analyzer ${project_SOURCE_DIR}/gege_ne
 add_executable(gege_compact_state_local_replay_validator ${project_SOURCE_DIR}/gege_compact_state_local_replay_validator.cpp)
 add_executable(gege_direct_state_local_exec_analyzer ${project_SOURCE_DIR}/gege_direct_state_local_exec_analyzer.cpp)
 add_executable(gege_state_local_accumulator_analyzer ${project_SOURCE_DIR}/gege_state_local_accumulator_analyzer.cpp)
+if(BUILD_TESTING)
+    add_executable(gege_stateflow_validator_tests ${GEGE_CPP_SOURCE}/tests/gege_stateflow_validator_tests.cpp)
+endif()
 target_link_libraries(gege_train ${PROJECT_NAME})
 target_link_libraries(gege_eval ${PROJECT_NAME})
 target_link_libraries(gege_unique_replay_bench ${PROJECT_NAME})
@@ -269,6 +274,10 @@ target_link_libraries(gege_next_state_descriptor_analyzer ${PROJECT_NAME})
 target_link_libraries(gege_compact_state_local_replay_validator ${PROJECT_NAME})
 target_link_libraries(gege_direct_state_local_exec_analyzer ${PROJECT_NAME})
 target_link_libraries(gege_state_local_accumulator_analyzer ${PROJECT_NAME})
+if(BUILD_TESTING)
+    target_link_libraries(gege_stateflow_validator_tests ${PROJECT_NAME})
+    add_test(NAME gege_stateflow_validator_tests COMMAND gege_stateflow_validator_tests)
+endif()
 
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib")
 message(STATUS "TORCH_PYTHON_LIBRARY: ${TORCH_PYTHON_LIBRARY}")

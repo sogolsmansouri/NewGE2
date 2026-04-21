@@ -94,7 +94,7 @@ struct LaneMatchCostConfig {
     int64_t host_bandwidth_bps = 16000000000LL;
     double imbalance_weight = 1.0;
     double boundary_weight = 1.0;
-    bool allow_peer_relay = true;
+    bool allow_peer_relay = false;
 };
 
 struct PlanEmbeddingLayout {
@@ -217,6 +217,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> projectStateflowPlanToL
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> stateflowPlanToTensorOrdering(const StateflowPlan &plan);
 std::string stateflowPlanToText(const StateflowPlan &plan, bool include_microstates = false);
 std::string stateflowPlanToJson(const StateflowPlan &plan, bool include_microstates = false);
+bool validateStateflowPlanExactSemantics(const StateflowPlan &plan);
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(EdgeBucketOrdering edge_bucket_ordering, int num_partitions, int buffer_capacity,
                                                                                int fine_to_coarse_ratio, int num_cache_partitions,

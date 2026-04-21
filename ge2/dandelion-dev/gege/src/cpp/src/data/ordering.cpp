@@ -156,7 +156,7 @@ LaneMatchCostConfig lane_match_cost_config_from_env() {
         std::max<int64_t>(1, stateflow_env_int64("GEGE_STATEFLOW_HOST_BANDWIDTH_BPS", "STATEFLOW_HOST_BANDWIDTH_BPS", 16000000000LL));
     cfg.imbalance_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_IMBALANCE_WEIGHT", 1.0);
     cfg.boundary_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_BOUNDARY_WEIGHT", 1.0);
-    cfg.allow_peer_relay = stateflow_env_bool("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "STATEFLOW_ALLOW_PEER_RELAY", true);
+    cfg.allow_peer_relay = stateflow_env_bool("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "STATEFLOW_ALLOW_PEER_RELAY", false);
     return cfg;
 }
 
@@ -2612,7 +2612,7 @@ bool sorted_vectors_equal(std::vector<T> lhs, std::vector<T> rhs) {
     return lhs == rhs;
 }
 
-bool validate_plan_exact_semantics(const StateflowPlan &plan) {
+bool validate_stateflow_plan_exact_semantics_impl(const StateflowPlan &plan) {
     const bool debug_validate = std::getenv("GEGE_STATEFLOW_DEBUG_VALIDATE") != nullptr;
     auto fail = [&](const std::string &reason) {
         if (debug_validate) {
@@ -2721,6 +2721,12 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
             const auto &handoff = lane.handoffs[idx - 1];
             if (handoff.src_microstate_id != prev_ms.microstate_id || handoff.dst_microstate_id != ms.microstate_id) {
                 return fail("lane-local handoff endpoints mismatch");
+            }
+            if (handoff.src_lane_id != lane.lane_id || handoff.dst_lane_id != lane.lane_id) {
+                return fail("lane-local handoff lane ids mismatch");
+            }
+            if (handoff.mode == HandoffMode::PEER_RELAY) {
+                return fail("lane-local PEER_RELAY requires cross-lane descriptor");
             }
 
             std::unordered_map<int, int64_t> prev_partition_to_object_id;
@@ -3355,6 +3361,10 @@ StateflowPlan compileHybridCoverStateflowPlanVariant(int num_partitions,
 
 }  // namespace
 
+bool validateStateflowPlanExactSemantics(const StateflowPlan &plan) {
+    return validate_stateflow_plan_exact_semantics_impl(plan);
+}
+
 std::string planFamilyName(PlanFamily family) {
     switch (family) {
         case PlanFamily::CUSTOM:
@@ -3808,7 +3818,7 @@ std::vector<StateflowPlan> enumerateSingleGpuStateflowPlans(int num_partitions,
         if (!stateflow_plan_valid(candidate)) {
             return;
         }
-        if (!validate_plan_exact_semantics(candidate)) {
+        if (!validateStateflowPlanExactSemantics(candidate)) {
             SPDLOG_WARN("Skipping invalid Stateflow planner candidate {}", stateflow_plan_name(candidate));
             return;
         }
@@ -3924,7 +3934,7 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
         build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, grouped_permutation, active_devices,
                                                         PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
                                                         partition_row_counts, layout);
-    if (stateflow_plan_valid(grouped_plan) && validate_plan_exact_semantics(grouped_plan)) {
+    if (stateflow_plan_valid(grouped_plan) && validateStateflowPlanExactSemantics(grouped_plan)) {
         score_stateflow_plan(grouped_plan, edge_bucket_sizes, layout);
         SPDLOG_DEBUG(
             "Stateflow multi-GPU candidate policy=disjoint_rounds cost={:.3f} rounds={} loads={} boundaries={} "
@@ -3941,7 +3951,7 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                                                                                       lane_matched_permutation, active_devices,
                                                                                       PlanVariant::MULTI_GPU_LANE_MATCHED,
                                                                                       edge_bucket_sizes, partition_row_counts, layout);
-    if (stateflow_plan_valid(lane_matched_plan) && validate_plan_exact_semantics(lane_matched_plan)) {
+    if (stateflow_plan_valid(lane_matched_plan) && validateStateflowPlanExactSemantics(lane_matched_plan)) {
         score_stateflow_plan(lane_matched_plan, edge_bucket_sizes, layout);
         SPDLOG_DEBUG(
             "Stateflow multi-GPU candidate policy=lane_matched cost={:.3f} rounds={} loads={} boundaries={} "
@@ -4007,7 +4017,7 @@ StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_s
                 best_it->total_superstates, best_it->estimated_cost, best_it->total_partition_loads,
                 best_it->boundary_count, best_it->max_overlap, best_it->total_handoffs, active_devices);
     log_stateflow_plan_summary(*best_it, "Stateflow multi-GPU selected");
-    if (!validate_plan_exact_semantics(*best_it)) {
+    if (!validateStateflowPlanExactSemantics(*best_it)) {
         SPDLOG_WARN("Stateflow multi-GPU plan failed exact-semantics validation");
     }
     return *best_it;
@@ -4121,7 +4131,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getHybridCoverEdgeBucke
         plan.total_partition_loads, single_partition_rotations, boundary_rotations, plan.max_overlap,
         plan.total_handoffs);
     log_stateflow_plan_summary(plan, "Stateflow plan");
-    if (!validate_plan_exact_semantics(plan)) {
+    if (!validateStateflowPlanExactSemantics(plan)) {
         SPDLOG_WARN("Stateflow plan {} failed exact-semantics validation", planFamilyName(plan.family));
     }
 

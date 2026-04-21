@@ -1433,10 +1433,24 @@ void DataLoader::setBufferOrdering() {
             if (stateflow_lane_matching_supported) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
                 auto partition_row_counts = computePartitionRowCounts(graph_storage_->getNumNodes(), options->num_partitions);
+                PlanEmbeddingLayout embedding_layout;
+                if (graph_storage_->storage_ptrs_.node_embeddings != nullptr) {
+                    embedding_layout.embedding_dim = graph_storage_->storage_ptrs_.node_embeddings->dim1_size_;
+                    embedding_layout.dtype_size = get_dtype_size_wrapper(graph_storage_->storage_ptrs_.node_embeddings->dtype_);
+                    embedding_layout.optimizer_state_multiplier =
+                        graph_storage_->storage_ptrs_.node_optimizer_state != nullptr ? 2 : 1;
+                }
                 auto stateflow_plan =
                     compileMultiGpuStateflowPlan(buffer_states_, edge_buckets_per_buffer_, requested_active_devices, edge_bucket_sizes,
-                                                 partition_row_counts);
+                                                 partition_row_counts, embedding_layout);
                 if (!stateflow_plan.lanes.empty() && stateflow_plan.total_microstates > 0) {
+                    auto multi_gpu_schedule = projectStateflowPlanToMultiGpuSchedule(stateflow_plan);
+                    for (const auto &handoff : multi_gpu_schedule.peer_handoffs) {
+                        SPDLOG_INFO(
+                            "[stateflow] round={} peer_handoff src_lane={} dst_lane={} src_state={} dst_state={} partition={} bytes={} slot_mapping=({}->{})",
+                            handoff.round_idx, handoff.src_lane_id, handoff.dst_lane_id, handoff.src_microstate_id,
+                            handoff.dst_microstate_id, handoff.partition_id, handoff.bytes, handoff.src_slot_id, handoff.dst_slot_id);
+                    }
                     auto planned_ordering = stateflowPlanToTensorOrdering(stateflow_plan);
                     buffer_states_ = std::get<0>(planned_ordering);
                     edge_buckets_per_buffer_ = std::get<1>(planned_ordering);

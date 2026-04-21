@@ -67,12 +67,15 @@ struct HandoffPlan {
     int64_t handoff_id = -1;
     int64_t src_microstate_id = -1;
     int64_t dst_microstate_id = -1;
+    int64_t src_lane_id = -1;
+    int64_t dst_lane_id = -1;
     std::vector<int64_t> kept_object_ids;
     std::vector<int64_t> admitted_object_ids;
     std::vector<int64_t> evicted_object_ids;
     std::vector<std::pair<int, int>> slot_mapping;
     HandoffMode mode = HandoffMode::FULL_RELOAD;
     int64_t estimated_cost = 0;
+    int64_t peer_bytes = 0;
 };
 
 struct PlanCostBreakdown {
@@ -80,8 +83,24 @@ struct PlanCostBreakdown {
     double bucket_edge_cost = 0.0;
     double boundary_cost = 0.0;
     double lane_imbalance_cost = 0.0;
+    double selection_cost = 0.0;
     int64_t lane_imbalance = 0;
+    int64_t planned_peer_bytes = 0;
     double weighted_admission_load = 0.0;
+};
+
+struct LaneMatchCostConfig {
+    int64_t peer_bandwidth_bps = 32000000000LL;
+    int64_t host_bandwidth_bps = 16000000000LL;
+    double imbalance_weight = 1.0;
+    double boundary_weight = 1.0;
+    bool allow_peer_relay = true;
+};
+
+struct PlanEmbeddingLayout {
+    int64_t embedding_dim = 0;
+    int64_t dtype_size = 0;
+    int64_t optimizer_state_multiplier = 1;
 };
 
 struct MicrostatePlan {
@@ -113,7 +132,9 @@ struct StateflowPlan {
     int64_t total_microstates = 0;
     int64_t total_superstates = 0;
     int64_t total_handoffs = 0;
+    int64_t total_cross_lane_handoffs = 0;
     int64_t total_admitted_objects = 0;
+    int64_t total_peer_handoff_bytes = 0;
     int64_t total_admissions_by_role[4] = {0, 0, 0, 0};
     int64_t total_bucket_assignments = 0;
     int64_t total_partition_loads = 0;
@@ -123,6 +144,25 @@ struct StateflowPlan {
     double estimated_cost = 0.0;
     PlanCostBreakdown cost_breakdown;
     std::vector<LanePlan> lanes;
+    std::vector<HandoffPlan> cross_lane_handoffs;
+};
+
+struct PeerHandoffDescriptor {
+    int64_t src_lane_id = -1;
+    int64_t dst_lane_id = -1;
+    int64_t src_microstate_id = -1;
+    int64_t dst_microstate_id = -1;
+    int64_t round_idx = -1;
+    int partition_id = -1;
+    int src_slot_id = -1;
+    int dst_slot_id = -1;
+    int64_t bytes = 0;
+};
+
+struct MultiGpuSchedule {
+    std::vector<std::vector<torch::Tensor>> buffer_states_per_device;
+    std::vector<std::vector<torch::Tensor>> edge_buckets_per_device;
+    std::vector<PeerHandoffDescriptor> peer_handoffs;
 };
 
 std::string planFamilyName(PlanFamily family);
@@ -162,8 +202,17 @@ StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_s
                                            const vector<torch::Tensor> &edge_buckets_per_buffer,
                                            int active_devices,
                                            const std::vector<int64_t> &edge_bucket_sizes,
-                                           const std::vector<int64_t> &partition_row_counts = {});
+                                           const std::vector<int64_t> &partition_row_counts = {},
+                                           const PlanEmbeddingLayout &layout = {});
 
+std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::Tensor> &buffer_states,
+                                                           const vector<torch::Tensor> &edge_buckets_per_buffer,
+                                                           int active_devices,
+                                                           const std::vector<int64_t> &edge_bucket_sizes,
+                                                           const std::vector<int64_t> &partition_row_counts = {},
+                                                           const PlanEmbeddingLayout &layout = {});
+
+MultiGpuSchedule projectStateflowPlanToMultiGpuSchedule(const StateflowPlan &plan);
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> projectStateflowPlanToLegacySchedule(const StateflowPlan &plan);
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> stateflowPlanToTensorOrdering(const StateflowPlan &plan);
 std::string stateflowPlanToText(const StateflowPlan &plan, bool include_microstates = false);
@@ -220,4 +269,6 @@ std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tenso
 
 std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states,
                                                                   const vector<torch::Tensor>& edge_buckets_per_buffer,
-                                                                  int active_devices);
+                                                                  int active_devices,
+                                                                  const std::vector<int64_t> &partition_row_counts = {},
+                                                                  const PlanEmbeddingLayout &layout = {});

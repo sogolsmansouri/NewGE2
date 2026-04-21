@@ -3,6 +3,7 @@
 #include "reporting/logger.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cctype>
 #include <cstdint>
@@ -33,6 +34,7 @@ std::tuple<torch::Tensor, torch::Tensor> unique_with_counts_sorted(torch::Tensor
 struct StateAccessSummary {
     std::vector<int64_t> partitions;
     std::unordered_map<int64_t, int64_t> incident_bucket_counts;
+    int64_t total_bucket_edges = 0;
 };
 
 enum class HybridCoverVariant {
@@ -89,6 +91,145 @@ double stateflow_cost_env(const char *name, double default_value) {
         SPDLOG_WARN("Ignoring invalid {}='{}'; using default {}", name, raw, default_value);
         return default_value;
     }
+}
+
+const char *stateflow_env_value(const char *primary, const char *secondary = nullptr) {
+    const char *raw = std::getenv(primary);
+    if (raw != nullptr) {
+        return raw;
+    }
+    if (secondary != nullptr) {
+        return std::getenv(secondary);
+    }
+    return nullptr;
+}
+
+int64_t stateflow_env_int64(const char *primary, const char *secondary, int64_t default_value) {
+    const char *raw = stateflow_env_value(primary, secondary);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    try {
+        return std::stoll(std::string(raw));
+    } catch (...) {
+        SPDLOG_WARN("Ignoring invalid {}='{}'; using default {}", primary, raw, default_value);
+        return default_value;
+    }
+}
+
+bool stateflow_env_bool(const char *primary, const char *secondary, bool default_value) {
+    const char *raw = stateflow_env_value(primary, secondary);
+    if (raw == nullptr) {
+        return default_value;
+    }
+    std::string value(raw);
+    return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
+}
+
+enum class LaneMatchSolver {
+    GREEDY = 0,
+    OPTIMAL2 = 1,
+};
+
+LaneMatchSolver stateflow_lane_match_solver() {
+    const char *raw = stateflow_env_value("GEGE_STATEFLOW_LANE_MATCH_SOLVER", "STATEFLOW_LANE_MATCH_SOLVER");
+    if (raw == nullptr) {
+        return LaneMatchSolver::OPTIMAL2;
+    }
+    std::string value(raw);
+    std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (value == "greedy") {
+        return LaneMatchSolver::GREEDY;
+    }
+    if (value == "optimal2" || value == "hungarian") {
+        return LaneMatchSolver::OPTIMAL2;
+    }
+    SPDLOG_WARN("Ignoring invalid lane match solver '{}'; using optimal2", value);
+    return LaneMatchSolver::OPTIMAL2;
+}
+
+LaneMatchCostConfig lane_match_cost_config_from_env() {
+    LaneMatchCostConfig cfg;
+    cfg.peer_bandwidth_bps =
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_STATEFLOW_PEER_BANDWIDTH_BPS", "STATEFLOW_PEER_BANDWIDTH_BPS", 32000000000LL));
+    cfg.host_bandwidth_bps =
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_STATEFLOW_HOST_BANDWIDTH_BPS", "STATEFLOW_HOST_BANDWIDTH_BPS", 16000000000LL));
+    cfg.imbalance_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_IMBALANCE_WEIGHT", 1.0);
+    cfg.boundary_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_BOUNDARY_WEIGHT", 1.0);
+    cfg.allow_peer_relay = stateflow_env_bool("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "STATEFLOW_ALLOW_PEER_RELAY", true);
+    return cfg;
+}
+
+int64_t plan_embedding_bytes_per_row(const PlanEmbeddingLayout &layout) {
+    if (layout.embedding_dim <= 0 || layout.dtype_size <= 0) {
+        return 0;
+    }
+    return std::max<int64_t>(layout.embedding_dim, 1) *
+           std::max<int64_t>(layout.dtype_size, 1) *
+           std::max<int64_t>(layout.optimizer_state_multiplier, 1);
+}
+
+int64_t partition_transfer_bytes(int64_t partition_id,
+                                 const std::vector<int64_t> &partition_row_counts,
+                                 int64_t bytes_per_row) {
+    if (bytes_per_row <= 0) {
+        return 1;
+    }
+    if (partition_id < 0 || partition_id >= static_cast<int64_t>(partition_row_counts.size())) {
+        return bytes_per_row;
+    }
+    return std::max<int64_t>(partition_row_counts[partition_id], 1) * bytes_per_row;
+}
+
+int64_t resident_overlap_bytes(const std::vector<int64_t> &lhs_partitions,
+                               const std::vector<int64_t> &rhs_partitions,
+                               const std::vector<int64_t> &partition_row_counts,
+                               int64_t bytes_per_row) {
+    std::size_t left = 0;
+    std::size_t right = 0;
+    int64_t bytes = 0;
+    while (left < lhs_partitions.size() && right < rhs_partitions.size()) {
+        if (lhs_partitions[left] == rhs_partitions[right]) {
+            bytes += partition_transfer_bytes(lhs_partitions[left], partition_row_counts, bytes_per_row);
+            left++;
+            right++;
+        } else if (lhs_partitions[left] < rhs_partitions[right]) {
+            left++;
+        } else {
+            right++;
+        }
+    }
+    return bytes;
+}
+
+int64_t handoff_bytes_host(const std::vector<int64_t> &needed_partitions,
+                           const std::vector<int64_t> &already_on_lane,
+                           const std::vector<int64_t> &partition_row_counts,
+                           int64_t bytes_per_row) {
+    std::unordered_set<int64_t> resident(already_on_lane.begin(), already_on_lane.end());
+    int64_t bytes = 0;
+    for (int64_t partition_id : needed_partitions) {
+        if (resident.count(partition_id) == 0) {
+            bytes += partition_transfer_bytes(partition_id, partition_row_counts, bytes_per_row);
+        }
+    }
+    return bytes;
+}
+
+int64_t handoff_bytes_peer(const std::vector<int64_t> &needed_partitions,
+                           const std::vector<int64_t> &already_on_lane,
+                           const std::vector<int64_t> &other_lane_resident,
+                           const std::vector<int64_t> &partition_row_counts,
+                           int64_t bytes_per_row) {
+    std::unordered_set<int64_t> resident(already_on_lane.begin(), already_on_lane.end());
+    std::unordered_set<int64_t> peer(other_lane_resident.begin(), other_lane_resident.end());
+    int64_t bytes = 0;
+    for (int64_t partition_id : needed_partitions) {
+        if (resident.count(partition_id) == 0 && peer.count(partition_id) > 0) {
+            bytes += partition_transfer_bytes(partition_id, partition_row_counts, bytes_per_row);
+        }
+    }
+    return bytes;
 }
 
 int64_t optimized_custom_schedule_restarts() {
@@ -1029,6 +1170,7 @@ std::vector<StateAccessSummary> build_state_access_summaries(const vector<torch:
         if (!edge_buckets.defined() || edge_buckets.numel() == 0) {
             continue;
         }
+        summaries[i].total_bucket_edges = edge_buckets.size(0);
         auto accessor = edge_buckets.accessor<int64_t, 2>();
         for (int64_t row = 0; row < edge_buckets.size(0); row++) {
             summaries[i].incident_bucket_counts[accessor[row][0]]++;
@@ -1187,6 +1329,92 @@ void search_best_disjoint_group(const std::vector<std::vector<bool>> &compatible
         search_best_disjoint_group(compatible, remaining, prev_group, summaries, target_group_size, i + 1, current_group, best);
         current_group.pop_back();
     }
+}
+
+double lane_assignment_transition_cost(const StateAccessSummary &previous_state,
+                                       const StateAccessSummary &next_state,
+                                       const std::vector<int64_t> &partition_row_counts,
+                                       const LaneMatchCostConfig &cfg,
+                                       int64_t bytes_per_row) {
+    const int64_t host_bytes =
+        handoff_bytes_host(next_state.partitions, previous_state.partitions, partition_row_counts, bytes_per_row);
+    const int64_t overlap_bytes =
+        resident_overlap_bytes(previous_state.partitions, next_state.partitions, partition_row_counts, bytes_per_row);
+    double cost = bytes_per_row > 0
+                      ? static_cast<double>(host_bytes) / static_cast<double>(std::max<int64_t>(cfg.host_bandwidth_bps, 1))
+                      : static_cast<double>(host_bytes);
+    if (overlap_bytes == 0) {
+        cost += cfg.boundary_weight;
+    }
+    return cost;
+}
+
+struct TwoLaneAssignmentResult {
+    double cost = std::numeric_limits<double>::infinity();
+    std::vector<int64_t> ordered_group;
+    std::vector<int64_t> chosen_states;
+};
+
+TwoLaneAssignmentResult get_best_two_lane_group(const std::vector<std::vector<bool>> &compatible,
+                                                const std::vector<int64_t> &remaining,
+                                                const std::vector<int64_t> &prev_group,
+                                                const std::vector<StateAccessSummary> &summaries,
+                                                const std::vector<int64_t> &partition_row_counts,
+                                                const LaneMatchCostConfig &cfg,
+                                                int64_t bytes_per_row) {
+    TwoLaneAssignmentResult best;
+    if (remaining.empty()) {
+        return best;
+    }
+    if (remaining.size() == 1 || prev_group.size() != 2) {
+        GroupSearchResult greedy;
+        std::vector<int64_t> current_group;
+        current_group.reserve(std::min<std::size_t>(remaining.size(), 2));
+        search_best_disjoint_group(compatible, remaining, prev_group, summaries, std::min<int>(2, remaining.size()), 0, current_group, greedy);
+        if (!greedy.chosen_states.empty()) {
+            best.cost = 0.0;
+            best.chosen_states = greedy.chosen_states;
+            best.ordered_group = greedy.ordered_group;
+        }
+        return best;
+    }
+
+    for (std::size_t left = 0; left < remaining.size(); left++) {
+        for (std::size_t right = left + 1; right < remaining.size(); right++) {
+            const int64_t first_state = remaining[left];
+            const int64_t second_state = remaining[right];
+            if (!compatible[first_state][second_state]) {
+                continue;
+            }
+
+            std::vector<std::vector<int64_t>> assignments = {{first_state, second_state}, {second_state, first_state}};
+            const double mean_edges =
+                (static_cast<double>(summaries[first_state].total_bucket_edges) + static_cast<double>(summaries[second_state].total_bucket_edges)) / 2.0;
+            const double imbalance_penalty =
+                mean_edges > 0.0
+                    ? cfg.imbalance_weight *
+                          ((std::pow(static_cast<double>(summaries[first_state].total_bucket_edges) - mean_edges, 2.0) +
+                            std::pow(static_cast<double>(summaries[second_state].total_bucket_edges) - mean_edges, 2.0)) /
+                           mean_edges)
+                    : 0.0;
+
+            for (const auto &assignment : assignments) {
+                double candidate_cost = imbalance_penalty;
+                candidate_cost += lane_assignment_transition_cost(summaries[prev_group[0]], summaries[assignment[0]],
+                                                                 partition_row_counts, cfg, bytes_per_row);
+                candidate_cost += lane_assignment_transition_cost(summaries[prev_group[1]], summaries[assignment[1]],
+                                                                 partition_row_counts, cfg, bytes_per_row);
+                if (candidate_cost < best.cost ||
+                    (candidate_cost == best.cost && assignment < best.ordered_group)) {
+                    best.cost = candidate_cost;
+                    best.ordered_group = assignment;
+                    best.chosen_states = {first_state, second_state};
+                }
+            }
+        }
+    }
+
+    return best;
 }
 
 struct AccessAwareGeneratedState {
@@ -2047,6 +2275,8 @@ void lift_stateflow_plan_ir(StateflowPlan &plan, const std::vector<int64_t> &par
                 handoff.handoff_id = next_handoff_id++;
                 handoff.src_microstate_id = prev_ms.microstate_id;
                 handoff.dst_microstate_id = microstate.microstate_id;
+                handoff.src_lane_id = lane.lane_id;
+                handoff.dst_lane_id = lane.lane_id;
                 std::unordered_map<int, int64_t> prev_partition_to_object_id;
                 for (const auto &obj : prev_ms.resident_objects) {
                     prev_partition_to_object_id[obj.partition_id] = obj.object_id;
@@ -2096,9 +2326,114 @@ void lift_stateflow_plan_ir(StateflowPlan &plan, const std::vector<int64_t> &par
 
 int64_t estimate_plan_bucket_edges(StateflowPlan &plan, const std::vector<int64_t> &edge_bucket_sizes);
 
+const ResidentObjectPlan *find_resident_object(const MicrostatePlan &microstate, int partition_id) {
+    for (const auto &obj : microstate.resident_objects) {
+        if (obj.partition_id == partition_id) {
+            return &obj;
+        }
+    }
+    return nullptr;
+}
+
+const MicrostatePlan *find_microstate_for_superstate(const LanePlan &lane, int64_t superstate_id) {
+    for (const auto &microstate : lane.microstates) {
+        if (microstate.superstate_id == superstate_id) {
+            return &microstate;
+        }
+    }
+    return nullptr;
+}
+
+void populate_cross_lane_handoffs(StateflowPlan &plan,
+                                  const std::vector<int64_t> &partition_row_counts,
+                                  const PlanEmbeddingLayout &layout) {
+    plan.cross_lane_handoffs.clear();
+    plan.total_cross_lane_handoffs = 0;
+    plan.total_peer_handoff_bytes = 0;
+    const int64_t bytes_per_row = plan_embedding_bytes_per_row(layout);
+    std::unordered_set<int64_t> emitted_peer_targets;
+
+    int64_t next_handoff_id = plan.total_handoffs;
+    for (auto &lane : plan.lanes) {
+        for (std::size_t idx = 1; idx < lane.microstates.size(); idx++) {
+            const auto &prev_ms = lane.microstates[idx - 1];
+            const auto &microstate = lane.microstates[idx];
+            std::unordered_set<int> prev_resident(prev_ms.resident_partitions.begin(), prev_ms.resident_partitions.end());
+
+            for (int partition_id : microstate.resident_partitions) {
+                if (prev_resident.count(partition_id) > 0) {
+                    continue;
+                }
+
+                const LanePlan *src_lane = nullptr;
+                const MicrostatePlan *src_microstate = nullptr;
+                int64_t best_peer_bytes = -1;
+                for (const auto &other_lane : plan.lanes) {
+                    if (other_lane.lane_id == lane.lane_id) {
+                        continue;
+                    }
+                    const auto *candidate_src = find_microstate_for_superstate(other_lane, microstate.superstate_id - 1);
+                    if (candidate_src == nullptr) {
+                        continue;
+                    }
+                    if (std::find(candidate_src->resident_partitions.begin(), candidate_src->resident_partitions.end(), partition_id) ==
+                        candidate_src->resident_partitions.end()) {
+                        continue;
+                    }
+                    int64_t candidate_peer_bytes = partition_transfer_bytes(partition_id, partition_row_counts, bytes_per_row);
+                    bool better_source = candidate_peer_bytes > best_peer_bytes;
+                    if (!better_source && candidate_peer_bytes == best_peer_bytes && src_lane != nullptr) {
+                        better_source = other_lane.lane_id < src_lane->lane_id;
+                    }
+                    if (better_source || src_lane == nullptr) {
+                        src_lane = &other_lane;
+                        src_microstate = candidate_src;
+                        best_peer_bytes = candidate_peer_bytes;
+                    }
+                }
+
+                if (src_lane == nullptr || src_microstate == nullptr) {
+                    continue;
+                }
+
+                const ResidentObjectPlan *src_obj = find_resident_object(*src_microstate, partition_id);
+                const ResidentObjectPlan *dst_obj = find_resident_object(microstate, partition_id);
+                if (src_obj == nullptr || dst_obj == nullptr) {
+                    continue;
+                }
+
+                int64_t target_key = (static_cast<int64_t>(lane.lane_id) << 40) |
+                                     (static_cast<int64_t>(microstate.microstate_id) << 20) |
+                                     static_cast<int64_t>(partition_id);
+                if (!emitted_peer_targets.insert(target_key).second) {
+                    continue;
+                }
+
+                HandoffPlan handoff;
+                handoff.handoff_id = next_handoff_id++;
+                handoff.src_microstate_id = src_microstate->microstate_id;
+                handoff.dst_microstate_id = microstate.microstate_id;
+                handoff.src_lane_id = src_lane->lane_id;
+                handoff.dst_lane_id = lane.lane_id;
+                handoff.admitted_object_ids = {dst_obj->object_id};
+                handoff.slot_mapping = {{src_obj->slot_id, dst_obj->slot_id}};
+                handoff.mode = HandoffMode::PEER_RELAY;
+                handoff.peer_bytes = partition_transfer_bytes(partition_id, partition_row_counts, bytes_per_row);
+                handoff.estimated_cost = handoff.peer_bytes;
+
+                plan.cross_lane_handoffs.emplace_back(std::move(handoff));
+                plan.total_cross_lane_handoffs++;
+                plan.total_peer_handoff_bytes += partition_transfer_bytes(partition_id, partition_row_counts, bytes_per_row);
+            }
+        }
+    }
+    plan.total_handoffs += plan.total_cross_lane_handoffs;
+}
+
 void finalize_stateflow_plan(StateflowPlan &plan,
                              const std::vector<int64_t> &edge_bucket_sizes = {},
-                             const std::vector<int64_t> &partition_row_counts = {}) {
+                             const std::vector<int64_t> &partition_row_counts = {},
+                             const PlanEmbeddingLayout &layout = {}) {
     plan.total_microstates = 0;
     plan.total_bucket_assignments = 0;
     plan.total_partition_loads = 0;
@@ -2126,6 +2461,7 @@ void finalize_stateflow_plan(StateflowPlan &plan,
     }
 
     lift_stateflow_plan_ir(plan, partition_row_counts);
+    populate_cross_lane_handoffs(plan, partition_row_counts, layout);
     populate_fragment_exact_semantics(plan);
     populate_fragment_estimates(plan, edge_bucket_sizes);
     plan.estimated_bucket_edges = estimate_plan_bucket_edges(plan, edge_bucket_sizes);
@@ -2239,6 +2575,9 @@ std::string ir_histogram_string(const StateflowPlan &plan) {
             mode_hist[static_cast<int>(h.mode)]++;
         }
     }
+    for (const auto &handoff : plan.cross_lane_handoffs) {
+        mode_hist[static_cast<int>(handoff.mode)]++;
+    }
 
     std::ostringstream oss;
     oss << "roles={ANCHOR:" << role_hist[static_cast<int>(ResidentObjectRole::ANCHOR)]
@@ -2267,6 +2606,16 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
         return false;
     }
     if (plan.total_admitted_objects != plan.total_partition_loads) {
+        return false;
+    }
+    int64_t lane_local_handoffs = 0;
+    for (const auto &lane : plan.lanes) {
+        lane_local_handoffs += static_cast<int64_t>(lane.handoffs.size());
+    }
+    if (plan.total_handoffs != lane_local_handoffs + static_cast<int64_t>(plan.cross_lane_handoffs.size())) {
+        return false;
+    }
+    if (plan.total_cross_lane_handoffs != static_cast<int64_t>(plan.cross_lane_handoffs.size())) {
         return false;
     }
 
@@ -2405,6 +2754,176 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
             if (handoff.mode != expected_mode) {
                 return false;
             }
+
+            std::unordered_set<int> prev_set(prev_ms.resident_partitions.begin(), prev_ms.resident_partitions.end());
+            std::unordered_set<int> local_admitted_partitions;
+            for (int64_t object_id : handoff.admitted_object_ids) {
+                bool found_partition = false;
+                for (const auto &obj : ms.resident_objects) {
+                    if (obj.object_id == object_id) {
+                        local_admitted_partitions.insert(obj.partition_id);
+                        found_partition = true;
+                        break;
+                    }
+                }
+                if (!found_partition) {
+                    return false;
+                }
+            }
+
+            std::unordered_set<int> peer_admitted_partitions;
+            for (const auto &peer_handoff : plan.cross_lane_handoffs) {
+                if (peer_handoff.dst_lane_id != lane.lane_id || peer_handoff.dst_microstate_id != ms.microstate_id) {
+                    continue;
+                }
+                if (peer_handoff.slot_mapping.size() != 1) {
+                    return false;
+                }
+                int dst_slot = peer_handoff.slot_mapping.front().second;
+                if (dst_slot < 0 || dst_slot >= static_cast<int>(ms.resident_partitions.size())) {
+                    return false;
+                }
+                int partition_id = ms.resident_partitions[dst_slot];
+                if (prev_set.count(partition_id) > 0) {
+                    return false;
+                }
+                if (local_admitted_partitions.count(partition_id) == 0) {
+                    return false;
+                }
+                if (!peer_admitted_partitions.insert(partition_id).second) {
+                    return false;
+                }
+            }
+
+            std::unordered_set<int> host_admitted_partitions = local_admitted_partitions;
+            for (int partition_id : peer_admitted_partitions) {
+                if (host_admitted_partitions.erase(partition_id) == 0) {
+                    return false;
+                }
+            }
+
+            std::unordered_set<int> expected_new_partitions;
+            std::unordered_set<int> kept_partitions;
+            for (int partition_id : ms.resident_partitions) {
+                if (prev_set.count(partition_id) > 0) {
+                    kept_partitions.insert(partition_id);
+                } else {
+                    expected_new_partitions.insert(partition_id);
+                }
+            }
+
+            std::unordered_set<int> covered_new_partitions = host_admitted_partitions;
+            covered_new_partitions.insert(peer_admitted_partitions.begin(), peer_admitted_partitions.end());
+            if (covered_new_partitions != expected_new_partitions) {
+                return false;
+            }
+
+            std::unordered_set<int> covered_partitions = kept_partitions;
+            covered_partitions.insert(covered_new_partitions.begin(), covered_new_partitions.end());
+            if (covered_partitions != curr_set) {
+                return false;
+            }
+        }
+    }
+
+    for (int64_t superstate_id = 0; superstate_id < plan.total_superstates; superstate_id++) {
+        std::unordered_set<int> resident_partitions;
+        for (const auto &lane : plan.lanes) {
+            for (const auto &microstate : lane.microstates) {
+                if (microstate.superstate_id != superstate_id) {
+                    continue;
+                }
+                for (int partition_id : microstate.resident_partitions) {
+                    if (!resident_partitions.insert(partition_id).second) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+
+    std::unordered_set<int64_t> peer_target_keys;
+    for (const auto &handoff : plan.cross_lane_handoffs) {
+        if (handoff.mode != HandoffMode::PEER_RELAY) {
+            return false;
+        }
+        if (handoff.src_lane_id < 0 || handoff.dst_lane_id < 0 || handoff.src_lane_id == handoff.dst_lane_id) {
+            return false;
+        }
+        const LanePlan *src_lane = nullptr;
+        const LanePlan *dst_lane = nullptr;
+        const MicrostatePlan *src_microstate = nullptr;
+        const MicrostatePlan *dst_microstate = nullptr;
+        for (const auto &lane : plan.lanes) {
+            if (lane.lane_id == handoff.src_lane_id) {
+                src_lane = &lane;
+                for (const auto &microstate : lane.microstates) {
+                    if (microstate.microstate_id == handoff.src_microstate_id) {
+                        src_microstate = &microstate;
+                        break;
+                    }
+                }
+            }
+            if (lane.lane_id == handoff.dst_lane_id) {
+                dst_lane = &lane;
+                for (const auto &microstate : lane.microstates) {
+                    if (microstate.microstate_id == handoff.dst_microstate_id) {
+                        dst_microstate = &microstate;
+                        break;
+                    }
+                }
+            }
+        }
+        if (src_lane == nullptr || dst_lane == nullptr || src_microstate == nullptr || dst_microstate == nullptr) {
+            return false;
+        }
+        if (src_microstate->superstate_id + 1 != dst_microstate->superstate_id) {
+            return false;
+        }
+        if (handoff.admitted_object_ids.size() != 1 || handoff.slot_mapping.size() != 1) {
+            return false;
+        }
+        int partition_id = -1;
+        int dst_slot = handoff.slot_mapping.front().second;
+        int src_slot = handoff.slot_mapping.front().first;
+        if (src_slot < 0 || dst_slot < 0 ||
+            src_slot >= static_cast<int>(src_microstate->resident_partitions.size()) ||
+            dst_slot >= static_cast<int>(dst_microstate->resident_partitions.size())) {
+            return false;
+        }
+        partition_id = dst_microstate->resident_partitions[dst_slot];
+        if (src_microstate->resident_partitions[src_slot] != partition_id) {
+            return false;
+        }
+        int64_t peer_target_key = (static_cast<int64_t>(handoff.dst_lane_id) << 40) |
+                                  (static_cast<int64_t>(handoff.dst_microstate_id) << 20) |
+                                  static_cast<int64_t>(partition_id);
+        if (!peer_target_keys.insert(peer_target_key).second) {
+            return false;
+        }
+        bool admitted_object_matches = false;
+        for (const auto &obj : dst_microstate->resident_objects) {
+            if (obj.partition_id == partition_id && obj.object_id == handoff.admitted_object_ids.front()) {
+                admitted_object_matches = true;
+                break;
+            }
+        }
+        if (!admitted_object_matches) {
+            return false;
+        }
+        const auto &dst_lane_microstates = dst_lane->microstates;
+        auto dst_it = std::find_if(dst_lane_microstates.begin(), dst_lane_microstates.end(),
+                                   [&](const auto &microstate) { return microstate.microstate_id == dst_microstate->microstate_id; });
+        if (dst_it == dst_lane_microstates.begin() || dst_it == dst_lane_microstates.end()) {
+            return false;
+        }
+        const auto &prev_dst_microstate = *(dst_it - 1);
+        if (std::find(prev_dst_microstate.resident_partitions.begin(), prev_dst_microstate.resident_partitions.end(), partition_id) !=
+            prev_dst_microstate.resident_partitions.end()) {
+            return false;
+        }
+        if (handoff.peer_bytes <= 0) {
+            return false;
         }
     }
 
@@ -2467,6 +2986,7 @@ std::string stateflow_cost_breakdown_string(const StateflowPlan &plan) {
         << ",bucket_edges:" << plan.cost_breakdown.bucket_edge_cost
         << ",boundary:" << plan.cost_breakdown.boundary_cost
         << ",lane_imbalance:" << plan.cost_breakdown.lane_imbalance_cost
+        << ",selection:" << plan.cost_breakdown.selection_cost
         << "} raw={admitted_partitions:" << plan.total_partition_loads
         << ",weighted_admission_load:" << plan.cost_breakdown.weighted_admission_load
         << ",admits_by_role={anchor:" << plan.total_admissions_by_role[static_cast<int>(ResidentObjectRole::ANCHOR)]
@@ -2476,6 +2996,9 @@ std::string stateflow_cost_breakdown_string(const StateflowPlan &plan) {
         << "},estimated_bucket_edges:" << plan.estimated_bucket_edges
         << ",boundary_count:" << plan.boundary_count
         << ",lane_imbalance:" << plan.cost_breakdown.lane_imbalance
+        << ",cross_lane_handoffs:" << plan.total_cross_lane_handoffs
+        << ",peer_handoff_bytes:" << plan.total_peer_handoff_bytes
+        << ",planned_peer_bytes:" << plan.cost_breakdown.planned_peer_bytes
         << "}";
     return oss.str();
 }
@@ -2509,9 +3032,10 @@ std::string json_escape_string(const std::string &input) {
 
 void log_stateflow_plan_summary(const StateflowPlan &plan, const std::string &label) {
     SPDLOG_INFO(
-        "{} family={} gpu_count={} buffer_capacity={} lanes={} microstates={} handoffs={} total_admitted_objects={} overlap_hist={} {}",
+        "{} family={} gpu_count={} buffer_capacity={} lanes={} microstates={} handoffs={} cross_lane_handoffs={} total_admitted_objects={} overlap_hist={} {}",
         label, stateflow_plan_name(plan), plan.gpu_count, plan.buffer_capacity, plan.lanes.size(), plan.total_microstates,
-        plan.total_handoffs, plan.total_admitted_objects, overlap_histogram_string(plan), stateflow_cost_breakdown_string(plan));
+        plan.total_handoffs, plan.total_cross_lane_handoffs, plan.total_admitted_objects, overlap_histogram_string(plan),
+        stateflow_cost_breakdown_string(plan));
     SPDLOG_INFO("{} IR {}", label, ir_histogram_string(plan));
 }
 
@@ -2543,7 +3067,9 @@ double resident_role_multiplier(ResidentObjectRole role) {
     return 1.0;
 }
 
-double score_stateflow_plan(StateflowPlan &plan, const std::vector<int64_t> &edge_bucket_sizes) {
+double score_stateflow_plan(StateflowPlan &plan,
+                            const std::vector<int64_t> &edge_bucket_sizes,
+                            const PlanEmbeddingLayout &layout = {}) {
     double alpha = stateflow_cost_env("GEGE_STATEFLOW_COST_ALPHA", 1.0);
     double beta = stateflow_cost_env("GEGE_STATEFLOW_COST_BETA", 1e-7);
     // Boundary count is a secondary penalty on single GPU: the dominant cost already comes from
@@ -2555,6 +3081,8 @@ double score_stateflow_plan(StateflowPlan &plan, const std::vector<int64_t> &edg
     plan.estimated_bucket_edges = estimate_plan_bucket_edges(plan, edge_bucket_sizes);
 
     double weighted_admission_load = 0.0;
+    double selection_admission_load = 0.0;
+    const int64_t bytes_per_row = plan_embedding_bytes_per_row(layout);
     for (auto &lane : plan.lanes) {
         for (std::size_t idx = 0; idx < lane.microstates.size(); idx++) {
             auto &microstate = lane.microstates[idx];
@@ -2562,9 +3090,12 @@ double score_stateflow_plan(StateflowPlan &plan, const std::vector<int64_t> &edg
                 continue;
             }
             std::unordered_map<int64_t, ResidentObjectRole> id_to_role;
+            std::unordered_map<int64_t, int64_t> id_to_rows;
             id_to_role.reserve(microstate.resident_objects.size());
+            id_to_rows.reserve(microstate.resident_objects.size());
             for (const auto &obj : microstate.resident_objects) {
                 id_to_role[obj.object_id] = obj.role;
+                id_to_rows[obj.object_id] = obj.rows;
             }
             double mode_mult = 1.0;
             int64_t handoff_cost = 0;
@@ -2575,6 +3106,13 @@ double score_stateflow_plan(StateflowPlan &plan, const std::vector<int64_t> &edg
                 auto role_it = id_to_role.find(object_id);
                 double role_mult = role_it == id_to_role.end() ? 1.0 : resident_role_multiplier(role_it->second);
                 weighted_admission_load += role_mult * mode_mult;
+                int64_t transfer_units = 1;
+                if (bytes_per_row > 0) {
+                    auto rows_it = id_to_rows.find(object_id);
+                    const int64_t rows = rows_it == id_to_rows.end() ? 0 : rows_it->second;
+                    transfer_units = std::max<int64_t>(rows, 1) * bytes_per_row;
+                }
+                selection_admission_load += static_cast<double>(transfer_units);
                 handoff_cost++;
             }
             if (idx > 0 && idx - 1 < lane.handoffs.size()) {
@@ -2585,6 +3123,8 @@ double score_stateflow_plan(StateflowPlan &plan, const std::vector<int64_t> &edg
 
     int64_t lane_min = std::numeric_limits<int64_t>::max();
     int64_t lane_max = 0;
+    std::vector<int64_t> lane_edges_by_lane;
+    lane_edges_by_lane.reserve(plan.lanes.size());
     for (const auto &lane : plan.lanes) {
         int64_t lane_edges = 0;
         if (edge_bucket_sizes.size() == static_cast<std::size_t>(plan.num_partitions * plan.num_partitions)) {
@@ -2600,23 +3140,39 @@ double score_stateflow_plan(StateflowPlan &plan, const std::vector<int64_t> &edg
         }
         lane_min = std::min(lane_min, lane_edges);
         lane_max = std::max(lane_max, lane_edges);
+        lane_edges_by_lane.emplace_back(lane_edges);
     }
     int64_t lane_imbalance = lane_min == std::numeric_limits<int64_t>::max() ? 0 : lane_max - lane_min;
     if (plan.lanes.size() <= 1) {
         lane_imbalance = 0;
     }
+    double lane_imbalance_cost = 0.0;
+    if (plan.lanes.size() > 1 && !lane_edges_by_lane.empty()) {
+        const double mean_lane_edges =
+            static_cast<double>(std::accumulate(lane_edges_by_lane.begin(), lane_edges_by_lane.end(), int64_t{0})) /
+            static_cast<double>(lane_edges_by_lane.size());
+        if (mean_lane_edges > 0.0) {
+            for (auto lane_edges : lane_edges_by_lane) {
+                lane_imbalance_cost += std::pow(static_cast<double>(lane_edges) - mean_lane_edges, 2.0) / mean_lane_edges;
+            }
+            lane_imbalance_cost *= delta;
+        }
+    }
 
+    const double selection_admission_basis = plan.lanes.size() > 1 ? selection_admission_load : weighted_admission_load;
     plan.cost_breakdown.weighted_admission_load = weighted_admission_load;
-    plan.cost_breakdown.admitted_partition_cost = alpha * weighted_admission_load;
+    plan.cost_breakdown.admitted_partition_cost = alpha * selection_admission_basis;
     plan.cost_breakdown.bucket_edge_cost = beta * static_cast<double>(plan.estimated_bucket_edges);
     plan.cost_breakdown.boundary_cost = gamma * static_cast<double>(plan.boundary_count);
-    plan.cost_breakdown.lane_imbalance_cost = delta * static_cast<double>(lane_imbalance);
+    plan.cost_breakdown.lane_imbalance_cost = lane_imbalance_cost;
     plan.cost_breakdown.lane_imbalance = lane_imbalance;
+    plan.cost_breakdown.selection_cost = plan.cost_breakdown.admitted_partition_cost +
+                                         plan.cost_breakdown.bucket_edge_cost +
+                                         plan.cost_breakdown.boundary_cost +
+                                         plan.cost_breakdown.lane_imbalance_cost;
+    plan.cost_breakdown.planned_peer_bytes = plan.total_peer_handoff_bytes;
 
-    plan.estimated_cost = plan.cost_breakdown.admitted_partition_cost +
-                          plan.cost_breakdown.bucket_edge_cost +
-                          plan.cost_breakdown.boundary_cost +
-                          plan.cost_breakdown.lane_imbalance_cost;
+    plan.estimated_cost = plan.cost_breakdown.selection_cost;
     return plan.estimated_cost;
 }
 
@@ -2653,7 +3209,8 @@ StateflowPlan build_multi_gpu_stateflow_plan_from_permutation(const vector<torch
                                                               int active_devices,
                                                               PlanVariant family_variant = PlanVariant::DEFAULT,
                                                               const std::vector<int64_t> &edge_bucket_sizes = {},
-                                                              const std::vector<int64_t> &partition_row_counts = {}) {
+                                                              const std::vector<int64_t> &partition_row_counts = {},
+                                                              const PlanEmbeddingLayout &layout = {}) {
     StateflowPlan plan;
     if (buffer_states.empty() || edge_buckets_per_buffer.size() != buffer_states.size() || active_devices <= 1 ||
         permutation.size() != buffer_states.size()) {
@@ -2691,7 +3248,7 @@ StateflowPlan build_multi_gpu_stateflow_plan_from_permutation(const vector<torch
     }
 
     plan.total_superstates = (static_cast<int64_t>(permutation.size()) + active_devices - 1) / active_devices;
-    finalize_stateflow_plan(plan, edge_bucket_sizes, partition_row_counts);
+    finalize_stateflow_plan(plan, edge_bucket_sizes, partition_row_counts, layout);
     return plan;
 }
 
@@ -2863,6 +3420,7 @@ std::string stateflowPlanToText(const StateflowPlan &plan, bool include_microsta
         << " lanes=" << plan.lanes.size()
         << " microstates=" << plan.total_microstates
         << " handoffs=" << plan.total_handoffs
+        << " cross_lane_handoffs=" << plan.total_cross_lane_handoffs
         << " total_admitted_objects=" << plan.total_admitted_objects
         << " overlap_hist=" << overlap_histogram_string(plan)
         << " " << stateflow_cost_breakdown_string(plan) << "\n";
@@ -2891,11 +3449,20 @@ std::string stateflowPlanToText(const StateflowPlan &plan, bool include_microsta
         for (const auto &handoff : lane.handoffs) {
             oss << "  handoff " << handoff.handoff_id
                 << " " << handoffModeName(handoff.mode)
+                << " lane=" << handoff.src_lane_id << "->" << handoff.dst_lane_id
                 << " " << handoff.src_microstate_id << "->" << handoff.dst_microstate_id
                 << " kept=" << handoff.kept_object_ids.size()
                 << " admitted=" << handoff.admitted_object_ids.size()
                 << " evicted=" << handoff.evicted_object_ids.size() << "\n";
         }
+    }
+    for (const auto &handoff : plan.cross_lane_handoffs) {
+        oss << "cross_lane_handoff " << handoff.handoff_id
+            << " " << handoffModeName(handoff.mode)
+            << " lane=" << handoff.src_lane_id << "->" << handoff.dst_lane_id
+            << " " << handoff.src_microstate_id << "->" << handoff.dst_microstate_id
+            << " admitted=" << handoff.admitted_object_ids.size()
+            << " peer_bytes=" << handoff.peer_bytes << "\n";
     }
 
     return oss.str();
@@ -2934,7 +3501,9 @@ std::string stateflowPlanToJson(const StateflowPlan &plan, bool include_microsta
     oss << ",\"total_microstates\":" << plan.total_microstates;
     oss << ",\"total_superstates\":" << plan.total_superstates;
     oss << ",\"total_handoffs\":" << plan.total_handoffs;
+    oss << ",\"total_cross_lane_handoffs\":" << plan.total_cross_lane_handoffs;
     oss << ",\"total_admitted_objects\":" << plan.total_admitted_objects;
+    oss << ",\"total_peer_handoff_bytes\":" << plan.total_peer_handoff_bytes;
     oss << ",\"total_partition_loads\":" << plan.total_partition_loads;
     oss << ",\"total_bucket_assignments\":" << plan.total_bucket_assignments;
     oss << ",\"boundary_count\":" << plan.boundary_count;
@@ -2952,7 +3521,9 @@ std::string stateflowPlanToJson(const StateflowPlan &plan, bool include_microsta
     oss << ",\"bucket_edge_cost\":" << plan.cost_breakdown.bucket_edge_cost;
     oss << ",\"boundary_cost\":" << plan.cost_breakdown.boundary_cost;
     oss << ",\"lane_imbalance_cost\":" << plan.cost_breakdown.lane_imbalance_cost;
+    oss << ",\"selection_cost\":" << plan.cost_breakdown.selection_cost;
     oss << ",\"lane_imbalance\":" << plan.cost_breakdown.lane_imbalance;
+    oss << ",\"planned_peer_bytes\":" << plan.cost_breakdown.planned_peer_bytes;
     oss << ",\"weighted_admission_load\":" << plan.cost_breakdown.weighted_admission_load;
     oss << "}";
 
@@ -3035,6 +3606,25 @@ std::string stateflowPlanToJson(const StateflowPlan &plan, bool include_microsta
                 oss << ",\"estimated_cost\":" << handoff.estimated_cost << "}";
             }
             oss << "]}";
+        }
+        oss << "],\"cross_lane_handoffs\":[";
+        for (std::size_t handoff_idx = 0; handoff_idx < plan.cross_lane_handoffs.size(); handoff_idx++) {
+            if (handoff_idx > 0) {
+                oss << ",";
+            }
+            const auto &handoff = plan.cross_lane_handoffs[handoff_idx];
+            oss << "{\"handoff_id\":" << handoff.handoff_id;
+            oss << ",\"src_lane_id\":" << handoff.src_lane_id;
+            oss << ",\"dst_lane_id\":" << handoff.dst_lane_id;
+            oss << ",\"src_microstate_id\":" << handoff.src_microstate_id;
+            oss << ",\"dst_microstate_id\":" << handoff.dst_microstate_id;
+            oss << ",\"admitted_object_ids\":";
+            append_int_vector(handoff.admitted_object_ids);
+            oss << ",\"slot_mapping\":";
+            append_bucket_pairs(handoff.slot_mapping);
+            oss << ",\"mode\":\"" << json_escape_string(handoffModeName(handoff.mode)) << "\"";
+            oss << ",\"estimated_cost\":" << handoff.estimated_cost;
+            oss << ",\"peer_bytes\":" << handoff.peer_bytes << "}";
         }
         oss << "]";
     }
@@ -3297,13 +3887,14 @@ StateflowPlan compileSingleGpuStateflowPlan(int num_partitions,
     return *best_it;
 }
 
-StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_states,
-                                           const vector<torch::Tensor> &edge_buckets_per_buffer,
-                                           int active_devices,
-                                           const std::vector<int64_t> &edge_bucket_sizes,
-                                           const std::vector<int64_t> &partition_row_counts) {
+std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::Tensor> &buffer_states,
+                                                           const vector<torch::Tensor> &edge_buckets_per_buffer,
+                                                           int active_devices,
+                                                           const std::vector<int64_t> &edge_bucket_sizes,
+                                                           const std::vector<int64_t> &partition_row_counts,
+                                                           const PlanEmbeddingLayout &layout) {
     if (active_devices <= 1 || buffer_states.empty() || edge_buckets_per_buffer.size() != buffer_states.size()) {
-        return StateflowPlan{};
+        return {};
     }
 
     std::vector<StateflowPlan> candidates;
@@ -3312,9 +3903,9 @@ StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_s
     StateflowPlan grouped_plan =
         build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, grouped_permutation, active_devices,
                                                         PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
-                                                        partition_row_counts);
+                                                        partition_row_counts, layout);
     if (stateflow_plan_valid(grouped_plan) && validate_plan_exact_semantics(grouped_plan)) {
-        score_stateflow_plan(grouped_plan, edge_bucket_sizes);
+        score_stateflow_plan(grouped_plan, edge_bucket_sizes, layout);
         SPDLOG_DEBUG(
             "Stateflow multi-GPU candidate policy=disjoint_rounds cost={:.3f} rounds={} loads={} boundaries={} "
             "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
@@ -3324,13 +3915,14 @@ StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_s
         candidates.emplace_back(std::move(grouped_plan));
     }
 
-    auto lane_matched_permutation = getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, active_devices);
+    auto lane_matched_permutation =
+        getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, active_devices, partition_row_counts, layout);
     StateflowPlan lane_matched_plan = build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer,
                                                                                       lane_matched_permutation, active_devices,
                                                                                       PlanVariant::MULTI_GPU_LANE_MATCHED,
-                                                                                      edge_bucket_sizes, partition_row_counts);
+                                                                                      edge_bucket_sizes, partition_row_counts, layout);
     if (stateflow_plan_valid(lane_matched_plan) && validate_plan_exact_semantics(lane_matched_plan)) {
-        score_stateflow_plan(lane_matched_plan, edge_bucket_sizes);
+        score_stateflow_plan(lane_matched_plan, edge_bucket_sizes, layout);
         SPDLOG_DEBUG(
             "Stateflow multi-GPU candidate policy=lane_matched cost={:.3f} rounds={} loads={} boundaries={} "
             "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
@@ -3340,8 +3932,42 @@ StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_s
         candidates.emplace_back(std::move(lane_matched_plan));
     }
 
+    return candidates;
+}
+
+StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_states,
+                                           const vector<torch::Tensor> &edge_buckets_per_buffer,
+                                           int active_devices,
+                                           const std::vector<int64_t> &edge_bucket_sizes,
+                                           const std::vector<int64_t> &partition_row_counts,
+                                           const PlanEmbeddingLayout &layout) {
+    std::vector<StateflowPlan> candidates =
+        enumerateMultiGpuStateflowPlans(buffer_states, edge_buckets_per_buffer, active_devices, edge_bucket_sizes, partition_row_counts, layout);
+
     if (candidates.empty()) {
         return StateflowPlan{};
+    }
+
+    const char *forced_family_env = std::getenv("GEGE_STATEFLOW_FORCE_FAMILY");
+    const char *forced_variant_env = std::getenv("GEGE_STATEFLOW_FORCE_VARIANT");
+    const std::string forced_family = forced_family_env != nullptr ? std::string(forced_family_env) : std::string();
+    const std::string forced_variant = forced_variant_env != nullptr ? std::string(forced_variant_env) : std::string();
+    std::vector<StateflowPlan> filtered_candidates;
+    if (!forced_family.empty() || !forced_variant.empty()) {
+        for (const auto &candidate : candidates) {
+            if (!force_matches_family(candidate, forced_family) || !force_matches_variant(candidate, forced_variant)) {
+                continue;
+            }
+            filtered_candidates.emplace_back(candidate);
+        }
+        if (filtered_candidates.empty()) {
+            SPDLOG_WARN("Stateflow force override family='{}' variant='{}' matched no multi-GPU candidates; ignoring override",
+                        forced_family, forced_variant);
+        } else {
+            SPDLOG_INFO("Stateflow force override family='{}' variant='{}' matched {} multi-GPU candidate(s)",
+                        forced_family, forced_variant, filtered_candidates.size());
+            candidates = std::move(filtered_candidates);
+        }
     }
 
     auto best_it = std::min_element(candidates.begin(), candidates.end(), [](const StateflowPlan &lhs, const StateflowPlan &rhs) {
@@ -3365,6 +3991,59 @@ StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_s
         SPDLOG_WARN("Stateflow multi-GPU plan failed exact-semantics validation");
     }
     return *best_it;
+}
+
+MultiGpuSchedule projectStateflowPlanToMultiGpuSchedule(const StateflowPlan &plan) {
+    MultiGpuSchedule schedule;
+    schedule.buffer_states_per_device.resize(plan.lanes.size());
+    schedule.edge_buckets_per_device.resize(plan.lanes.size());
+
+    for (std::size_t lane_idx = 0; lane_idx < plan.lanes.size(); lane_idx++) {
+        const auto &lane = plan.lanes[lane_idx];
+        std::vector<std::vector<int>> buffer_states;
+        std::vector<std::vector<std::pair<int, int>>> edge_buckets;
+        buffer_states.reserve(lane.microstates.size());
+        edge_buckets.reserve(lane.microstates.size());
+        for (const auto &microstate : lane.microstates) {
+            buffer_states.emplace_back(microstate.resident_partitions);
+            edge_buckets.emplace_back(microstate.edge_buckets);
+        }
+        auto tensors = convertEdgeBucketOrderToTensors(std::move(buffer_states), std::move(edge_buckets));
+        schedule.buffer_states_per_device[lane_idx] = std::move(std::get<0>(tensors));
+        schedule.edge_buckets_per_device[lane_idx] = std::move(std::get<1>(tensors));
+    }
+
+    for (const auto &handoff : plan.cross_lane_handoffs) {
+        PeerHandoffDescriptor descriptor;
+        descriptor.src_lane_id = handoff.src_lane_id;
+        descriptor.dst_lane_id = handoff.dst_lane_id;
+        descriptor.src_microstate_id = handoff.src_microstate_id;
+        descriptor.dst_microstate_id = handoff.dst_microstate_id;
+        descriptor.bytes = handoff.peer_bytes;
+        if (!handoff.slot_mapping.empty()) {
+            descriptor.src_slot_id = handoff.slot_mapping.front().first;
+            descriptor.dst_slot_id = handoff.slot_mapping.front().second;
+        }
+        for (const auto &lane : plan.lanes) {
+            if (lane.lane_id != handoff.dst_lane_id) {
+                continue;
+            }
+            for (const auto &microstate : lane.microstates) {
+                if (microstate.microstate_id != handoff.dst_microstate_id) {
+                    continue;
+                }
+                descriptor.round_idx = microstate.superstate_id;
+                if (descriptor.dst_slot_id >= 0 && descriptor.dst_slot_id < static_cast<int>(microstate.resident_partitions.size())) {
+                    descriptor.partition_id = microstate.resident_partitions[descriptor.dst_slot_id];
+                }
+                break;
+            }
+            break;
+        }
+        schedule.peer_handoffs.emplace_back(std::move(descriptor));
+    }
+
+    return schedule;
 }
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> projectStateflowPlanToLegacySchedule(const StateflowPlan &plan) {
@@ -3947,7 +4626,9 @@ std::vector<int64_t> getDisjointBufferStatePermutation(const vector<torch::Tenso
 
 std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<torch::Tensor>& buffer_states,
                                                                   const vector<torch::Tensor>& edge_buckets_per_buffer,
-                                                                  int active_devices) {
+                                                                  int active_devices,
+                                                                  const std::vector<int64_t> &partition_row_counts,
+                                                                  const PlanEmbeddingLayout &layout) {
     if (active_devices <= 1 || buffer_states.size() <= 1 || edge_buckets_per_buffer.size() != buffer_states.size()) {
         return getDisjointBufferStatePermutation(buffer_states, active_devices);
     }
@@ -3976,26 +4657,41 @@ std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<t
     permutation.reserve(buffer_states.size());
 
     std::vector<int64_t> previous_group;
+    LaneMatchCostConfig lane_match_cfg = lane_match_cost_config_from_env();
+    LaneMatchSolver solver = stateflow_lane_match_solver();
+    const int64_t bytes_per_row = plan_embedding_bytes_per_row(layout);
     while (!remaining.empty()) {
         int target_group_size = std::min<int>(active_devices, remaining.size());
-        GroupSearchResult best_group;
-        std::vector<int64_t> current_group;
-        current_group.reserve(target_group_size);
-        search_best_disjoint_group(compatible, remaining, previous_group, summaries, target_group_size, 0, current_group, best_group);
+        std::vector<int64_t> ordered_group;
+        std::vector<int64_t> chosen_states;
+        if (solver == LaneMatchSolver::OPTIMAL2 && active_devices == 2 && target_group_size == 2) {
+            auto best_group =
+                get_best_two_lane_group(compatible, remaining, previous_group, summaries, partition_row_counts, lane_match_cfg,
+                                        bytes_per_row);
+            ordered_group = std::move(best_group.ordered_group);
+            chosen_states = std::move(best_group.chosen_states);
+        } else {
+            GroupSearchResult best_group;
+            std::vector<int64_t> current_group;
+            current_group.reserve(target_group_size);
+            search_best_disjoint_group(compatible, remaining, previous_group, summaries, target_group_size, 0, current_group, best_group);
+            ordered_group = std::move(best_group.ordered_group);
+            chosen_states = std::move(best_group.chosen_states);
+        }
 
-        if (best_group.chosen_states.empty()) {
+        if (chosen_states.empty()) {
             return getDisjointBufferStatePermutation(buffer_states, active_devices);
         }
 
-        for (auto state_idx : best_group.ordered_group) {
+        for (auto state_idx : ordered_group) {
             permutation.emplace_back(state_idx);
         }
 
-        previous_group = best_group.ordered_group;
+        previous_group = ordered_group;
         std::vector<int64_t> next_remaining;
-        next_remaining.reserve(remaining.size() - best_group.chosen_states.size());
+        next_remaining.reserve(remaining.size() - chosen_states.size());
         for (auto state_idx : remaining) {
-            if (std::find(best_group.chosen_states.begin(), best_group.chosen_states.end(), state_idx) == best_group.chosen_states.end()) {
+            if (std::find(chosen_states.begin(), chosen_states.end(), state_idx) == chosen_states.end()) {
                 next_remaining.emplace_back(state_idx);
             }
         }

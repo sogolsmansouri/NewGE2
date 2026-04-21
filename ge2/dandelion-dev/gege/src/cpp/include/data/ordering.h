@@ -151,6 +151,13 @@ StateflowPlan compileSingleGpuStateflowPlan(int num_partitions,
                                             bool allow_hybrid_cover,
                                             const std::vector<int64_t> &partition_row_counts = {});
 
+std::vector<StateflowPlan> enumerateSingleGpuStateflowPlans(int num_partitions,
+                                                            int buffer_capacity,
+                                                            bool randomly_assign_edge_buckets,
+                                                            const std::vector<int64_t> &edge_bucket_sizes,
+                                                            bool allow_hybrid_cover,
+                                                            const std::vector<int64_t> &partition_row_counts = {});
+
 StateflowPlan compileMultiGpuStateflowPlan(const vector<torch::Tensor> &buffer_states,
                                            const vector<torch::Tensor> &edge_buckets_per_buffer,
                                            int active_devices,

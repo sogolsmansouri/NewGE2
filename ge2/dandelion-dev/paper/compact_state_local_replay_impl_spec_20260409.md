@@ -508,3 +508,92 @@ The reproducible headline to remember is:
 - fixed `prefetch=true` epoch 2: `188.6s`
 
 That is roughly a `6%` epoch-time win on the tested setup.
+
+## Stateflow Candidate Sweep Harness
+
+The single-GPU Phase-2 evaluation path now has a dedicated harness:
+
+- script:
+  `/home/smansou2/newCode/ge2/dandelion-dev/scripts/benchmark_stateflow_candidates.py`
+- analyzer support:
+  `gege_stateflow_planner_analyzer --all-candidates --json`
+- forced-plan env:
+  - `GEGE_STATEFLOW_FORCE_FAMILY`
+  - `GEGE_STATEFLOW_FORCE_VARIANT`
+
+The intended workflow is:
+
+1. build `gege_train` and `gege_stateflow_planner_analyzer` on the recovered
+   fast `base` stack
+2. export the dataset-specific fast runtime env
+3. run the harness once per dataset
+4. compare predicted cost against measured epoch runtime from the emitted CSV
+
+### Verified FB Fast-Path Harness Run
+
+The harness was validated first on the known-fast FB candidate only:
+
+```bash
+python /home/smansou2/newCode/ge2/dandelion-dev/scripts/benchmark_stateflow_candidates.py \
+  /home/smansou2/codex_runs/tmp/fb_8107cc36_8k_1024_r64_1e_20260417.yaml \
+  --build-dir /tmp/gege_current_base_build3 \
+  --candidate HYBRID_COVER:legacy_rotated \
+  --epochs 1 \
+  --run-root-base /dev/shm/smansou2_ge2/stateflow_candidate_sweep_fb_fast_smoke_20260421 \
+  --output-csv /home/smansou2/codex_runs/exp_logs/stateflow_candidate_sweep_fb_fast_smoke_20260421.csv
+```
+
+Observed result:
+
+- `HYBRID_COVER:legacy_rotated`: `186437ms`
+- CSV:
+  `/home/smansou2/codex_runs/exp_logs/stateflow_candidate_sweep_fb_fast_smoke_20260421.csv`
+- log:
+  `/home/smansou2/codex_runs/exp_logs/fb_8107cc36_8k_1024_r64_1e_20260417_hybrid_cover_legacy_rotated_20260421_112650.log`
+
+This validates that the harness can reproduce the known fast FB regime when run
+under the recovered `base` stack and dataset-specific fast env.
+
+### Verified Twitter Full Candidate Sweep
+
+A full six-candidate Twitter sweep was run on the recovered fast stack:
+
+- CSV:
+  `/home/smansou2/codex_runs/exp_logs/stateflow_candidate_sweep_twitter_fast_20260421.csv`
+
+Measured epoch times:
+
+- `HYBRID_COVER:legacy_rotated` — `198165ms`
+- `HYBRID_COVER:reversed` — `198250ms`
+- `HYBRID_COVER:natural` — `199764ms`
+- `CUSTOM:gpu_aware` — `212101ms`
+- `CUSTOM:reversed` — `219827ms`
+- `CUSTOM:canonical` — `221150ms`
+
+Quick rank result:
+
+- Spearman rank correlation between predicted cost and measured epoch runtime:
+  `0.942857`
+
+Interpretation:
+
+- on Twitter, the planner's low-cost candidates are also the fast runtime
+  candidates
+- the two best measured candidates are Hybrid-Cover variants
+- all tested CUSTOM variants are slower than all tested Hybrid-Cover variants
+
+### Remaining Single-GPU Runs
+
+The remaining Phase-2 single-GPU work is now straightforward:
+
+1. run the full FB candidate sweep, not just the HC validation candidate
+2. run the same full sweep on LJ
+3. combine `Twitter + FB + LJ` into one table:
+   - candidate family / variant
+   - predicted total cost
+   - per-term cost breakdown
+   - measured epoch runtime
+   - selected log path / CSV row
+
+For the paper, that combined table is the clean evidence that the planner is a
+real cost-driven selector rather than just a scheduling abstraction.

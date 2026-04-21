@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "spdlog/spdlog.h"
 #include "data/ordering.h"
 
 namespace {
@@ -17,8 +18,11 @@ struct Args {
     int buffer_capacity = 4;
     bool randomly_assign_edge_buckets = false;
     bool allow_hybrid_cover = true;
+    bool all_candidates = false;
     bool include_microstates = false;
     bool emit_json = false;
+    std::string force_family;
+    std::string force_variant;
     double alpha = 1.0;
     double beta = 1e-7;
     double gamma = 0.95;
@@ -28,7 +32,8 @@ struct Args {
 void print_usage(const char *prog) {
     std::cerr << "Usage: " << prog
               << " <dataset_dir> <num_partitions> <buffer_capacity>"
-                 " [--random] [--no-hybrid] [--include-microstates] [--json]"
+                 " [--random] [--no-hybrid] [--all-candidates] [--include-microstates] [--json]"
+                 " [--force-family <name>] [--force-variant <name>]"
                  " [--alpha <double>] [--beta <double>] [--gamma <double>] [--delta <double>]\n";
 }
 
@@ -49,10 +54,16 @@ Args parse_args(int argc, char **argv) {
             args.randomly_assign_edge_buckets = true;
         } else if (arg == "--no-hybrid") {
             args.allow_hybrid_cover = false;
+        } else if (arg == "--all-candidates") {
+            args.all_candidates = true;
         } else if (arg == "--include-microstates") {
             args.include_microstates = true;
         } else if (arg == "--json") {
             args.emit_json = true;
+        } else if (arg == "--force-family" && idx + 1 < argc) {
+            args.force_family = argv[++idx];
+        } else if (arg == "--force-variant" && idx + 1 < argc) {
+            args.force_variant = argv[++idx];
         } else if (arg == "--alpha" && idx + 1 < argc) {
             args.alpha = std::stod(argv[++idx]);
         } else if (arg == "--beta" && idx + 1 < argc) {
@@ -135,6 +146,9 @@ void set_weight_env(const char *name, double value) {
 int main(int argc, char **argv) {
     try {
         Args args = parse_args(argc, argv);
+        if (args.emit_json) {
+            spdlog::set_level(spdlog::level::off);
+        }
         auto edge_bucket_sizes = read_bucket_sizes(args.dataset_dir, args.num_partitions);
         auto partition_row_counts = computePartitionRowCounts(read_num_nodes(args.dataset_dir), args.num_partitions);
 
@@ -142,6 +156,45 @@ int main(int argc, char **argv) {
         set_weight_env("GEGE_STATEFLOW_COST_BETA", args.beta);
         set_weight_env("GEGE_STATEFLOW_COST_GAMMA", args.gamma);
         set_weight_env("GEGE_STATEFLOW_COST_DELTA", args.delta);
+        if (!args.force_family.empty()) {
+            if (setenv("GEGE_STATEFLOW_FORCE_FAMILY", args.force_family.c_str(), 1) != 0) {
+                throw std::runtime_error("Failed to set GEGE_STATEFLOW_FORCE_FAMILY");
+            }
+        }
+        if (!args.force_variant.empty()) {
+            if (setenv("GEGE_STATEFLOW_FORCE_VARIANT", args.force_variant.c_str(), 1) != 0) {
+                throw std::runtime_error("Failed to set GEGE_STATEFLOW_FORCE_VARIANT");
+            }
+        }
+
+        if (args.all_candidates) {
+            auto plans = enumerateSingleGpuStateflowPlans(args.num_partitions, args.buffer_capacity,
+                                                          args.randomly_assign_edge_buckets, edge_bucket_sizes,
+                                                          args.allow_hybrid_cover, partition_row_counts);
+            if (args.emit_json) {
+                std::cout << "[";
+                for (std::size_t idx = 0; idx < plans.size(); idx++) {
+                    if (idx > 0) {
+                        std::cout << ",";
+                    }
+                    std::cout << stateflowPlanToJson(plans[idx], args.include_microstates);
+                }
+                std::cout << "]\n";
+                return 0;
+            }
+
+            std::cout << "dataset_dir=" << args.dataset_dir << "\n";
+            std::cout << "num_partitions=" << args.num_partitions << "\n";
+            std::cout << "buffer_capacity=" << args.buffer_capacity << "\n";
+            std::cout << "weights={alpha:" << args.alpha << ",beta:" << args.beta
+                      << ",gamma:" << args.gamma << ",delta:" << args.delta << "}\n";
+            std::cout << "candidate_count=" << plans.size() << "\n";
+            for (std::size_t idx = 0; idx < plans.size(); idx++) {
+                std::cout << "\n[candidate " << idx << "]\n";
+                std::cout << stateflowPlanToText(plans[idx], args.include_microstates);
+            }
+            return 0;
+        }
 
         StateflowPlan plan = compileSingleGpuStateflowPlan(args.num_partitions, args.buffer_capacity,
                                                            args.randomly_assign_edge_buckets, edge_bucket_sizes,

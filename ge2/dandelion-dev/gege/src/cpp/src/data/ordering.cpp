@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -3123,12 +3124,75 @@ StateflowPlan build_reversed_microstate_candidate(const StateflowPlan &source,
                                              edge_bucket_sizes, partition_row_counts);
 }
 
-StateflowPlan compileSingleGpuStateflowPlan(int num_partitions,
-                                            int buffer_capacity,
-                                            bool randomly_assign_edge_buckets,
-                                            const std::vector<int64_t> &edge_bucket_sizes,
-                                            bool allow_hybrid_cover,
-                                            const std::vector<int64_t> &partition_row_counts) {
+std::string normalize_plan_token(const std::string &raw) {
+    std::string normalized;
+    normalized.reserve(raw.size());
+    for (unsigned char ch : raw) {
+        if (std::isalnum(ch)) {
+            normalized.push_back(static_cast<char>(std::tolower(ch)));
+        }
+    }
+    return normalized;
+}
+
+bool stateflow_plan_less(const StateflowPlan &lhs, const StateflowPlan &rhs) {
+    if (lhs.estimated_cost != rhs.estimated_cost) {
+        return lhs.estimated_cost < rhs.estimated_cost;
+    }
+    if (lhs.total_partition_loads != rhs.total_partition_loads) {
+        return lhs.total_partition_loads < rhs.total_partition_loads;
+    }
+    if (lhs.max_overlap != rhs.max_overlap) {
+        return lhs.max_overlap > rhs.max_overlap;
+    }
+    if (lhs.family != rhs.family) {
+        return static_cast<int>(lhs.family) < static_cast<int>(rhs.family);
+    }
+    return static_cast<int>(lhs.family_variant) < static_cast<int>(rhs.family_variant);
+}
+
+bool force_matches_family(const StateflowPlan &plan, const std::string &forced_family) {
+    if (forced_family.empty()) {
+        return true;
+    }
+
+    const std::string normalized = normalize_plan_token(forced_family);
+    if (normalized.empty()) {
+        return true;
+    }
+
+    const std::string family_name = normalize_plan_token(planFamilyName(plan.family));
+    if (normalized == family_name) {
+        return true;
+    }
+
+    if (normalized == "hybridcover" && plan.family == PlanFamily::HYBRID_COVER) {
+        return true;
+    }
+
+    return false;
+}
+
+bool force_matches_variant(const StateflowPlan &plan, const std::string &forced_variant) {
+    if (forced_variant.empty()) {
+        return true;
+    }
+
+    const std::string normalized = normalize_plan_token(forced_variant);
+    if (normalized.empty()) {
+        return true;
+    }
+
+    return normalized == normalize_plan_token(planVariantName(plan.family_variant)) ||
+           normalized == normalize_plan_token(stateflow_plan_name(plan));
+}
+
+std::vector<StateflowPlan> enumerateSingleGpuStateflowPlans(int num_partitions,
+                                                            int buffer_capacity,
+                                                            bool randomly_assign_edge_buckets,
+                                                            const std::vector<int64_t> &edge_bucket_sizes,
+                                                            bool allow_hybrid_cover,
+                                                            const std::vector<int64_t> &partition_row_counts) {
     std::vector<StateflowPlan> candidates;
     auto append_candidate = [&](StateflowPlan candidate) {
         if (!stateflow_plan_valid(candidate)) {
@@ -3185,25 +3249,46 @@ StateflowPlan compileSingleGpuStateflowPlan(int num_partitions,
         append_candidate(factory());
     }
 
+    return candidates;
+}
+
+StateflowPlan compileSingleGpuStateflowPlan(int num_partitions,
+                                            int buffer_capacity,
+                                            bool randomly_assign_edge_buckets,
+                                            const std::vector<int64_t> &edge_bucket_sizes,
+                                            bool allow_hybrid_cover,
+                                            const std::vector<int64_t> &partition_row_counts) {
+    std::vector<StateflowPlan> candidates = enumerateSingleGpuStateflowPlans(num_partitions, buffer_capacity,
+                                                                             randomly_assign_edge_buckets, edge_bucket_sizes,
+                                                                             allow_hybrid_cover, partition_row_counts);
+
     if (candidates.empty()) {
         return StateflowPlan{};
     }
 
-    auto best_it = std::min_element(candidates.begin(), candidates.end(), [](const StateflowPlan &lhs, const StateflowPlan &rhs) {
-        if (lhs.estimated_cost != rhs.estimated_cost) {
-            return lhs.estimated_cost < rhs.estimated_cost;
+    const char *forced_family_env = std::getenv("GEGE_STATEFLOW_FORCE_FAMILY");
+    const char *forced_variant_env = std::getenv("GEGE_STATEFLOW_FORCE_VARIANT");
+    const std::string forced_family = forced_family_env != nullptr ? std::string(forced_family_env) : std::string();
+    const std::string forced_variant = forced_variant_env != nullptr ? std::string(forced_variant_env) : std::string();
+    std::vector<StateflowPlan> filtered_candidates;
+    if (!forced_family.empty() || !forced_variant.empty()) {
+        for (const auto &candidate : candidates) {
+            if (!force_matches_family(candidate, forced_family) || !force_matches_variant(candidate, forced_variant)) {
+                continue;
+            }
+            filtered_candidates.emplace_back(candidate);
         }
-        if (lhs.total_partition_loads != rhs.total_partition_loads) {
-            return lhs.total_partition_loads < rhs.total_partition_loads;
+        if (filtered_candidates.empty()) {
+            SPDLOG_WARN("Stateflow force override family='{}' variant='{}' matched no single-GPU candidates; ignoring override",
+                        forced_family, forced_variant);
+        } else {
+            SPDLOG_INFO("Stateflow force override family='{}' variant='{}' matched {} candidate(s)",
+                        forced_family, forced_variant, filtered_candidates.size());
+            candidates = std::move(filtered_candidates);
         }
-        if (lhs.max_overlap != rhs.max_overlap) {
-            return lhs.max_overlap > rhs.max_overlap;
-        }
-        if (lhs.family != rhs.family) {
-            return static_cast<int>(lhs.family) < static_cast<int>(rhs.family);
-        }
-        return static_cast<int>(lhs.family_variant) < static_cast<int>(rhs.family_variant);
-    });
+    }
+
+    auto best_it = std::min_element(candidates.begin(), candidates.end(), stateflow_plan_less);
 
     SPDLOG_INFO("Stateflow planner selected family={} cost={:.3f} loads={} boundaries={} max_overlap={} {}",
                 stateflow_plan_name(*best_it), best_it->estimated_cost, best_it->total_partition_loads,

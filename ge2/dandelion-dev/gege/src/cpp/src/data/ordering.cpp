@@ -2602,35 +2602,43 @@ bool sorted_vectors_equal(std::vector<T> lhs, std::vector<T> rhs) {
 }
 
 bool validate_plan_exact_semantics(const StateflowPlan &plan) {
-    if (plan.num_partitions <= 0) {
+    const bool debug_validate = std::getenv("GEGE_STATEFLOW_DEBUG_VALIDATE") != nullptr;
+    auto fail = [&](const std::string &reason) {
+        if (debug_validate) {
+            SPDLOG_WARN("Stateflow validation failed for family={} variant={}: {}",
+                        static_cast<int>(plan.family), static_cast<int>(plan.family_variant), reason);
+        }
         return false;
+    };
+    if (plan.num_partitions <= 0) {
+        return fail("num_partitions <= 0");
     }
     if (plan.total_admitted_objects != plan.total_partition_loads) {
-        return false;
+        return fail("total_admitted_objects != total_partition_loads");
     }
     int64_t lane_local_handoffs = 0;
     for (const auto &lane : plan.lanes) {
         lane_local_handoffs += static_cast<int64_t>(lane.handoffs.size());
     }
     if (plan.total_handoffs != lane_local_handoffs + static_cast<int64_t>(plan.cross_lane_handoffs.size())) {
-        return false;
+        return fail("total_handoffs mismatch");
     }
     if (plan.total_cross_lane_handoffs != static_cast<int64_t>(plan.cross_lane_handoffs.size())) {
-        return false;
+        return fail("total_cross_lane_handoffs mismatch");
     }
 
     std::unordered_map<int64_t, int64_t> bucket_counts;
     for (const auto &lane : plan.lanes) {
         if (lane.handoffs.size() + (lane.microstates.empty() ? 0 : 1) != lane.microstates.size()) {
-            return false;
+            return fail("lane handoff count does not match microstate count");
         }
 
         for (const auto &ms : lane.microstates) {
             if (ms.lane_id != lane.lane_id) {
-                return false;
+                return fail("microstate lane_id mismatch");
             }
             if (ms.resident_objects.size() != ms.resident_partitions.size()) {
-                return false;
+                return fail("resident_objects size != resident_partitions size");
             }
 
             std::unordered_set<int> resident_partition_ids(ms.resident_partitions.begin(), ms.resident_partitions.end());
@@ -2639,45 +2647,45 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
             std::unordered_map<int, int64_t> partition_to_object_id;
             for (const auto &obj : ms.resident_objects) {
                 if (obj.partition_id < 0 || obj.partition_id >= plan.num_partitions) {
-                    return false;
+                    return fail("resident object partition out of bounds");
                 }
                 if (obj.slot_id < 0 || obj.slot_id >= static_cast<int>(ms.resident_partitions.size())) {
-                    return false;
+                    return fail("resident object slot out of bounds");
                 }
                 if (resident_partition_ids.count(obj.partition_id) == 0) {
-                    return false;
+                    return fail("resident object partition not found in resident_partitions");
                 }
                 if (!used_slots.insert(obj.slot_id).second) {
-                    return false;
+                    return fail("duplicate resident object slot");
                 }
                 if (!resident_object_ids.insert(obj.object_id).second) {
-                    return false;
+                    return fail("duplicate resident object id");
                 }
                 partition_to_object_id[obj.partition_id] = obj.object_id;
                 if (ms.resident_partitions[obj.slot_id] != obj.partition_id) {
-                    return false;
+                    return fail("resident object slot does not map to partition");
                 }
             }
 
             std::unordered_set<int64_t> ms_bucket_keys;
             for (const auto &frag : ms.active_fragments) {
                 if (!frag.exact_semantics_tag) {
-                    return false;
+                    return fail("fragment exact_semantics_tag false");
                 }
                 if (frag.edge_buckets.empty() || frag.required_object_ids.empty()) {
-                    return false;
+                    return fail("fragment missing edge buckets or required object ids");
                 }
                 for (int64_t object_id : frag.required_object_ids) {
                     if (resident_object_ids.count(object_id) == 0) {
-                        return false;
+                        return fail("fragment required object id missing from resident set");
                     }
                 }
                 for (const auto &[s, d] : frag.edge_buckets) {
                     if (s < 0 || s >= plan.num_partitions || d < 0 || d >= plan.num_partitions) {
-                        return false;
+                        return fail("fragment edge bucket partition out of bounds");
                     }
                     if (resident_partition_ids.count(s) == 0 || resident_partition_ids.count(d) == 0) {
-                        return false;
+                        return fail("fragment edge bucket references non-resident partition");
                     }
                     int64_t key = static_cast<int64_t>(s) * plan.num_partitions + static_cast<int64_t>(d);
                     ms_bucket_keys.insert(key);
@@ -2689,7 +2697,7 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
                 expected_ms_bucket_keys.insert(key);
             }
             if (ms_bucket_keys != expected_ms_bucket_keys) {
-                return false;
+                return fail("fragment union does not match microstate edge buckets");
             }
             for (int64_t key : ms_bucket_keys) {
                 bucket_counts[key]++;
@@ -2701,7 +2709,7 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
             const auto &ms = lane.microstates[idx];
             const auto &handoff = lane.handoffs[idx - 1];
             if (handoff.src_microstate_id != prev_ms.microstate_id || handoff.dst_microstate_id != ms.microstate_id) {
-                return false;
+                return fail("lane-local handoff endpoints mismatch");
             }
 
             std::unordered_map<int, int64_t> prev_partition_to_object_id;
@@ -2719,7 +2727,7 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
                 int part = prev_ms.resident_partitions[slot];
                 auto prev_obj_it = prev_partition_to_object_id.find(part);
                 if (prev_obj_it == prev_partition_to_object_id.end()) {
-                    return false;
+                    return fail("previous partition missing object id");
                 }
                 if (curr_set.count(part) > 0) {
                     expected_kept_object_ids.emplace_back(prev_obj_it->second);
@@ -2740,7 +2748,7 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
                 !sorted_vectors_equal(expected_admitted_object_ids, handoff.admitted_object_ids) ||
                 !sorted_vectors_equal(expected_evicted_object_ids, handoff.evicted_object_ids) ||
                 !sorted_vectors_equal(expected_slot_mapping, handoff.slot_mapping)) {
-                return false;
+                return fail("lane-local handoff payload mismatch");
             }
 
             HandoffMode expected_mode;
@@ -2752,7 +2760,7 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
                 expected_mode = HandoffMode::FULL_RELOAD;
             }
             if (handoff.mode != expected_mode) {
-                return false;
+                return fail("lane-local handoff mode mismatch");
             }
 
             std::unordered_set<int> prev_set(prev_ms.resident_partitions.begin(), prev_ms.resident_partitions.end());
@@ -2767,7 +2775,7 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
                     }
                 }
                 if (!found_partition) {
-                    return false;
+                    return fail("admitted object id missing from resident objects");
                 }
             }
 
@@ -2777,28 +2785,28 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
                     continue;
                 }
                 if (peer_handoff.slot_mapping.size() != 1) {
-                    return false;
+                    return fail("peer handoff slot mapping size != 1");
                 }
                 int dst_slot = peer_handoff.slot_mapping.front().second;
                 if (dst_slot < 0 || dst_slot >= static_cast<int>(ms.resident_partitions.size())) {
-                    return false;
+                    return fail("peer handoff dst slot out of bounds");
                 }
                 int partition_id = ms.resident_partitions[dst_slot];
                 if (prev_set.count(partition_id) > 0) {
-                    return false;
+                    return fail("peer admitted partition already resident in previous microstate");
                 }
                 if (local_admitted_partitions.count(partition_id) == 0) {
-                    return false;
+                    return fail("peer admitted partition not in local admitted set");
                 }
                 if (!peer_admitted_partitions.insert(partition_id).second) {
-                    return false;
+                    return fail("duplicate peer-admitted partition for destination microstate");
                 }
             }
 
             std::unordered_set<int> host_admitted_partitions = local_admitted_partitions;
             for (int partition_id : peer_admitted_partitions) {
                 if (host_admitted_partitions.erase(partition_id) == 0) {
-                    return false;
+                    return fail("peer-admitted partition missing from local admitted set");
                 }
             }
 
@@ -2815,27 +2823,28 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
             std::unordered_set<int> covered_new_partitions = host_admitted_partitions;
             covered_new_partitions.insert(peer_admitted_partitions.begin(), peer_admitted_partitions.end());
             if (covered_new_partitions != expected_new_partitions) {
-                return false;
+                return fail("covered new partitions do not match expected new partitions");
             }
 
             std::unordered_set<int> covered_partitions = kept_partitions;
             covered_partitions.insert(covered_new_partitions.begin(), covered_new_partitions.end());
             if (covered_partitions != curr_set) {
-                return false;
+                return fail("covered partitions do not match current resident set");
             }
         }
     }
 
     for (int64_t superstate_id = 0; superstate_id < plan.total_superstates; superstate_id++) {
-        std::unordered_set<int> resident_partitions;
+        std::unordered_map<int, int> resident_partition_to_lane;
         for (const auto &lane : plan.lanes) {
             for (const auto &microstate : lane.microstates) {
                 if (microstate.superstate_id != superstate_id) {
                     continue;
                 }
                 for (int partition_id : microstate.resident_partitions) {
-                    if (!resident_partitions.insert(partition_id).second) {
-                        return false;
+                    auto [it, inserted] = resident_partition_to_lane.emplace(partition_id, lane.lane_id);
+                    if (!inserted && it->second != lane.lane_id) {
+                        return fail("duplicate resident partition across lanes within superstate");
                     }
                 }
             }
@@ -2845,10 +2854,10 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
     std::unordered_set<int64_t> peer_target_keys;
     for (const auto &handoff : plan.cross_lane_handoffs) {
         if (handoff.mode != HandoffMode::PEER_RELAY) {
-            return false;
+            return fail("cross-lane handoff mode is not PEER_RELAY");
         }
         if (handoff.src_lane_id < 0 || handoff.dst_lane_id < 0 || handoff.src_lane_id == handoff.dst_lane_id) {
-            return false;
+            return fail("cross-lane handoff lane ids invalid");
         }
         const LanePlan *src_lane = nullptr;
         const LanePlan *dst_lane = nullptr;
@@ -2875,13 +2884,13 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
             }
         }
         if (src_lane == nullptr || dst_lane == nullptr || src_microstate == nullptr || dst_microstate == nullptr) {
-            return false;
+            return fail("cross-lane handoff references missing lane or microstate");
         }
         if (src_microstate->superstate_id + 1 != dst_microstate->superstate_id) {
-            return false;
+            return fail("cross-lane handoff superstate transition invalid");
         }
         if (handoff.admitted_object_ids.size() != 1 || handoff.slot_mapping.size() != 1) {
-            return false;
+            return fail("cross-lane handoff payload size invalid");
         }
         int partition_id = -1;
         int dst_slot = handoff.slot_mapping.front().second;
@@ -2889,17 +2898,17 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
         if (src_slot < 0 || dst_slot < 0 ||
             src_slot >= static_cast<int>(src_microstate->resident_partitions.size()) ||
             dst_slot >= static_cast<int>(dst_microstate->resident_partitions.size())) {
-            return false;
+            return fail("cross-lane handoff slot out of bounds");
         }
         partition_id = dst_microstate->resident_partitions[dst_slot];
         if (src_microstate->resident_partitions[src_slot] != partition_id) {
-            return false;
+            return fail("cross-lane handoff source slot does not hold destination partition");
         }
         int64_t peer_target_key = (static_cast<int64_t>(handoff.dst_lane_id) << 40) |
                                   (static_cast<int64_t>(handoff.dst_microstate_id) << 20) |
                                   static_cast<int64_t>(partition_id);
         if (!peer_target_keys.insert(peer_target_key).second) {
-            return false;
+            return fail("duplicate cross-lane peer target");
         }
         bool admitted_object_matches = false;
         for (const auto &obj : dst_microstate->resident_objects) {
@@ -2909,34 +2918,34 @@ bool validate_plan_exact_semantics(const StateflowPlan &plan) {
             }
         }
         if (!admitted_object_matches) {
-            return false;
+            return fail("cross-lane handoff admitted object id does not match destination partition");
         }
         const auto &dst_lane_microstates = dst_lane->microstates;
         auto dst_it = std::find_if(dst_lane_microstates.begin(), dst_lane_microstates.end(),
                                    [&](const auto &microstate) { return microstate.microstate_id == dst_microstate->microstate_id; });
         if (dst_it == dst_lane_microstates.begin() || dst_it == dst_lane_microstates.end()) {
-            return false;
+            return fail("cross-lane destination microstate missing previous microstate");
         }
         const auto &prev_dst_microstate = *(dst_it - 1);
         if (std::find(prev_dst_microstate.resident_partitions.begin(), prev_dst_microstate.resident_partitions.end(), partition_id) !=
             prev_dst_microstate.resident_partitions.end()) {
-            return false;
+            return fail("cross-lane admitted partition already present in previous destination microstate");
         }
         if (handoff.peer_bytes <= 0) {
-            return false;
+            return fail("cross-lane peer_bytes <= 0");
         }
     }
 
     const int64_t expected_total_buckets = static_cast<int64_t>(plan.num_partitions) * static_cast<int64_t>(plan.num_partitions);
     if (static_cast<int64_t>(bucket_counts.size()) != expected_total_buckets) {
-        return false;
+        return fail("bucket coverage cardinality mismatch");
     }
     for (int src_part = 0; src_part < plan.num_partitions; src_part++) {
         for (int dst_part = 0; dst_part < plan.num_partitions; dst_part++) {
             int64_t key = static_cast<int64_t>(src_part) * plan.num_partitions + dst_part;
             auto count_it = bucket_counts.find(key);
             if (count_it == bucket_counts.end() || count_it->second != 1) {
-                return false;
+                return fail("bucket coverage is not exact-once");
             }
         }
     }

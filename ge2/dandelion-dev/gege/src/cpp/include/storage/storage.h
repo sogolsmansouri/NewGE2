@@ -247,7 +247,7 @@ class MemPartitionBufferStorage : public Storage {
     std::unique_ptr<ReusableBarrier> peer_relay_ready_barrier_;
     std::unique_ptr<ReusableBarrier> peer_relay_build_barrier_;
     std::vector<torch::Tensor> peer_relay_next_states_;
-    std::vector<torch::Tensor> peer_relay_staged_views_;
+    std::vector<std::unordered_map<int64_t, torch::Tensor>> peer_relay_source_scratch_tensors_;
     bool stateflow_peer_schedule_active_ = false;
     std::vector<std::unordered_map<int64_t, PeerHandoffDescriptor>> stateflow_peer_handoff_index_per_device_;
     std::vector<int64_t> stateflow_transition_counts_;
@@ -260,7 +260,6 @@ class MemPartitionBufferStorage : public Storage {
     std::vector<std::unordered_set<int64_t>> stateflow_peer_mismatch_warned_keys_;
     void ensureHostLoaded_();
     void initializePeerRelay_();
-    torch::Tensor ensurePeerRelayStagedView_(int32_t device_idx);
     bool peerRelayEnabled_();
 
 };

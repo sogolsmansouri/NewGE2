@@ -662,7 +662,7 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
     peer_relay_ready_barrier_.reset();
     peer_relay_build_barrier_.reset();
     peer_relay_next_states_.clear();
-    peer_relay_staged_views_.clear();
+    peer_relay_source_scratch_tensors_.clear();
 
     StateflowPeerRuntimeMode stateflow_mode = stateflow_peer_runtime_mode();
     StateflowPeerRuntimeScope stateflow_scope = stateflow_peer_runtime_scope();
@@ -769,11 +769,11 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
     peer_relay_ready_barrier_ = std::make_unique<ReusableBarrier>(static_cast<int>(devices_.size()));
     peer_relay_build_barrier_ = std::make_unique<ReusableBarrier>(static_cast<int>(devices_.size()));
     peer_relay_next_states_.resize(devices_.size());
-    peer_relay_staged_views_.resize(devices_.size());
+    peer_relay_source_scratch_tensors_.resize(devices_.size());
 
     peer_relay_runtime_enabled_ = true;
     SPDLOG_INFO(
-        "Enabled peer relay runtime for {} CUDA devices (stateflow_schedule_active={} stateflow_mode={} stateflow_scope={} low_level_requested={}); staging buffers will be allocated lazily at first swap and CPU backing store will be synchronized at unload/eval boundaries",
+        "Enabled peer relay runtime for {} CUDA devices (stateflow_schedule_active={} stateflow_mode={} stateflow_scope={} low_level_requested={}); source scratch will be allocated lazily for outgoing handoffs and CPU backing store will be synchronized at unload/eval boundaries",
         devices_.size(), stateflow_peer_schedule_active_, stateflow_peer_runtime_mode_name(stateflow_mode),
         stateflow_peer_runtime_scope_name(stateflow_scope), low_level_runtime_requested);
 #endif
@@ -786,48 +786,6 @@ bool MemPartitionBufferStorage::peerRelayEnabled_() {
         initializePeerRelay_();
     }
     return peer_relay_runtime_enabled_;
-}
-
-torch::Tensor MemPartitionBufferStorage::ensurePeerRelayStagedView_(int32_t device_idx) {
-    if (device_idx < 0 || device_idx >= static_cast<int32_t>(buffers_.size())) {
-        throw GegeRuntimeException("MemPartitionBufferStorage::ensurePeerRelayStagedView_ received an invalid device index");
-    }
-    if (!peer_relay_runtime_enabled_) {
-        throw GegeRuntimeException("MemPartitionBufferStorage::ensurePeerRelayStagedView_ called while peer relay runtime is disabled");
-    }
-
-    {
-        std::lock_guard<std::mutex> lock(peer_relay_init_lock_);
-        if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < peer_relay_staged_views_.size() &&
-            peer_relay_staged_views_[device_idx].defined()) {
-            return peer_relay_staged_views_[device_idx];
-        }
-    }
-
-#if !defined(GEGE_CUDA)
-    throw GegeRuntimeException("MemPartitionBufferStorage::ensurePeerRelayStagedView_ requires GEGE_CUDA");
-#else
-    auto *buffer = buffers_[device_idx];
-    try {
-        c10::cuda::CUDAGuard device_guard(buffer->device_);
-        torch::Tensor staged_view = torch::empty_like(buffer->buffer_tensor_gpu_view_);
-
-        std::lock_guard<std::mutex> lock(peer_relay_init_lock_);
-        if (!peer_relay_staged_views_[device_idx].defined()) {
-            peer_relay_staged_views_[device_idx] = staged_view;
-            SPDLOG_INFO("Allocated peer relay staging buffer lazily device={} rows={} dim={}",
-                        buffer->device_.index(),
-                        peer_relay_staged_views_[device_idx].size(0),
-                        peer_relay_staged_views_[device_idx].size(1));
-        }
-        return peer_relay_staged_views_[device_idx];
-    } catch (const c10::Error &e) {
-        cudaGetLastError();
-        throw GegeRuntimeException(
-            fmt::format("Stateflow/partition peer relay unable to allocate relay staging buffer on device {} during swap ({})",
-                        buffer->device_.index(), e.what()));
-    }
-#endif
 }
 
 
@@ -1003,6 +961,10 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
     if (!buffer->buffer_state_.defined() || buffer->buffer_state_iterator_ == buffer->buffer_states_.end()) {
         return;
     }
+    if (!stateflow_peer_schedule_active_) {
+        buffers_[device_idx]->performNextSwap(swap_ready_event);
+        return;
+    }
 
     {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
@@ -1010,36 +972,54 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
     }
     peer_relay_ready_barrier_->arrive_and_wait();
 
-    std::vector<int> current_owner(options_->num_partitions, -1);
-    std::vector<bool> next_required(options_->num_partitions, false);
-    for (int src_dev = 0; src_dev < static_cast<int>(buffers_.size()); src_dev++) {
-        auto *src_buffer = buffers_[src_dev];
-        auto current_state = src_buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
-        auto *state_ptr = current_state.data_ptr<int64_t>();
-        for (int64_t i = 0; i < current_state.numel(); i++) {
-            current_owner[state_ptr[i]] = src_dev;
-        }
-
-        auto next_state = peer_relay_next_states_[src_dev].to(torch::kCPU).to(torch::kInt64).contiguous();
-        auto *next_ptr = next_state.data_ptr<int64_t>();
-        for (int64_t i = 0; i < next_state.numel(); i++) {
-            int64_t partition_id = next_ptr[i];
-            if (partition_id >= 0 && partition_id < static_cast<int64_t>(next_required.size())) {
-                next_required[partition_id] = true;
-            }
-        }
+    auto previous_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto next_state = peer_relay_next_states_[device_idx].to(torch::kCPU).to(torch::kInt64).contiguous();
+    std::vector<int> evict_ids = buffer->getNextEvict();
+    std::vector<int> admit_ids = buffer->getNextAdmit();
+    if (evict_ids.size() != admit_ids.size()) {
+        throw GegeRuntimeException("MemPartitionBufferStorage::performNextSwap expected matched evict/admit counts for Stateflow peer relay");
     }
 
-    auto next_state = peer_relay_next_states_[device_idx].to(torch::kCPU).to(torch::kInt64).contiguous();
-    auto previous_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
-    torch::Tensor staged_view = ensurePeerRelayStagedView_(device_idx);
     bool stateflow_runtime_controlling =
-        stateflow_peer_schedule_active_ && stateflow_peer_runtime_mode() != StateflowPeerRuntimeMode::OFF &&
         device_idx >= 0 && static_cast<std::size_t>(device_idx) < stateflow_peer_handoff_index_per_device_.size();
     int64_t transition_round_idx =
         stateflow_runtime_controlling && static_cast<std::size_t>(device_idx) < stateflow_transition_counts_.size()
             ? stateflow_transition_counts_[device_idx] + 1
             : -1;
+
+    std::unordered_set<int> evict_id_set(evict_ids.begin(), evict_ids.end());
+    std::vector<int> retained_ids;
+    std::unordered_map<int, int64_t> retained_slots_before;
+    auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
+    for (int64_t slot = 0; slot < previous_state.numel(); slot++) {
+        int partition_id = static_cast<int>(previous_state_ptr[slot]);
+        if (evict_id_set.find(partition_id) == evict_id_set.end()) {
+            retained_ids.emplace_back(partition_id);
+            retained_slots_before[partition_id] = buffer->partition_table_[partition_id]->buffer_idx_;
+        }
+    }
+
+    std::vector<int64_t> evict_slots;
+    evict_slots.reserve(evict_ids.size());
+    for (int evict_id : evict_ids) {
+        Partition *partition = buffer->partition_table_[evict_id];
+        if (partition->buffer_idx_ < 0) {
+            throw GegeRuntimeException("MemPartitionBufferStorage::performNextSwap encountered an evict partition without a resident buffer slot");
+        }
+        evict_slots.emplace_back(partition->buffer_idx_);
+    }
+
+    std::vector<bool> next_required(options_->num_partitions, false);
+    for (int lane = 0; lane < static_cast<int>(buffers_.size()); lane++) {
+        auto lane_next_state = peer_relay_next_states_[lane].to(torch::kCPU).to(torch::kInt64).contiguous();
+        auto *lane_next_ptr = lane_next_state.data_ptr<int64_t>();
+        for (int64_t i = 0; i < lane_next_state.numel(); i++) {
+            int64_t partition_id = lane_next_ptr[i];
+            if (partition_id >= 0 && partition_id < static_cast<int64_t>(next_required.size())) {
+                next_required[partition_id] = true;
+            }
+        }
+    }
 
     auto load_partition_from_host = [&](Partition *partition, const torch::Tensor &cpu_view) {
         if (!buffer->pos_.defined()) {
@@ -1059,6 +1039,46 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         data_.index_put_({host_indices}, cpu_view);
     };
 
+    auto warn_stateflow_fallback = [&](int64_t handoff_key, const std::string &message) {
+        if (device_idx < 0 || static_cast<std::size_t>(device_idx) >= stateflow_peer_mismatch_warned_keys_.size()) {
+            SPDLOG_WARN("{}", message);
+            return;
+        }
+        if (stateflow_peer_mismatch_warned_keys_[device_idx].emplace(handoff_key).second) {
+            SPDLOG_WARN("{}", message);
+        }
+    };
+
+    std::vector<PeerHandoffDescriptor> outgoing_handoffs;
+    if (stateflow_runtime_controlling) {
+        for (const auto &handoff_index : stateflow_peer_handoff_index_per_device_) {
+            for (const auto &[handoff_key, handoff] : handoff_index) {
+                if (handoff.round_idx == transition_round_idx && handoff.src_lane_id == device_idx) {
+                    outgoing_handoffs.emplace_back(handoff);
+                }
+            }
+        }
+        std::sort(outgoing_handoffs.begin(), outgoing_handoffs.end(),
+                  [](const PeerHandoffDescriptor &lhs, const PeerHandoffDescriptor &rhs) {
+                      if (lhs.partition_id != rhs.partition_id) {
+                          return lhs.partition_id < rhs.partition_id;
+                      }
+                      if (lhs.dst_lane_id != rhs.dst_lane_id) {
+                          return lhs.dst_lane_id < rhs.dst_lane_id;
+                      }
+                      return lhs.dst_slot_id < rhs.dst_slot_id;
+                  });
+    }
+
+    struct RelayDebugSlot {
+        int partition_id;
+        int src_dev;
+        int64_t dst_slot;
+    };
+
+    auto &local_source_scratch = peer_relay_source_scratch_tensors_[device_idx];
+    local_source_scratch.clear();
+
     {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
         auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
@@ -1067,7 +1087,44 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             auto ready_event = reinterpret_cast<cudaEvent_t>(swap_ready_event);
             AT_CUDA_CHECK(cudaStreamWaitEvent(comm_stream.stream(), ready_event, 0));
         }
-        std::vector<std::tuple<int, int, int64_t, int64_t>> relay_debug_slots;
+
+        bool submitted_source_scratch = false;
+        for (const auto &handoff : outgoing_handoffs) {
+            if (handoff.partition_id < 0 || handoff.partition_id >= static_cast<int>(buffer->partition_table_.size())) {
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer handoff references invalid partition {} on source lane {}", handoff.partition_id, device_idx));
+            }
+
+            Partition *src_partition = buffer->partition_table_[handoff.partition_id];
+            if (!src_partition->present_ || src_partition->buffer_idx_ < 0) {
+                continue;
+            }
+            if (src_partition->buffer_idx_ != handoff.src_slot_id) {
+                continue;
+            }
+
+            int64_t rows = src_partition->partition_size_;
+            int64_t src_offset = static_cast<int64_t>(src_partition->buffer_idx_) * buffer->partition_size_;
+            torch::Tensor src_view = buffer->buffer_tensor_gpu_view_.slice(0, src_offset, src_offset + rows);
+            try {
+                torch::Tensor source_scratch = torch::empty({rows, dim1_size_}, src_view.options());
+                source_scratch.copy_(src_view, true);
+                local_source_scratch[handoff.partition_id] = source_scratch;
+                submitted_source_scratch = true;
+            } catch (const c10::Error &e) {
+                cudaGetLastError();
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer relay unable to allocate source scratch for partition {} on device {} during swap ({})",
+                                handoff.partition_id, buffer->device_.index(), e.what()));
+            }
+        }
+
+        if (submitted_source_scratch) {
+            cudaStreamSynchronize(comm_stream.stream());
+        }
+        peer_relay_ready_barrier_->arrive_and_wait();
+
+        std::vector<RelayDebugSlot> relay_debug_slots;
         std::vector<int> host_evict_ids;
         int64_t peer_bytes_executed = 0;
         int64_t host_fallback_bytes = 0;
@@ -1076,25 +1133,23 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         int64_t descriptor_mismatch_count = 0;
         bool submitted_peer_copy = false;
 
-        auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
-        for (int64_t slot = 0; slot < previous_state.numel(); slot++) {
-            int partition_id = static_cast<int>(previous_state_ptr[slot]);
-            if (partition_id < 0 || partition_id >= static_cast<int>(next_required.size()) || next_required[partition_id]) {
+        for (int evict_id : evict_ids) {
+            if (evict_id < 0 || evict_id >= static_cast<int>(next_required.size()) || next_required[evict_id]) {
                 continue;
             }
 
-            Partition *partition = buffer->partition_table_[partition_id];
+            Partition *partition = buffer->partition_table_[evict_id];
             int64_t src_slot = partition->buffer_idx_;
             int64_t buffer_offset = src_slot * buffer->partition_size_;
             torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
             torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
             cpu_view.copy_(gpu_view.detach(), true);
-            host_evict_ids.emplace_back(partition_id);
+            host_evict_ids.emplace_back(evict_id);
         }
 
         if (!host_evict_ids.empty()) {
             cudaStreamSynchronize(comm_stream.stream());
-            for (auto partition_id : host_evict_ids) {
+            for (int partition_id : host_evict_ids) {
                 Partition *partition = buffer->partition_table_[partition_id];
                 int64_t src_slot = partition->buffer_idx_;
                 int64_t buffer_offset = src_slot * buffer->partition_size_;
@@ -1103,15 +1158,15 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         }
 
-        auto *next_state_ptr = next_state.data_ptr<int64_t>();
-        for (int64_t slot = 0; slot < next_state.numel(); slot++) {
-            int partition_id = static_cast<int>(next_state_ptr[slot]);
-            int src_dev = current_owner[partition_id];
+        for (std::size_t admit_offset = 0; admit_offset < admit_ids.size(); admit_offset++) {
+            int partition_id = admit_ids[admit_offset];
             Partition *dst_partition = buffer->partition_table_[partition_id];
             int64_t rows = dst_partition->partition_size_;
             int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
-            int64_t dst_offset = slot * buffer->partition_size_;
+            int64_t dst_slot = evict_slots[admit_offset];
+            int64_t dst_offset = dst_slot * buffer->partition_size_;
             int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
+
             const PeerHandoffDescriptor *scheduled_handoff = nullptr;
             if (stateflow_runtime_controlling) {
                 auto handoff_it = stateflow_peer_handoff_index_per_device_[device_idx].find(handoff_key);
@@ -1119,88 +1174,92 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     scheduled_handoff = &handoff_it->second;
                 }
             }
-            if (src_dev >= 0) {
-                auto *src_buffer = buffers_[src_dev];
-                Partition *src_partition = src_buffer->partition_table_[partition_id];
-                int64_t src_slot = src_partition->buffer_idx_;
-                bool use_peer_copy = true;
-                if (src_dev != device_idx && stateflow_runtime_controlling) {
-                    bool handoff_matches =
-                        scheduled_handoff != nullptr && scheduled_handoff->src_lane_id == src_dev &&
-                        scheduled_handoff->dst_lane_id == device_idx && scheduled_handoff->src_slot_id == src_slot &&
-                        scheduled_handoff->dst_slot_id == slot;
-                    if (!handoff_matches) {
-                        use_peer_copy = false;
+
+            bool used_peer_copy = false;
+            if (scheduled_handoff != nullptr) {
+                if (scheduled_handoff->dst_lane_id != device_idx || scheduled_handoff->dst_slot_id != dst_slot) {
+                    descriptor_mismatch_count += 1;
+                    warn_stateflow_fallback(
+                        handoff_key,
+                        fmt::format(
+                            "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected destination slot does not match the runtime evict slot (expected dst_lane={} dst_slot={}, actual dst_lane={} dst_slot={})",
+                            device_idx, transition_round_idx, partition_id, scheduled_handoff->dst_lane_id,
+                            scheduled_handoff->dst_slot_id, device_idx, dst_slot));
+                } else if (scheduled_handoff->src_lane_id == device_idx) {
+                    throw GegeRuntimeException(
+                        fmt::format("Stateflow peer relay encountered an unexpected local source for dst_lane={} round={} partition={}",
+                                    device_idx, transition_round_idx, partition_id));
+                } else if (scheduled_handoff->src_lane_id < 0 ||
+                           scheduled_handoff->src_lane_id >= static_cast<int>(buffers_.size())) {
+                    descriptor_mismatch_count += 1;
+                    warn_stateflow_fallback(
+                        handoff_key,
+                        fmt::format(
+                            "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected source lane={} is invalid",
+                            device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id));
+                } else {
+                    auto *src_buffer = buffers_[scheduled_handoff->src_lane_id];
+                    Partition *src_partition = src_buffer->partition_table_[partition_id];
+                    auto &source_scratch_map = peer_relay_source_scratch_tensors_[scheduled_handoff->src_lane_id];
+                    auto scratch_it = source_scratch_map.find(partition_id);
+                    if (!src_partition->present_ || src_partition->buffer_idx_ < 0) {
                         descriptor_mismatch_count += 1;
-                        if (device_idx >= 0 &&
-                            static_cast<std::size_t>(device_idx) < stateflow_peer_mismatch_warned_keys_.size() &&
-                            stateflow_peer_mismatch_warned_keys_[device_idx].emplace(handoff_key).second) {
-                            if (scheduled_handoff == nullptr) {
-                                SPDLOG_WARN(
-                                    "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because no descriptor matched the runtime source lane/slot (actual src_lane={} src_slot={} dst_slot={})",
-                                    device_idx, transition_round_idx, partition_id, src_dev, src_slot, slot);
-                            } else {
-                                SPDLOG_WARN(
-                                    "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected descriptor does not match the runtime source lane/slot (expected src_lane={} src_slot={} dst_slot={}, actual src_lane={} src_slot={} dst_slot={})",
-                                    device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id,
-                                    scheduled_handoff->src_slot_id, scheduled_handoff->dst_slot_id, src_dev, src_slot, slot);
-                            }
+                        warn_stateflow_fallback(
+                            handoff_key,
+                            fmt::format(
+                                "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected source lane={} is not resident at runtime",
+                                device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id));
+                    } else if (src_partition->buffer_idx_ != scheduled_handoff->src_slot_id) {
+                        descriptor_mismatch_count += 1;
+                        warn_stateflow_fallback(
+                            handoff_key,
+                            fmt::format(
+                                "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected source slot does not match the runtime slot (expected src_lane={} src_slot={}, actual src_lane={} src_slot={})",
+                                device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id,
+                                scheduled_handoff->src_slot_id, scheduled_handoff->src_lane_id, src_partition->buffer_idx_));
+                    } else if (scratch_it == source_scratch_map.end() || !scratch_it->second.defined()) {
+                        descriptor_mismatch_count += 1;
+                        warn_stateflow_fallback(
+                            handoff_key,
+                            fmt::format(
+                                "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because no source scratch was prepared for src_lane={} src_slot={}",
+                                device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id,
+                                scheduled_handoff->src_slot_id));
+                    } else {
+                        torch::Tensor src_scratch = scratch_it->second;
+                        void *dst_ptr =
+                            static_cast<char *>(buffer->buffer_tensor_gpu_view_.data_ptr()) +
+                            (dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
+                        void *src_ptr = src_scratch.data_ptr();
+                        cudaError_t status = cudaMemcpyPeerAsync(
+                            dst_ptr, buffer->device_.index(), src_ptr, src_buffer->device_.index(), bytes, comm_stream.stream());
+                        if (status != cudaSuccess) {
+                            throw GegeRuntimeException(
+                                fmt::format("Peer relay copy failed for partition {} from device {} to {}: {}",
+                                            partition_id, src_buffer->device_.index(), buffer->device_.index(),
+                                            cudaGetErrorString(status)));
+                        }
+                        used_peer_copy = true;
+                        submitted_peer_copy = true;
+                        peer_bytes_executed += bytes;
+                        peer_copy_count += 1;
+                        if (eval_finite_debug_enabled()) {
+                            relay_debug_slots.push_back({partition_id, static_cast<int>(scheduled_handoff->src_lane_id), dst_slot});
                         }
                     }
                 }
-                if (!use_peer_copy) {
-                    torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
-                    load_partition_from_host(dst_partition, cpu_view);
-                    torch::Tensor gpu_view = staged_view.slice(0, dst_offset, dst_offset + rows);
-                    gpu_view.copy_(cpu_view, true);
+            }
+
+            if (!used_peer_copy) {
+                torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
+                load_partition_from_host(dst_partition, cpu_view);
+                torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, dst_offset, dst_offset + rows);
+                gpu_view.copy_(cpu_view, true);
+                if (scheduled_handoff != nullptr) {
                     host_fallback_bytes += bytes;
                     host_fallback_count += 1;
-                    continue;
                 }
-
-                void *dst_ptr = static_cast<char *>(staged_view.data_ptr()) + (dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
-                void *src_ptr = static_cast<char *>(src_buffer->buffer_tensor_gpu_view_.data_ptr()) +
-                                (src_slot * src_buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
-
-                cudaError_t status;
-                if (src_dev == device_idx) {
-                    status = cudaMemcpyAsync(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice, comm_stream.stream());
-                } else {
-                    status = cudaMemcpyPeerAsync(dst_ptr, buffer->device_.index(), src_ptr, src_buffer->device_.index(), bytes, comm_stream.stream());
-                }
-
-                if (status != cudaSuccess) {
-                    throw GegeRuntimeException(fmt::format("Peer relay copy failed for partition {} from device {} to {}: {}",
-                                                          partition_id, src_buffer->device_.index(), buffer->device_.index(),
-                                                          cudaGetErrorString(status)));
-                }
-                if (src_dev != device_idx) {
-                    submitted_peer_copy = true;
-                    peer_bytes_executed += bytes;
-                    peer_copy_count += 1;
-                }
-                if (eval_finite_debug_enabled()) {
-                    relay_debug_slots.emplace_back(partition_id, src_dev, src_slot, slot);
-                }
-                continue;
             }
-
-            if (stateflow_runtime_controlling && scheduled_handoff != nullptr) {
-                descriptor_mismatch_count += 1;
-                if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < stateflow_peer_mismatch_warned_keys_.size() &&
-                    stateflow_peer_mismatch_warned_keys_[device_idx].emplace(handoff_key).second) {
-                    SPDLOG_WARN(
-                        "Stateflow peer relay falling back to host for dst_lane={} round={} partition={} because the projected source lane={} is not resident at runtime",
-                        device_idx, transition_round_idx, partition_id, scheduled_handoff->src_lane_id);
-                }
-                host_fallback_bytes += bytes;
-                host_fallback_count += 1;
-            }
-
-            torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
-            load_partition_from_host(dst_partition, cpu_view);
-            torch::Tensor gpu_view = staged_view.slice(0, dst_offset, dst_offset + rows);
-            gpu_view.copy_(cpu_view, true);
         }
 
         auto peer_sync_start = std::chrono::high_resolution_clock::now();
@@ -1218,37 +1277,36 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         }
 
         if (eval_finite_debug_enabled()) {
-            for (const auto &[partition_id, src_dev, src_slot, dst_slot] : relay_debug_slots) {
-                auto *src_buffer = buffers_[src_dev];
-                Partition *dst_partition = buffer->partition_table_[partition_id];
+            for (const auto &debug_slot : relay_debug_slots) {
+                auto &source_scratch_map = peer_relay_source_scratch_tensors_[debug_slot.src_dev];
+                auto scratch_it = source_scratch_map.find(debug_slot.partition_id);
+                if (scratch_it == source_scratch_map.end() || !scratch_it->second.defined()) {
+                    continue;
+                }
+                Partition *dst_partition = buffer->partition_table_[debug_slot.partition_id];
                 int64_t rows = dst_partition->partition_size_;
-                torch::Tensor src_view = src_buffer->buffer_tensor_gpu_view_.slice(
-                    0, src_slot * src_buffer->partition_size_, src_slot * src_buffer->partition_size_ + rows);
-                torch::Tensor dst_view = staged_view.slice(
-                    0, dst_slot * buffer->partition_size_, dst_slot * buffer->partition_size_ + rows);
-                log_non_finite_rows_if_any("src", partition_id, src_buffer->device_.index(), buffer->device_.index(), src_view);
-                log_non_finite_rows_if_any("staged", partition_id, src_buffer->device_.index(), buffer->device_.index(), dst_view);
+                torch::Tensor dst_view =
+                    buffer->buffer_tensor_gpu_view_.slice(0, debug_slot.dst_slot * buffer->partition_size_,
+                                                          debug_slot.dst_slot * buffer->partition_size_ + rows);
+                log_non_finite_rows_if_any("src_scratch", debug_slot.partition_id, buffers_[debug_slot.src_dev]->device_.index(),
+                                           buffer->device_.index(), scratch_it->second);
+                log_non_finite_rows_if_any("dst", debug_slot.partition_id, buffers_[debug_slot.src_dev]->device_.index(),
+                                           buffer->device_.index(), dst_view);
             }
         }
     }
 
     peer_relay_build_barrier_->arrive_and_wait();
+    peer_relay_source_scratch_tensors_[device_idx].clear();
 
-    auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
-    for (int64_t i = 0; i < previous_state.numel(); i++) {
-        int partition_id = static_cast<int>(previous_state_ptr[i]);
-        Partition *partition = buffer->partition_table_[partition_id];
+    for (int evict_id : evict_ids) {
+        Partition *partition = buffer->partition_table_[evict_id];
         partition->present_ = false;
         partition->buffer_idx_ = -1;
         partition->data_ptr_ = nullptr;
+        partition->physical_frame_idx_ = -1;
     }
 
-    buffer->buffer_tensor_gpu_view_ = staged_view;
-    // Free the previous live buffer after each peer-relay swap. We reallocate
-    // the scratch buffer lazily on the next swap, which keeps steady-state
-    // memory at one live buffer per storage instead of a persistent ping-pong
-    // pair per storage.
-    peer_relay_staged_views_[device_idx] = torch::Tensor();
     buffer->buffer_state_ = *buffer->buffer_state_iterator_;
     for (int i = 0; i < buffer->buffer_sizes_; i++) {
         if (buffer->buffer_state_iterator_ != buffer->buffer_states_.end()) {
@@ -1256,17 +1314,47 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         }
     }
 
+    std::unordered_map<int, int64_t> admit_slots_by_partition;
+    admit_slots_by_partition.reserve(admit_ids.size());
+    for (std::size_t admit_offset = 0; admit_offset < admit_ids.size(); admit_offset++) {
+        admit_slots_by_partition.emplace(admit_ids[admit_offset], evict_slots[admit_offset]);
+    }
+
     int64_t num_rows = 0;
     auto current_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
     auto *current_state_ptr = current_state.data_ptr<int64_t>();
-    for (int64_t slot = 0; slot < current_state.numel(); slot++) {
-        int partition_id = static_cast<int>(current_state_ptr[slot]);
+    for (int64_t i = 0; i < current_state.numel(); i++) {
+        int partition_id = static_cast<int>(current_state_ptr[i]);
         Partition *partition = buffer->partition_table_[partition_id];
-        partition->present_ = true;
-        partition->buffer_idx_ = slot;
-        partition->data_ptr_ = nullptr;
+        if (!partition->present_ && partition->buffer_idx_ == -1) {
+            auto admit_slot_it = admit_slots_by_partition.find(partition_id);
+            if (admit_slot_it == admit_slots_by_partition.end()) {
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer relay expected partition {} to map to an evict slot during swap finalization",
+                                partition_id));
+            }
+            partition->present_ = true;
+            partition->buffer_idx_ = static_cast<int>(admit_slot_it->second);
+            partition->data_ptr_ = nullptr;
+        }
+        partition->physical_frame_idx_ = static_cast<int>(partition->buffer_idx_);
         num_rows += partition->partition_size_;
     }
+
+    for (int retained_id : retained_ids) {
+        Partition *partition = buffer->partition_table_[retained_id];
+        auto prev_slot_it = retained_slots_before.find(retained_id);
+        if (prev_slot_it == retained_slots_before.end()) {
+            continue;
+        }
+        if (!partition->present_ || partition->buffer_idx_ != prev_slot_it->second) {
+            throw GegeRuntimeException(
+                fmt::format("Stateflow peer relay changed retained partition {} slot from {} to {}",
+                            retained_id, prev_slot_it->second, partition->buffer_idx_));
+        }
+        partition->physical_frame_idx_ = static_cast<int>(partition->buffer_idx_);
+    }
+
     buffer->size_.store(num_rows);
     buffer->loaded_ = true;
     if (stateflow_runtime_controlling && device_idx >= 0 && static_cast<std::size_t>(device_idx) < stateflow_transition_counts_.size()) {

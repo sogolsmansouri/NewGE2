@@ -82,6 +82,11 @@ enum class StateflowPeerRuntimeMode {
     OFF = 2,
 };
 
+enum class StateflowPeerRuntimeScope {
+    ALL = 0,
+    EMBEDDINGS = 1,
+};
+
 StateflowPeerRuntimeMode stateflow_peer_runtime_mode() {
     static StateflowPeerRuntimeMode mode = []() {
         const char *raw = std::getenv("GEGE_STATEFLOW_PEER_RUNTIME");
@@ -110,6 +115,36 @@ const char *stateflow_peer_runtime_mode_name(StateflowPeerRuntimeMode mode) {
             return "off";
     }
     return "auto";
+}
+
+StateflowPeerRuntimeScope stateflow_peer_runtime_scope() {
+    static StateflowPeerRuntimeScope scope = []() {
+        const char *raw = std::getenv("GEGE_STATEFLOW_PEER_RUNTIME_SCOPE");
+        if (raw == nullptr) {
+            return StateflowPeerRuntimeScope::ALL;
+        }
+        std::string value(raw);
+        if (value == "embeddings" || value == "EMBEDDINGS" || value == "embedding" || value == "EMBEDDING") {
+            return StateflowPeerRuntimeScope::EMBEDDINGS;
+        }
+        return StateflowPeerRuntimeScope::ALL;
+    }();
+    return scope;
+}
+
+const char *stateflow_peer_runtime_scope_name(StateflowPeerRuntimeScope scope) {
+    switch (scope) {
+        case StateflowPeerRuntimeScope::ALL:
+            return "all";
+        case StateflowPeerRuntimeScope::EMBEDDINGS:
+            return "embeddings";
+    }
+    return "all";
+}
+
+bool stateflow_optimizer_state_storage_filename(const std::string &filename) {
+    return filename.find("embeddings_state") != std::string::npos || filename.find("optimizer_state") != std::string::npos ||
+           filename.find("_state.bin") != std::string::npos;
 }
 
 int64_t peer_handoff_lookup_key(int64_t round_idx, int partition_id) {
@@ -630,9 +665,20 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
     peer_relay_staged_views_.clear();
 
     StateflowPeerRuntimeMode stateflow_mode = stateflow_peer_runtime_mode();
-    bool stateflow_runtime_requested = stateflow_peer_schedule_active_ && stateflow_mode != StateflowPeerRuntimeMode::OFF;
+    StateflowPeerRuntimeScope stateflow_scope = stateflow_peer_runtime_scope();
+    bool stateflow_runtime_scope_allows_storage =
+        stateflow_scope == StateflowPeerRuntimeScope::ALL || !stateflow_optimizer_state_storage_filename(filename_);
+    bool stateflow_runtime_requested =
+        stateflow_peer_schedule_active_ && stateflow_mode != StateflowPeerRuntimeMode::OFF && stateflow_runtime_scope_allows_storage;
     bool low_level_runtime_requested = partition_buffer_peer_relay_enabled();
-    bool force_peer_runtime = stateflow_peer_schedule_active_ && stateflow_mode == StateflowPeerRuntimeMode::ON;
+    bool force_peer_runtime =
+        stateflow_peer_schedule_active_ && stateflow_mode == StateflowPeerRuntimeMode::ON && stateflow_runtime_scope_allows_storage;
+
+    if (stateflow_peer_schedule_active_ && stateflow_mode != StateflowPeerRuntimeMode::OFF && !stateflow_runtime_scope_allows_storage &&
+        !low_level_runtime_requested) {
+        SPDLOG_INFO("Skipping Stateflow peer relay runtime for storage={} because GEGE_STATEFLOW_PEER_RUNTIME_SCOPE={}",
+                    filename_, stateflow_peer_runtime_scope_name(stateflow_scope));
+    }
 
     auto fail_or_fallback = [&](const std::string &message, bool warn = true) {
 #if defined(GEGE_CUDA)
@@ -727,8 +773,9 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
 
     peer_relay_runtime_enabled_ = true;
     SPDLOG_INFO(
-        "Enabled peer relay runtime for {} CUDA devices (stateflow_schedule_active={} stateflow_mode={} low_level_requested={}); staging buffers will be allocated lazily at first swap and CPU backing store will be synchronized at unload/eval boundaries",
-        devices_.size(), stateflow_peer_schedule_active_, stateflow_peer_runtime_mode_name(stateflow_mode), low_level_runtime_requested);
+        "Enabled peer relay runtime for {} CUDA devices (stateflow_schedule_active={} stateflow_mode={} stateflow_scope={} low_level_requested={}); staging buffers will be allocated lazily at first swap and CPU backing store will be synchronized at unload/eval boundaries",
+        devices_.size(), stateflow_peer_schedule_active_, stateflow_peer_runtime_mode_name(stateflow_mode),
+        stateflow_peer_runtime_scope_name(stateflow_scope), low_level_runtime_requested);
 #endif
 }
 

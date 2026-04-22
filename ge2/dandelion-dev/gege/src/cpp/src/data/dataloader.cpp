@@ -1461,8 +1461,7 @@ void DataLoader::setBufferOrdering() {
             }
             bool stateflow_lane_matching_supported =
                 stateflow_lane_matching_requested && requested_active_devices > 1 && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
-                !options->randomly_assign_edge_buckets && !access_aware_state_generation && !used_optimized_custom_schedule &&
-                !used_hybrid_cover_schedule;
+                !options->randomly_assign_edge_buckets && !access_aware_state_generation && !used_hybrid_cover_schedule;
             if (stateflow_lane_matching_supported) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
                 auto partition_row_counts = computePartitionRowCounts(graph_storage_->getNumNodes(), options->num_partitions);
@@ -1495,7 +1494,8 @@ void DataLoader::setBufferOrdering() {
                     edge_buckets_per_buffer_ = std::get<1>(planned_ordering);
                     used_stateflow_planner = true;
                     used_stateflow_lane_matching = true;
-                    SPDLOG_INFO("Using stateflow multi-GPU lane matching for {} logical device(s)", requested_active_devices);
+                    SPDLOG_INFO("Using stateflow multi-GPU lane matching for {} logical device(s) (optimized_custom_base={})",
+                                requested_active_devices, used_optimized_custom_schedule);
                 }
             }
             if (!used_stateflow_planner && !access_aware_state_generation && !used_optimized_custom_schedule &&

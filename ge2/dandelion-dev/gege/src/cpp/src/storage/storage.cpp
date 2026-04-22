@@ -1158,6 +1158,14 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         auto publish_cv = peer_relay_source_publish_cvs_[device_idx];
         {
             std::lock_guard<std::mutex> publish_lock(*publish_mutex);
+            // Scratch tensors are only needed for the currently published round.
+            // Retaining one tensor per partition across rounds quickly accumulates
+            // tens of gigabytes on 24 GB boards, and any destination that trails
+            // far enough behind to need an older round already falls back because
+            // scratch_rounds no longer matches the requested transition round.
+            published_source_scratch.clear();
+            source_scratch_pool.clear();
+
             auto &slot_snapshot = peer_relay_source_slot_snapshots_[device_idx];
             std::fill(slot_snapshot.begin(), slot_snapshot.end(), -1);
             auto *previous_state_ptr = previous_state.data_ptr<int64_t>();

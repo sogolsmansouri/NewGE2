@@ -271,6 +271,7 @@ class MemPartitionBuffer : public PartitionBuffer {
     void ensureBackingTensorsAllocated_();
     void resetFrameCacheState_();
     void refreshFrameCacheTensors_();
+    bool asyncAdmitPreloadEnabled_() const;
     bool frameCacheEnabled_() const;
     int64_t logicalSlotToPhysicalFrame_(int64_t logical_slot) const;
     int64_t logicalSlotRowOffset_(int64_t logical_slot) const;
@@ -282,6 +283,7 @@ class MemPartitionBuffer : public PartitionBuffer {
     torch::Tensor hostPartitionRows_(Partition *partition);
     void copyPartitionFromHostToPinned_(Partition *partition, torch::Tensor pinned_view);
     void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
+    void startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots);
     void joinAsyncAdmitPreload_();
     bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
                                    int64_t *visible_install_rows = nullptr, int64_t *hidden_publish_rows = nullptr,

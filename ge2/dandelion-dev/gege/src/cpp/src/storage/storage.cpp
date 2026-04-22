@@ -76,6 +76,11 @@ bool partition_buffer_peer_relay_enabled() {
     return enabled;
 }
 
+bool multi_gpu_async_admit_preload_enabled() {
+    static bool enabled = parse_env_flag("GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD", false);
+    return enabled;
+}
+
 enum class StateflowPeerRuntimeMode {
     AUTO = 0,
     ON = 1,
@@ -1377,6 +1382,34 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         }
 
+        std::unordered_set<int> preloaded_host_admit_ids;
+        if (multi_gpu_async_admit_preload_enabled()) {
+            std::vector<int> host_preload_admit_ids;
+            std::vector<int64_t> host_preload_slots;
+            host_preload_admit_ids.reserve(admit_ids.size());
+            host_preload_slots.reserve(evict_slots.size());
+            for (std::size_t idx = 0; idx < admit_ids.size(); idx++) {
+                int partition_id = admit_ids[idx];
+                int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
+                bool has_scheduled_peer_handoff = false;
+                if (stateflow_runtime_controlling) {
+                    auto handoff_it = stateflow_peer_handoff_index_per_device_[device_idx].find(handoff_key);
+                    has_scheduled_peer_handoff = handoff_it != stateflow_peer_handoff_index_per_device_[device_idx].end();
+                }
+                if (!has_scheduled_peer_handoff) {
+                    host_preload_admit_ids.push_back(partition_id);
+                    host_preload_slots.push_back(evict_slots[idx]);
+                }
+            }
+
+            if (!host_preload_admit_ids.empty()) {
+                double preload_wait_ms = 0.0;
+                if (buffer->consumeAsyncAdmitPreload_(host_preload_admit_ids, host_preload_slots, &preload_wait_ms)) {
+                    preloaded_host_admit_ids.insert(host_preload_admit_ids.begin(), host_preload_admit_ids.end());
+                }
+            }
+        }
+
         struct ScopedCudaEvent {
             cudaEvent_t handle = nullptr;
 
@@ -1398,6 +1431,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                         fmt::format("Stateflow peer relay failed to place retained partition {} into slot {} on device {} (actual slot={})",
                                     partition_id, slot, buffer->device_.index(), retained_it->second));
                 }
+                continue;
+            }
+            if (preloaded_host_admit_ids.find(partition_id) != preloaded_host_admit_ids.end()) {
                 continue;
             }
 
@@ -1620,10 +1656,57 @@ void MemPartitionBufferStorage::startAsyncAdmitPreload(int32_t device_idx) {
     if (device_idx < 0 || device_idx >= static_cast<int32_t>(buffers_.size())) {
         throw GegeRuntimeException("MemPartitionBufferStorage::startAsyncAdmitPreload received an invalid device index");
     }
-    if (peerRelayEnabled_()) {
+    if (!peerRelayEnabled_()) {
+        buffers_[device_idx]->startAsyncAdmitPreload();
         return;
     }
-    buffers_[device_idx]->startAsyncAdmitPreload();
+    if (!stateflow_peer_schedule_active_ || !multi_gpu_async_admit_preload_enabled()) {
+        return;
+    }
+
+    auto *buffer = buffers_[device_idx];
+    if (!buffer->buffer_state_.defined() || buffer->buffer_state_iterator_ == buffer->buffer_states_.end()) {
+        return;
+    }
+
+    std::vector<int> evict_ids = buffer->getNextEvict();
+    std::vector<int> admit_ids = buffer->getNextAdmit();
+    if (evict_ids.size() != admit_ids.size()) {
+        throw GegeRuntimeException("MemPartitionBufferStorage::startAsyncAdmitPreload expected matched evict/admit counts");
+    }
+
+    int64_t transition_round_idx =
+        static_cast<std::size_t>(device_idx) < stateflow_transition_counts_.size() ? stateflow_transition_counts_[device_idx] + 1 : -1;
+
+    std::vector<int64_t> evict_slots;
+    evict_slots.reserve(evict_ids.size());
+    for (int evict_id : evict_ids) {
+        Partition *partition = buffer->partition_table_[evict_id];
+        if (partition->buffer_idx_ < 0) {
+            return;
+        }
+        evict_slots.emplace_back(partition->buffer_idx_);
+    }
+
+    std::vector<int> host_preload_admit_ids;
+    std::vector<int64_t> host_preload_slots;
+    host_preload_admit_ids.reserve(admit_ids.size());
+    host_preload_slots.reserve(evict_slots.size());
+    for (std::size_t idx = 0; idx < admit_ids.size(); idx++) {
+        int partition_id = admit_ids[idx];
+        int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
+        bool has_scheduled_peer_handoff = false;
+        if (static_cast<std::size_t>(device_idx) < stateflow_peer_handoff_index_per_device_.size()) {
+            auto handoff_it = stateflow_peer_handoff_index_per_device_[device_idx].find(handoff_key);
+            has_scheduled_peer_handoff = handoff_it != stateflow_peer_handoff_index_per_device_[device_idx].end();
+        }
+        if (!has_scheduled_peer_handoff) {
+            host_preload_admit_ids.push_back(partition_id);
+            host_preload_slots.push_back(evict_slots[idx]);
+        }
+    }
+
+    buffer->startAsyncAdmitPreloadForPlan_(host_preload_admit_ids, host_preload_slots);
 }
 
 torch::Tensor MemPartitionBufferStorage::indexRead(Indices indices) { 

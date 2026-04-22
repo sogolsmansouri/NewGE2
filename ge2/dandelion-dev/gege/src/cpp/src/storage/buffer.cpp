@@ -90,6 +90,11 @@ bool single_gpu_async_admit_preload_enabled() {
     return enabled;
 }
 
+bool multi_gpu_async_admit_preload_enabled() {
+    static bool enabled = parse_env_flag("GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD", false);
+    return enabled;
+}
+
 bool single_gpu_async_evict_writeback_enabled() {
     static bool enabled = parse_env_flag("GEGE_SINGLE_GPU_ASYNC_EVICT_WRITEBACK", false);
     return enabled;
@@ -1336,6 +1341,16 @@ MemPartitionBuffer::~MemPartitionBuffer() {
 
 bool MemPartitionBuffer::frameCacheEnabled_() const { return hidden_frame_capacity_ > 0; }
 
+bool MemPartitionBuffer::asyncAdmitPreloadEnabled_() const {
+    if (!device_.is_cuda()) {
+        return false;
+    }
+    if (buffer_sizes_ == 1) {
+        return single_gpu_async_admit_preload_enabled() && single_gpu_gpu_aware_custom_enabled();
+    }
+    return multi_gpu_async_admit_preload_enabled();
+}
+
 void MemPartitionBuffer::refreshFrameCacheTensors_() {
     logical_to_physical_frame_cpu_ = torch::tensor(logical_to_physical_frames_, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
     if (device_.is_cuda()) {
@@ -1823,14 +1838,6 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
 }
 
 void MemPartitionBuffer::startAsyncAdmitPreload() {
-    if (!single_gpu_async_admit_preload_enabled() || !single_gpu_gpu_aware_custom_enabled() || buffer_sizes_ != 1 || !device_.is_cuda() ||
-        !loaded_ || !buffer_state_.defined() || buffer_state_iterator_ == buffer_states_.end() || !buffer_tensor_gpu_view_.defined() ||
-        !data_storage_.defined()) {
-        return;
-    }
-
-    joinAsyncAdmitPreload_();
-
     std::vector<int> admit_ids = getNextAdmit();
     std::vector<int> evict_ids = getNextEvict();
     if (admit_ids.empty() || admit_ids.size() != evict_ids.size()) {
@@ -1848,6 +1855,24 @@ void MemPartitionBuffer::startAsyncAdmitPreload() {
             return;
         }
         evict_slots.emplace_back(partition->buffer_idx_);
+    }
+
+    startAsyncAdmitPreloadForPlan_(admit_ids, evict_slots);
+}
+
+void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots) {
+    if (!asyncAdmitPreloadEnabled_() || !loaded_ || !buffer_state_.defined() || buffer_state_iterator_ == buffer_states_.end() ||
+        !buffer_tensor_gpu_view_.defined() || !data_storage_.defined()) {
+        return;
+    }
+
+    joinAsyncAdmitPreload_();
+
+    if (admit_ids.empty() || admit_ids.size() != evict_slots.size()) {
+        std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
+        async_admit_preload_valid_ = false;
+        async_admit_preload_in_flight_ = false;
+        return;
     }
 
     int64_t admit_rows = partition_rows_for_ids(admit_ids, partition_table_);

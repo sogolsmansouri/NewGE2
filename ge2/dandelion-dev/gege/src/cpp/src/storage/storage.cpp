@@ -988,15 +988,10 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             : -1;
 
     std::unordered_set<int> evict_id_set(evict_ids.begin(), evict_ids.end());
-    std::vector<int> retained_ids;
-    std::unordered_map<int, int64_t> retained_slots_before;
-    auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
-    for (int64_t slot = 0; slot < previous_state.numel(); slot++) {
-        int partition_id = static_cast<int>(previous_state_ptr[slot]);
-        if (evict_id_set.find(partition_id) == evict_id_set.end()) {
-            retained_ids.emplace_back(partition_id);
-            retained_slots_before[partition_id] = buffer->partition_table_[partition_id]->buffer_idx_;
-        }
+    std::unordered_map<int, int64_t> next_slot_by_partition;
+    auto *next_state_ptr = next_state.data_ptr<int64_t>();
+    for (int64_t slot = 0; slot < next_state.numel(); slot++) {
+        next_slot_by_partition[static_cast<int>(next_state_ptr[slot])] = slot;
     }
 
     std::vector<int64_t> evict_slots;
@@ -1158,12 +1153,128 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         }
 
-        for (std::size_t admit_offset = 0; admit_offset < admit_ids.size(); admit_offset++) {
-            int partition_id = admit_ids[admit_offset];
+        auto copy_partition_between_slots = [&](int partition_id, int64_t src_slot, int64_t dst_slot) {
+            if (src_slot == dst_slot) {
+                return;
+            }
+            Partition *partition = buffer->partition_table_[partition_id];
+            int64_t bytes = partition->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_);
+            void *dst_ptr =
+                static_cast<char *>(buffer->buffer_tensor_gpu_view_.data_ptr()) +
+                (dst_slot * buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
+            void *src_ptr =
+                static_cast<char *>(buffer->buffer_tensor_gpu_view_.data_ptr()) +
+                (src_slot * buffer->partition_size_ * dim1_size_ * get_dtype_size_wrapper(dtype_));
+            cudaError_t status = cudaMemcpyAsync(dst_ptr, src_ptr, bytes, cudaMemcpyDeviceToDevice, comm_stream.stream());
+            if (status != cudaSuccess) {
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer relay local slot move failed for partition {} on device {} (src_slot={} dst_slot={}): {}",
+                                partition_id, buffer->device_.index(), src_slot, dst_slot, cudaGetErrorString(status)));
+            }
+        };
+
+        auto remove_free_slot = [](std::vector<int64_t> &free_slots, int64_t slot) {
+            auto it = std::find(free_slots.begin(), free_slots.end(), slot);
+            if (it == free_slots.end()) {
+                throw GegeRuntimeException(fmt::format("Stateflow peer relay lost track of free slot {}", slot));
+            }
+            free_slots.erase(it);
+        };
+
+        std::vector<int> slot_to_partition(previous_state.numel(), -1);
+        std::vector<int64_t> free_slots;
+        std::unordered_map<int, int64_t> current_slot_by_partition;
+        current_slot_by_partition.reserve(previous_state.numel());
+        auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
+        for (int64_t idx = 0; idx < previous_state.numel(); idx++) {
+            int partition_id = static_cast<int>(previous_state_ptr[idx]);
+            Partition *partition = buffer->partition_table_[partition_id];
+            int64_t current_slot = partition->buffer_idx_;
+            if (current_slot < 0 || current_slot >= previous_state.numel()) {
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer relay encountered invalid current slot {} for partition {} on device {}",
+                                current_slot, partition_id, buffer->device_.index()));
+            }
+            if (evict_id_set.count(partition_id) > 0) {
+                free_slots.emplace_back(current_slot);
+            } else {
+                slot_to_partition[current_slot] = partition_id;
+                current_slot_by_partition[partition_id] = current_slot;
+            }
+        }
+
+        std::unordered_set<int> pending_moves;
+        pending_moves.reserve(current_slot_by_partition.size());
+        for (const auto &[partition_id, current_slot] : current_slot_by_partition) {
+            auto target_it = next_slot_by_partition.find(partition_id);
+            if (target_it == next_slot_by_partition.end()) {
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer relay lost retained partition {} from next-state layout on device {}",
+                                partition_id, buffer->device_.index()));
+            }
+            if (target_it->second != current_slot) {
+                pending_moves.insert(partition_id);
+            }
+        }
+
+        while (!pending_moves.empty()) {
+            bool progressed = false;
+            for (auto it = pending_moves.begin(); it != pending_moves.end();) {
+                int partition_id = *it;
+                int64_t current_slot = current_slot_by_partition.at(partition_id);
+                int64_t target_slot = next_slot_by_partition.at(partition_id);
+                if (std::find(free_slots.begin(), free_slots.end(), target_slot) != free_slots.end()) {
+                    copy_partition_between_slots(partition_id, current_slot, target_slot);
+                    slot_to_partition[target_slot] = partition_id;
+                    remove_free_slot(free_slots, target_slot);
+                    slot_to_partition[current_slot] = -1;
+                    free_slots.emplace_back(current_slot);
+                    current_slot_by_partition[partition_id] = target_slot;
+                    it = pending_moves.erase(it);
+                    progressed = true;
+                } else {
+                    ++it;
+                }
+            }
+
+            if (pending_moves.empty()) {
+                break;
+            }
+
+            if (!progressed) {
+                if (free_slots.empty()) {
+                    throw GegeRuntimeException(
+                        fmt::format("Stateflow peer relay has no free slot available to realize retained-slot permutation on device {}",
+                                    buffer->device_.index()));
+                }
+                int partition_id = *pending_moves.begin();
+                int64_t current_slot = current_slot_by_partition.at(partition_id);
+                int64_t scratch_slot = free_slots.back();
+                free_slots.pop_back();
+                copy_partition_between_slots(partition_id, current_slot, scratch_slot);
+                slot_to_partition[scratch_slot] = partition_id;
+                slot_to_partition[current_slot] = -1;
+                free_slots.emplace_back(current_slot);
+                current_slot_by_partition[partition_id] = scratch_slot;
+            }
+        }
+
+        for (int64_t slot = 0; slot < next_state.numel(); slot++) {
+            int partition_id = static_cast<int>(next_state_ptr[slot]);
+            auto retained_it = current_slot_by_partition.find(partition_id);
+            if (retained_it != current_slot_by_partition.end()) {
+                if (retained_it->second != slot) {
+                    throw GegeRuntimeException(
+                        fmt::format("Stateflow peer relay failed to place retained partition {} into slot {} on device {} (actual slot={})",
+                                    partition_id, slot, buffer->device_.index(), retained_it->second));
+                }
+                continue;
+            }
+
             Partition *dst_partition = buffer->partition_table_[partition_id];
             int64_t rows = dst_partition->partition_size_;
             int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
-            int64_t dst_slot = evict_slots[admit_offset];
+            int64_t dst_slot = slot;
             int64_t dst_offset = dst_slot * buffer->partition_size_;
             int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
 
@@ -1299,7 +1410,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
     peer_relay_build_barrier_->arrive_and_wait();
     peer_relay_source_scratch_tensors_[device_idx].clear();
 
-    for (int evict_id : evict_ids) {
+    auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
+    for (int64_t i = 0; i < previous_state.numel(); i++) {
+        int evict_id = static_cast<int>(previous_state_ptr[i]);
         Partition *partition = buffer->partition_table_[evict_id];
         partition->present_ = false;
         partition->buffer_idx_ = -1;
@@ -1314,45 +1427,17 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         }
     }
 
-    std::unordered_map<int, int64_t> admit_slots_by_partition;
-    admit_slots_by_partition.reserve(admit_ids.size());
-    for (std::size_t admit_offset = 0; admit_offset < admit_ids.size(); admit_offset++) {
-        admit_slots_by_partition.emplace(admit_ids[admit_offset], evict_slots[admit_offset]);
-    }
-
     int64_t num_rows = 0;
     auto current_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
     auto *current_state_ptr = current_state.data_ptr<int64_t>();
     for (int64_t i = 0; i < current_state.numel(); i++) {
         int partition_id = static_cast<int>(current_state_ptr[i]);
         Partition *partition = buffer->partition_table_[partition_id];
-        if (!partition->present_ && partition->buffer_idx_ == -1) {
-            auto admit_slot_it = admit_slots_by_partition.find(partition_id);
-            if (admit_slot_it == admit_slots_by_partition.end()) {
-                throw GegeRuntimeException(
-                    fmt::format("Stateflow peer relay expected partition {} to map to an evict slot during swap finalization",
-                                partition_id));
-            }
-            partition->present_ = true;
-            partition->buffer_idx_ = static_cast<int>(admit_slot_it->second);
-            partition->data_ptr_ = nullptr;
-        }
-        partition->physical_frame_idx_ = static_cast<int>(partition->buffer_idx_);
+        partition->present_ = true;
+        partition->buffer_idx_ = static_cast<int>(i);
+        partition->data_ptr_ = nullptr;
+        partition->physical_frame_idx_ = static_cast<int>(i);
         num_rows += partition->partition_size_;
-    }
-
-    for (int retained_id : retained_ids) {
-        Partition *partition = buffer->partition_table_[retained_id];
-        auto prev_slot_it = retained_slots_before.find(retained_id);
-        if (prev_slot_it == retained_slots_before.end()) {
-            continue;
-        }
-        if (!partition->present_ || partition->buffer_idx_ != prev_slot_it->second) {
-            throw GegeRuntimeException(
-                fmt::format("Stateflow peer relay changed retained partition {} slot from {} to {}",
-                            retained_id, prev_slot_it->second, partition->buffer_idx_));
-        }
-        partition->physical_frame_idx_ = static_cast<int>(partition->buffer_idx_);
     }
 
     buffer->size_.store(num_rows);

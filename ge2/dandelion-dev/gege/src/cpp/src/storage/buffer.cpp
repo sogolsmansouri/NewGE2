@@ -1306,7 +1306,10 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     }
 
     hidden_frame_capacity_ =
-        (single_gpu_gpu_aware_custom_enabled() && buffer_sizes_ == 1 && device_.is_cuda()) ? static_cast<int>(frame_cache_hidden_frames()) : 0;
+        ((single_gpu_gpu_aware_custom_enabled() && buffer_sizes_ == 1 && device_.is_cuda()) ||
+         (multi_gpu_async_admit_preload_enabled() && buffer_sizes_ > 1 && device_.is_cuda()))
+            ? static_cast<int>(frame_cache_hidden_frames())
+            : 0;
     physical_frame_capacity_ = capacity_ + hidden_frame_capacity_;
     resetFrameCacheState_();
 

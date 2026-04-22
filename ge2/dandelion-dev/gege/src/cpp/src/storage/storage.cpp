@@ -1073,6 +1073,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
     if (transition_round_idx > 0 && static_cast<std::size_t>(transition_round_idx) < stateflow_global_next_required_by_round_.size()) {
         next_required = &stateflow_global_next_required_by_round_[static_cast<std::size_t>(transition_round_idx)];
     }
+    bool frame_cache_mapping = buffer->frameCacheEnabled_();
 
     std::unordered_set<int> evict_id_set(evict_ids.begin(), evict_ids.end());
     std::unordered_map<int, int64_t> next_slot_by_partition;
@@ -1207,7 +1208,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 }
 
                 int64_t rows = src_partition->partition_size_;
-                int64_t src_offset = static_cast<int64_t>(src_partition->buffer_idx_) * buffer->partition_size_;
+                int64_t src_offset = buffer->logicalSlotRowOffset_(src_partition->buffer_idx_);
                 torch::Tensor src_view = buffer->buffer_tensor_gpu_view_.slice(0, src_offset, src_offset + rows);
                 try {
                     torch::Tensor source_scratch;
@@ -1258,7 +1259,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
 
             Partition *partition = buffer->partition_table_[evict_id];
             int64_t src_slot = partition->buffer_idx_;
-            int64_t buffer_offset = src_slot * buffer->partition_size_;
+            int64_t buffer_offset = buffer->logicalSlotRowOffset_(src_slot);
             torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
             torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
             cpu_view.copy_(gpu_view.detach(), true);
@@ -1270,14 +1271,21 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             for (int partition_id : host_evict_ids) {
                 Partition *partition = buffer->partition_table_[partition_id];
                 int64_t src_slot = partition->buffer_idx_;
-                int64_t buffer_offset = src_slot * buffer->partition_size_;
+                int64_t buffer_offset = buffer->logicalSlotRowOffset_(src_slot);
                 torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
                 write_partition_to_host(partition, cpu_view);
             }
         }
 
-        auto copy_partition_between_slots = [&](int partition_id, int64_t src_slot, int64_t dst_slot) {
+        auto move_partition_between_slots = [&](int partition_id, int64_t src_slot, int64_t dst_slot) {
             if (src_slot == dst_slot) {
+                return;
+            }
+            if (frame_cache_mapping) {
+                int64_t src_frame = buffer->logicalSlotToPhysicalFrame_(src_slot);
+                int64_t dst_frame = buffer->logicalSlotToPhysicalFrame_(dst_slot);
+                buffer->logical_to_physical_frames_[static_cast<std::size_t>(dst_slot)] = src_frame;
+                buffer->logical_to_physical_frames_[static_cast<std::size_t>(src_slot)] = dst_frame;
                 return;
             }
             Partition *partition = buffer->partition_table_[partition_id];
@@ -1347,7 +1355,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 int64_t current_slot = current_slot_by_partition.at(partition_id);
                 int64_t target_slot = next_slot_by_partition.at(partition_id);
                 if (std::find(free_slots.begin(), free_slots.end(), target_slot) != free_slots.end()) {
-                    copy_partition_between_slots(partition_id, current_slot, target_slot);
+                    move_partition_between_slots(partition_id, current_slot, target_slot);
                     slot_to_partition[target_slot] = partition_id;
                     remove_free_slot(free_slots, target_slot);
                     slot_to_partition[current_slot] = -1;
@@ -1374,7 +1382,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 int64_t current_slot = current_slot_by_partition.at(partition_id);
                 int64_t scratch_slot = free_slots.back();
                 free_slots.pop_back();
-                copy_partition_between_slots(partition_id, current_slot, scratch_slot);
+                move_partition_between_slots(partition_id, current_slot, scratch_slot);
                 slot_to_partition[scratch_slot] = partition_id;
                 slot_to_partition[current_slot] = -1;
                 free_slots.emplace_back(current_slot);
@@ -1441,7 +1449,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             int64_t rows = dst_partition->partition_size_;
             int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
             int64_t dst_slot = slot;
-            int64_t dst_offset = dst_slot * buffer->partition_size_;
+            int64_t dst_offset = buffer->logicalSlotRowOffset_(dst_slot);
             int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
 
             const PeerHandoffDescriptor *scheduled_handoff = nullptr;
@@ -1586,6 +1594,31 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         }
         AT_CUDA_CHECK(cudaEventDestroy(layout_ready_event.handle));
         layout_ready_event.handle = nullptr;
+        bool published_hidden_frames = false;
+        if (!buffer->pending_hidden_publishes_.empty()) {
+            std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+            for (const auto &hidden_publish : buffer->pending_hidden_publishes_) {
+                auto free_it = std::find(buffer->free_physical_frames_.begin(), buffer->free_physical_frames_.end(), hidden_publish.frame);
+                if (free_it != buffer->free_physical_frames_.end()) {
+                    buffer->free_physical_frames_.erase(free_it);
+                }
+            }
+            for (const auto &hidden_publish : buffer->pending_hidden_publishes_) {
+                int64_t published_old_frame =
+                    buffer->logical_to_physical_frames_[static_cast<std::size_t>(hidden_publish.logical_slot)];
+                buffer->logical_to_physical_frames_[static_cast<std::size_t>(hidden_publish.logical_slot)] = hidden_publish.frame;
+                if (published_old_frame != hidden_publish.frame &&
+                    std::find(buffer->free_physical_frames_.begin(), buffer->free_physical_frames_.end(), published_old_frame) ==
+                        buffer->free_physical_frames_.end()) {
+                    buffer->free_physical_frames_.push_back(published_old_frame);
+                }
+            }
+            published_hidden_frames = true;
+            buffer->pending_hidden_publishes_.clear();
+        }
+        if (frame_cache_mapping || published_hidden_frames) {
+            buffer->refreshFrameCacheTensors_();
+        }
         if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_peer_bytes_executed_.size()) {
             device_peer_bytes_executed_[device_idx] += peer_bytes_executed;
             device_host_fallback_bytes_[device_idx] += host_fallback_bytes;
@@ -1603,9 +1636,8 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 }
                 Partition *dst_partition = buffer->partition_table_[debug_slot.partition_id];
                 int64_t rows = dst_partition->partition_size_;
-                torch::Tensor dst_view =
-                    buffer->buffer_tensor_gpu_view_.slice(0, debug_slot.dst_slot * buffer->partition_size_,
-                                                          debug_slot.dst_slot * buffer->partition_size_ + rows);
+                int64_t dst_offset = buffer->logicalSlotRowOffset_(debug_slot.dst_slot);
+                torch::Tensor dst_view = buffer->buffer_tensor_gpu_view_.slice(0, dst_offset, dst_offset + rows);
                 log_non_finite_rows_if_any("src_scratch", debug_slot.partition_id, buffers_[debug_slot.src_dev]->device_.index(),
                                            buffer->device_.index(), scratch_it->second);
                 log_non_finite_rows_if_any("dst", debug_slot.partition_id, buffers_[debug_slot.src_dev]->device_.index(),
@@ -1640,7 +1672,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         partition->present_ = true;
         partition->buffer_idx_ = static_cast<int>(i);
         partition->data_ptr_ = nullptr;
-        partition->physical_frame_idx_ = static_cast<int>(i);
+        partition->physical_frame_idx_ = static_cast<int>(buffer->logicalSlotToPhysicalFrame_(i));
         num_rows += partition->partition_size_;
     }
 

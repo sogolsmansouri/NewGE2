@@ -1,0 +1,21 @@
+Compiled Stateflow gives the multi-GPU out-of-core trainer a
+representation for decisions it previously hid: whether an admit is
+sourced from host memory, kept in place, or handed across lanes. On
+Twitter 16p, the compiler side is already decisive:
+\textsc{Lane\_Matched} lowers selection cost by 14\%, cuts host admits
+from 72 to 62, and replaces 10 \texttt{FULL\_RELOAD} events with 18
+\texttt{PEER\_RELAY} descriptors.
+
+The runtime side is now correct end-to-end. On two \SI{24}{GB} RTX
+A5000s, the embeddings-scope peer runtime executes every planned relay
+for both \textsc{Lane\_Matched} and \textsc{Disjoint\_Rounds} with zero
+host fallback and zero descriptor mismatch, and
+\textsc{Lane\_Matched} remains the strongest peer-enabled schedule.
+What remains open is performance, not semantics: on this PCIe system,
+peer execution displaces host traffic but leaves epoch time effectively
+flat relative to the host-reload baseline.
+
+That is still a useful checkpoint. The IR, compiler, validator, and
+runtime contract are now stable enough to support the next phase:
+bringing peer traffic under optimization with a peer-aware cost model
+and reducing swap overhead through more overlapped execution.

@@ -1,0 +1,153 @@
+% Section 1 -- Introduction
+%
+% Shape:
+%   1.1 Motivating gap: KGE embeddings no longer fit in GPU memory,
+%       and the fix for a single GPU does not generalize to many.
+%   1.2 Why multi-GPU COVER-replication is the wrong baseline.
+%   1.3 Thesis: the scheduler needs a typed, costed IR.
+%   1.4 Contributions + results preview.
+
+Knowledge graph embedding (KGE) training pushes two tensors through
+the GPU on every step: a block of embedding rows and a matching block
+of optimizer state. Both scale linearly with the number of nodes and
+with the embedding dimension $d$, and both must be writable on the
+device that touches them. At today's dataset sizes that product no
+longer fits. A Twitter-scale graph with 41.6\,M nodes at $d\!=\!400$ in
+fp32 requires \SI{66.6}{GB} for the embedding matrix and an equal
+\SI{66.6}{GB} for Adagrad's accumulator -- a combined \SI{133}{GB}
+against a \SI{24}{GB} device-memory budget. Billion-edge KGE
+has been an \emph{out-of-core} workload for several years now, and the
+community has responded with partitioned trainers that stream
+residency in and out of the GPU on a schedule.
+
+\paragraph{The single-GPU story has stabilized.}
+Recent work on partitioned KGE -- GE\textsuperscript{2}~\cite{ge2_report},
+Marius~\cite{marius}, DGL-KE~\cite{dgl_ke}, PyTorch-BigGraph~\cite{pytorch_biggraph} --
+has converged on a common recipe: partition the node set into $p$
+blocks, schedule microsteps over the resulting $p^2$ edge buckets so
+that each block is resident when its edges are trained, and keep the
+blocks on the GPU long enough to amortize loading. GE\textsuperscript{2}'s
+COVER algorithm formalizes this as a Partition Scheduling Problem and
+reduces the schedule to a Resolvable Balanced Incomplete Block Design
+(RBIBD) with parameters $(p, q, 1)$. The result is optimal in admit
+count for single-GPU execution and matches the communication
+lower-bound $\tfrac{4GNd}{3}$ to within a small constant factor.
+
+\paragraph{The multi-GPU extension is not a schedule.}
+The natural way to use two GPUs with a COVER-based trainer is to run
+two independent COVER instances, each on a disjoint subset of rounds.
+This is what every current partitioned KGE system actually does.
+It scales throughput approximately linearly in the common case, but
+it makes two decisions silently:
+
+\begin{enumerate}
+\item \emph{Inter-GPU handoffs are charged as host reloads.} If lane
+0 held partition $\pi$ in round $r$ and lane 1 needs $\pi$ in round
+$r\!+\!1$, the system evicts $\pi$ from lane 0 and re-admits it to
+lane 1 from the host -- even though $\pi$'s most recent authoritative
+copy lives one PCIe hop away on a peer device. The peer path is
+invisible to the scheduler.
+\item \emph{Lane assignment is a side effect of the partition
+numbering.} Because each lane runs its own COVER, the lane a
+partition lands on in round $r$ is determined by the order COVER
+enumerates microsteps, not by any attempt to keep a partition on the
+same lane across rounds. A favorable assignment happens by accident;
+an unfavorable one happens as often.
+\end{enumerate}
+
+Both are scheduling decisions, but the multi-GPU system has nowhere to
+express them. GE\textsuperscript{2}'s scheduler is a COVER solver; its
+output is a list of per-device buckets and a host reload pattern. It
+does not carry a notion of a \emph{cross-lane handoff}, so it has no
+way to reason about one, optimize against one, or hand one to a
+runtime that could execute it peer-to-peer.
+
+\paragraph{Thesis.}
+We argue that the multi-GPU gap is a representation problem before it
+is a performance problem. The scheduler is not missing an algorithm;
+it is missing a type. If a compiler can see that a partition is
+resident on lane 0 at round $r$ and needed on lane 1 at round $r\!+\!1$,
+it can choose whether to serve that admit from host memory or from
+a peer device, weigh the two against each other under an explicit
+cost model, and commit to one. Today's systems cannot even formulate
+the question, because their output format has no field for the
+answer.
+
+Our contribution is \emph{Compiled Stateflow}, a typed intermediate
+representation (IR) for out-of-core partition schedules, and a
+lane-matching compiler that produces plans in that IR. Stateflow
+makes every byte of partition residency, host admit, and cross-device
+handoff a first-class value with an explicit cost. A plan in
+Stateflow is a data structure -- produced, validated, and scored
+offline -- that carries four distinct handoff modes
+(\texttt{FULL\_RELOAD}, \texttt{ROTATING\_OVERWRITE},
+\texttt{DELAYED\_KEEP\_ALIVE}, \texttt{PEER\_RELAY}) and a
+decomposable cost function over admits, bucket balance, boundary
+crossings, and lane imbalance. The runtime consumes
+\texttt{PeerHandoffDescriptor}s projected from the plan and can
+execute them as \texttt{cudaMemcpyPeerAsync} without any scheduling
+logic of its own.
+
+\paragraph{Results preview.}
+On Twitter (41.6\,M nodes, 1.46\,B edges), a 16-partition configuration
+on two \SI{24}{GB} RTX A5000s, our lane-matching compiler produces
+plans that:
+\begin{itemize}
+\item lower the host-denominated selection cost from
+$1.499 \!\times\! 10^{11}$ to $1.291 \!\times\! 10^{11}$ -- a
+\textbf{14\% reduction} in compile-time cost,
+\item cut host admits from 72 to 62 (14\%),
+\item \textbf{eliminate every \texttt{FULL\_RELOAD} handoff}
+(10 $\rightarrow$ 0), converting them into 18
+\texttt{ROTATING\_OVERWRITE} and 18 \texttt{PEER\_RELAY} descriptors,
+\item expose \textbf{\SI{37.49}{GB} of planned device-to-device traffic}
+for the runtime, versus \SI{16.66}{GB} for
+\textsc{Disjoint\_Rounds},
+\item and, in the final embeddings-scope runtime, execute
+\textbf{all 18 planned peer relays} for \textsc{Lane\_Matched}
+(\SI{18.74}{GB}, zero fallback, zero descriptor mismatch), while
+leaving epoch time effectively flat
+(\SI{209.450}{s} vs.\ \SI{208.256}{s} for the host-reload baseline).
+\end{itemize}
+
+The compile-time wins are attributable to the compiler; the runtime
+result shows that the projected descriptors are now executable and
+measurable end-to-end. On this PCIe machine, Phase 4b is
+correctness-positive but not yet wall-clock-positive.
+
+\paragraph{Contributions.}
+\begin{enumerate}
+\item \textbf{Compiled Stateflow}, a typed IR for out-of-core
+partition scheduling that separates intra-lane from cross-lane
+handoffs, makes every transfer a typed object, and supports a
+decomposable cost model (Section~\ref{sec:ir}).
+\item \textbf{A lane-matching compiler} for multi-GPU KGE training
+that emits Stateflow plans with cross-lane \texttt{PEER\_RELAY}
+descriptors, under a host-denominated cost model that does not
+credit itself by default for peer savings that are reported but not
+optimized
+(Section~\ref{sec:compiler}).
+\item \textbf{A five-invariant validator} (V1--V5) that rejects
+structurally inconsistent or unexecutable plans before they reach
+the runtime (Section~\ref{sec:ir:validator}).
+\item \textbf{A peer-aware runtime path} built around
+\texttt{cudaMemcpyPeerAsync}, gated behind a kill switch and a
+fallback to host reloads when peer access is unavailable
+(Section~\ref{sec:runtime}).
+\item \textbf{An evaluation} on Twitter (41.6\,M, 1.46\,B) showing
+the compiler's compile-time gains and the runtime's exact zero-fallback
+execution of planned peer relays; on our PCIe A5000 setup, the
+peer-enabled path is effectively tied with the host baseline rather
+than faster (Section~\ref{sec:eval}).
+\end{enumerate}
+
+The rest of the paper is organized as follows.
+Section~\ref{sec:background} reviews KGE training, out-of-core
+partitioning, and the COVER baseline.
+Section~\ref{sec:ir} introduces the Stateflow IR, its types, cost
+model, and validator.
+Section~\ref{sec:compiler} presents the lane-matching compiler.
+Section~\ref{sec:runtime} describes the peer-aware runtime.
+Section~\ref{sec:eval} evaluates both on Twitter.
+Section~\ref{sec:related} relates Stateflow to other IRs and other
+out-of-core trainers, and Section~\ref{sec:conclusion} concludes.

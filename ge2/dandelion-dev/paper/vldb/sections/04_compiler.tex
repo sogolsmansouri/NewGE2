@@ -1,0 +1,273 @@
+% Section 4 -- Lane-Matching Compiler
+
+\subsection{Compiler Overview}\label{sec:compiler:overview}
+
+The lane-matching compiler turns a single-GPU COVER/Hybrid-Cover
+schedule into a multi-lane Stateflow plan. Its input is a list of
+\emph{buffer states} -- each state is a $q$-subset of partitions that
+would occupy one device for one microstep on a single GPU -- together
+with the per-state edge buckets that cover the resulting edges. Its
+output is a permutation of those states arranged into rounds of
+$k$ lanes, along with a populated \texttt{StateflowPlan} including
+cross-lane \texttt{PEER\_RELAY} descriptors.
+
+The compiler runs in three passes (Figure~\ref{fig:compiler:pipeline}).
+First, \emph{lane assignment} chooses, for each round, which buffer
+states run on which lane so as to maximize residency overlap with the
+previous round. Second, \emph{plan construction} materializes the
+permutation into a \texttt{StateflowPlan} with per-lane microstates and
+intra-lane handoffs. Third, \emph{cross-lane lifting} walks the plan
+and emits a \texttt{PeerHandoffDescriptor} whenever a microstate
+admits a partition that a peer lane held in the previous round.
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+buffer_states, edge_buckets  (single-GPU COVER output)
+        |
+        v
+[Pass 1] assign_lanes_per_round  -> permutation: [s0,s1,s2,s3,...]
+        |                            (round r uses permutation[r*k..r*k+k])
+        v
+[Pass 2] build_multi_gpu_stateflow_plan_from_permutation
+        |   ->  plan with per-lane microstates + intra-lane handoffs
+        v
+[Pass 3] populate_cross_lane_handoffs
+            ->  plan.cross_lane_handoffs += PEER_RELAY descriptors
+        |
+        v
+[Pass 4] score_stateflow_plan    (selection_cost, planned_peer_bytes)
+        |
+        v
+[Pass 5] validator (V1--V5)      (reject or accept)
+\end{lstlisting}
+\caption{Lane-matching compiler pipeline. Passes 1--3 produce the
+plan; Pass 4 scores it; Pass 5 rejects it on invariant violation.}
+\label{fig:compiler:pipeline}
+\end{figure}
+
+The rest of this section fills in the two non-trivial passes. Passes
+2, 4, and 5 are mechanical: Pass~2 re-packs tensors into microstates
+(Section~\ref{sec:ir:types}); Pass~4 is Equation~\ref{eq:cost}; Pass~5
+is the validator of Section~\ref{sec:ir:validator}.
+
+\subsection{Pass 1: Per-Round Lane Assignment}\label{sec:compiler:assign}
+
+At each round $r$, the compiler must choose $k$ buffer states from
+those not yet placed, and it must order them across lanes
+$\ell \in \{0, \dots, k-1\}$. Two states may be placed in the same
+round only if they are \emph{disjoint} -- the intersection of their
+partition sets is empty -- otherwise they would double-load the same
+partition on two devices and break superstate disjointness (invariant
+V4). Compatibility is precomputed as a symmetric boolean matrix over
+all state pairs.
+
+Given disjointness as a hard constraint, the assignment problem at
+round $r$ is:
+\[
+\arg\min_{(a_0, \dots, a_{k-1})}
+  \underbrace{\sum_{\ell=0}^{k-1}
+              T(\mathrm{prev}_\ell,\, a_\ell)}_{\text{transition cost}}
+  \ +\
+  \underbrace{I(a_0, \dots, a_{k-1})}_{\text{imbalance penalty}},
+\]
+where $a_\ell$ is the state assigned to lane $\ell$,
+$\mathrm{prev}_\ell$ is what lane $\ell$ held in round $r\!-\!1$, and
+the sum runs over all disjoint $k$-tuples drawn from the remaining
+states.
+
+\paragraph{Transition cost.} The per-lane term $T(p, n)$ prices the
+handoff from previous state $p$ to next state $n$ on the same lane:
+\begin{equation}
+T(p, n) = \frac{\mathrm{host\_bytes}(p, n)}{B_{\mathrm{host}}}
+         + [\mathrm{overlap}(p, n) = 0] \cdot w_{\mathrm{bnd}}.
+\label{eq:transition}
+\end{equation}
+Here $\mathrm{host\_bytes}(p, n)$ is the byte volume that would need
+to be loaded from host if the admit were served by \texttt{FULL\_RELOAD}
+(partitions in $n$ but not in $p$, scaled by the embedding layout);
+$B_{\mathrm{host}}$ is the host bandwidth from
+\texttt{LaneMatchCostConfig}; and $w_{\mathrm{bnd}}$ is an additive
+boundary penalty applied whenever residency changes completely between
+rounds (the typical case for disjoint-round baselines).
+
+Equation~\ref{eq:transition} is intentionally \emph{host-denominated}.
+In Phase 3, peer transfers are planned but not executed, so crediting
+a lane assignment with peer-bandwidth savings it will not realize
+would make the compiler over-eager. A configuration flag
+(\texttt{allow\_peer\_relay}) enables an optional $-\,\mathrm{peer\_bytes}
+/B_{\mathrm{peer}}$ credit term; it is disabled by default and guarded
+behind \texttt{GEGE\_STATEFLOW\_ALLOW\_PEER\_RELAY=1}. We leave it off
+for the headline measurements.
+
+\paragraph{Imbalance penalty.} The per-round term $I$ discourages
+assignments where one lane is handed a large bucket and the other a
+small one, which would waste the gap between their respective
+completions:
+\begin{equation}
+I(a_0, \dots, a_{k-1}) = w_{\mathrm{imb}}
+  \cdot \frac{\sum_\ell (E_{a_\ell} - \bar E)^2}{\bar E},
+\label{eq:imbalance}
+\end{equation}
+where $E_{a_\ell}$ is lane $\ell$'s total edge-bucket volume for the
+round and $\bar E$ is the mean across lanes. This is a chi-square-style
+normalization: the penalty scales with relative, not absolute,
+imbalance. $w_{\mathrm{imb}}$ defaults to $0.25$.
+
+\subsection{Solvers}\label{sec:compiler:solvers}
+
+The per-round problem has $\binom{m}{k} \cdot k!$ candidate
+$k$-tuples, where $m$ is the number of unplaced states. Three solvers
+are provided; the choice is controlled by
+\texttt{GEGE\_STATEFLOW\_LANE\_MATCH\_SOLVER}.
+
+\begin{description}
+\item[\texttt{optimal2} (default).] Historical name for the exact
+small-$k$ solver. The compiler enumerates all compatible disjoint
+$k$-tuples and, for each tuple, solves the lane-assignment subproblem
+exactly with subset DP over the $k \times k$ transition-cost matrix.
+At $k{=}2$ this degenerates to the original exhaustive pair search;
+at $k{=}4$ it remains easily tractable and preserves the same
+host-bytes / boundary / imbalance objective as the 2-lane case.
+
+\item[\texttt{greedy}.] Incremental search that places states one at a
+time, choosing each to maximize overlap with the corresponding
+previous-round lane. Cheap, but it can commit early to an assignment
+that is locally good and globally suboptimal. Used as a fallback when
+the exact solver is intentionally disabled.
+
+\item[\texttt{hungarian} (alias for \texttt{optimal2}).] Accepted for
+backward compatibility with earlier drafts. The current implementation
+routes it to the same exact small-$k$ solver.
+\end{description}
+
+At two GPUs -- the focus of this paper -- exhaustive enumeration is
+both optimal and trivially auditable. The same exact objective now
+extends unchanged to four GPUs; the only difference is that the
+assignment step is solved with subset DP instead of a hand-written
+two-lane special case. \texttt{optimal2} remains the default.
+
+\subsection{Pass 3: Cross-Lane Lifting}\label{sec:compiler:lift}
+
+Once the per-round assignment is baked into a permutation and
+materialized by Pass 2, the resulting plan already has correct
+per-lane handoffs (each \texttt{LanePlan} has $N$ microstates and $N-1$
+intra-lane \texttt{HandoffPlan}s). It does \emph{not} yet know which
+admits could have been peer-served; that information is computed in
+Pass 3 by walking the plan.
+
+\begin{algorithm}[t]
+\caption{Cross-lane lifting (\texttt{populate\_cross\_lane\_handoffs})}
+\label{alg:lift}
+\begin{algorithmic}[1]
+\State $\text{cross\_lane\_handoffs} \gets \emptyset$
+\For{each lane $\ell$ and each microstate $m$ on $\ell$ with $m \ne m_0$}
+  \State let $m_{-1}$ be the previous microstate on $\ell$
+  \For{each partition $\pi \in m.\mathrm{resident\_partitions}$ not in $m_{-1}$}
+    \State $\text{best} \gets \bot$
+  \For{each other lane $\ell'$}
+      \State let $m'$ be $\ell'$'s microstate at superstate $m.\mathrm{superstate\_id}{-}1$
+      \If{$m' \ne \bot$ and $\pi \in m'.\mathrm{resident\_partitions}$}
+        \State $b \gets \mathrm{partition\_transfer\_bytes}(\pi)$
+        \If{$\text{best} = \bot$ \textbf{or} $\ell' < \text{best.lane}$}
+          \State $\text{best} \gets (\ell', m', b)$
+        \EndIf
+      \EndIf
+    \EndFor
+    \If{$\text{best} \ne \bot$}
+      \State emit \texttt{PEER\_RELAY} handoff from $\text{best}.\ell'$ to $\ell$, partition $\pi$
+      \State $\text{plan.total\_peer\_handoff\_bytes} \mathrel{+}= \text{best.bytes}$
+    \EndIf
+  \EndFor
+\EndFor
+\end{algorithmic}
+\end{algorithm}
+
+Algorithm~\ref{alg:lift} is complete: for every admit on every lane,
+it either finds a peer source (in which case a \texttt{PeerHandoff}
+descriptor is emitted and accounted against
+\texttt{total\_peer\_handoff\_bytes}) or it does not (in which case
+the admit will be served by host fallback at runtime, already represented
+by the intra-lane \texttt{FULL\_RELOAD} in Pass 2). Deduplication by
+$(\ell, m, \pi)$ prevents double-counting when a partition is
+simultaneously resident on multiple peer lanes.
+
+\paragraph{Source tie-breaking.} Under the current byte model,
+\texttt{partition\_transfer\_bytes} depends only on the partition being
+transferred, not on which peer lane serves it. When two peer lanes
+could each service the same admit, we therefore break ties by smaller
+lane id. The rule is deliberately simple and deterministic; a future
+bandwidth-aware model could replace it with link-specific source
+selection without changing the rest of the pass.
+
+\paragraph{What Pass 3 does \emph{not} do.} It does not modify the
+lane assignment chosen by Pass 1. The per-lane permutation is frozen
+by the time Pass 3 runs. Co-designing the two passes -- letting the
+availability of a peer source pull the per-lane assignment toward
+configurations that maximize such sources -- is a natural next step.
+The cleaner staging is to run them independently, confirm the per-lane
+story is correct, then extend.
+
+\subsection{Variants and Baseline}\label{sec:compiler:variants}
+
+The compiler produces two named multi-GPU variants, both of which
+share Passes 2--5:
+
+\begin{description}
+\item[\textsc{DISJOINT\_ROUNDS}.] A baseline that skips Pass 1 entirely
+and routes to \texttt{getDisjointBufferStatePermutation}: states are
+partitioned into disjoint rounds in their COVER-enumeration order,
+then assigned to lanes in round order. This is the behavior of running
+two independent COVER schedulers on alternating rounds -- the status
+quo for multi-GPU COVER-based trainers (Section~\ref{sec:intro}).
+\item[\textsc{LANE\_MATCHED}.] The full Pass 1 + Pass 3 pipeline
+described above. This is the variant the compiler would choose under
+default scoring on Twitter (Section~\ref{sec:eval}).
+\end{description}
+
+Both variants satisfy V1--V5; both populate
+\texttt{cross\_lane\_handoffs} and \texttt{total\_peer\_handoff\_bytes}.
+The difference is entirely in the lane assignment. On Twitter 16p
+2-GPU, this difference alone changes the handoff-mode distribution
+from $\{\texttt{FULL\_RELOAD}:10,\ \texttt{ROTATING\_OVERWRITE}:8,\
+\texttt{PEER\_RELAY}:8\}$ to
+$\{\texttt{FULL\_RELOAD}:0,\ \texttt{ROTATING\_OVERWRITE}:18,\
+\texttt{PEER\_RELAY}:18\}$, eliminating every cold admit from the plan.
+
+\subsection{Pass 4: Scoring}\label{sec:compiler:score}
+
+Scored plans expose every term of Equation~\ref{eq:cost} on
+\texttt{StateflowPlan.cost\_breakdown}:
+\texttt{admitted\_partition\_cost},
+\texttt{bucket\_edge\_cost},
+\texttt{boundary\_cost},
+\texttt{lane\_imbalance\_cost}, and the summed
+\texttt{selection\_cost}. For multi-GPU plans, the admitted term is
+byte-accurate (summed $\mathrm{rows}(\pi) \cdot \mathrm{bytes\_per\_row}$
+over admitted objects); for single-GPU plans, it falls back to a
+count-based weighted admission load (preserving backward compatibility
+with existing single-GPU cost reports).
+
+\texttt{planned\_peer\_bytes} is populated alongside
+\texttt{selection\_cost} but \emph{not summed into it}. This is the
+same split introduced in Section~\ref{sec:ir:cost}: the compiler
+reports the Phase 4 opportunity without letting itself claim credit
+for it. A consumer that wants to optimize under a peer-aware cost
+model can sum the two terms explicitly; the default pipeline does not.
+
+\subsection{Complexity and Determinism}\label{sec:compiler:complexity}
+
+Per round, Pass 1 does
+$O\!\left(\binom{m}{k} \cdot k \cdot 2^k\right)$ work with the exact
+\texttt{optimal2} solver and reduces to $O(m^2)$ at $k{=}2$;
+Pass 3 does $O(k \cdot N \cdot q)$ work to scan candidate peer sources
+(where $N$ is the number of microstates per lane and $q$ is the buffer
+capacity). Pass 4 is linear in the plan size. At Twitter 16p / 2-GPU,
+the entire compile takes a few milliseconds and is completely
+dominated by I/O overhead elsewhere in the training pipeline.
+
+Every solver uses total orderings on ties (state-index, then lane-id),
+so plans are deterministic for a fixed input. This matters for
+reproducibility in the evaluation (Section~\ref{sec:eval}) and for the
+validator: V1--V5 are strict equalities, so a non-deterministic
+compiler would randomly fail otherwise-valid runs.

@@ -1,0 +1,301 @@
+% Section 3 -- Compiled Stateflow IR
+%
+% Goal: introduce the typed IR.  Keep it self-contained -- a reader who
+% skipped the background should still be able to see what a plan is,
+% what it costs, and how we reject bad plans.
+
+\subsection{Design Goals}\label{sec:ir:goals}
+
+Out-of-core KGE training is a scheduling problem whose decisions --
+which partition to evict, which to admit, from where to source the
+admit -- happen at runtime but are determined by choices made long
+before any GPU kernel runs. We designed Compiled Stateflow around four
+goals that fall out of that observation.
+
+\paragraph{G1: Every byte is typed.} Host admits, device-to-device peer
+copies, and kept-alive resident pages differ by two or three orders of
+magnitude in latency and by an order of magnitude in bandwidth. A
+scheduler that cannot distinguish them cannot reason about them. Every
+transfer in Stateflow carries a mode tag and a byte count.
+
+\paragraph{G2: Plans are values, not side effects.} A Stateflow plan is
+a pure data structure. It is produced by the compiler, handed to a
+validator, and only then consumed by the runtime. This separation lets
+us enumerate candidates, cost them, apply invariants, and diff plans
+across configurations without running the trainer.
+
+\paragraph{G3: Cost is explicit and decomposable.} The scheduler's
+objective function is not a scalar black box. A plan's cost decomposes
+into admit cost, bucket imbalance, boundary crossings, and lane
+imbalance, each attributable to a concrete portion of the plan. This
+lets the compiler explain \emph{why} one plan beat another, which in
+turn lets us write targeted transformations.
+
+\paragraph{G4: The IR survives Phase changes.} We stage the system in
+phases -- single-GPU scheduling, multi-GPU compilation, peer runtime,
+bandwidth-aware staggering -- and the IR is the one artifact that
+remains stable across them. Phase 3 adds descriptors the runtime does
+not yet execute; the final Phase 4b runtime now executes them without
+changing the compiler. Phase 5's staggering will introduce new cost
+terms without changing the type hierarchy. A type that absorbs
+additions without breaking consumers is the whole reason to build an
+IR at all.
+
+\subsection{Type Hierarchy}\label{sec:ir:types}
+
+A plan is a nested structure (Figure~\ref{fig:ir:types}). At the top,
+\texttt{StateflowPlan} holds one \texttt{LanePlan} per active GPU plus
+a top-level list of cross-lane handoffs. Each \texttt{LanePlan} is an
+ordered sequence of \texttt{Microstate}s -- the per-lane steps between
+round boundaries -- connected by intra-lane \texttt{Handoff}s. A
+\texttt{Microstate} names the partitions resident on the device at that
+step, the fragments they occupy, and the resident objects (embeddings,
+optimizer state) that back them.
+
+\begin{figure}[t]
+\centering
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+StateflowPlan
+  family        : {CUSTOM, HYBRID_COVER, MULTI_GPU}
+  variant       : {CANONICAL, GPU_AWARE, REVERSED, ...
+                   DISJOINT_ROUNDS, LANE_MATCHED}
+  lanes         : [LanePlan]
+  cross_lane_handoffs : [HandoffPlan]    # top-level only
+  cost          : PlanCostBreakdown
+  total_peer_handoff_bytes : int64
+
+LanePlan
+  lane_id       : int
+  microstates   : [MicrostatePlan]       # length N
+  handoffs      : [HandoffPlan]          # length N-1, intra-lane
+
+MicrostatePlan
+  round_idx     : int
+  resident_partitions : [int]
+  fragments     : [FragmentPlan]
+  resident_objects    : [ResidentObjectPlan]
+
+HandoffPlan
+  mode          : {FULL_RELOAD, ROTATING_OVERWRITE,
+                   DELAYED_KEEP_ALIVE, PEER_RELAY}
+  partition_id  : int
+  src_lane_id   : int     # -1 if host-sourced
+  dst_lane_id   : int
+  bytes         : int64
+  peer_bytes    : int64   # nonzero iff PEER_RELAY
+
+PeerHandoffDescriptor                    # runtime target
+  src_lane, dst_lane, src_slot, dst_slot : int
+  round_idx, partition_id                : int
+  bytes                                  : int64
+\end{lstlisting}
+\caption{Core Stateflow types. The IR separates intra-lane handoffs
+(attached to a \texttt{LanePlan}) from cross-lane handoffs (attached to
+the top-level plan). The runtime consumes \texttt{PeerHandoffDescriptor}s
+projected from the plan.}
+\label{fig:ir:types}
+\end{figure}
+
+Two design choices in Figure~\ref{fig:ir:types} are worth calling out.
+
+First, \textbf{cross-lane handoffs live at the top level}, not inside
+\texttt{LanePlan.handoffs}. A \texttt{LanePlan} with $N$ microstates
+must have exactly $N-1$ intra-lane handoffs; this invariant is checked
+by the validator and lets downstream code zip lanes with their own
+transitions. Mixing cross-lane handoffs into that list would break the
+invariant or require per-entry tagging at every call site. We instead
+expose them through \texttt{StateflowPlan.cross\_lane\_handoffs}, a
+flat list the runtime indexes by \texttt{round\_idx}.
+
+Second, \texttt{HandoffPlan} carries both \texttt{bytes} and
+\texttt{peer\_bytes}. The former is the host-fallback cost (what a
+host admit would transfer); the latter is nonzero only for
+\texttt{PEER\_RELAY} and captures the device-to-device byte count the
+runtime would issue via \texttt{cudaMemcpyPeerAsync}. Keeping them
+separate lets the default cost model be host-denominated (safe) while
+still reporting peer-executable volume for Phase 4 headroom analysis.
+
+\subsection{Handoff Modes}\label{sec:ir:modes}
+
+Partition residency changes at round boundaries. We identified four
+distinct ways a partition can become resident on lane $\ell$ at round
+$r{+}1$; each is a separate handoff mode because each has a different
+cost and different runtime mechanism.
+
+\begin{description}
+\item[\texttt{FULL\_RELOAD}] The partition is fetched from host memory
+as if this were a cold admit. Cost: full host-bandwidth transfer of
+embeddings and optimizer state. Occurs when no lane held the partition
+in round $r$, or when the holder did not share an NVLink/PCIe peer
+path to $\ell$.
+\item[\texttt{ROTATING\_OVERWRITE}] The partition was resident on $\ell$
+in round $r$ and its slot is reused in round $r{+}1$. No transfer; the
+cost is zero. Named for the rotating-window layouts that naturally
+produce this pattern.
+\item[\texttt{DELAYED\_KEEP\_ALIVE}] The partition was resident on $\ell$
+in round $r$, is not needed in round $r{+}1$, but is scheduled for
+round $r{+}2$. The runtime keeps it pinned to avoid reloading it one
+round later. Cost: device memory occupancy for one extra round; no
+transfer.
+\item[\texttt{PEER\_RELAY}] The partition is resident on lane $\ell'$
+in round $r$, not on $\ell$, but needed on $\ell$ in round $r{+}1$. A
+device-to-device copy from $\ell'$ to $\ell$ delivers it. Cost:
+\texttt{peer\_bytes} at peer bandwidth (substantially below host
+bandwidth on modern interconnects). Requires
+\texttt{cudaDeviceCanAccessPeer} to be true.
+\end{description}
+
+\texttt{PEER\_RELAY} is the mode that makes the multi-GPU case
+interesting. The compiler emits it whenever lane matching produces a
+cross-lane opportunity; the runtime executes it as
+\texttt{cudaMemcpyPeerAsync}. The same descriptor supported both
+bring-up regimes: Phase 3 logged it while still executing a host
+reload, and the final Phase 4b runtime consumes it directly without
+changing the compiler or validator.
+
+\subsection{Cost Model}\label{sec:ir:cost}
+
+Candidate plans are ranked by a weighted sum of four terms:
+\begin{align}
+\mathrm{cost}(P) =\ & \alpha \cdot \mathrm{admit}(P)
+                    + \beta  \cdot \mathrm{bucket}(P) \nonumber \\
+                  & + \gamma \cdot \mathrm{boundary}(P)
+                    + \delta \cdot \mathrm{imbalance}(P).
+\label{eq:cost}
+\end{align}
+
+\paragraph{Admit cost.} $\mathrm{admit}(P) = \sum_h b_h$, summed over
+handoffs $h$ that cause a host fetch. Measured in bytes; this is the
+host-bandwidth-denominated cost of populating microstates whose
+partitions were not resident in the preceding round. In default
+configuration, \texttt{PEER\_RELAY} is counted as a \emph{host} admit
+(its bytes would be loaded from host if the peer path were
+unavailable). This is a deliberately conservative choice: until the
+selector is made peer-aware, the compiler must not give itself credit
+for savings it is not yet optimizing for.
+
+\paragraph{Bucket cost.} $\mathrm{bucket}(P)$ penalizes uneven edge
+bucket sizes across microstates. Small buckets underutilize the GPU;
+enormous buckets over-fill a single superstep. We weight this term
+with a small $\beta \!\approx\! 10^{-7}$ so it acts as a tie-breaker
+among plans with similar admit cost.
+
+\paragraph{Boundary cost.} $\mathrm{boundary}(P)$ counts superstate
+boundaries -- transitions that force global synchronization across
+lanes. In the multi-GPU setting these are NCCL all-reduce points;
+each one is a latency cost plus a bandwidth tax on embedding
+gradients.
+
+\paragraph{Imbalance cost.} $\mathrm{imbalance}(P) = \max_\ell W_\ell
+- \min_\ell W_\ell$, where $W_\ell$ is lane $\ell$'s per-round work
+(typically summed bucket bytes). A plan where one lane finishes
+substantially before another wastes the gap; this term pushes the
+compiler toward lane assignments where the work lands evenly.
+
+\paragraph{Reported metrics, not optimized.} Two quantities are
+recorded on every \texttt{StateflowPlan} but not summed into
+Equation~\ref{eq:cost}: \texttt{total\_peer\_handoff\_bytes} and
+\texttt{total\_cross\_lane\_handoffs}. These characterize the plan's
+Phase 4 opportunity (how much host I/O a peer runtime could displace)
+without letting the selector claim credit for it during compilation.
+Even now that the runtime executes peer copies, the default selector
+keeps these as reported metrics rather than optimized terms. A future
+peer-aware cost model can sum them into Equation~\ref{eq:cost}
+explicitly -- a clean extension point that does not disturb Phases 1--4.
+
+\subsection{Validator Invariants}\label{sec:ir:validator}
+
+A plan is only useful if it is executable. The validator rejects plans
+that violate any of the following invariants; no plan leaves the
+compiler without passing.
+
+\begin{description}
+\item[V1: Structural consistency.] Each lane has
+$|\text{handoffs}| = |\text{microstates}| - 1$. Cross-lane handoffs
+appear only in \texttt{StateflowPlan.cross\_lane\_handoffs}, never in
+\texttt{LanePlan.handoffs}.
+\item[V2: Coverage.] For every microstate boundary $(r, r{+}1)$ on
+every lane $\ell$, the resident set at $r{+}1$ equals
+$(\text{kept}_{\ell}) \cup (\text{host-admitted}) \cup
+ (\text{peer-received})$. No partition appears on a lane without a
+sourcing handoff.
+\item[V3: Peer admit sourcing.] A partition delivered by
+\texttt{PEER\_RELAY} must be resident on the source lane in round $r$
+and must not be resident on the destination lane in round $r$. Both
+ends are checked.
+\item[V4: Superstate disjointness.] Within a round, partitions
+assigned to the same superstate must be disjoint across lanes.
+Violating this would double-count gradient contributions during the
+all-reduce.
+\item[V5: Handoff consistency.] Every cross-lane handoff with mode
+\texttt{PEER\_RELAY} has matching source and destination lanes in the
+microstate's resident sets. The byte count agrees with the embedding
+layout (Section~\ref{sec:ir:layout}).
+\end{description}
+
+Invariants V1--V5 are machine-checked and cheap -- the validator
+passes in microseconds on 16-partition plans. They serve two
+purposes: they catch compiler bugs at their source (a corrupt plan
+cannot reach the runtime), and they document the contract between the
+IR and every downstream consumer.
+
+\subsection{Embedding Layout}\label{sec:ir:layout}
+
+Byte counts are not inferable from partition IDs alone: they depend on
+embedding dimension, dtype, and whether the trainer uses optimizer
+state that doubles the resident footprint. \texttt{PlanEmbeddingLayout}
+captures this:
+
+\begin{lstlisting}[basicstyle=\ttfamily\footnotesize]
+PlanEmbeddingLayout
+  embedding_dim           : int    # e.g. 400
+  dtype_size              : int    # bytes per element
+  optimizer_state_multiplier : int # 1 or 2
+\end{lstlisting}
+
+\noindent
+A partition of $n$ rows contributes
+$n \cdot \mathtt{embedding\_dim} \cdot \mathtt{dtype\_size}
+     \cdot \mathtt{optimizer\_state\_multiplier}$ bytes to any handoff
+that transfers it. The layout is populated once at plan construction
+from the graph storage metadata, then embedded in every plan so
+downstream tooling (cost reporters, visualizers) can produce concrete
+byte figures without re-querying the model.
+
+\subsection{A Concrete Example}\label{sec:ir:example}
+
+Consider Twitter (41.6M nodes, $d\!=\!400$, fp32, Adagrad), 16
+partitions, buffer capacity 4, two GPUs. Two compiled plans:
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+ & \textsc{Disjoint\_Rounds} & \textsc{Lane\_Matched} \\
+\midrule
+selection cost        & $1.499 \times 10^{11}$ & $1.291 \times 10^{11}$ \\
+host admits           & 72                     & 62                     \\
+cross-lane handoffs   & 8                      & 18                     \\
+\texttt{PEER\_RELAY} bytes & 16.66 GB          & 37.49 GB               \\
+\texttt{FULL\_RELOAD} count & 10               & 0                      \\
+\texttt{ROTATING\_OVERWRITE} & 8               & 18                     \\
+boundaries            & 18                     & 18                     \\
+\bottomrule
+\end{tabular}
+\caption{Two compiled Stateflow plans on Twitter 16-partition, 2-GPU.
+\textsc{Lane\_Matched} lowers host-denominated cost by 14\% and
+eliminates all \texttt{FULL\_RELOAD} events and exposes 37.49 GB of
+peer-relay opportunity. Section~\ref{sec:eval} shows the runtime
+executing the embeddings half of that traffic with zero fallback.}
+\label{tab:ir:example}
+\end{table}
+
+Both plans satisfy V1--V5 and are produced by the same compiler under
+different variant flags. \textsc{Lane\_Matched} is the output of the
+compiler described in Section~\ref{sec:compiler}; \textsc{Disjoint\_Rounds}
+is a baseline that ignores cross-lane opportunities. The entire
+difference is visible in the IR -- no runtime is needed to see that
+\textsc{Lane\_Matched} has eliminated the full reloads. The runtime
+results of Section~\ref{sec:eval} then show that these IR-level
+differences survive projection and swap-time execution exactly.

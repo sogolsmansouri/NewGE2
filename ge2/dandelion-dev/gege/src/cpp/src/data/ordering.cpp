@@ -1349,28 +1349,179 @@ double lane_assignment_transition_cost(const StateAccessSummary &previous_state,
     return cost;
 }
 
-struct TwoLaneAssignmentResult {
+double lane_group_imbalance_penalty(const std::vector<int64_t> &group,
+                                    const std::vector<StateAccessSummary> &summaries,
+                                    const LaneMatchCostConfig &cfg) {
+    if (group.empty()) {
+        return 0.0;
+    }
+
+    double total_edges = 0.0;
+    for (auto state_idx : group) {
+        total_edges += static_cast<double>(summaries[state_idx].total_bucket_edges);
+    }
+    double mean_edges = total_edges / static_cast<double>(group.size());
+    if (mean_edges <= 0.0) {
+        return 0.0;
+    }
+
+    double variance = 0.0;
+    for (auto state_idx : group) {
+        double diff = static_cast<double>(summaries[state_idx].total_bucket_edges) - mean_edges;
+        variance += diff * diff;
+    }
+
+    return cfg.imbalance_weight * (variance / mean_edges);
+}
+
+struct LaneAlignmentResult {
+    double cost = std::numeric_limits<double>::infinity();
+    std::vector<int64_t> ordered_group;
+};
+
+LaneAlignmentResult search_best_lane_alignment_dp(const std::vector<int64_t> &prev_group,
+                                                  const std::vector<int64_t> &candidate_group,
+                                                  const std::vector<StateAccessSummary> &summaries,
+                                                  const std::vector<int64_t> &partition_row_counts,
+                                                  const LaneMatchCostConfig &cfg,
+                                                  int64_t bytes_per_row,
+                                                  uint64_t used_mask,
+                                                  std::unordered_map<uint64_t, LaneAlignmentResult> &memo) {
+    const std::size_t slot = static_cast<std::size_t>(__builtin_popcountll(used_mask));
+    if (slot == prev_group.size()) {
+        return LaneAlignmentResult{0.0, {}};
+    }
+
+    auto memo_it = memo.find(used_mask);
+    if (memo_it != memo.end()) {
+        return memo_it->second;
+    }
+
+    LaneAlignmentResult best;
+    for (std::size_t candidate_idx = 0; candidate_idx < candidate_group.size(); candidate_idx++) {
+        if (((used_mask >> candidate_idx) & 1ULL) != 0ULL) {
+            continue;
+        }
+
+        LaneAlignmentResult suffix = search_best_lane_alignment_dp(prev_group, candidate_group, summaries, partition_row_counts, cfg,
+                                                                   bytes_per_row, used_mask | (1ULL << candidate_idx), memo);
+        if (suffix.cost == std::numeric_limits<double>::infinity()) {
+            continue;
+        }
+
+        double step_cost = lane_assignment_transition_cost(summaries[prev_group[slot]], summaries[candidate_group[candidate_idx]],
+                                                           partition_row_counts, cfg, bytes_per_row);
+        std::vector<int64_t> ordered_group;
+        ordered_group.reserve(1 + suffix.ordered_group.size());
+        ordered_group.emplace_back(candidate_group[candidate_idx]);
+        ordered_group.insert(ordered_group.end(), suffix.ordered_group.begin(), suffix.ordered_group.end());
+
+        double candidate_cost = step_cost + suffix.cost;
+        if (candidate_cost < best.cost || (candidate_cost == best.cost && ordered_group < best.ordered_group)) {
+            best.cost = candidate_cost;
+            best.ordered_group = std::move(ordered_group);
+        }
+    }
+
+    memo.emplace(used_mask, best);
+    return best;
+}
+
+LaneAlignmentResult get_best_lane_alignment(const std::vector<int64_t> &prev_group,
+                                            const std::vector<int64_t> &candidate_group,
+                                            const std::vector<StateAccessSummary> &summaries,
+                                            const std::vector<int64_t> &partition_row_counts,
+                                            const LaneMatchCostConfig &cfg,
+                                            int64_t bytes_per_row) {
+    if (candidate_group.empty()) {
+        return LaneAlignmentResult{0.0, {}};
+    }
+    if (prev_group.empty()) {
+        return LaneAlignmentResult{0.0, candidate_group};
+    }
+    if (prev_group.size() != candidate_group.size() || candidate_group.size() >= 64) {
+        return LaneAlignmentResult{};
+    }
+
+    std::unordered_map<uint64_t, LaneAlignmentResult> memo;
+    return search_best_lane_alignment_dp(prev_group, candidate_group, summaries, partition_row_counts, cfg, bytes_per_row, 0ULL, memo);
+}
+
+struct LaneGroupAssignmentResult {
     double cost = std::numeric_limits<double>::infinity();
     std::vector<int64_t> ordered_group;
     std::vector<int64_t> chosen_states;
 };
 
-TwoLaneAssignmentResult get_best_two_lane_group(const std::vector<std::vector<bool>> &compatible,
-                                                const std::vector<int64_t> &remaining,
-                                                const std::vector<int64_t> &prev_group,
-                                                const std::vector<StateAccessSummary> &summaries,
-                                                const std::vector<int64_t> &partition_row_counts,
-                                                const LaneMatchCostConfig &cfg,
-                                                int64_t bytes_per_row) {
-    TwoLaneAssignmentResult best;
+void search_best_cost_aware_group(const std::vector<std::vector<bool>> &compatible,
+                                  const std::vector<int64_t> &remaining,
+                                  const std::vector<int64_t> &prev_group,
+                                  const std::vector<StateAccessSummary> &summaries,
+                                  const std::vector<int64_t> &partition_row_counts,
+                                  const LaneMatchCostConfig &cfg,
+                                  int64_t bytes_per_row,
+                                  int target_group_size,
+                                  std::size_t start_idx,
+                                  std::vector<int64_t> &current_group,
+                                  LaneGroupAssignmentResult &best) {
+    if (current_group.size() == static_cast<std::size_t>(target_group_size)) {
+        LaneAlignmentResult alignment =
+            get_best_lane_alignment(prev_group, current_group, summaries, partition_row_counts, cfg, bytes_per_row);
+        if (alignment.cost == std::numeric_limits<double>::infinity()) {
+            return;
+        }
+
+        LaneGroupAssignmentResult candidate;
+        candidate.chosen_states = current_group;
+        candidate.ordered_group = std::move(alignment.ordered_group);
+        candidate.cost = alignment.cost + lane_group_imbalance_penalty(current_group, summaries, cfg);
+        if (candidate.cost < best.cost || (candidate.cost == best.cost && candidate.ordered_group < best.ordered_group)) {
+            best = std::move(candidate);
+        }
+        return;
+    }
+
+    if (current_group.size() + (remaining.size() - start_idx) < static_cast<std::size_t>(target_group_size)) {
+        return;
+    }
+
+    for (std::size_t candidate_idx = start_idx; candidate_idx < remaining.size(); candidate_idx++) {
+        int64_t candidate_state = remaining[candidate_idx];
+        bool valid = true;
+        for (auto chosen_state : current_group) {
+            if (!compatible[candidate_state][chosen_state]) {
+                valid = false;
+                break;
+            }
+        }
+        if (!valid) {
+            continue;
+        }
+
+        current_group.emplace_back(candidate_state);
+        search_best_cost_aware_group(compatible, remaining, prev_group, summaries, partition_row_counts, cfg, bytes_per_row,
+                                     target_group_size, candidate_idx + 1, current_group, best);
+        current_group.pop_back();
+    }
+}
+
+LaneGroupAssignmentResult get_best_cost_aware_lane_group(const std::vector<std::vector<bool>> &compatible,
+                                                         const std::vector<int64_t> &remaining,
+                                                         const std::vector<int64_t> &prev_group,
+                                                         const std::vector<StateAccessSummary> &summaries,
+                                                         const std::vector<int64_t> &partition_row_counts,
+                                                         const LaneMatchCostConfig &cfg,
+                                                         int64_t bytes_per_row,
+                                                         int target_group_size) {
+    LaneGroupAssignmentResult best;
     if (remaining.empty()) {
         return best;
     }
-    if (remaining.size() == 1 || prev_group.size() != 2) {
+    if (target_group_size <= 1 || prev_group.size() != static_cast<std::size_t>(target_group_size)) {
         GroupSearchResult greedy;
         std::vector<int64_t> current_group;
-        current_group.reserve(std::min<std::size_t>(remaining.size(), 2));
-        search_best_disjoint_group(compatible, remaining, prev_group, summaries, std::min<int>(2, remaining.size()), 0, current_group, greedy);
+        current_group.reserve(std::min<std::size_t>(remaining.size(), static_cast<std::size_t>(std::max(target_group_size, 1))));
+        search_best_disjoint_group(compatible, remaining, prev_group, summaries, std::max(target_group_size, 1), 0, current_group, greedy);
         if (!greedy.chosen_states.empty()) {
             best.cost = 0.0;
             best.chosen_states = greedy.chosen_states;
@@ -1379,41 +1530,21 @@ TwoLaneAssignmentResult get_best_two_lane_group(const std::vector<std::vector<bo
         return best;
     }
 
-    for (std::size_t left = 0; left < remaining.size(); left++) {
-        for (std::size_t right = left + 1; right < remaining.size(); right++) {
-            const int64_t first_state = remaining[left];
-            const int64_t second_state = remaining[right];
-            if (!compatible[first_state][second_state]) {
-                continue;
-            }
+    std::vector<int64_t> current_group;
+    current_group.reserve(target_group_size);
+    search_best_cost_aware_group(compatible, remaining, prev_group, summaries, partition_row_counts, cfg, bytes_per_row, target_group_size, 0,
+                                 current_group, best);
 
-            std::vector<std::vector<int64_t>> assignments = {{first_state, second_state}, {second_state, first_state}};
-            const double mean_edges =
-                (static_cast<double>(summaries[first_state].total_bucket_edges) + static_cast<double>(summaries[second_state].total_bucket_edges)) / 2.0;
-            const double imbalance_penalty =
-                mean_edges > 0.0
-                    ? cfg.imbalance_weight *
-                          ((std::pow(static_cast<double>(summaries[first_state].total_bucket_edges) - mean_edges, 2.0) +
-                            std::pow(static_cast<double>(summaries[second_state].total_bucket_edges) - mean_edges, 2.0)) /
-                           mean_edges)
-                    : 0.0;
-
-            for (const auto &assignment : assignments) {
-                double candidate_cost = imbalance_penalty;
-                candidate_cost += lane_assignment_transition_cost(summaries[prev_group[0]], summaries[assignment[0]],
-                                                                 partition_row_counts, cfg, bytes_per_row);
-                candidate_cost += lane_assignment_transition_cost(summaries[prev_group[1]], summaries[assignment[1]],
-                                                                 partition_row_counts, cfg, bytes_per_row);
-                if (candidate_cost < best.cost ||
-                    (candidate_cost == best.cost && assignment < best.ordered_group)) {
-                    best.cost = candidate_cost;
-                    best.ordered_group = assignment;
-                    best.chosen_states = {first_state, second_state};
-                }
-            }
+    if (best.cost == std::numeric_limits<double>::infinity()) {
+        GroupSearchResult greedy;
+        current_group.clear();
+        search_best_disjoint_group(compatible, remaining, prev_group, summaries, target_group_size, 0, current_group, greedy);
+        if (!greedy.chosen_states.empty()) {
+            best.cost = 0.0;
+            best.chosen_states = greedy.chosen_states;
+            best.ordered_group = greedy.ordered_group;
         }
     }
-
     return best;
 }
 
@@ -4690,10 +4821,11 @@ std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<t
         int target_group_size = std::min<int>(active_devices, remaining.size());
         std::vector<int64_t> ordered_group;
         std::vector<int64_t> chosen_states;
-        if (solver == LaneMatchSolver::OPTIMAL2 && active_devices == 2 && target_group_size == 2) {
+        if (solver == LaneMatchSolver::OPTIMAL2 && target_group_size >= 2 &&
+            previous_group.size() == static_cast<std::size_t>(target_group_size)) {
             auto best_group =
-                get_best_two_lane_group(compatible, remaining, previous_group, summaries, partition_row_counts, lane_match_cfg,
-                                        bytes_per_row);
+                get_best_cost_aware_lane_group(compatible, remaining, previous_group, summaries, partition_row_counts, lane_match_cfg,
+                                               bytes_per_row, target_group_size);
             ordered_group = std::move(best_group.ordered_group);
             chosen_states = std::move(best_group.chosen_states);
         } else {

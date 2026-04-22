@@ -430,10 +430,7 @@ class GraphModelStorage {
             if (storage_ptrs_.node_optimizer_state != nullptr && train_) {
                 optimizer_storage = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state);
             }
-            bool serialize_mem_swaps = embedding_storage->peerRelayRuntimeEnabled();
-            if (optimizer_storage != nullptr) {
-                serialize_mem_swaps = serialize_mem_swaps || optimizer_storage->peerRelayRuntimeEnabled();
-            }
+            bool serialize_mem_swaps = read_env_flag("GEGE_STATEFLOW_SERIALIZE_MEM_SWAPS", false);
 
             std::vector<std::thread> threads;
             std::exception_ptr thread_exception = nullptr;
@@ -449,7 +446,9 @@ class GraphModelStorage {
                 }
             };
 
-            if (serialize_mem_swaps) {
+            if (optimizer_storage == nullptr) {
+                run_mem_swap(embedding_storage);
+            } else if (serialize_mem_swaps) {
                 run_mem_swap(embedding_storage);
                 if (optimizer_storage != nullptr && thread_exception == nullptr) {
                     run_mem_swap(optimizer_storage);

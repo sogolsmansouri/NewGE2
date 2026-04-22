@@ -195,6 +195,7 @@ class MemPartitionBufferStorage : public Storage {
             buffers_[i]->setBufferOrdering(buffer_states); 
         }
         std::fill(stateflow_transition_counts_.begin(), stateflow_transition_counts_.end(), 0);
+        rebuildStateflowGlobalNextRequired_(buffer_states);
     }
 
     void setStateflowPeerHandoffs(const std::vector<PeerHandoffDescriptor> &peer_handoffs);
@@ -244,10 +245,15 @@ class MemPartitionBufferStorage : public Storage {
     bool peer_relay_runtime_enabled_;
     std::mutex peer_relay_init_lock_;
     bool peer_relay_init_attempted_;
-    std::unique_ptr<ReusableBarrier> peer_relay_ready_barrier_;
-    std::unique_ptr<ReusableBarrier> peer_relay_build_barrier_;
-    std::vector<torch::Tensor> peer_relay_next_states_;
+    std::vector<std::vector<uint8_t>> stateflow_global_next_required_by_round_;
     std::vector<std::unordered_map<int64_t, torch::Tensor>> peer_relay_source_scratch_tensors_;
+    std::vector<std::unordered_map<int64_t, torch::Tensor>> peer_relay_source_scratch_pool_tensors_;
+    std::vector<std::vector<int64_t>> peer_relay_source_slot_snapshots_;
+    std::vector<std::vector<int64_t>> peer_relay_source_scratch_rounds_;
+    std::vector<std::uintptr_t> peer_relay_source_ready_events_;
+    std::vector<std::shared_ptr<std::mutex>> peer_relay_source_publish_mutexes_;
+    std::vector<std::shared_ptr<std::condition_variable>> peer_relay_source_publish_cvs_;
+    std::vector<int64_t> peer_relay_source_published_rounds_;
     bool stateflow_peer_schedule_active_ = false;
     std::vector<std::unordered_map<int64_t, PeerHandoffDescriptor>> stateflow_peer_handoff_index_per_device_;
     std::vector<int64_t> stateflow_transition_counts_;
@@ -258,6 +264,7 @@ class MemPartitionBufferStorage : public Storage {
     std::vector<int64_t> device_descriptor_mismatch_count_;
     std::vector<int64_t> device_peer_sync_wait_ns_;
     std::vector<std::unordered_set<int64_t>> stateflow_peer_mismatch_warned_keys_;
+    void rebuildStateflowGlobalNextRequired_(const std::vector<torch::Tensor> &buffer_states);
     void ensureHostLoaded_();
     void initializePeerRelay_();
     bool peerRelayEnabled_();

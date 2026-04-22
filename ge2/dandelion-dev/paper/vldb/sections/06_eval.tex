@@ -1,0 +1,89 @@
+% Section 6 -- Evaluation
+
+\subsection{Experimental Setup}
+
+We evaluate on Twitter (41.6\,M nodes, 1.46\,B edges), 16 partitions,
+buffer capacity 4, and two \SI{24}{GB} RTX A5000 GPUs connected over
+PCIe. We use the existing GE\textsuperscript{2} Twitter
+DistMult/Adagrad configuration and compare three runs:
+\textsc{Lane\_Matched} with peer execution disabled,
+\textsc{Lane\_Matched} with peer execution enabled, and
+\textsc{Disjoint\_Rounds} with peer execution enabled.
+
+For the peer-enabled runs we set
+\texttt{GEGE\_STATEFLOW\_PEER\_RUNTIME\_SCOPE=embeddings}, so the
+runtime executes peer transfers for node embeddings while optimizer
+state remains on the existing host path. Under this scope, executed
+peer bytes should equal exactly half of the compiler-reported planned
+peer bytes. We report compile-time selection cost, admits, and handoff
+distribution from the IR, then runtime epoch time, executed peer
+bytes, host fallback bytes, descriptor mismatches, and peer-sync wait
+time from the runtime telemetry.
+
+\subsection{Compile-Time Effect}
+
+Table~\ref{tab:ir:example} summarizes the two compiled plans.
+\textsc{Lane\_Matched} lowers selection cost from
+$1.499 \times 10^{11}$ to $1.291 \times 10^{11}$ (14\%), reduces host
+admits from 72 to 62, and changes the handoff distribution from
+\{\texttt{FULL\_RELOAD}:10, \texttt{ROTATING\_OVERWRITE}:8,
+\texttt{PEER\_RELAY}:8\} to
+\{\texttt{FULL\_RELOAD}:0, \texttt{ROTATING\_OVERWRITE}:18,
+\texttt{PEER\_RELAY}:18\}. The important point is that this entire
+improvement is visible before runtime: the compiler eliminates every
+cold admit from the plan and exposes \SI{37.49}{GB} of peer-relay
+opportunity, versus \SI{16.66}{GB} for \textsc{Disjoint\_Rounds}.
+
+\subsection{Runtime Effect}
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrrrrr}
+\toprule
+Variant & Epoch (s) & Peer GB & Copies & Fallback GB & Mismatch \\
+\midrule
+\textsc{Lane\_Matched}, peer off          & 208.256 & 0.00  & 0  & 0.00 & 0 \\
+\textsc{Lane\_Matched}, peer on (emb.)    & 209.450 & 18.74 & 18 & 0.00 & 0 \\
+\textsc{Disjoint\_Rounds}, peer on (emb.) & 209.525 & 8.33  & 8  & 0.00 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Twitter 16-partition runtime on two RTX A5000s. Peer-on runs
+use \texttt{GEGE\_STATEFLOW\_PEER\_RUNTIME\_SCOPE=embeddings}, so the
+executed peer bytes are exactly half of the planned peer bytes in
+Table~\ref{tab:ir:example}.}
+\label{tab:eval:runtime}
+\end{table}
+
+Table~\ref{tab:eval:runtime} gives the runtime result. For
+\textsc{Lane\_Matched}, the peer-enabled run executes all 18 planned
+embedding handoffs, totaling \SI{18.74}{GB} of device-to-device
+traffic, with zero host fallback and zero descriptor mismatch. The
+runtime telemetry reports \texttt{peer\_sync\_wait\_ms=1019.646} for
+the epoch. For \textsc{Disjoint\_Rounds}, the runtime executes all 8
+planned embedding handoffs, totaling \SI{8.33}{GB}, also with zero
+fallback and zero mismatch.
+
+\textsc{Lane\_Matched} remains the best peer-enabled schedule, but only
+by \SI{0.075}{s}: \SI{209.450}{s} versus \SI{209.525}{s}. Both peer-on
+runs are about \SI{1.2}{s} slower than the
+\textsc{Lane\_Matched}/peer-off baseline at \SI{208.256}{s}. On this
+PCIe A5000 setup, peer execution therefore displaces host traffic
+correctly but does not convert that displacement into an epoch-time
+speedup. The implication is that the remaining ceiling is the swap
+runtime itself rather than descriptor quality: the compiler removes
+cold reloads and doubles executed peer traffic, but the wall-clock path
+is still dominated by swap orchestration overhead on this hardware.
+
+\subsection{Takeaway}
+
+The runtime result is still valuable. Phase 4b is
+\emph{correctness-complete}: the compiler-emitted descriptors survive
+projection, validation, slot alignment, and swap-time execution with
+zero fallback. The peer-enabled runtime also preserves the compiler's
+ordering preference: \textsc{Lane\_Matched} executes more than twice the
+peer traffic of \textsc{Disjoint\_Rounds}
+(\SI{18.74}{GB} vs.\ \SI{8.33}{GB}) and remains the best peer-enabled
+variant. What the result does \emph{not} show is a wall-clock win on
+this hardware. The next step is therefore Phase 5 overlap and
+staggering, or evaluation on a faster peer interconnect.

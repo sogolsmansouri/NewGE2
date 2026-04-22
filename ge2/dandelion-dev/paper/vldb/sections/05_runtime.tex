@@ -1,0 +1,68 @@
+% Section 5 -- Runtime Execution
+
+\subsection{From Descriptors to Runtime State}
+
+Phase 3 stopped at descriptor emission: the compiler and validator
+produced \texttt{PeerHandoffDescriptor}s, but the runtime still served
+every admit from host memory. The final runtime keeps the compiler and
+validator unchanged and only changes how those descriptors are
+consumed.
+
+At load time, the projected descriptors are handed to
+\texttt{MemPartitionBufferStorage}, indexed by
+$(\texttt{dst\_lane}, \texttt{round\_idx}, \texttt{partition\_id})$,
+and checked for duplicates. Runtime initialization then attempts to
+enable CUDA peer access in both directions for every active device
+pair. Two environment controls gate the feature:
+\texttt{GEGE\_STATEFLOW\_PEER\_RUNTIME=\{off,auto,on\}} controls whether
+peer execution is disabled, opportunistic, or required, and
+\texttt{GEGE\_STATEFLOW\_PEER\_RUNTIME\_SCOPE=\{all,embeddings\}}
+controls whether the peer path is applied to both embeddings and
+optimizer state or to embeddings only.
+
+\subsection{In-Place Peer Execution}
+
+Our first Phase 4 prototype allocated a full staged destination buffer
+per device. That design was simple but too memory-hungry for
+\SI{24}{GB} boards. The final Phase 4b runtime instead performs
+\emph{in-place, slot-aligned} peer admits.
+
+At each round boundary, each lane materializes only its own next-state
+layout locally, while the runtime consults a precomputed per-round
+``globally required'' set to decide which evictions truly leave the
+next frontier. This removes the old cross-device next-state barrier.
+The source side snapshots only those partitions that will be exported
+to other lanes into small per-partition source-scratch tensors and
+publishes their slot locations plus a CUDA ready event. Destinations
+wait only on the specific source lanes they consume, not on a global
+all-lane barrier. This decouples peer reads from subsequent local slot
+reuse without allocating another full device-sized buffer.
+
+The destination side then realizes the planner's next-state slot layout
+exactly. Retained partitions are permuted into their target slots using
+free evict slots as temporary scratch when necessary; partitions that
+leave the global next-state frontier are written back to host; and each
+new admit is filled either by \texttt{cudaMemcpyPeerAsync} from the
+source scratch or by the legacy host path. Because the runtime
+materializes the planner's slot layout rather than reusing slots
+opportunistically, the compiler's \texttt{src\_slot} and
+\texttt{dst\_slot} remain valid at execution time.
+
+\subsection{Safety and Telemetry}
+
+The validator still enforces the structural invariants of
+Section~\ref{sec:ir:validator}; the runtime adds dynamic checks that the
+projected source lane, destination lane, and slot IDs match the actual
+swap-time state. Any mismatch falls back to host reload and increments
+a visible counter rather than risking a corrupt swap. This made the
+bring-up path auditable: we could distinguish ``descriptor emitted but
+not executed,'' ``descriptor executed with fallback,'' and ``descriptor
+executed exactly.''
+
+Each epoch reports
+\texttt{peer\_bytes\_executed}, \texttt{host\_fallback\_bytes},
+\texttt{peer\_copy\_count}, \texttt{descriptor\_mismatch\_count}, and
+\texttt{peer\_sync\_wait\_ms}, with per-device breakdowns. These are
+the counters used in Section~\ref{sec:eval} to show that the final
+Phase 4b runtime executes the planned peer relays with zero fallback
+and zero slot mismatch.

@@ -10,16 +10,15 @@
 
 namespace {
 
-StateflowPlan build_valid_multi_gpu_plan(PlanVariant variant) {
+StateflowPlan build_valid_multi_gpu_plan(PlanVariant variant, int active_devices = 2) {
     constexpr int kNumPartitions = 16;
     constexpr int kBufferCapacity = 4;
-    constexpr int kActiveDevices = 2;
 
     auto [buffer_states, edge_buckets] = getCustomEdgeBucketOrdering(kNumPartitions, kBufferCapacity, false);
     std::vector<int64_t> edge_bucket_sizes(static_cast<std::size_t>(kNumPartitions * kNumPartitions), 1);
     std::vector<int64_t> partition_row_counts(static_cast<std::size_t>(kNumPartitions), 1024);
     auto candidates =
-        enumerateMultiGpuStateflowPlans(buffer_states, edge_buckets, kActiveDevices, edge_bucket_sizes, partition_row_counts, {});
+        enumerateMultiGpuStateflowPlans(buffer_states, edge_buckets, active_devices, edge_bucket_sizes, partition_row_counts, {});
 
     for (const auto &candidate : candidates) {
         if (candidate.family_variant == variant) {
@@ -83,6 +82,12 @@ void test_reject_bucket_coverage_gap() {
     expect_false(validateStateflowPlanExactSemantics(plan), "bucket coverage gap should fail validation");
 }
 
+void test_four_gpu_lane_matched_candidate_validates() {
+    auto plan = build_valid_multi_gpu_plan(PlanVariant::MULTI_GPU_LANE_MATCHED, 4);
+    expect_true(plan.gpu_count == 4, "expected 4-GPU lane-matched candidate");
+    expect_true(validateStateflowPlanExactSemantics(plan), "4-GPU lane-matched plan should validate");
+}
+
 }  // namespace
 
 int main() {
@@ -90,6 +95,7 @@ int main() {
         {"reject_cross_lane_handoff_in_lane_plan", test_reject_cross_lane_handoff_in_lane_plan},
         {"reject_peer_relay_without_cross_lane_descriptor", test_reject_peer_relay_without_cross_lane_descriptor},
         {"reject_bucket_coverage_gap", test_reject_bucket_coverage_gap},
+        {"four_gpu_lane_matched_candidate_validates", test_four_gpu_lane_matched_candidate_validates},
     };
 
     for (const auto &[name, test] : tests) {

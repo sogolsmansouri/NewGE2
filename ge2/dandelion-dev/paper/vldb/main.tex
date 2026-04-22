@@ -1,0 +1,121 @@
+% !TEX TS-program = pdflatex
+% !TEX encoding = UTF-8 Unicode
+%
+% Compiled Stateflow: A Typed IR for Out-of-Core Multi-GPU KGE Training
+% VLDB submission draft
+%
+% Class: swap to the official PVLDB class (\documentclass{vldb}) once the
+% template ships for the target round.  Using acmart[sigconf] as a
+% compatible stand-in while drafting.
+\documentclass[sigconf, nonacm]{acmart}
+
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{url}
+
+% Lightweight fallback for unit formatting in the draft build.
+\providecommand{\SI}[2]{#1\,#2}
+
+% PVLDB copyright placeholder -- replaced by official block at camera-ready.
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\lstset{
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{blue}\bfseries,
+  commentstyle=\color{gray}\itshape,
+  showstringspaces=false,
+  columns=fullflexible,
+  breaklines=true,
+}
+
+\begin{document}
+
+\title{Compiled Stateflow: A Typed IR for Out-of-Core Multi-GPU KGE Training}
+
+\author{Anonymous Authors}
+\affiliation{%
+  \institution{Anonymous Institution}
+  \country{}
+}
+
+\begin{abstract}
+Knowledge graph embedding (KGE) training at billion-edge scale forces
+embeddings and optimizer state out of GPU memory: on a \SI{24}{GB}
+GPU, a 41.6M-node graph at 400 dimensions requires \SI{66.6}{GB} of
+embeddings and an equivalent amount of Adagrad state. State-of-the-art
+out-of-core trainers address single-GPU residency through partitioned
+schedules (e.g., the COVER schedule used in GE\textsuperscript{2}), but
+extend to multi-GPU settings by treating each device as an independent
+COVER instance. This leaves inter-GPU handoffs implicit, hides their
+cost from the scheduler, and forecloses peer-to-peer transfers whose
+cost model differs fundamentally from host reloads.
+\par\vspace{0.5em}
+We introduce \emph{Compiled Stateflow}, a typed intermediate
+representation (IR) for out-of-core partition schedules. Stateflow makes
+every byte of partition residency, host admit, and cross-device handoff
+a first-class object with an explicit cost. A lane-matching compiler
+chooses per-GPU assignments that minimize host I/O under a unified cost
+model, exposing cross-lane peer opportunities as typed
+\texttt{PeerHandoff} descriptors executable as \texttt{cudaMemcpyPeerAsync}.
+On Twitter (41.6M nodes, 1.46B edges) with 16 partitions, our compiler
+reduces compile-time selection cost by 14\% and eliminates all
+\texttt{FULL\_RELOAD} handoffs, exposing \SI{37.49}{GB} of per-epoch
+peer-transfer opportunity. On a two-GPU RTX A5000 PCIe system, the
+runtime executes the embedding half of that opportunity
+(\SI{18.74}{GB}/epoch) with zero host fallback and zero descriptor
+mismatches. Epoch time remains effectively flat relative to host
+reloads, showing that the IR and runtime are correct even when this
+interconnect does not turn peer copies into a wall-clock win. We
+present the IR, cost model, lane-matching algorithm, validator
+invariants, and measured runtime behavior.
+\end{abstract}
+
+\keywords{knowledge graph embeddings, out-of-core training, multi-GPU
+scheduling, intermediate representations, peer-to-peer transfers}
+
+\maketitle
+
+%-----------------------------------------------------------------------
+\section{Introduction}\label{sec:intro}
+\input{sections/01_intro}
+
+%-----------------------------------------------------------------------
+\section{Background}\label{sec:background}
+\input{sections/02_background}
+
+%-----------------------------------------------------------------------
+\section{Compiled Stateflow IR}\label{sec:ir}
+\input{sections/03_ir}
+
+%-----------------------------------------------------------------------
+\section{Lane-Matching Compiler}\label{sec:compiler}
+\input{sections/04_compiler}
+
+%-----------------------------------------------------------------------
+\section{Runtime Execution}\label{sec:runtime}
+\input{sections/05_runtime}
+
+%-----------------------------------------------------------------------
+\section{Evaluation}\label{sec:eval}
+\input{sections/06_eval}
+
+%-----------------------------------------------------------------------
+\section{Related Work}\label{sec:related}
+\input{sections/07_related}
+
+%-----------------------------------------------------------------------
+\section{Conclusion}\label{sec:conclusion}
+\input{sections/08_conclusion}
+
+%-----------------------------------------------------------------------
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{references}
+
+\end{document}

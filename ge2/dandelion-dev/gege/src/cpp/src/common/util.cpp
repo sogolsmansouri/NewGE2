@@ -451,7 +451,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
             fixed_buffer_bitmap_verify_counter().fetch_add(1) < fixed_buffer_bitmap_verify_max_calls()) {
             all_ids = pack_ids_into_cached_buffer(unmapped_tensors);
             UniqueMapCudaDebugInfo reference_debug_info;
-            auto reference_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &reference_debug_info);
+            auto reference_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &reference_debug_info, value_domain_size);
             torch::Tensor reference_map = std::get<0>(reference_tup);
             torch::Tensor reference_inverse = std::get<1>(reference_tup);
             torch::Tensor active_map = map.narrow(0, 0, reference_map.numel());
@@ -475,14 +475,14 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
             mapped_all_ids = std::get<1>(unique_tup);
             fixed_active_mask = std::get<2>(unique_tup);
         } else {
-            auto unique_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &unique_debug_info);
+            auto unique_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &unique_debug_info, value_domain_size);
             map = std::get<0>(unique_tup);
             mapped_all_ids = std::get<1>(unique_tup);
         }
         if (use_fixed_bitmap && fixed_buffer_bitmap_verify_enabled() &&
             fixed_buffer_bitmap_verify_counter().fetch_add(1) < fixed_buffer_bitmap_verify_max_calls()) {
             UniqueMapCudaDebugInfo reference_debug_info;
-            auto reference_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &reference_debug_info);
+            auto reference_tup = map_tensors_unique_inverse_cuda(all_ids, sorted, &reference_debug_info, value_domain_size);
             torch::Tensor reference_map = std::get<0>(reference_tup);
             torch::Tensor reference_inverse = std::get<1>(reference_tup);
             torch::Tensor active_map = map.narrow(0, 0, reference_map.numel());

@@ -1580,7 +1580,8 @@ void active_masked_index_add_cuda(torch::Tensor target,
 }
 
 std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda(torch::Tensor all_ids, bool sorted,
-                                                                         UniqueMapCudaDebugInfo* debug_info) {
+                                                                         UniqueMapCudaDebugInfo* debug_info,
+                                                                         int64_t value_domain_size) {
     UniqueBackend requested_backend = resolve_unique_backend(std::string());
     initialize_debug_info(debug_info, sorted, requested_backend);
     if (sorted) {
@@ -1593,7 +1594,7 @@ std::tuple<torch::Tensor, torch::Tensor> map_tensors_unique_inverse_cuda(torch::
         case UniqueBackend::kHash:
             return map_tensors_unique_inverse_cuda_hash(all_ids, debug_info);
         case UniqueBackend::kBitmap:
-            return map_tensors_unique_inverse_cuda_bitmap(all_ids, debug_info, -1);
+            return map_tensors_unique_inverse_cuda_bitmap(all_ids, debug_info, value_domain_size);
         case UniqueBackend::kCuco:
             return map_tensors_unique_inverse_cuda_cuco(all_ids, debug_info);
         case UniqueBackend::kAuto:

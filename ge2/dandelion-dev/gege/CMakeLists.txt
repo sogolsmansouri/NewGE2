@@ -204,6 +204,10 @@ add_library(${PROJECT_NAME}
 target_link_libraries(${PROJECT_NAME} ${Python3_LIBRARIES})
 target_link_libraries(${PROJECT_NAME} ${GEGE_TORCH_LIBRARIES})
 target_link_libraries(${PROJECT_NAME} spdlog)
+if("${CMAKE_CXX_COMPILER_ID}" MATCHES "GNU" AND
+   CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9.0)
+    target_link_libraries(${PROJECT_NAME} stdc++fs)
+endif()
 set_target_properties(${PROJECT_NAME} PROPERTIES PUBLIC_HEADER "${project_HEADERS}")
 set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

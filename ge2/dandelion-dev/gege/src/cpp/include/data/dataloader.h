@@ -225,6 +225,9 @@ class DataLoader {
     std::vector<int64_t> device_current_state_index_;
     std::vector<int64_t> device_current_active_bucket_count_;
     std::vector<int64_t> device_current_active_edge_count_;
+    std::vector<torch::Tensor> device_neighbor_local_to_batch_map_;
+    std::vector<torch::Tensor> device_neighbor_local_to_batch_stamp_;
+    std::vector<int64_t> device_neighbor_local_to_batch_generation_;
     std::vector<std::string> device_current_state_partitions_;
     std::vector<int64_t> device_state_build_sequence_;
 

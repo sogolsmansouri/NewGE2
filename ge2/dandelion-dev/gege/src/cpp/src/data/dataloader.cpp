@@ -620,6 +620,9 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     std::fill(device_current_state_index_.begin(), device_current_state_index_.end(), -1);
     initialize_perf_vector(device_current_active_bucket_count_, devices_.size());
     initialize_perf_vector(device_current_active_edge_count_, devices_.size());
+    device_neighbor_local_to_batch_map_.assign(devices_.size(), torch::Tensor());
+    device_neighbor_local_to_batch_stamp_.assign(devices_.size(), torch::Tensor());
+    device_neighbor_local_to_batch_generation_.assign(devices_.size(), 0);
     device_current_state_partitions_.assign(devices_.size(), std::string("-"));
     initialize_perf_vector(device_state_build_sequence_, devices_.size());
 
@@ -752,6 +755,9 @@ DataLoader::DataLoader(shared_ptr<GraphModelStorage> graph_storage, LearningTask
     std::fill(device_current_state_index_.begin(), device_current_state_index_.end(), -1);
     initialize_perf_vector(device_current_active_bucket_count_, devices_.size());
     initialize_perf_vector(device_current_active_edge_count_, devices_.size());
+    device_neighbor_local_to_batch_map_.assign(devices_.size(), torch::Tensor());
+    device_neighbor_local_to_batch_stamp_.assign(devices_.size(), torch::Tensor());
+    device_neighbor_local_to_batch_generation_.assign(devices_.size(), 0);
     device_current_state_partitions_.assign(devices_.size(), std::string("-"));
     initialize_perf_vector(device_state_build_sequence_, devices_.size());
     negative_sampler_ = negative_sampler;
@@ -1947,35 +1953,103 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         batch->dense_graph_ = neighbor_sampler_->getNeighbors(batch->root_node_indices_, graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_);
         batch->unique_node_indices_ = batch->dense_graph_.getNodeIDs();
 
-        // map edges and negatives to their corresponding index in unique_node_indices_
-        auto tup = torch::sort(batch->unique_node_indices_);
-        torch::Tensor sorted_map = std::get<0>(tup);
-        torch::Tensor map_to_unsorted = std::get<1>(tup);
+        int64_t num_nbrs_sampled = batch->dense_graph_.hop_offsets_[-2].item<int64_t>();
 
-        mapped_tensors = apply_tensor_map(sorted_map, all_ids);
+        auto assign_neighbor_mappings = [&]() {
+            auto remap_assign_start = std::chrono::high_resolution_clock::now();
+            std::size_t mapped_tensor_idx = 0;
+            src_mapping = mapped_tensors[mapped_tensor_idx++] - num_nbrs_sampled;
+            dst_mapping = mapped_tensors[mapped_tensor_idx++] - num_nbrs_sampled;
+
+            if (batch->src_neg_indices_.defined()) {
+                src_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->src_neg_indices_.sizes()) - num_nbrs_sampled;
+            }
+
+            if (batch->dst_neg_indices_.defined()) {
+                dst_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->dst_neg_indices_.sizes()) - num_nbrs_sampled;
+            }
+            auto remap_assign_end = std::chrono::high_resolution_clock::now();
+            remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
+            remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
+        };
+
+        auto run_searchsorted_neighbor_map = [&]() {
+            auto tup = torch::sort(batch->unique_node_indices_);
+            torch::Tensor sorted_map = std::get<0>(tup);
+            torch::Tensor map_to_unsorted = std::get<1>(tup);
+
+            std::vector<torch::Tensor> sorted_mapped_tensors = apply_tensor_map(sorted_map, all_ids);
+            mapped_tensors.clear();
+            mapped_tensors.reserve(sorted_mapped_tensors.size());
+            for (auto &tensor : sorted_mapped_tensors) {
+                mapped_tensors.emplace_back(map_to_unsorted.index_select(0, tensor));
+            }
+        };
+
+        bool use_direct_neighbor_map = fast_map_tensors_enabled() && device_idx >= 0 &&
+                                       static_cast<std::size_t>(device_idx) < device_neighbor_local_to_batch_map_.size() &&
+                                       batch->unique_node_indices_.defined() &&
+                                       batch->unique_node_indices_.scalar_type() == torch::kInt64 &&
+                                       batch->dense_graph_.num_nodes_in_memory_ > 0;
+        int64_t neighbor_map_generation = 0;
+        if (use_direct_neighbor_map) {
+            auto &local_to_batch_map = device_neighbor_local_to_batch_map_[device_idx];
+            auto &local_to_batch_stamp = device_neighbor_local_to_batch_stamp_[device_idx];
+            int64_t map_size = static_cast<int64_t>(batch->dense_graph_.num_nodes_in_memory_);
+            auto map_options = batch->unique_node_indices_.options().dtype(torch::kInt64);
+            if (!local_to_batch_map.defined() || local_to_batch_map.device() != batch->unique_node_indices_.device() ||
+                local_to_batch_map.scalar_type() != torch::kInt64 || local_to_batch_map.numel() < map_size) {
+                local_to_batch_map = torch::full({map_size}, -1, map_options);
+                local_to_batch_stamp = torch::zeros({map_size}, map_options);
+                device_neighbor_local_to_batch_generation_[device_idx] = 0;
+            }
+
+            neighbor_map_generation = ++device_neighbor_local_to_batch_generation_[device_idx];
+            if (neighbor_map_generation <= 0) {
+                local_to_batch_stamp.zero_();
+                neighbor_map_generation = 1;
+                device_neighbor_local_to_batch_generation_[device_idx] = neighbor_map_generation;
+            }
+
+            local_to_batch_map.index_copy_(0, batch->unique_node_indices_,
+                                           torch::arange(batch->unique_node_indices_.numel(), map_options));
+            if (verify_node_mapping_enabled()) {
+                local_to_batch_stamp.index_fill_(0, batch->unique_node_indices_, neighbor_map_generation);
+            }
+
+            mapped_tensors.clear();
+            mapped_tensors.reserve(all_ids.size());
+            for (const auto &ids : all_ids) {
+                mapped_tensors.emplace_back(local_to_batch_map.index_select(0, ids));
+            }
+        } else {
+            run_searchsorted_neighbor_map();
+        }
+
         auto map_lookup_end = std::chrono::high_resolution_clock::now();
         map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
         map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);
 
-        int64_t num_nbrs_sampled = batch->dense_graph_.hop_offsets_[-2].item<int64_t>();
-
-        auto remap_assign_start = std::chrono::high_resolution_clock::now();
-        std::size_t mapped_tensor_idx = 0;
-        src_mapping = map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]) - num_nbrs_sampled;
-        dst_mapping = map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]) - num_nbrs_sampled;
-
-        if (batch->src_neg_indices_.defined()) {
-            src_neg_mapping =
-                map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]).reshape(batch->src_neg_indices_.sizes()) - num_nbrs_sampled;
+        if (use_direct_neighbor_map && verify_node_mapping_enabled()) {
+            auto map_verify_start = std::chrono::high_resolution_clock::now();
+            auto &local_to_batch_stamp = device_neighbor_local_to_batch_stamp_[device_idx];
+            bool direct_map_valid = true;
+            for (const auto &ids : all_ids) {
+                if (!torch::all(local_to_batch_stamp.index_select(0, ids) == neighbor_map_generation).item<bool>()) {
+                    direct_map_valid = false;
+                    break;
+                }
+            }
+            auto map_verify_end = std::chrono::high_resolution_clock::now();
+            map_verify_ms = elapsed_ms(map_verify_start, map_verify_end);
+            map_verify_elapsed = elapsed_ns(map_verify_start, map_verify_end);
+            if (!direct_map_valid) {
+                SPDLOG_WARN("Neighbor direct map verification failed on batch {}; falling back to searchsorted mapping", batch->batch_id_);
+                run_searchsorted_neighbor_map();
+            }
         }
 
-        if (batch->dst_neg_indices_.defined()) {
-            dst_neg_mapping =
-                map_to_unsorted.index_select(0, mapped_tensors[mapped_tensor_idx++]).reshape(batch->dst_neg_indices_.sizes()) - num_nbrs_sampled;
-        }
-        auto remap_assign_end = std::chrono::high_resolution_clock::now();
-        remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);
-        remap_assign_elapsed = elapsed_ns(remap_assign_start, remap_assign_end);
+        assign_neighbor_mappings();
     } else {
         // map edges and negatives to their corresponding index in unique_node_indices_
         auto map_lookup_start = std::chrono::high_resolution_clock::now();

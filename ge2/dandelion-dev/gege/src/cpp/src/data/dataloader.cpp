@@ -1980,7 +1980,15 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         // map edges and negatives to their corresponding index in unique_node_indices_
         auto map_lookup_start = std::chrono::high_resolution_clock::now();
         torch::Tensor active_unique_mask;
-        auto tup = map_tensors(all_ids, !fast_map_tensors_enabled(), collect_map_tensor_breakdown ? &map_tensor_timing : nullptr, &active_unique_mask);
+        int64_t map_value_domain_size = -1;
+        if (batch->streamed_edge_size_ > 0 && graph_storage_ != nullptr && graph_storage_->useInMemorySubGraph() &&
+            device_idx >= 0 && static_cast<std::size_t>(device_idx) < graph_storage_->current_subgraph_states_.size() &&
+            graph_storage_->current_subgraph_states_[device_idx] != nullptr &&
+            graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.defined()) {
+            map_value_domain_size = graph_storage_->getNumNodesInMemory(device_idx);
+        }
+        auto tup = map_tensors(all_ids, !fast_map_tensors_enabled(), collect_map_tensor_breakdown ? &map_tensor_timing : nullptr,
+                               &active_unique_mask, map_value_domain_size);
         auto map_lookup_end = std::chrono::high_resolution_clock::now();
         map_lookup_ms = elapsed_ms(map_lookup_start, map_lookup_end);
         map_lookup_elapsed = elapsed_ns(map_lookup_start, map_lookup_end);

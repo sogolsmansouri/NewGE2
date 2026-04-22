@@ -396,7 +396,7 @@ std::string get_directory(std::string filename) {
 }
 
 std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<torch::Tensor> unmapped_tensors, bool sorted, MapTensorTiming *timing,
-                                                                  torch::Tensor *active_unique_mask) {
+                                                                  torch::Tensor *active_unique_mask, int64_t value_domain_size) {
     auto total_start = std::chrono::high_resolution_clock::now();
     auto step_start = total_start;
 
@@ -442,7 +442,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
     unique_debug_info.measure_device_timing = timing != nullptr && map_tensor_device_timing_enabled();
 #ifdef GEGE_CUDA
     if (use_direct_multi) {
-        auto unique_tup = map_tensors_unique_inverse_cuda_bitmap_padded_multi(unmapped_tensors, &unique_debug_info);
+        auto unique_tup = map_tensors_unique_inverse_cuda_bitmap_padded_multi(unmapped_tensors, &unique_debug_info, value_domain_size);
         map = std::get<0>(unique_tup);
         mapped_tensors = std::get<1>(unique_tup);
         fixed_active_mask = std::get<2>(unique_tup);
@@ -470,7 +470,7 @@ std::tuple<torch::Tensor, std::vector<torch::Tensor>> map_tensors(std::vector<to
     } else if (all_ids.is_cuda() && all_ids.scalar_type() == torch::kInt64) {
         bool use_fixed_bitmap = fixed_buffer_bitmap_map_enabled() && !sorted;
         if (use_fixed_bitmap) {
-            auto unique_tup = map_tensors_unique_inverse_cuda_bitmap_padded(all_ids, &unique_debug_info);
+            auto unique_tup = map_tensors_unique_inverse_cuda_bitmap_padded(all_ids, &unique_debug_info, value_domain_size);
             map = std::get<0>(unique_tup);
             mapped_all_ids = std::get<1>(unique_tup);
             fixed_active_mask = std::get<2>(unique_tup);

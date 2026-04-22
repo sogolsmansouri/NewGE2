@@ -1,6 +1,7 @@
 #include "data/ordering.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -9,6 +10,35 @@
 #include <vector>
 
 namespace {
+
+class ScopedEnvVar {
+  public:
+    ScopedEnvVar(const char *name, const char *value) : name_(name) {
+        const char *existing = std::getenv(name_);
+        if (existing != nullptr) {
+            had_previous_ = true;
+            previous_ = existing;
+        }
+        if (value != nullptr) {
+            setenv(name_, value, 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (had_previous_) {
+            setenv(name_, previous_.c_str(), 1);
+        } else {
+            unsetenv(name_);
+        }
+    }
+
+  private:
+    const char *name_;
+    bool had_previous_ = false;
+    std::string previous_;
+};
 
 StateflowPlan build_valid_multi_gpu_plan(PlanVariant variant, int active_devices = 2) {
     constexpr int kNumPartitions = 16;
@@ -88,6 +118,20 @@ void test_four_gpu_lane_matched_candidate_validates() {
     expect_true(validateStateflowPlanExactSemantics(plan), "4-GPU lane-matched plan should validate");
 }
 
+void test_peer_aware_lane_matching_reduces_lane_matched_cost() {
+    ScopedEnvVar host_only_env("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "0");
+    auto host_only = build_valid_multi_gpu_plan(PlanVariant::MULTI_GPU_LANE_MATCHED);
+    expect_true(validateStateflowPlanExactSemantics(host_only), "host-only lane-matched plan should validate");
+    expect_true(host_only.total_peer_handoff_bytes > 0, "expected lane-matched plan to expose peer opportunities");
+
+    ScopedEnvVar peer_aware_env("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "1");
+    auto peer_aware = build_valid_multi_gpu_plan(PlanVariant::MULTI_GPU_LANE_MATCHED);
+    expect_true(validateStateflowPlanExactSemantics(peer_aware), "peer-aware lane-matched plan should validate");
+    expect_true(peer_aware.total_peer_handoff_bytes > 0, "expected peer-aware lane-matched plan to expose peer opportunities");
+    expect_true(peer_aware.estimated_cost <= host_only.estimated_cost,
+                "peer-aware lane-matched cost should not exceed the host-only cost");
+}
+
 }  // namespace
 
 int main() {
@@ -96,6 +140,7 @@ int main() {
         {"reject_peer_relay_without_cross_lane_descriptor", test_reject_peer_relay_without_cross_lane_descriptor},
         {"reject_bucket_coverage_gap", test_reject_bucket_coverage_gap},
         {"four_gpu_lane_matched_candidate_validates", test_four_gpu_lane_matched_candidate_validates},
+        {"peer_aware_lane_matching_reduces_lane_matched_cost", test_peer_aware_lane_matching_reduces_lane_matched_cost},
     };
 
     for (const auto &[name, test] : tests) {

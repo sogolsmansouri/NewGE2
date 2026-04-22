@@ -232,6 +232,50 @@ int64_t handoff_bytes_peer(const std::vector<int64_t> &needed_partitions,
     return bytes;
 }
 
+int64_t handoff_bytes_peer_from_lane_group(const std::vector<int64_t> &needed_partitions,
+                                           const std::vector<int64_t> &already_on_lane,
+                                           const std::vector<StateAccessSummary> &summaries,
+                                           const std::vector<int64_t> &prev_group,
+                                           std::size_t lane_slot,
+                                           const std::vector<int64_t> &partition_row_counts,
+                                           int64_t bytes_per_row) {
+    if (prev_group.empty() || lane_slot >= prev_group.size()) {
+        return 0;
+    }
+
+    std::unordered_set<int64_t> resident(already_on_lane.begin(), already_on_lane.end());
+    std::unordered_set<int64_t> peer_resident;
+    for (std::size_t idx = 0; idx < prev_group.size(); idx++) {
+        if (idx == lane_slot) {
+            continue;
+        }
+        int64_t state_idx = prev_group[idx];
+        if (state_idx < 0 || state_idx >= static_cast<int64_t>(summaries.size())) {
+            continue;
+        }
+        for (int64_t partition_id : summaries[static_cast<std::size_t>(state_idx)].partitions) {
+            peer_resident.insert(partition_id);
+        }
+    }
+
+    int64_t bytes = 0;
+    for (int64_t partition_id : needed_partitions) {
+        if (resident.count(partition_id) == 0 && peer_resident.count(partition_id) > 0) {
+            bytes += partition_transfer_bytes(partition_id, partition_row_counts, bytes_per_row);
+        }
+    }
+    return bytes;
+}
+
+double peer_bytes_as_host_equivalent(int64_t peer_bytes, const LaneMatchCostConfig &cfg) {
+    if (peer_bytes <= 0) {
+        return 0.0;
+    }
+    return static_cast<double>(peer_bytes) *
+           static_cast<double>(std::max<int64_t>(cfg.host_bandwidth_bps, 1)) /
+           static_cast<double>(std::max<int64_t>(cfg.peer_bandwidth_bps, 1));
+}
+
 int64_t optimized_custom_schedule_restarts() {
     const char *raw = std::getenv("GEGE_CUSTOM_OPTIMIZER_RESTARTS");
     if (raw == nullptr) {
@@ -1333,16 +1377,27 @@ void search_best_disjoint_group(const std::vector<std::vector<bool>> &compatible
 
 double lane_assignment_transition_cost(const StateAccessSummary &previous_state,
                                        const StateAccessSummary &next_state,
+                                       const std::vector<StateAccessSummary> &summaries,
+                                       const std::vector<int64_t> &prev_group,
+                                       std::size_t lane_slot,
                                        const std::vector<int64_t> &partition_row_counts,
                                        const LaneMatchCostConfig &cfg,
                                        int64_t bytes_per_row) {
     const int64_t host_bytes =
         handoff_bytes_host(next_state.partitions, previous_state.partitions, partition_row_counts, bytes_per_row);
+    int64_t peer_bytes = 0;
+    if (cfg.allow_peer_relay) {
+        peer_bytes = handoff_bytes_peer_from_lane_group(next_state.partitions, previous_state.partitions, summaries, prev_group,
+                                                        lane_slot, partition_row_counts, bytes_per_row);
+        peer_bytes = std::min(peer_bytes, host_bytes);
+    }
     const int64_t overlap_bytes =
         resident_overlap_bytes(previous_state.partitions, next_state.partitions, partition_row_counts, bytes_per_row);
+    const double effective_host_equivalent_bytes =
+        static_cast<double>(host_bytes - peer_bytes) + peer_bytes_as_host_equivalent(peer_bytes, cfg);
     double cost = bytes_per_row > 0
-                      ? static_cast<double>(host_bytes) / static_cast<double>(std::max<int64_t>(cfg.host_bandwidth_bps, 1))
-                      : static_cast<double>(host_bytes);
+                      ? effective_host_equivalent_bytes / static_cast<double>(std::max<int64_t>(cfg.host_bandwidth_bps, 1))
+                      : effective_host_equivalent_bytes;
     if (overlap_bytes == 0) {
         cost += cfg.boundary_weight;
     }
@@ -1410,7 +1465,7 @@ LaneAlignmentResult search_best_lane_alignment_dp(const std::vector<int64_t> &pr
         }
 
         double step_cost = lane_assignment_transition_cost(summaries[prev_group[slot]], summaries[candidate_group[candidate_idx]],
-                                                           partition_row_counts, cfg, bytes_per_row);
+                                                           summaries, prev_group, slot, partition_row_counts, cfg, bytes_per_row);
         std::vector<int64_t> ordered_group;
         ordered_group.reserve(1 + suffix.ordered_group.size());
         ordered_group.emplace_back(candidate_group[candidate_idx]);
@@ -3236,6 +3291,7 @@ double score_stateflow_plan(StateflowPlan &plan,
     double weighted_admission_load = 0.0;
     double selection_admission_load = 0.0;
     const int64_t bytes_per_row = plan_embedding_bytes_per_row(layout);
+    const LaneMatchCostConfig lane_match_cfg = lane_match_cost_config_from_env();
     for (auto &lane : plan.lanes) {
         for (std::size_t idx = 0; idx < lane.microstates.size(); idx++) {
             auto &microstate = lane.microstates[idx];
@@ -3312,7 +3368,12 @@ double score_stateflow_plan(StateflowPlan &plan,
         }
     }
 
-    const double selection_admission_basis = plan.lanes.size() > 1 ? selection_admission_load : weighted_admission_load;
+    double selection_admission_basis = plan.lanes.size() > 1 ? selection_admission_load : weighted_admission_load;
+    if (plan.lanes.size() > 1 && lane_match_cfg.allow_peer_relay && plan.total_peer_handoff_bytes > 0) {
+        const double peer_host_equivalent_bytes = peer_bytes_as_host_equivalent(plan.total_peer_handoff_bytes, lane_match_cfg);
+        selection_admission_basis =
+            std::max(0.0, selection_admission_load - static_cast<double>(plan.total_peer_handoff_bytes)) + peer_host_equivalent_bytes;
+    }
     plan.cost_breakdown.weighted_admission_load = weighted_admission_load;
     plan.cost_breakdown.admitted_partition_cost = alpha * selection_admission_basis;
     plan.cost_breakdown.bucket_edge_cost = beta * static_cast<double>(plan.estimated_bucket_edges);

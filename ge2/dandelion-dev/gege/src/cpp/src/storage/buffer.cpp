@@ -2723,7 +2723,7 @@ void MemPartitionBuffer::performNextSwapLegacy_(std::uintptr_t swap_ready_event)
         phase_start = now;
     }
 
-    if (single_gpu_async_admit_preload_enabled()) {
+    if (asyncAdmitPreloadEnabled_()) {
         auto preload_consume_start = std::chrono::high_resolution_clock::now();
         preloaded_admit = consumeAsyncAdmitPreload_(admit_ids, evict_slots, &preload_wait_ms);
         if (log_timing) {
@@ -2989,7 +2989,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         int64_t delayed_stale_rows = 0;
         if (frame_cache_delayed_stale_writeback_enabled() && !single_gpu_async_evict_writeback_enabled() &&
             frame_cache_hidden_only_preload_enabled() &&
-            single_gpu_async_admit_preload_enabled() && !admit_ids.empty() && !evict_slots.empty()) {
+            asyncAdmitPreloadEnabled_() && !admit_ids.empty() && !evict_slots.empty()) {
             joinAsyncAdmitPreload_();
             std::lock_guard<std::mutex> preload_lock(async_admit_preload_lock_);
             if (async_admit_preload_valid_ && !async_admit_preload_hidden_publishes_.empty() && async_admit_preload_admit_ids_.empty() &&
@@ -3278,7 +3278,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             phase_start = now;
         }
 
-        if (single_gpu_async_admit_preload_enabled()) {
+        if (asyncAdmitPreloadEnabled_()) {
             auto preload_consume_start = std::chrono::high_resolution_clock::now();
             preloaded_admit = consumeAsyncAdmitPreload_(admit_ids, evict_slots, &preload_wait_ms,
                                                         &preload_visible_install_rows, &hidden_publish_rows,

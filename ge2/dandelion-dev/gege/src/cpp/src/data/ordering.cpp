@@ -148,6 +148,10 @@ LaneMatchSolver stateflow_lane_match_solver() {
     return LaneMatchSolver::OPTIMAL2;
 }
 
+bool stateflow_allow_peer_relay_default() {
+    return stateflow_env_bool("GEGE_PARTITION_BUFFER_PEER_RELAY", "PARTITION_BUFFER_PEER_RELAY", false);
+}
+
 LaneMatchCostConfig lane_match_cost_config_from_env() {
     LaneMatchCostConfig cfg;
     cfg.peer_bandwidth_bps =
@@ -156,7 +160,8 @@ LaneMatchCostConfig lane_match_cost_config_from_env() {
         std::max<int64_t>(1, stateflow_env_int64("GEGE_STATEFLOW_HOST_BANDWIDTH_BPS", "STATEFLOW_HOST_BANDWIDTH_BPS", 16000000000LL));
     cfg.imbalance_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_IMBALANCE_WEIGHT", 1.0);
     cfg.boundary_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_BOUNDARY_WEIGHT", 1.0);
-    cfg.allow_peer_relay = stateflow_env_bool("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "STATEFLOW_ALLOW_PEER_RELAY", false);
+    cfg.allow_peer_relay =
+        stateflow_env_bool("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "STATEFLOW_ALLOW_PEER_RELAY", stateflow_allow_peer_relay_default());
     return cfg;
 }
 

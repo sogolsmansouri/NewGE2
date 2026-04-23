@@ -399,7 +399,9 @@ bool storage_sync_before_swap_enabled() {
 
 void empty_cache_for_storage_device(const torch::Device &device) {
     static bool sync_enabled = parse_storage_cuda_env_flag("GEGE_SYNC_BEFORE_SWAP", true);
-    static bool empty_cache_enabled = parse_storage_cuda_env_flag("GEGE_EMPTY_CACHE_AROUND_SWAP", true);
+    // Allocator cache flushes are process-global in PyTorch and can serialize
+    // otherwise independent multi-GPU lanes. Keep swap-time flushing opt-in.
+    static bool empty_cache_enabled = parse_storage_cuda_env_flag("GEGE_EMPTY_CACHE_AROUND_SWAP", false);
     if (!sync_enabled && !empty_cache_enabled) {
         return;
     }

@@ -65,7 +65,9 @@ void synchronize_cuda_swap_device(const torch::Device &device) {
 
 void empty_cache_for_swap_device(const torch::Device &device) {
     static bool sync_enabled = parse_cuda_swap_env_flag("GEGE_SYNC_BEFORE_SWAP", true);
-    static bool empty_cache_enabled = parse_cuda_swap_env_flag("GEGE_EMPTY_CACHE_AROUND_SWAP", true);
+    // Allocator cache flushes are process-global in PyTorch and can serialize
+    // otherwise independent multi-GPU lanes. Keep swap-time flushing opt-in.
+    static bool empty_cache_enabled = parse_cuda_swap_env_flag("GEGE_EMPTY_CACHE_AROUND_SWAP", false);
     if (!sync_enabled && !empty_cache_enabled) {
         return;
     }
@@ -155,6 +157,11 @@ bool single_gpu_gpu_aware_custom_enabled() {
 
 bool keep_storage_hot_between_epochs_enabled() {
     static bool enabled = parse_env_flag("GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS", false);
+    return enabled;
+}
+
+bool partition_buffer_peer_relay_requested() {
+    static bool enabled = parse_env_flag("GEGE_PARTITION_BUFFER_PEER_RELAY", false);
     return enabled;
 }
 
@@ -1316,7 +1323,9 @@ void DataLoader::setBufferOrdering() {
             bool access_aware_state_generation = false;
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
             bool hybrid_cover_schedule_requested = parse_env_flag("GEGE_HYBRID_COVER", false);
-            bool stateflow_lane_matching_requested = parse_env_flag("GEGE_STATEFLOW_LANE_MATCHING", false);
+            bool stateflow_lane_matching_requested = parse_env_flag(
+                "GEGE_STATEFLOW_LANE_MATCHING",
+                requested_active_devices > 1 && physical_devices > 1 && partition_buffer_peer_relay_requested());
             bool hybrid_cover_geometry_supported =
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
                 !options->randomly_assign_edge_buckets && requested_active_devices == 1 && physical_devices == 1 &&

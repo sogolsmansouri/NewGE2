@@ -11,6 +11,7 @@ SUMMARY_SCRIPT="${SUMMARY_SCRIPT:-$REPO_ROOT/scripts/summarize_benchmark_logs.py
 UPDATE_SCRIPT="${UPDATE_SCRIPT:-$REPO_ROOT/scripts/update_single_gpu_ablation_table.py}"
 EPOCHS="${EPOCHS:-5}"
 DATASET_DIR="${DATASET_DIR:-}"
+RUNTIME_BASE_PROFILE="${GEGE_RUNTIME_BASE_PROFILE:-historical}"
 SWAP_EMPTY_CACHE_OVERRIDE="${GEGE_EMPTY_CACHE_AROUND_SWAP-}"
 SWAP_SYNC_OVERRIDE="${GEGE_SYNC_BEFORE_SWAP-}"
 STATEFLOW_LANE_MATCHING_OVERRIDE="${GEGE_STATEFLOW_LANE_MATCHING-}"
@@ -57,6 +58,49 @@ configure_build_if_needed() {
   cmake --build "$BUILD_DIR" -j --target gege_train >/dev/null
 }
 
+apply_runtime_base_profile() {
+  case "$RUNTIME_BASE_PROFILE" in
+    historical)
+      unset GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD
+      unset GEGE_MEM_PARTITION_BUFFER_PINNED_HOST
+      unset GEGE_FIXED_BUFFER_BITMAP_MAP
+      unset GEGE_FIXED_BUFFER_BITMAP_REUSE_OUTPUTS
+      unset GEGE_FIXED_BUFFER_MASKED_UPDATE
+      unset GEGE_FIXED_BUFFER_MANUAL_DOT_RNS
+      unset GEGE_EMPTY_CACHE_AROUND_SWAP
+      unset GEGE_SYNC_BEFORE_SWAP
+      ;;
+    transferable_nonprefetch|current_baseenv)
+      export GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD=1
+      export GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=1
+      export GEGE_FIXED_BUFFER_BITMAP_MAP=1
+      export GEGE_FIXED_BUFFER_BITMAP_REUSE_OUTPUTS=1
+      export GEGE_FIXED_BUFFER_MASKED_UPDATE=1
+      export GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=1
+      export GEGE_EMPTY_CACHE_AROUND_SWAP=0
+      export GEGE_SYNC_BEFORE_SWAP=0
+      ;;
+    *)
+      echo "unknown GEGE_RUNTIME_BASE_PROFILE: $RUNTIME_BASE_PROFILE" >&2
+      exit 1
+      ;;
+  esac
+}
+
+runtime_base_flags_string() {
+  case "$RUNTIME_BASE_PROFILE" in
+    historical)
+      printf '%s' 'GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; all optional stack flags off; fixed off env block above'
+      ;;
+    transferable_nonprefetch|current_baseenv)
+      printf '%s' 'GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; transferable non-prefetch runtime base on: GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD=1, GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=1, GEGE_FIXED_BUFFER_BITMAP_MAP=1, GEGE_FIXED_BUFFER_BITMAP_REUSE_OUTPUTS=1, GEGE_FIXED_BUFFER_MASKED_UPDATE=1, GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=1, GEGE_EMPTY_CACHE_AROUND_SWAP=0, GEGE_SYNC_BEFORE_SWAP=0; all stack flags off'
+      ;;
+    *)
+      printf '%s' 'unknown'
+      ;;
+  esac
+}
+
 reset_env() {
   local v
   while IFS= read -r v; do
@@ -81,17 +125,10 @@ reset_env() {
   export GEGE_OPTIMIZED_CUSTOM_SCHEDULE=0
   export GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS=0
   export GEGE_PARTITION_BUFFER_PEER_RELAY=0
-  export GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD=1
 
   unset GEGE_GLOBAL_DEGREE_SAMPLING
   unset GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM
-
-  # Shared optimized runtime base used by the Twitter fast-path runs.
-  export GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=1
-  export GEGE_FIXED_BUFFER_BITMAP_MAP=1
-  export GEGE_FIXED_BUFFER_BITMAP_REUSE_OUTPUTS=1
-  export GEGE_FIXED_BUFFER_MASKED_UPDATE=1
-  export GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=1
+  apply_runtime_base_profile
 
   if [[ -n "$SWAP_EMPTY_CACHE_OVERRIDE" ]]; then
     export GEGE_EMPTY_CACHE_AROUND_SWAP="$SWAP_EMPTY_CACHE_OVERRIDE"
@@ -231,10 +268,10 @@ enable_stack_through() {
 flags_string_for_case() {
   case "$1" in
     control_main_all_flags_off)
-      printf '%s' 'GEGE_EMULATE_DOT_SINGLE_RELATION=1 fixed; shared runtime base on: GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD=1, GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=1, GEGE_FIXED_BUFFER_BITMAP_MAP=1, GEGE_FIXED_BUFFER_BITMAP_REUSE_OUTPUTS=1, GEGE_FIXED_BUFFER_MASKED_UPDATE=1, GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=1; all stack flags off'
+      runtime_base_flags_string
       ;;
     incremental_01_deg_chunk_exclusion)
-      printf '%s' 'shared runtime base + GEGE_DEG_CHUNK_EXCLUSION=1'
+      printf '%s' 'previous_stack + GEGE_DEG_CHUNK_EXCLUSION=1'
       ;;
     incremental_02_active_edge_shuffle)
       printf '%s' 'previous_stack + GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1'

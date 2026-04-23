@@ -2905,7 +2905,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         return;
     }
 
-    if (single_gpu_gpu_aware_custom_enabled() && buffer_sizes_ == 1 && device_.is_cuda()) {
+    if (frameCacheEnabled_() && device_.is_cuda()) {
         pending_hidden_publishes_.clear();
         int64_t timing_id = -1;
         bool log_timing = should_log_partition_buffer_swap_timing(timing_id);

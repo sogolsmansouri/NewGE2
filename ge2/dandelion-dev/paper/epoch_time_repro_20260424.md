@@ -44,6 +44,7 @@ export GEGE_GPU_ACTIVE_EDGE_SHUFFLE=1
 export GEGE_DEG_CHUNK_EXCLUSION=1
 export GEGE_CSR_GATHER=0
 export GEGE_CSR_UPDATE=0
+export GEGE_CSR_UPDATE_REDUCE=0
 export GEGE_EMPTY_CACHE_AROUND_SWAP=0
 export GEGE_SYNC_BEFORE_SWAP=0
 export GEGE_MEM_SWAP_EVENT_SYNC=1
@@ -72,6 +73,13 @@ export GEGE_UNIQUE_BITMAP_NUM_NODES=86054151
 export GEGE_EMULATE_DOT_SINGLE_RELATION=0
 export GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=0
 ```
+
+The Freebase frozen config intentionally mirrors the paper-quality model setup:
+`GLOROT_UNIFORM`, encoder `bias: false`, and ADAGRAD for dense/relation
+parameters. The paper-10k eval helper also defaults to non-bucket/CSR-off
+Freebase evaluation. Do not compare eval metrics from a checkpoint trained with
+the older `GLOROT_NORMAL` + bias + ADAM Freebase config; that is not the
+paper-quality path.
 
 The runner also preloads Torch's packaged `libcudart.so.12` before tcmalloc to
 avoid the CUDA runtime symbol mismatch seen with the Conda top-level runtime.
@@ -103,6 +111,18 @@ export GEGE_RUN_NAME=fb86m_epoch158_10e_eval_20260424
 export GEGE_RUN_ROOT=/dev/shm/smansou2_ge2/fb86m_epoch158_10e_eval_20260424
 export GEGE_LOG_DIR=/home/smansou2/codex_runs/exp_logs
 ```
+
+## Train log pipeline fingerprint
+
+Each `*_train.log` produced by `run_epoch_time_repro_20260424.sh` starts with a
+`gege_epoch_repro_pipeline_fingerprint` banner (the same lines are printed to the
+terminal before `gege_train` output). It records the effective values for
+`GEGE_PREPARED_BATCH_PIPELINE`, `GEGE_PREFETCH_PREPARE_NEXT_PARTITION`,
+`GEGE_PARTITION_BUFFER_PIPELINE_TIMING`, `GEGE_FULL_PIPELINE_PREFETCH`,
+`GEGE_BUCKET_STREAMING_LP`, `GEGE_FRAME_CACHE_HIDDEN_FRAMES`, plus the resolved
+temp config’s first `prefetch:` and `prefetching:` lines. Use that header when
+attributing epoch wall time to subgraph prefetch, prepared-batch pipelining, or
+bucket streaming.
 
 ## Observed Epoch-Time Results
 

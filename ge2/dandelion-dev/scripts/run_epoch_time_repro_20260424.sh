@@ -172,8 +172,23 @@ echo "GEGE_MEM_SWAP_EVENT_SYNC=$GEGE_MEM_SWAP_EVENT_SYNC"
 echo "GEGE_FRAME_CACHE_HIDDEN_FRAMES=$GEGE_FRAME_CACHE_HIDDEN_FRAMES"
 echo "GEGE_BUCKET_STREAMING_LP=$GEGE_BUCKET_STREAMING_LP"
 
+# Record pipeline-relevant settings inside the train log (and stdout) so epoch
+# wall times are not misattributed to mechanisms that are intentionally off.
+{
+  echo "--- gege_epoch_repro_pipeline_fingerprint $(date -Is) ---"
+  echo "GEGE_PREPARED_BATCH_PIPELINE=${GEGE_PREPARED_BATCH_PIPELINE:-unset}"
+  echo "GEGE_PREFETCH_PREPARE_NEXT_PARTITION=${GEGE_PREFETCH_PREPARE_NEXT_PARTITION:-unset}"
+  echo "GEGE_FULL_PIPELINE_PREFETCH=${GEGE_FULL_PIPELINE_PREFETCH:-unset}"
+  echo "GEGE_PARTITION_BUFFER_PIPELINE_TIMING=${GEGE_PARTITION_BUFFER_PIPELINE_TIMING:-unset}"
+  echo "GEGE_BUCKET_STREAMING_LP=${GEGE_BUCKET_STREAMING_LP:-unset}"
+  echo "GEGE_FRAME_CACHE_HIDDEN_FRAMES=${GEGE_FRAME_CACHE_HIDDEN_FRAMES:-unset}"
+  echo "storage_prefetch_line=$(grep -E '^[[:space:]]*prefetch:' "$TMP_CFG" 2>/dev/null | head -n1 | tr -d '\r' || echo 'missing')"
+  echo "embed_prefetching_line=$(grep -E 'prefetching:' "$TMP_CFG" 2>/dev/null | head -n1 | tr -d '\r' || echo 'missing')"
+  echo "--- end fingerprint ---"
+} | tee "$TRAIN_LOG"
+
 set +e
-"$TRAIN_BIN" "$TMP_CFG" 2>&1 | tee "$TRAIN_LOG"
+"$TRAIN_BIN" "$TMP_CFG" 2>&1 | tee -a "$TRAIN_LOG"
 train_status=${PIPESTATUS[0]}
 set -e
 echo "train_status=$train_status"

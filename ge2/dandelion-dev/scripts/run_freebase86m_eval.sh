@@ -32,6 +32,9 @@ Options:
 Notes:
   - 'paper-10k' matches the GE2 Table 4 protocol: exact filtered MRR on 10^4
     test edges, not the full 5% test split.
+  - Freebase eval defaults to the quality-preserving non-bucket path:
+    GEGE_BUCKET_STREAMING_LP=0, GEGE_CSR_GATHER=0, GEGE_CSR_UPDATE=0.
+    Override those environment variables explicitly only for attribution runs.
   - 'full' points eval at the full Freebase86M 90/5/5 split dataset.
   - The default batch size is conservative for 24 GB GPUs. Increase it only if
     you have already verified your card can hold the eval batches.
@@ -194,6 +197,9 @@ echo "  GEGE_PARTITION_BUFFER_PIPELINE_TIMING=1"
 echo "  GEGE_PARTITION_BUFFER_PIPELINE_TIMING_MAX=4096"
 echo "  GEGE_PARTITION_BUFFER_SWAP_TIMING=1"
 echo "  GEGE_PARTITION_BUFFER_SWAP_TIMING_MAX=4096"
+echo "  GEGE_BUCKET_STREAMING_LP=${GEGE_BUCKET_STREAMING_LP:-0}"
+echo "  GEGE_CSR_GATHER=${GEGE_CSR_GATHER:-0}"
+echo "  GEGE_CSR_UPDATE=${GEGE_CSR_UPDATE:-0}"
 echo "  GEGE_UNIQUE_BITMAP_NUM_NODES=86054151"
 
 if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -210,10 +216,10 @@ export GEGE_PARTITION_BUFFER_PIPELINE_TIMING_MAX=4096
 export GEGE_PARTITION_BUFFER_SWAP_TIMING=1
 export GEGE_PARTITION_BUFFER_SWAP_TIMING_MAX=4096
 export GEGE_FAST_MAP_TENSORS=1
-export GEGE_BUCKET_STREAMING_LP=1
-export GEGE_CSR_GATHER=1
-export GEGE_CSR_UPDATE=1
-export GEGE_CSR_UPDATE_REDUCE=0
+export GEGE_BUCKET_STREAMING_LP="${GEGE_BUCKET_STREAMING_LP:-0}"
+export GEGE_CSR_GATHER="${GEGE_CSR_GATHER:-0}"
+export GEGE_CSR_UPDATE="${GEGE_CSR_UPDATE:-0}"
+export GEGE_CSR_UPDATE_REDUCE="${GEGE_CSR_UPDATE_REDUCE:-0}"
 export GEGE_CSR_DEBUG=0
 export GEGE_STAGE_DEBUG=0
 export GEGE_DEG_CHUNK_EXCLUSION=1

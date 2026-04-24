@@ -74,12 +74,15 @@ export GEGE_EMULATE_DOT_SINGLE_RELATION=0
 export GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=0
 ```
 
-The Freebase frozen config intentionally mirrors the paper-quality model setup:
-`GLOROT_UNIFORM`, encoder `bias: false`, and ADAGRAD for dense/relation
-parameters. The paper-10k eval helper also defaults to non-bucket/CSR-off
-Freebase evaluation. Do not compare eval metrics from a checkpoint trained with
-the older `GLOROT_NORMAL` + bias + ADAM Freebase config; that is not the
-paper-quality path.
+The Freebase frozen config intentionally mirrors the GE2/Table-4-style
+Freebase quality target: ComplEx decoder, total embedding width `100`
+(`50` real + `50` imaginary channels), `GLOROT_UNIFORM`, encoder `bias:
+false`, and ADAGRAD for dense/relation parameters. The paper-10k eval helper
+also defaults to non-bucket/CSR-off Freebase evaluation. Do not compare eval
+metrics from a checkpoint trained with the older `DISTMULT`, `GLOROT_NORMAL` +
+bias + ADAM Freebase config; that is not the GE2 Freebase quality path. The
+reference target for the 10k Freebase eval is approximately `MRR=0.404`,
+`Hits@10=0.604`.
 
 The runner also preloads Torch's packaged `libcudart.so.12` before tcmalloc to
 avoid the CUDA runtime symbol mismatch seen with the Conda top-level runtime.
@@ -107,8 +110,8 @@ Freebase 10-epoch train plus paper-10k exact filtered eval:
 Useful overrides:
 
 ```bash
-export GEGE_RUN_NAME=fb86m_epoch158_10e_eval_20260424
-export GEGE_RUN_ROOT=/dev/shm/smansou2_ge2/fb86m_epoch158_10e_eval_20260424
+export GEGE_RUN_NAME=fb86m_complex_ge2_10e_eval_20260424
+export GEGE_RUN_ROOT=/dev/shm/smansou2_ge2/fb86m_complex_ge2_10e_eval_20260424
 export GEGE_LOG_DIR=/home/smansou2/codex_runs/exp_logs
 ```
 

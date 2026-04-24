@@ -1900,35 +1900,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
         async_admit_preload_total_ms_ = 0.0;
     }
 
-    std::vector<HiddenFramePublish> hidden_publishes;
-    std::vector<int> stage_admit_ids = admit_ids;
-    std::vector<int64_t> stage_evict_slots = evict_slots;
-    if (frameCacheEnabled_() && !admit_ids.empty()) {
-        std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
-        std::size_t hidden_count = std::min<std::size_t>(free_physical_frames_.size(), admit_ids.size());
-        hidden_publishes.reserve(hidden_count);
-        for (std::size_t idx = 0; idx < hidden_count; idx++) {
-            hidden_publishes.push_back(HiddenFramePublish{
-                admit_ids[idx],
-                evict_slots[idx],
-                free_physical_frames_[free_physical_frames_.size() - 1 - idx],
-            });
-        }
-        if (!hidden_publishes.empty()) {
-            if (frame_cache_hidden_only_preload_enabled()) {
-                stage_admit_ids.clear();
-                stage_evict_slots.clear();
-            } else {
-                stage_admit_ids.erase(stage_admit_ids.begin(),
-                                      stage_admit_ids.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
-                stage_evict_slots.erase(stage_evict_slots.begin(),
-                                        stage_evict_slots.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
-            }
-        }
-    }
-    int64_t stage_rows = partition_rows_for_ids(stage_admit_ids, partition_table_);
-
-    async_admit_preload_thread_ = std::thread([this, admit_ids, stage_admit_ids, stage_evict_slots, hidden_publishes, stage_rows]() {
+    async_admit_preload_thread_ = std::thread([this, admit_ids, evict_slots]() {
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double host_load_ms = 0.0;
@@ -1936,6 +1908,49 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
 
         try {
             joinAsyncEvictWritebackForPartitions_(admit_ids);
+
+            std::vector<HiddenFramePublish> hidden_publishes;
+            std::vector<int> stage_admit_ids = admit_ids;
+            std::vector<int64_t> stage_evict_slots = evict_slots;
+            if (frameCacheEnabled_() && !admit_ids.empty()) {
+                const std::size_t target_hidden_count =
+                    std::min<std::size_t>(static_cast<std::size_t>(hidden_frame_capacity_), admit_ids.size());
+                if (target_hidden_count > 0 && frame_cache_hidden_only_preload_enabled() &&
+                    frame_cache_delayed_stale_writeback_enabled() && !single_gpu_async_evict_writeback_enabled()) {
+                    std::size_t free_count = 0;
+                    {
+                        std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+                        free_count = free_physical_frames_.size();
+                    }
+                    if (free_count < target_hidden_count) {
+                        joinAsyncEvictWriteback_();
+                    }
+                }
+                {
+                    std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+                    const std::size_t hidden_count = std::min<std::size_t>(free_physical_frames_.size(), target_hidden_count);
+                    hidden_publishes.reserve(hidden_count);
+                    for (std::size_t idx = 0; idx < hidden_count; idx++) {
+                        hidden_publishes.push_back(HiddenFramePublish{
+                            admit_ids[idx],
+                            evict_slots[idx],
+                            free_physical_frames_[free_physical_frames_.size() - 1 - idx],
+                        });
+                    }
+                }
+                if (!hidden_publishes.empty()) {
+                    if (frame_cache_hidden_only_preload_enabled()) {
+                        stage_admit_ids.clear();
+                        stage_evict_slots.clear();
+                    } else {
+                        stage_admit_ids.erase(stage_admit_ids.begin(),
+                                              stage_admit_ids.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
+                        stage_evict_slots.erase(stage_evict_slots.begin(),
+                                                stage_evict_slots.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
+                    }
+                }
+            }
+            int64_t stage_rows = partition_rows_for_ids(stage_admit_ids, partition_table_);
 
             std::vector<int64_t> row_offsets;
             row_offsets.reserve(stage_admit_ids.size() + 1);

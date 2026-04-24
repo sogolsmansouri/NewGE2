@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <exception>
@@ -115,6 +116,20 @@ class GraphModelStorage {
     void updateInMemorySubGraph(int32_t device_idx = 0);
 
     void getNextSubGraph(int32_t device_idx = 0);
+
+    /**
+     * Wait until the background prefetch builder has finished populating `next_subgraph_state_`.
+     * Only meaningful when `prefetch_` is enabled and a prefetch is in flight.
+     */
+    bool waitForSubgraphPrefetchComplete(const std::atomic<bool> *stop_flag = nullptr);
+
+    void notifySubgraphPrefetchWaiters();
+
+    /**
+     * Snapshot of the prefetched next in-memory subgraph state (may be nullptr if not ready).
+     * Callers must not mutate the returned object.
+     */
+    shared_ptr<InMemorySubgraphState> getPrefetchedNextSubgraphStateSnapshot() const;
 
     EdgeList merge_sorted_edge_buckets(EdgeList edges, torch::Tensor starts, int buffer_size, bool src);
 
@@ -399,8 +414,6 @@ class GraphModelStorage {
 
         if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
             std::uintptr_t swap_ready_event_handle = 0;
-#ifdef GEGE_CUDA
-            cudaEvent_t swap_ready_event = nullptr;
             auto read_env_flag = [](const char *name, bool default_value) {
                 const char *raw = std::getenv(name);
                 if (raw == nullptr) {
@@ -415,6 +428,8 @@ class GraphModelStorage {
                 }
                 return default_value;
             };
+#ifdef GEGE_CUDA
+            cudaEvent_t swap_ready_event = nullptr;
             bool swap_event_sync = read_env_flag("GEGE_MEM_SWAP_EVENT_SYNC", true);
             bool global_swap_sync = read_env_flag("GEGE_SYNC_BEFORE_SWAP", true);
             if (swap_event_sync && !global_swap_sync && device_idx >= 0 &&

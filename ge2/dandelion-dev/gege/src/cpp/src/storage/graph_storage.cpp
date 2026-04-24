@@ -126,6 +126,11 @@ bool startup_timing_enabled() {
     return enabled;
 }
 
+bool remap_validate_slots_enabled() {
+    static bool enabled = parse_graph_storage_env_flag("GEGE_REMAP_VALIDATE_SLOTS", false);
+    return enabled;
+}
+
 template <typename T>
 std::string vector_prefix_string(const std::vector<T> &values, std::size_t limit = 8) {
     std::ostringstream oss;
@@ -453,13 +458,15 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
     torch::Tensor src = edges_for_map.select(1, 0);
     // For arity-3/4 [src, rel, dst, ...], dst is col 2, not the last column
     torch::Tensor dst = (storage_ptrs_.edges->dim1_size_ >= 4) ? edges_for_map.select(1, 2) : edges_for_map.select(1, -1);
-    torch::Tensor src_partitions = torch::floor(src.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
-    torch::Tensor dst_partitions = torch::floor(dst.to(torch::kFloat64).div(static_cast<double>(partition_size))).to(torch::kInt64);
+    torch::Tensor src_partitions = src.floor_divide(partition_size);
+    torch::Tensor dst_partitions = dst.floor_divide(partition_size);
     torch::Tensor src_slots = partition_to_buffer_slot.index_select(0, src_partitions);
     torch::Tensor dst_slots = partition_to_buffer_slot.index_select(0, dst_partitions);
 
-    if (torch::lt(src_slots, 0).any().item<bool>() || torch::lt(dst_slots, 0).any().item<bool>()) {
-        throw GegeRuntimeException("Encountered edge endpoint outside current partition buffer state during arithmetic remap");
+    if (remap_validate_slots_enabled()) {
+        if (torch::lt(src_slots, 0).any().item<bool>() || torch::lt(dst_slots, 0).any().item<bool>()) {
+            throw GegeRuntimeException("Encountered edge endpoint outside current partition buffer state during arithmetic remap");
+        }
     }
 
     torch::Tensor src_local =
@@ -1348,6 +1355,32 @@ void GraphModelStorage::getNextSubGraph(int32_t device_idx) {
     next_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
     next_subgraph_state_->in_memory_subgraph_ = nullptr;
     std::thread(&GraphModelStorage::updateInMemorySubGraph_, this, next_subgraph_state_, next_swap_ids, device_idx).detach();
+}
+
+bool GraphModelStorage::waitForSubgraphPrefetchComplete(const std::atomic<bool> *stop_flag) {
+    if (!prefetch_) {
+        return false;
+    }
+    std::unique_lock<std::mutex> lock(*subgraph_lock_);
+    subgraph_cv_->wait(lock, [this, stop_flag] {
+        return prefetch_complete_ == true || (stop_flag != nullptr && stop_flag->load(std::memory_order_relaxed));
+    });
+    return prefetch_complete_ == true;
+}
+
+void GraphModelStorage::notifySubgraphPrefetchWaiters() {
+    if (!prefetch_) {
+        return;
+    }
+    subgraph_cv_->notify_all();
+}
+
+shared_ptr<InMemorySubgraphState> GraphModelStorage::getPrefetchedNextSubgraphStateSnapshot() const {
+    if (!prefetch_) {
+        return next_subgraph_state_;
+    }
+    std::lock_guard<std::mutex> lock(*subgraph_lock_);
+    return next_subgraph_state_;
 }
 
 void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState> subgraph, std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx) {

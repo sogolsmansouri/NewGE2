@@ -1,10 +1,11 @@
 # Frozen Freebase86M single-GPU epoch-time repro, 2026-04-24.
 #
-# This is the GE2/Table-4-style Freebase model setup plus the current
-# epoch-time runtime flags from scripts/run_epoch_time_repro_20260424.sh.
-# Keep this in sync with the DistKGE GE2 Freebase ComplEx setup:
-# output_dim 100, GLOROT_UNIFORM, no embedding bias, ADAGRAD
-# dense/relation optimizer, and non-bucket Freebase LP.
+# This is the GE2 technical-report Table 4 Freebase DistMult setup plus the
+# current epoch-time runtime flags from scripts/run_epoch_time_repro_20260424.sh.
+# Target row: FB / DistMult / GE2, MRR=0.404, Hit@10=0.604.
+# Keep this at output_dim 100, GLOROT_UNIFORM, no embedding bias, ADAGRAD
+# dense/relation optimizer, RNS+DegreeNS hybrid negatives, and non-bucket
+# Freebase LP.
 model:
   random_seed: 741135446461071584
   learning_task: LINK_PREDICTION
@@ -34,7 +35,7 @@ model:
     eval_neighbor_sampling: []
     embedding_dim: 100
   decoder:
-    type: COMPLEX
+    type: DISTMULT
     options:
       inverse_edges: true
       use_relation_features: false

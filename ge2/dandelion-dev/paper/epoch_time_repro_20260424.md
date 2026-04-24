@@ -74,15 +74,15 @@ export GEGE_EMULATE_DOT_SINGLE_RELATION=0
 export GEGE_FIXED_BUFFER_MANUAL_DOT_RNS=0
 ```
 
-The Freebase frozen config intentionally mirrors the GE2/Table-4-style
-Freebase quality target: ComplEx decoder, total embedding width `100`
-(`50` real + `50` imaginary channels), `GLOROT_UNIFORM`, encoder `bias:
-false`, and ADAGRAD for dense/relation parameters. The paper-10k eval helper
-also defaults to non-bucket/CSR-off Freebase evaluation. Do not compare eval
-metrics from a checkpoint trained with the older `DISTMULT`, `GLOROT_NORMAL` +
-bias + ADAM Freebase config; that is not the GE2 Freebase quality path. The
-reference target for the 10k Freebase eval is approximately `MRR=0.404`,
-`Hits@10=0.604`.
+The Freebase frozen config intentionally mirrors the GE2 technical-report
+Table 4 Freebase DistMult quality target: `DISTMULT`, total embedding width
+`100`, `GLOROT_UNIFORM`, encoder `bias: false`, ADAGRAD for dense/relation
+parameters, and the RNS+DegreeNS hybrid negative sampler (`degree_fraction:
+0.5`). The paper-10k eval helper also defaults to non-bucket/CSR-off Freebase
+evaluation. The reference target for the Freebase DistMult row is
+approximately `MRR=0.404`, `Hits@10=0.604`. The report also has a separate
+Freebase ComplEx row at approximately `MRR=0.438`, `Hits@10=0.612`; do not use
+ComplEx when reproducing the `0.404/0.604` DistMult row.
 
 The runner also preloads Torch's packaged `libcudart.so.12` before tcmalloc to
 avoid the CUDA runtime symbol mismatch seen with the Conda top-level runtime.
@@ -110,8 +110,8 @@ Freebase 10-epoch train plus paper-10k exact filtered eval:
 Useful overrides:
 
 ```bash
-export GEGE_RUN_NAME=fb86m_complex_ge2_10e_eval_20260424
-export GEGE_RUN_ROOT=/dev/shm/smansou2_ge2/fb86m_complex_ge2_10e_eval_20260424
+export GEGE_RUN_NAME=fb86m_distmult_ge2_10e_eval_20260424
+export GEGE_RUN_ROOT=/dev/shm/smansou2_ge2/fb86m_distmult_ge2_10e_eval_20260424
 export GEGE_LOG_DIR=/home/smansou2/codex_runs/exp_logs
 ```
 

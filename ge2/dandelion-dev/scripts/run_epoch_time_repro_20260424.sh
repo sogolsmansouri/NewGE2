@@ -44,7 +44,7 @@ case "$MODE" in
     DATASET="fb"
     CONFIG_SRC="$ROOT/gege/configs/repro/freebase86m_16p_epoch158_20260424.yaml"
     DEFAULT_EPOCHS=2
-    DEFAULT_RUN_NAME="fb86m_complex_ge2_repro_2e_${TIMESTAMP}"
+    DEFAULT_RUN_NAME="fb86m_distmult_ge2_repro_2e_${TIMESTAMP}"
     SAVE_MODEL=false
     RUN_EVAL=0
     ;;
@@ -52,7 +52,7 @@ case "$MODE" in
     DATASET="fb"
     CONFIG_SRC="$ROOT/gege/configs/repro/freebase86m_16p_epoch158_20260424.yaml"
     DEFAULT_EPOCHS=10
-    DEFAULT_RUN_NAME="fb86m_complex_ge2_repro_10e_eval_${TIMESTAMP}"
+    DEFAULT_RUN_NAME="fb86m_distmult_ge2_repro_10e_eval_${TIMESTAMP}"
     SAVE_MODEL=true
     RUN_EVAL=1
     ;;

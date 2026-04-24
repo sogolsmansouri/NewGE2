@@ -4,7 +4,11 @@ Layer::Layer() : device_(torch::kCPU) {}
 
 torch::Tensor Layer::post_hook(torch::Tensor input) {
     if (config_->bias) {
-        input = input + bias_;
+        torch::Tensor bias = bias_;
+        if (bias.device() != input.device()) {
+            bias = bias.to(input.device());
+        }
+        input = input + bias;
     }
     input = apply_activation(config_->activation, input);
 

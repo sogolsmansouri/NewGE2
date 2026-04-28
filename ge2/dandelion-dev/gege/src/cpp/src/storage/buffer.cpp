@@ -1684,12 +1684,27 @@ void MemPartitionBuffer::joinAsyncEvictWritebackForPartitions_(const std::vector
 
 void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
                                                    torch::Tensor expected_host_stage, std::vector<int64_t> release_frames,
-                                                   std::vector<int64_t> source_frame_offsets) {
+                                                   std::vector<int64_t> source_frame_offsets, std::uintptr_t source_ready_event,
+                                                   bool destroy_source_ready_event) {
+    auto destroy_source_event_if_owned = [&]() {
+#ifdef GEGE_CUDA
+        if (destroy_source_ready_event && source_ready_event != 0) {
+            auto ready_event = reinterpret_cast<cudaEvent_t>(source_ready_event);
+            static_cast<void>(cudaEventDestroy(ready_event));
+        }
+#endif
+    };
     if (evict_ids.empty() || (gpu_stage.defined() == false && source_frame_offsets.empty())) {
+        destroy_source_event_if_owned();
         return;
     }
 
-    joinAsyncEvictWriteback_();
+    try {
+        joinAsyncEvictWriteback_();
+    } catch (...) {
+        destroy_source_event_if_owned();
+        throw;
+    }
     {
         std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
         async_evict_writeback_in_flight_ = true;
@@ -1697,8 +1712,10 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
         async_evict_writeback_partition_ids_ = evict_ids;
     }
 
-    async_evict_writeback_thread_ =
-        std::thread([this, evict_ids, row_offsets, gpu_stage, expected_host_stage, release_frames, source_frame_offsets]() {
+    try {
+        async_evict_writeback_thread_ =
+            std::thread([this, evict_ids, row_offsets, gpu_stage, expected_host_stage, release_frames, source_frame_offsets, source_ready_event,
+                         destroy_source_ready_event]() {
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double host_alloc_ms = 0.0;
@@ -1706,6 +1723,16 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
         double verify_host_copy_ms = 0.0;
         double host_storage_write_ms = 0.0;
         double verify_host_storage_ms = 0.0;
+        std::uintptr_t owned_source_ready_event = source_ready_event;
+        auto destroy_owned_source_event = [&]() {
+#ifdef GEGE_CUDA
+            if (destroy_source_ready_event && owned_source_ready_event != 0) {
+                auto ready_event = reinterpret_cast<cudaEvent_t>(owned_source_ready_event);
+                static_cast<void>(cudaEventDestroy(ready_event));
+                owned_source_ready_event = 0;
+            }
+#endif
+        };
         try {
             torch::TensorOptions host_options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
             if (use_pinned_host_buffer_) {
@@ -1728,6 +1755,10 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                 bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(host_stage);
                 auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
                 c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                if (owned_source_ready_event != 0) {
+                    auto ready_event = reinterpret_cast<cudaEvent_t>(owned_source_ready_event);
+                    AT_CUDA_CHECK(cudaStreamWaitEvent(copy_stream.stream(), ready_event, 0));
+                }
                 for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                     torch::Tensor host_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
                     int64_t source_start = source_frame_offsets[idx];
@@ -1759,6 +1790,7 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                 host_stage.copy_(gpu_stage);
             }
 #endif
+            destroy_owned_source_event();
             auto after_gpu_to_host = std::chrono::high_resolution_clock::now();
             gpu_to_host_stage_ms = elapsed_ms(phase_start, after_gpu_to_host);
             phase_start = after_gpu_to_host;
@@ -1835,11 +1867,20 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                     elapsed_ms(total_start, std::chrono::high_resolution_clock::now()));
             }
         } catch (...) {
+            destroy_owned_source_event();
             std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
             async_evict_writeback_in_flight_ = false;
             async_evict_writeback_exception_ = std::current_exception();
         }
-    });
+        });
+    } catch (...) {
+        destroy_source_event_if_owned();
+        std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
+        async_evict_writeback_in_flight_ = false;
+        async_evict_writeback_exception_ = nullptr;
+        async_evict_writeback_partition_ids_.clear();
+        throw;
+    }
 }
 
 void MemPartitionBuffer::startAsyncAdmitPreload() {
@@ -2321,7 +2362,7 @@ void MemPartitionBuffer::indexAdd(torch::Tensor indices, torch::Tensor values) {
         // TODO: throw invalid input to func exception
         throw std::runtime_error("");
     }
-    torch::Tensor storage_indices = indices.to(torch::kInt64);
+    torch::Tensor storage_indices = translateLogicalIndicesToPhysical_(indices.to(torch::kInt64), "indexAdd");
     markDirtyRows_(storage_indices);
     int64_t debug_update_id = -1;
     bool run_stage_debug = should_run_stage_debug(debug_update_id);
@@ -2429,7 +2470,7 @@ void MemPartitionBuffer::indexAddMasked(torch::Tensor indices, torch::Tensor val
             verify_id = fixed_buffer_masked_index_add_verify_counter().fetch_add(1);
             verify_index_add = verify_id < fixed_buffer_masked_update_verify_max();
         }
-        torch::Tensor storage_indices = indices.to(torch::kInt64);
+        torch::Tensor storage_indices = translateLogicalIndicesToPhysical_(indices.to(torch::kInt64), "indexAddMasked");
         if (verify_index_add) {
             torch::NoGradGuard no_grad;
             active_rows = torch::nonzero(active_mask).flatten();
@@ -3499,8 +3540,25 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         }
 
         if (delayed_stale_writeback && !delayed_stale_partition_ids.empty()) {
+            std::uintptr_t delayed_stale_ready_event_handle = 0;
+            bool destroy_delayed_stale_ready_event = false;
+#ifdef GEGE_CUDA
+            if (swap_ready_event != 0 && device_.is_cuda()) {
+                c10::cuda::CUDAGuard device_guard(device_);
+                auto ordering_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                c10::cuda::CUDAStreamGuard stream_guard(ordering_stream);
+                cudaEvent_t delayed_stale_ready_event = nullptr;
+                auto ready_event = reinterpret_cast<cudaEvent_t>(swap_ready_event);
+                AT_CUDA_CHECK(cudaEventCreateWithFlags(&delayed_stale_ready_event, cudaEventDisableTiming));
+                AT_CUDA_CHECK(cudaStreamWaitEvent(ordering_stream.stream(), ready_event, 0));
+                AT_CUDA_CHECK(cudaEventRecord(delayed_stale_ready_event, ordering_stream.stream()));
+                delayed_stale_ready_event_handle = reinterpret_cast<std::uintptr_t>(delayed_stale_ready_event);
+                destroy_delayed_stale_ready_event = true;
+            }
+#endif
             startAsyncEvictWriteback_(delayed_stale_partition_ids, delayed_stale_row_offsets, torch::Tensor(), torch::Tensor(),
-                                      delayed_stale_old_frames, delayed_stale_source_offsets);
+                                      delayed_stale_old_frames, delayed_stale_source_offsets, delayed_stale_ready_event_handle,
+                                      destroy_delayed_stale_ready_event);
         }
         if (frameCacheEnabled_()) {
             std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
@@ -3854,5 +3912,6 @@ torch::Tensor MemPartitionBuffer::indexRead(torch::Tensor indices) {
         throw std::runtime_error("");
     }
 
-    return buffer_tensor_gpu_view_.index_select(0, indices.to(torch::kInt64));
+    torch::Tensor storage_indices = translateLogicalIndicesToPhysical_(indices.to(torch::kInt64), "indexRead");
+    return buffer_tensor_gpu_view_.index_select(0, storage_indices);
 }

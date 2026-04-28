@@ -97,7 +97,11 @@ struct NegativeFilterBreakdown {
 thread_local NegativeFilterBreakdown *active_negative_filter_breakdown = nullptr;
 
 bool deg_local_filter_padded_enabled() {
+#ifdef GEGE_CUDA
+    static bool enabled = parse_negative_env_flag("GEGE_DEG_LOCAL_FILTER_PADDED", true);
+#else
     static bool enabled = parse_negative_env_flag("GEGE_DEG_LOCAL_FILTER_PADDED", false);
+#endif
     return enabled;
 }
 
@@ -198,7 +202,8 @@ ChunkNegativePlan build_chunk_negative_plan(shared_ptr<GegeGraph> graph,
 
     if (num_degree > 0) {
         auto degree_start = std::chrono::high_resolution_clock::now();
-        if (!negative_global_degree_sampling_enabled()) {
+        bool global_degree_sampling = negative_global_degree_sampling_enabled();
+        if (!global_degree_sampling) {
             bool can_exclude_current_chunk =
                 exclude_current_chunk_degree_samples && num_chunks > 1 && batch_size > 1 &&
                 batch_size > static_cast<int64_t>(std::ceil(static_cast<double>(batch_size) / num_chunks));

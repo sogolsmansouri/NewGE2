@@ -643,14 +643,24 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corr
     use_csr_gather = csr_gather_enabled() && node_embeddings.device().is_cuda();
 #endif
 
+    torch::Device score_device = positive_edges.device();
+    bool emb_on_cpu = node_embeddings.device().is_cpu() && score_device.is_cuda();
+
     torch::Tensor src_ids = positive_edges.select(1, 0);
     torch::Tensor dst_ids = is_nary ? positive_edges.select(1, 2) : positive_edges.select(1, -1);
-    auto src_dst = gather_positive_embeddings(node_embeddings, src_ids, dst_ids, use_csr_gather);
+    auto src_dst = gather_positive_embeddings(node_embeddings, src_ids.to(node_embeddings.device()), dst_ids.to(node_embeddings.device()), use_csr_gather);
     torch::Tensor src = std::get<0>(src_dst);
     torch::Tensor dst = std::get<1>(src_dst);
+    if (emb_on_cpu) {
+        src = src.to(score_device);
+        dst = dst.to(score_device);
+    }
     torch::Tensor rel_ids;
 
-    torch::Tensor dst_neg_embs = gather_negative_embeddings(node_embeddings, dst_negs, use_csr_gather);
+    torch::Tensor dst_neg_embs = gather_negative_embeddings(node_embeddings, dst_negs.to(node_embeddings.device()), use_csr_gather);
+    if (emb_on_cpu) {
+        dst_neg_embs = dst_neg_embs.to(score_device);
+    }
 
     if (has_relations) {
         rel_ids = positive_edges.select(1, 1);
@@ -664,7 +674,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> node_corr
             torch::Tensor inv_rels = decoder->select_relations(rel_ids, true);
             torch::Tensor adjusted_dst = decoder->apply_relation(dst, inv_rels);
 
-            torch::Tensor src_neg_embs = gather_negative_embeddings(node_embeddings, src_negs, use_csr_gather);
+            torch::Tensor src_neg_embs = gather_negative_embeddings(node_embeddings, src_negs.to(node_embeddings.device()), use_csr_gather);
+            if (emb_on_cpu) {
+                src_neg_embs = src_neg_embs.to(score_device);
+            }
 
             inv_pos_scores = decoder->compute_scores(adjusted_dst, src);
             inv_neg_scores = decoder->compute_scores(adjusted_dst, src_neg_embs);

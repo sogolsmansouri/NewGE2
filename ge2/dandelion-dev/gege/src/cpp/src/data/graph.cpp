@@ -106,6 +106,7 @@ void GegeGraph::to(torch::Device device) {
     out_num_neighbors_ = out_num_neighbors_.to(device);
     in_sorted_uniques_ = in_sorted_uniques_.to(device);
     in_offsets_ = in_offsets_.to(device);
+    in_num_neighbors_ = in_num_neighbors_.to(device);
 }
 
 // 1 hop sampler

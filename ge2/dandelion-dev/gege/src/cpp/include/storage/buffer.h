@@ -186,7 +186,7 @@ class PartitionBuffer {
 
     void sync();
 
-    int64_t getNumInMemory() { return buffer_tensor_view_.defined() ? buffer_tensor_view_.size(0) : capacity_ * partition_size_; }
+    int64_t getNumInMemory() { return capacity_ * partition_size_; }
 
     int64_t getPartitionSize() const { return partition_size_; }
 };
@@ -293,7 +293,9 @@ class MemPartitionBuffer : public PartitionBuffer {
     void startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
                                    torch::Tensor expected_host_stage = torch::Tensor(),
                                    std::vector<int64_t> release_frames = {},
-                                   std::vector<int64_t> source_frame_offsets = {});
+                                   std::vector<int64_t> source_frame_offsets = {},
+                                   std::uintptr_t source_ready_event = 0,
+                                   bool destroy_source_ready_event = false);
     void ensureDirtyRowMaskAllocated_();
     void markDirtyRows_(torch::Tensor indices, torch::Tensor active_mask = torch::Tensor());
     void clearDirtyRowsForSlots_(const std::vector<int64_t> &slots, const std::vector<int> &partition_ids);

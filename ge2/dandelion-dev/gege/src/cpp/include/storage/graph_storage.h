@@ -66,7 +66,6 @@ class GraphModelStorage {
                                               torch::Device device);
 
     void startAsyncAdmitPreload_(int32_t device_idx = 0);
-
     int64_t num_nodes_;
     int64_t num_edges_;
     bool partition_buffer_lp_fast_path_enabled_;

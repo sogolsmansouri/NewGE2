@@ -259,6 +259,12 @@ class DataLoader {
      */
     bool hasNextBatch(int32_t device_idx = 0);
 
+    /**
+     * True when getBatch() can prepare another batch without crossing the
+     * current in-memory subgraph boundary.
+     */
+    bool canPrepareNextBatchInCurrentState(int32_t device_idx = 0) const;
+
     shared_ptr<Batch> getNextBatch(int32_t device_idx = 0);
 
     /**

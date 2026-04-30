@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <limits>
 #include <sstream>
@@ -1204,7 +1205,8 @@ torch::Tensor Model::forward_nc(at::optional<torch::Tensor> node_embeddings, at:
     return y_pred;
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::forward_lp(shared_ptr<Batch> batch, bool train) {
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::forward_lp(shared_ptr<Batch> batch, bool train,
+                                                                                        std::function<void()> post_decoder_gather_callback) {
     if (!train) {
         log_eval_tensor_if_non_finite("node_embeddings", batch->batch_id_, batch->node_embeddings_);
         log_eval_tensor_if_non_finite("node_features", batch->batch_id_, batch->node_features_);
@@ -1244,7 +1246,7 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
             std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
                 mod_node_corrupt_forward(negative_sampling_method_, negative_sampling_selected_ratio_, negative_sampler_, edge_decoder, batch->edges_, encoded_nodes,
                                          batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_, batch->node_embeddings_g_,
-                                         batch->qual_embeddings_);
+                                         batch->qual_embeddings_, post_decoder_gather_callback);
         } else {  // evalutate
             std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
                 node_corrupt_forward(edge_decoder, batch->edges_, encoded_nodes, batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_,
@@ -1277,6 +1279,11 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
 }
 
 void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
+    train_batch_with_callback(batch, call_step, nullptr, nullptr);
+}
+
+void Model::train_batch_with_callback(shared_ptr<Batch> batch, bool call_step, std::function<void()> post_forward_callback,
+                                      std::function<void()> post_decoder_gather_callback) {
     if (call_step) {
         clear_grad();
     }
@@ -1286,6 +1293,12 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
         bool has_relations = batch->edges_.size(1) == 3;
         bool include_src_negatives = has_relations && manual_edge_decoder->use_inverse_relations_;
         verify_manual_dot_rns_update(this, batch, include_src_negatives);
+        if (post_decoder_gather_callback) {
+            post_decoder_gather_callback();
+        }
+        if (post_forward_callback) {
+            post_forward_callback();
+        }
         manual_dot_rns_update(batch, sparse_lr_, include_src_negatives);
         return;
     }
@@ -1308,8 +1321,11 @@ void Model::train_batch(shared_ptr<Batch> batch, bool call_step) {
     torch::Tensor loss;
 
     if (learning_task_ == LearningTask::LINK_PREDICTION) {
-        auto all_scores = forward_lp(batch, true);
+        auto all_scores = forward_lp(batch, true, post_decoder_gather_callback);
         verify_padded_forward_equivalence(this, batch, all_scores);
+        if (post_forward_callback) {
+            post_forward_callback();
+        }
 
         torch::Tensor pos_scores = std::get<0>(all_scores);
         torch::Tensor neg_scores = std::get<1>(all_scores);

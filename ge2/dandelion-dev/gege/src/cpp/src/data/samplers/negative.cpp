@@ -20,6 +20,25 @@ std::string planned_uniform_cache_key(const torch::Device &device, int64_t num_n
     return key;
 }
 
+int batched_negative_plan_batches() {
+    static int batches = std::max(parse_negative_env_int("GEGE_BATCHED_NEGATIVE_PLAN_BATCHES", 0), 0);
+    return batches;
+}
+
+std::string batched_sample_edge_cache_key(const torch::Device &device, int64_t batch_size, int num_chunks, int num_degree,
+                                          bool exclude_current_chunk) {
+    std::string key = device.str();
+    key += "|";
+    key += std::to_string(batch_size);
+    key += "|";
+    key += std::to_string(num_chunks);
+    key += "|";
+    key += std::to_string(num_degree);
+    key += "|";
+    key += exclude_current_chunk ? "exclude" : "plain";
+    return key;
+}
+
 void initialize_negative_perf_vector(std::vector<int64_t> &values, std::size_t size) {
     values.assign(size, 0);
 }
@@ -63,6 +82,75 @@ struct ChunkNegativePlan {
     bool chunk_exclusion_active = false;
     bool sample_ids_are_edge_ids = false;
 };
+
+bool negative_global_degree_sampling_enabled();
+
+torch::Tensor pop_batched_uniform_ids(NegativeSamplingBase *sampler, int cache_id, torch::Device device, int64_t num_nodes, int num_chunks,
+                                      int num_uniform, const torch::TensorOptions &ind_opts, int64_t &elapsed_ns) {
+    int batches = batched_negative_plan_batches();
+    if (sampler == nullptr || batches <= 1 || num_uniform <= 0) {
+        return torch::Tensor();
+    }
+
+    auto start = std::chrono::high_resolution_clock::now();
+    std::lock_guard<std::mutex> lock(sampler->plan_mutex_);
+    auto &queue = sampler->batched_uniform_negatives_[cache_id][planned_uniform_cache_key(device, num_nodes, num_chunks, num_uniform)];
+    if (queue.empty()) {
+        torch::Tensor block = torch::randint(num_nodes, {batches, num_chunks, num_uniform}, ind_opts);
+        for (int i = 0; i < batches; i++) {
+            queue.emplace_back(block.select(0, i));
+        }
+    }
+    torch::Tensor result = queue.front();
+    queue.pop_front();
+    elapsed_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - start).count();
+    return result;
+}
+
+torch::Tensor pop_batched_sample_edge_ids(NegativeSamplingBase *sampler, int cache_id, torch::Tensor edges, int num_chunks, int num_degree,
+                                          bool exclude_current_chunk, int64_t &elapsed_ns, bool &chunk_exclusion_active) {
+    int batches = batched_negative_plan_batches();
+    if (sampler == nullptr || batches <= 1 || num_degree <= 0 || negative_global_degree_sampling_enabled()) {
+        return torch::Tensor();
+    }
+
+    int64_t batch_size = edges.size(0);
+    auto start = std::chrono::high_resolution_clock::now();
+    std::lock_guard<std::mutex> lock(sampler->plan_mutex_);
+    auto &queue = sampler->batched_sample_edge_ids_[cache_id][
+        batched_sample_edge_cache_key(edges.device(), batch_size, num_chunks, num_degree, exclude_current_chunk)];
+    if (queue.empty()) {
+        auto ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
+        torch::Tensor block;
+        if (exclude_current_chunk) {
+            int64_t chunk_size = static_cast<int64_t>(std::ceil(static_cast<double>(batch_size) / num_chunks));
+            torch::Tensor chunk_starts = torch::arange(num_chunks, ind_opts) * chunk_size;
+            torch::Tensor remaining_rows = torch::full({num_chunks}, batch_size, ind_opts) - chunk_starts;
+            torch::Tensor chunk_lengths = torch::clamp(remaining_rows, 0, chunk_size);
+            torch::Tensor available_counts = batch_size - chunk_lengths;
+            auto rand_opts = torch::TensorOptions().dtype(torch::kFloat32).device(edges.device());
+            torch::Tensor random_positions =
+                torch::floor(torch::rand({batches, num_chunks, num_degree}, rand_opts) *
+                             available_counts.to(torch::kFloat32).view({1, num_chunks, 1}))
+                    .to(torch::kInt64);
+            torch::Tensor shift_mask = (random_positions >= chunk_starts.view({1, num_chunks, 1})).to(torch::kInt64);
+            block = random_positions + shift_mask * chunk_lengths.view({1, num_chunks, 1});
+            chunk_exclusion_active = true;
+        } else {
+            block = torch::randint(0, batch_size, {batches, num_chunks, num_degree}, ind_opts);
+        }
+        for (int i = 0; i < batches; i++) {
+            queue.emplace_back(block.select(0, i));
+        }
+    }
+    torch::Tensor result = queue.front();
+    queue.pop_front();
+    if (result.defined() && exclude_current_chunk) {
+        chunk_exclusion_active = true;
+    }
+    elapsed_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - start).count();
+    return result;
+}
 
 bool negative_deg_chunk_exclusion_enabled() {
     static bool enabled = parse_negative_env_flag("GEGE_DEG_CHUNK_EXCLUSION", false);
@@ -815,6 +903,10 @@ void NegativeSamplingBase::resetPlanCache() {
     std::lock_guard<std::mutex> lock(plan_mutex_);
     planned_uniform_negatives_[0].clear();
     planned_uniform_negatives_[1].clear();
+    batched_uniform_negatives_[0].clear();
+    batched_uniform_negatives_[1].clear();
+    batched_sample_edge_ids_[0].clear();
+    batched_sample_edge_ids_[1].clear();
     state_negative_pool_plan_cache_[0].clear();
     state_negative_pool_plan_cache_[1].clear();
 }
@@ -1004,6 +1096,9 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
     }
 
     torch::Tensor planned_uniform_ids;
+    if (!uniform_ids.defined() && num_negatives_ != -1 && num_uni > 0 && batched_negative_plan_batches() > 1) {
+        uniform_ids = pop_batched_uniform_ids(this, cache_id, edges.device(), num_nodes, num_chunks_, num_uni, ind_opts, uniform_randint_elapsed);
+    }
     if (!uniform_ids.defined() && num_negatives_ != -1 && num_uni > 0 && superbatch_negative_plan_batches_ > 0) {
         auto lock_wait_start = std::chrono::high_resolution_clock::now();
         std::lock_guard<std::mutex> lock(plan_mutex_);
@@ -1028,6 +1123,20 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
 
     bool need_uniform_ids = num_uni > 0 && !uniform_ids.defined();
     bool need_sample_edge_ids = num_batch > 0 && !sample_edge_ids.defined();
+    if (need_sample_edge_ids && batched_negative_plan_batches() > 1) {
+        bool exclude_current_chunk_degree_samples =
+            negative_deg_chunk_exclusion_enabled() && !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && edges.size(1) == 2;
+        bool can_exclude_current_chunk =
+            exclude_current_chunk_degree_samples && num_chunks_ > 1 && edges.size(0) > 1 &&
+            edges.size(0) > static_cast<int64_t>(std::ceil(static_cast<double>(edges.size(0)) / num_chunks_));
+        sample_edge_ids = pop_batched_sample_edge_ids(this, cache_id, edges, num_chunks_, num_batch, can_exclude_current_chunk,
+                                                      sample_edge_randint_elapsed, chunk_exclusion_active);
+        if (sample_edge_ids.defined()) {
+            sample_ids_are_edge_ids = true;
+            need_sample_edge_ids = false;
+        }
+    }
+    need_uniform_ids = num_uni > 0 && !uniform_ids.defined();
     if (need_uniform_ids || need_sample_edge_ids) {
         bool exclude_current_chunk_degree_samples =
             negative_deg_chunk_exclusion_enabled() && !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && edges.size(1) == 2;
@@ -1164,6 +1273,9 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     }
 
     torch::Tensor planned_uniform_ids;
+    if (!uniform_ids.defined() && num_negatives_ != -1 && num_uni > 0 && batched_negative_plan_batches() > 1) {
+        uniform_ids = pop_batched_uniform_ids(this, 0, edges.device(), num_nodes, num_chunks_, num_uni, ind_opts, uniform_randint_elapsed);
+    }
     if (!uniform_ids.defined() && num_negatives_ != -1 && num_uni > 0 && superbatch_negative_plan_batches_ > 0) {
         auto lock_wait_start = std::chrono::high_resolution_clock::now();
         std::lock_guard<std::mutex> lock(plan_mutex_);
@@ -1188,6 +1300,20 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
 
     bool need_uniform_ids = num_uni > 0 && !uniform_ids.defined();
     bool need_dst_sample_edge_ids = num_batch > 0 && !dst_sample_edge_ids.defined();
+    if (need_dst_sample_edge_ids && batched_negative_plan_batches() > 1) {
+        bool exclude_current_chunk_degree_samples =
+            negative_deg_chunk_exclusion_enabled() && !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && edges.size(1) == 2;
+        bool can_exclude_current_chunk =
+            exclude_current_chunk_degree_samples && num_chunks_ > 1 && edges.size(0) > 1 &&
+            edges.size(0) > static_cast<int64_t>(std::ceil(static_cast<double>(edges.size(0)) / num_chunks_));
+        dst_sample_edge_ids = pop_batched_sample_edge_ids(this, 0, edges, num_chunks_, num_batch, can_exclude_current_chunk,
+                                                          sample_edge_randint_elapsed, dst_chunk_exclusion_active);
+        if (dst_sample_edge_ids.defined()) {
+            dst_sample_ids_are_edge_ids = true;
+            need_dst_sample_edge_ids = false;
+        }
+    }
+    need_uniform_ids = num_uni > 0 && !uniform_ids.defined();
     if (need_uniform_ids || need_dst_sample_edge_ids) {
         bool exclude_current_chunk_degree_samples =
             negative_deg_chunk_exclusion_enabled() && !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && edges.size(1) == 2;
@@ -1207,6 +1333,19 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     }
 
     bool need_src_sample_edge_ids = need_src_negatives && num_batch > 0 && !src_sample_edge_ids.defined();
+    if (need_src_sample_edge_ids && batched_negative_plan_batches() > 1) {
+        bool exclude_current_chunk_degree_samples =
+            negative_deg_chunk_exclusion_enabled() && !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && edges.size(1) == 2;
+        bool can_exclude_current_chunk =
+            exclude_current_chunk_degree_samples && num_chunks_ > 1 && edges.size(0) > 1 &&
+            edges.size(0) > static_cast<int64_t>(std::ceil(static_cast<double>(edges.size(0)) / num_chunks_));
+        src_sample_edge_ids = pop_batched_sample_edge_ids(this, 1, edges, num_chunks_, num_batch, can_exclude_current_chunk,
+                                                          sample_edge_randint_elapsed, src_chunk_exclusion_active);
+        if (src_sample_edge_ids.defined()) {
+            src_sample_ids_are_edge_ids = true;
+            need_src_sample_edge_ids = false;
+        }
+    }
     if (need_src_sample_edge_ids) {
         bool exclude_current_chunk_degree_samples =
             negative_deg_chunk_exclusion_enabled() && !filtered_ && local_filter_mode_ == LocalFilterMode::DEG && edges.size(1) == 2;

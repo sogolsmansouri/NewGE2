@@ -1,0 +1,156 @@
+# Freebase86M single-GPU p32 epoch-time experiment, 2026-04-28.
+#
+# This is the GE2 technical-report Table 4 Freebase DistMult setup plus the
+# current epoch-time runtime flags from scripts/run_epoch_time_repro_20260424.sh.
+# Target row: FB / DistMult / GE2, MRR=0.404, Hit@10=0.604.
+# Keep this at output_dim 100, GLOROT_UNIFORM, no embedding bias, ADAGRAD
+# dense/relation optimizer, RNS+DegreeNS hybrid negatives, and non-bucket
+# Freebase LP.
+model:
+  random_seed: 741135446461071584
+  learning_task: LINK_PREDICTION
+  encoder:
+    layers:
+    - - type: EMBEDDING
+        options: {}
+        input_dim: -1
+        output_dim: 100
+        init:
+          type: GLOROT_UNIFORM
+          options: {}
+        optimizer:
+          type: DEFAULT
+          options:
+            learning_rate: 0.1
+            eps: 1.0e-10
+            init_value: 0.0
+            lr_decay: 0.0
+            weight_decay: 0.0
+        bias: false
+        bias_init:
+          type: ZEROS
+          options: {}
+        activation: NONE
+    train_neighbor_sampling: []
+    eval_neighbor_sampling: []
+    embedding_dim: 100
+  decoder:
+    type: DISTMULT
+    options:
+      inverse_edges: true
+      use_relation_features: false
+      edge_decoder_method: CORRUPT_NODE
+    optimizer:
+      type: ADAGRAD
+      options:
+        learning_rate: 0.1
+        eps: 1.0e-10
+        init_value: 0.0
+        lr_decay: 0.0
+        weight_decay: 0.0
+  loss:
+    type: SOFTMAX_CE
+    options:
+      reduction: SUM
+  dense_optimizer:
+    type: ADAGRAD
+    options:
+      learning_rate: 0.1
+      eps: 1.0e-10
+      init_value: 0.0
+      lr_decay: 0.0
+      weight_decay: 0.0
+  sparse_optimizer:
+    type: ADAGRAD
+    options:
+      learning_rate: 0.1
+      eps: 1.0e-10
+      init_value: 0.0
+      lr_decay: 0.0
+      weight_decay: 0.0
+storage:
+  device_type: cuda
+  device_ids:
+  - 0
+  dataset:
+    dataset_dir: /home/smansou2/newCode/ge2/dandelion-dev/datasets/freebase86m_32p/
+    num_edges: 304727650
+    num_nodes: 86054151
+    num_relations: 14824
+    num_train: 304727650
+    num_valid: 16929318
+    num_test: 16929308
+    node_feature_dim: -1
+    rel_feature_dim: -1
+    num_classes: -1
+    initialized: true
+  edges:
+    type: HOST_MEMORY
+    options:
+      dtype: int
+  nodes:
+    type: DEVICE_MEMORY
+    options:
+      dtype: int
+  embeddings:
+    type: MEM_PARTITION_BUFFER
+    options:
+      dtype: float
+      num_partitions: 32
+      buffer_capacity: 4
+      prefetching: false
+      fine_to_coarse_ratio: 1
+      num_cache_partitions: 0
+      edge_bucket_ordering: CUSTOM
+      node_partition_ordering: DISPERSED
+      randomly_assign_edge_buckets: false
+  features:
+    type: DEVICE_MEMORY
+    options:
+      dtype: float
+  prefetch: false
+  shuffle_input: true
+  full_graph_evaluation: false
+  export_encoded_nodes: false
+  model_dir: /dev/shm/smansou2_ge2/freebase86m_32p_epoch158_20260428/model
+  log_level: info
+training:
+  batch_size: 50000
+  negative_sampling_method: RNS
+  negative_sampling_selected_ratio: 1.0
+  dense_sync_batches: 1
+  logical_active_devices: 0
+  negative_sampling:
+    num_chunks: 50
+    negatives_per_positive: 1000
+    degree_fraction: 0.5
+    superbatch_negative_plan_batches: 0
+    filtered: false
+    local_filter_mode: DEG
+    tournament_selection: false
+    tiled_tournament_scores: false
+    tiled_tournament_groups_per_tile: 64
+  num_epochs: 2
+  epochs_per_shuffle: 1
+  logs_per_epoch: 10
+  save_model: false
+  checkpoint:
+    save_best: false
+    interval: -1
+    save_state: false
+  resume_training: false
+  resume_from_checkpoint: ''
+evaluation:
+  batch_size: 250
+  negative_sampling:
+    num_chunks: 1
+    negatives_per_positive: 10000
+    degree_fraction: 0.0
+    superbatch_negative_plan_batches: 0
+    filtered: true
+    local_filter_mode: DEG
+    tournament_selection: false
+    tiled_tournament_scores: false
+    tiled_tournament_groups_per_tile: 64
+  epochs_per_eval: 1000
+  checkpoint_dir: /dev/shm/smansou2_ge2/freebase86m_32p_epoch158_20260428/model

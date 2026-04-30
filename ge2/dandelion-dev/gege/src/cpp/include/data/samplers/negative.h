@@ -246,6 +246,8 @@ class NegativeSamplingBase : public NegativeSampler {
     int state_negative_pool_refresh_batches_;
     std::mutex plan_mutex_;
     std::map<std::string, std::deque<torch::Tensor>> planned_uniform_negatives_[2];
+    std::map<std::string, std::deque<torch::Tensor>> batched_uniform_negatives_[2];
+    std::map<std::string, std::deque<torch::Tensor>> batched_sample_edge_ids_[2];
 
     NegativeSamplingBase(int num_chunks, int num_negatives, float degree_fraction, bool filtered = false,
                          int superbatch_negative_plan_batches = 0, LocalFilterMode local_filter_mode = LocalFilterMode::DEG, bool tournament_selection = false,

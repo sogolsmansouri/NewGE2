@@ -308,8 +308,135 @@ int64_t optimized_custom_schedule_seed() {
 }
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getHybridCoverEdgeBucketOrdering(int num_partitions, int buffer_capacity);
+std::vector<std::vector<int>> reorder_states_for_max_overlap(const std::vector<std::vector<int>> &states);
+std::vector<std::vector<int>> build_custom_template_buffer_states(int num_partitions, int buffer_capacity);
+
+bool is_positive_power_of_two(int value) {
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+bool can_lift_q4_custom_template(int num_partitions, int buffer_capacity) {
+    if (buffer_capacity <= 4 || buffer_capacity % 4 != 0) {
+        return false;
+    }
+
+    int fine_per_coarse = buffer_capacity / 4;
+    if (fine_per_coarse <= 1 || num_partitions % fine_per_coarse != 0) {
+        return false;
+    }
+
+    int coarse_num_partitions = num_partitions / fine_per_coarse;
+    return coarse_num_partitions >= 4 && is_positive_power_of_two(coarse_num_partitions);
+}
+
+std::vector<std::vector<int>> expand_coarse_custom_states(const std::vector<std::vector<int>> &coarse_states,
+                                                          int fine_per_coarse) {
+    std::vector<std::vector<int>> expanded_states;
+    expanded_states.reserve(coarse_states.size());
+    for (const auto &coarse_state : coarse_states) {
+        std::vector<int> fine_state;
+        fine_state.reserve(coarse_state.size() * fine_per_coarse);
+        for (int coarse_part : coarse_state) {
+            int fine_start = coarse_part * fine_per_coarse;
+            for (int offset = 0; offset < fine_per_coarse; offset++) {
+                fine_state.emplace_back(fine_start + offset);
+            }
+        }
+        expanded_states.emplace_back(std::move(fine_state));
+    }
+    return expanded_states;
+}
+
+std::vector<std::vector<int>> build_lifted_q4_custom_template_buffer_states(int num_partitions, int buffer_capacity) {
+    int fine_per_coarse = buffer_capacity / 4;
+    int coarse_num_partitions = num_partitions / fine_per_coarse;
+    auto coarse_states = build_custom_template_buffer_states(coarse_num_partitions, 4);
+    return expand_coarse_custom_states(coarse_states, fine_per_coarse);
+}
+
+std::vector<std::vector<int>> build_randomized_lifted_q4_custom_template_buffer_states(int num_partitions, int buffer_capacity) {
+    int fine_per_coarse = buffer_capacity / 4;
+    int coarse_num_partitions = num_partitions / fine_per_coarse;
+    auto coarse_states = build_custom_template_buffer_states(coarse_num_partitions, 4);
+
+    Indices coarse_partitions_map = torch::randperm(coarse_num_partitions, torch::kInt32);
+    for (auto &state : coarse_states) {
+        for (auto &partition : state) {
+            partition = coarse_partitions_map[partition].item<int>();
+        }
+    }
+
+    return expand_coarse_custom_states(coarse_states, fine_per_coarse);
+}
+
+std::vector<int> block_pair_group_slice(int group_id, int buffer_capacity, int begin, int end) {
+    std::vector<int> partitions;
+    partitions.reserve(std::max(0, end - begin));
+    int group_start = group_id * buffer_capacity;
+    for (int offset = begin; offset < end; offset++) {
+        partitions.emplace_back(group_start + offset);
+    }
+    return partitions;
+}
+
+std::vector<int> concat_partition_slices(const std::vector<int> &lhs, const std::vector<int> &rhs) {
+    std::vector<int> state;
+    state.reserve(lhs.size() + rhs.size());
+    state.insert(state.end(), lhs.begin(), lhs.end());
+    state.insert(state.end(), rhs.begin(), rhs.end());
+    return state;
+}
+
+std::vector<std::vector<int>> build_block_pair_cover_buffer_states(int num_partitions, int buffer_capacity) {
+    std::vector<std::vector<int>> buffer_states;
+    if (num_partitions <= 0 || buffer_capacity <= 0 || buffer_capacity > num_partitions) {
+        SPDLOG_WARN("Invalid CUSTOM block-pair cover parameters: num_partitions={} buffer_capacity={}",
+                    num_partitions, buffer_capacity);
+        return buffer_states;
+    }
+
+    if (num_partitions % buffer_capacity != 0 || buffer_capacity % 2 != 0) {
+        SPDLOG_WARN(
+            "CUSTOM block-pair cover requires num_partitions divisible by an even buffer_capacity; got num_partitions={} buffer_capacity={}",
+            num_partitions, buffer_capacity);
+        return buffer_states;
+    }
+
+    int num_groups = num_partitions / buffer_capacity;
+    int half = buffer_capacity / 2;
+    buffer_states.reserve(num_groups + 4 * (num_groups * (num_groups - 1) / 2));
+
+    for (int group = 0; group < num_groups; group++) {
+        buffer_states.emplace_back(block_pair_group_slice(group, buffer_capacity, 0, buffer_capacity));
+    }
+
+    for (int lhs_group = 0; lhs_group < num_groups; lhs_group++) {
+        auto lhs_a = block_pair_group_slice(lhs_group, buffer_capacity, 0, half);
+        auto lhs_b = block_pair_group_slice(lhs_group, buffer_capacity, half, buffer_capacity);
+        for (int rhs_group = lhs_group + 1; rhs_group < num_groups; rhs_group++) {
+            auto rhs_a = block_pair_group_slice(rhs_group, buffer_capacity, 0, half);
+            auto rhs_b = block_pair_group_slice(rhs_group, buffer_capacity, half, buffer_capacity);
+
+            buffer_states.emplace_back(concat_partition_slices(lhs_a, rhs_a));
+            buffer_states.emplace_back(concat_partition_slices(lhs_a, rhs_b));
+            buffer_states.emplace_back(concat_partition_slices(lhs_b, rhs_b));
+            buffer_states.emplace_back(concat_partition_slices(lhs_b, rhs_a));
+        }
+    }
+
+    buffer_states = reorder_states_for_max_overlap(buffer_states);
+    return buffer_states;
+}
 
 std::vector<std::vector<int>> build_custom_template_buffer_states(int num_partitions, int buffer_capacity) {
+    if (can_lift_q4_custom_template(num_partitions, buffer_capacity)) {
+        return build_lifted_q4_custom_template_buffer_states(num_partitions, buffer_capacity);
+    }
+
+    if (buffer_capacity != 4) {
+        return build_block_pair_cover_buffer_states(num_partitions, buffer_capacity);
+    }
+
     assert(buffer_capacity == 4);
     int32_t sub_chunk_per_perm = num_partitions / buffer_capacity;
     int32_t log2l = 0;
@@ -4946,6 +5073,55 @@ int32_t pow(int32_t a, int32_t x)
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomEdgeBucketOrdering(int num_partitions, int buffer_capacity, bool randomly_assign_edge_buckets)
 {
+    if (buffer_capacity != 4) {
+        bool lifted_q4 = can_lift_q4_custom_template(num_partitions, buffer_capacity);
+        auto buffer_states = lifted_q4
+                                 ? build_randomized_lifted_q4_custom_template_buffer_states(num_partitions, buffer_capacity)
+                                 : build_custom_template_buffer_states(num_partitions, buffer_capacity);
+        if (buffer_states.empty()) {
+            return convertEdgeBucketOrderToTensors({}, {});
+        }
+
+        if (!lifted_q4) {
+            Indices all_partitions_map = torch::randperm(num_partitions, torch::kInt32);
+            for (auto &state : buffer_states) {
+                for (auto &partition : state) {
+                    partition = all_partitions_map[partition].item<int>();
+                }
+            }
+        }
+
+        Indices all_buffer_map = torch::randperm(buffer_states.size(), torch::kInt32);
+        std::vector<std::vector<int>> shuffle_buffer_states;
+        shuffle_buffer_states.reserve(buffer_states.size());
+        for (int i = 0; i < static_cast<int>(buffer_states.size()); i++) {
+            shuffle_buffer_states.push_back(buffer_states[all_buffer_map[i].item<int>()]);
+        }
+        buffer_states = shuffle_buffer_states;
+
+        std::vector<std::vector<std::pair<int, int>>> edge_buckets_per_buffer;
+        if (randomly_assign_edge_buckets) {
+            edge_buckets_per_buffer = randomlyAssignEdgeBucketsToBuffers(buffer_states, num_partitions);
+        } else {
+            edge_buckets_per_buffer = greedyAssignEdgeBucketsToBuffers(buffer_states, num_partitions);
+        }
+
+        int64_t assigned_buckets = 0;
+        int64_t retained_total = 0;
+        for (const auto &buckets : edge_buckets_per_buffer) {
+            assigned_buckets += static_cast<int64_t>(buckets.size());
+        }
+        for (std::size_t idx = 1; idx < buffer_states.size(); idx++) {
+            retained_total += state_overlap_count(buffer_states[idx - 1], buffer_states[idx]);
+        }
+        double retained_avg = buffer_states.size() > 1
+                                  ? static_cast<double>(retained_total) / static_cast<double>(buffer_states.size() - 1)
+                                  : 0.0;
+        SPDLOG_INFO("Generating CUSTOM {} Ordering: states={} assigned_buckets={} retained_avg={:.3f}",
+                    lifted_q4 ? "lifted-q4" : "block-pair cover", buffer_states.size(), assigned_buckets, retained_avg);
+        return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
+    }
+
     assert(buffer_capacity == 4);
     int32_t sub_chunk_per_perm = num_partitions / buffer_capacity;
     int32_t log2l = 0;

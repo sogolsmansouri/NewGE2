@@ -30,7 +30,8 @@ void init_model(py::module &m) {
 
         .def("forward_nc", &Model::forward_nc, py::arg("node_embeddings"), py::arg("node_features"), py::arg("dense_graph"), py::arg("train"),
              py::call_guard<py::gil_scoped_release>())
-        .def("forward_lp", &Model::forward_lp, py::arg("batch"), py::arg("train"), py::call_guard<py::gil_scoped_release>())
+        .def("forward_lp", [](Model &model, shared_ptr<Batch> batch, bool train) { return model.forward_lp(batch, train); },
+             py::arg("batch"), py::arg("train"), py::call_guard<py::gil_scoped_release>())
         .def("train_batch", &Model::train_batch, py::arg("batch"), py::arg("call_step") = true, py::call_guard<py::gil_scoped_release>())
         .def("evaluate_batch", &Model::evaluate_batch, py::arg("batch"), py::call_guard<py::gil_scoped_release>())
         .def("clear_grad", &Model::clear_grad)

@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -100,6 +101,12 @@ bool single_gpu_async_evict_writeback_enabled() {
     return enabled;
 }
 
+int mem_partition_buffer_async_evict_max_in_flight() {
+    static int max_in_flight =
+        std::max<int>(static_cast<int>(parse_env_int("GEGE_MEM_PARTITION_BUFFER_ASYNC_EVICT_MAX_IN_FLIGHT", 1)), 1);
+    return max_in_flight;
+}
+
 bool single_gpu_async_evict_writeback_verify_enabled() {
     static bool enabled = parse_env_flag("GEGE_SINGLE_GPU_ASYNC_EVICT_VERIFY", false);
     return enabled;
@@ -113,6 +120,20 @@ bool single_gpu_async_evict_source_verify_enabled() {
 bool mem_partition_buffer_dirty_profile_enabled() {
     static bool enabled = parse_env_flag("GEGE_MEM_PARTITION_BUFFER_DIRTY_PROFILE", false);
     return enabled;
+}
+
+bool mem_partition_buffer_dirty_writeback_enabled() {
+    static bool enabled = parse_env_flag("GEGE_MEM_PARTITION_BUFFER_DIRTY_WRITEBACK", false);
+    return enabled;
+}
+
+bool mem_partition_buffer_dirty_tracking_enabled() {
+    return mem_partition_buffer_dirty_profile_enabled() || mem_partition_buffer_dirty_writeback_enabled();
+}
+
+int64_t mem_partition_buffer_dirty_writeback_max_percent() {
+    static int64_t percent = std::max<int64_t>(parse_env_int("GEGE_MEM_PARTITION_BUFFER_DIRTY_WRITEBACK_MAX_PERCENT", 75), 0);
+    return percent;
 }
 
 bool single_gpu_async_stage_memory_guard_enabled() {
@@ -173,6 +194,31 @@ bool frame_cache_hidden_only_preload_enabled() {
 bool frame_cache_delayed_stale_writeback_enabled() {
     static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK", false);
     return enabled;
+}
+
+bool frame_cache_skip_empty_evict_sync_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_SKIP_EMPTY_EVICT_SYNC", true);
+    return enabled;
+}
+
+bool frame_cache_prioritized_writeback_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_PRIORITIZED_WRITEBACK", false);
+    return enabled;
+}
+
+bool frame_cache_defer_stale_writeback_until_preload_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_DEFER_STALE_WRITEBACK_UNTIL_PRELOAD", false);
+    return enabled;
+}
+
+bool frame_cache_serialize_admit_h2d_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_SERIALIZE_ADMIT_H2D", false);
+    return enabled;
+}
+
+std::mutex &frame_cache_admit_h2d_mutex() {
+    static std::mutex mutex;
+    return mutex;
 }
 
 bool tensor_supports_non_blocking_host_copy(const torch::Tensor &tensor) {
@@ -1522,7 +1568,7 @@ int64_t MemPartitionBuffer::contiguousHostPartitionStart_(int partition_id) cons
 }
 
 void MemPartitionBuffer::ensureDirtyRowMaskAllocated_() {
-    if (!mem_partition_buffer_dirty_profile_enabled()) {
+    if (!mem_partition_buffer_dirty_tracking_enabled()) {
         return;
     }
     if (dirty_row_mask_.defined()) {
@@ -1542,7 +1588,7 @@ void MemPartitionBuffer::ensureDirtyRowMaskAllocated_() {
 }
 
 void MemPartitionBuffer::markDirtyRows_(torch::Tensor indices, torch::Tensor active_mask) {
-    if (!mem_partition_buffer_dirty_profile_enabled()) {
+    if (!mem_partition_buffer_dirty_tracking_enabled()) {
         return;
     }
     if (!indices.defined() || indices.numel() == 0) {
@@ -1571,7 +1617,10 @@ void MemPartitionBuffer::clearDirtyRowsForSlots_(const std::vector<int64_t> &slo
     }
     for (std::size_t idx = 0; idx < slots.size() && idx < partition_ids.size(); idx++) {
         Partition *partition = partition_table_[partition_ids[idx]];
-        int64_t buffer_offset = partitionRowOffset_(partition);
+        int64_t buffer_offset = frameCacheEnabled_() ? logicalSlotRowOffset_(slots[idx]) : slots[idx] * partition_size_;
+        if (buffer_offset < 0) {
+            continue;
+        }
         dirty_row_mask_.slice(0, buffer_offset, buffer_offset + partition->partition_size_).zero_();
     }
 }
@@ -1644,9 +1693,61 @@ void MemPartitionBuffer::joinAsyncAdmitPreload_() {
     }
 }
 
+void MemPartitionBuffer::reapCompletedAsyncEvictWritebacks_() {
+    std::vector<std::unique_ptr<AsyncEvictWritebackTask>> tasks_to_join;
+    {
+        std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
+        auto task_it = async_evict_writeback_tasks_.begin();
+        while (task_it != async_evict_writeback_tasks_.end()) {
+            if ((*task_it)->done) {
+                tasks_to_join.emplace_back(std::move(*task_it));
+                task_it = async_evict_writeback_tasks_.erase(task_it);
+            } else {
+                ++task_it;
+            }
+        }
+    }
+
+    for (auto &task : tasks_to_join) {
+        if (task->thread.joinable()) {
+            task->thread.join();
+        }
+    }
+}
+
+void MemPartitionBuffer::waitForAsyncEvictWritebackSlot_() {
+    int max_in_flight = mem_partition_buffer_async_evict_max_in_flight();
+    if (max_in_flight <= 1) {
+        joinAsyncEvictWriteback_();
+        return;
+    }
+
+    reapCompletedAsyncEvictWritebacks_();
+    std::exception_ptr writeback_exception = nullptr;
+    {
+        std::unique_lock<std::mutex> lock(async_evict_writeback_lock_);
+        async_evict_writeback_cv_.wait(lock, [&]() {
+            return async_evict_writeback_active_count_ < max_in_flight || async_evict_writeback_exception_ != nullptr;
+        });
+        writeback_exception = async_evict_writeback_exception_;
+    }
+    if (writeback_exception != nullptr) {
+        joinAsyncEvictWriteback_();
+    }
+    reapCompletedAsyncEvictWritebacks_();
+}
+
 void MemPartitionBuffer::joinAsyncEvictWriteback_() {
-    if (async_evict_writeback_thread_.joinable()) {
-        async_evict_writeback_thread_.join();
+    std::vector<std::unique_ptr<AsyncEvictWritebackTask>> tasks_to_join;
+    {
+        std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
+        tasks_to_join = std::move(async_evict_writeback_tasks_);
+    }
+
+    for (auto &task : tasks_to_join) {
+        if (task->thread.joinable()) {
+            task->thread.join();
+        }
     }
 
     std::exception_ptr writeback_exception = nullptr;
@@ -1654,32 +1755,125 @@ void MemPartitionBuffer::joinAsyncEvictWriteback_() {
         std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
         writeback_exception = async_evict_writeback_exception_;
         async_evict_writeback_exception_ = nullptr;
+        async_evict_writeback_active_count_ = 0;
         async_evict_writeback_in_flight_ = false;
-        async_evict_writeback_partition_ids_.clear();
+        async_evict_writeback_pending_partition_counts_.clear();
     }
+    async_evict_writeback_cv_.notify_all();
     if (writeback_exception != nullptr) {
         std::rethrow_exception(writeback_exception);
     }
 }
 
 void MemPartitionBuffer::joinAsyncEvictWritebackForPartitions_(const std::vector<int> &partition_ids) {
-    bool must_join = false;
+    if (partition_ids.empty()) {
+        return;
+    }
+
+    std::exception_ptr writeback_exception = nullptr;
     {
-        std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
-        if (async_evict_writeback_thread_.joinable()) {
+        std::unique_lock<std::mutex> lock(async_evict_writeback_lock_);
+        auto has_pending_partition = [&]() {
+            if (!async_evict_writeback_in_flight_) {
+                return false;
+            }
             for (int partition_id : partition_ids) {
-                if (std::find(async_evict_writeback_partition_ids_.begin(), async_evict_writeback_partition_ids_.end(), partition_id) !=
-                    async_evict_writeback_partition_ids_.end()) {
-                    must_join = true;
-                    break;
+                auto pending_it = async_evict_writeback_pending_partition_counts_.find(partition_id);
+                if (pending_it != async_evict_writeback_pending_partition_counts_.end() && pending_it->second > 0) {
+                    return true;
                 }
             }
+            return false;
+        };
+        async_evict_writeback_cv_.wait(lock, [&]() {
+            return !has_pending_partition() || async_evict_writeback_exception_ != nullptr;
+        });
+        writeback_exception = async_evict_writeback_exception_;
+    }
+
+    if (writeback_exception != nullptr) {
+        joinAsyncEvictWriteback_();
+    }
+    reapCompletedAsyncEvictWritebacks_();
+}
+
+void MemPartitionBuffer::flushPendingDelayedStaleWriteback_() {
+    if (pending_delayed_stale_partition_ids_.empty()) {
+        return;
+    }
+
+    std::vector<int> partition_ids = std::move(pending_delayed_stale_partition_ids_);
+    std::vector<int64_t> row_offsets = std::move(pending_delayed_stale_row_offsets_);
+    std::vector<int64_t> release_frames = std::move(pending_delayed_stale_release_frames_);
+    std::vector<int64_t> source_offsets = std::move(pending_delayed_stale_source_offsets_);
+    std::uintptr_t ready_event = pending_delayed_stale_ready_event_;
+    bool destroy_ready_event = pending_delayed_stale_destroy_ready_event_;
+
+    pending_delayed_stale_partition_ids_.clear();
+    pending_delayed_stale_row_offsets_.clear();
+    pending_delayed_stale_release_frames_.clear();
+    pending_delayed_stale_source_offsets_.clear();
+    pending_delayed_stale_ready_event_ = 0;
+    pending_delayed_stale_destroy_ready_event_ = false;
+
+    startAsyncEvictWriteback_(partition_ids, row_offsets, torch::Tensor(), torch::Tensor(),
+                              release_frames, source_offsets, ready_event, destroy_ready_event);
+}
+
+std::vector<std::size_t> MemPartitionBuffer::prioritizedWritebackOrder_(const std::vector<int> &partition_ids) const {
+    std::vector<std::size_t> order(partition_ids.size());
+    std::iota(order.begin(), order.end(), 0);
+    if (!frame_cache_prioritized_writeback_enabled() || partition_ids.size() <= 1 || buffer_state_iterator_ == buffer_states_.end()) {
+        return order;
+    }
+
+    const int64_t never_used_distance = std::numeric_limits<int64_t>::max() / 4;
+    std::unordered_map<int, int64_t> next_use_distance;
+    next_use_distance.reserve(partition_ids.size());
+    for (int partition_id : partition_ids) {
+        next_use_distance[partition_id] = never_used_distance;
+    }
+
+    int64_t distance = 0;
+    auto state_it = buffer_state_iterator_;
+    while (state_it != buffer_states_.end()) {
+        distance++;
+        torch::Tensor state_cpu = state_it->to(torch::kCPU).to(torch::kInt64).contiguous();
+        const auto *state_ptr = state_cpu.data_ptr<int64_t>();
+        for (int64_t idx = 0; idx < state_cpu.numel(); idx++) {
+            auto use_it = next_use_distance.find(static_cast<int>(state_ptr[idx]));
+            if (use_it != next_use_distance.end() && use_it->second == never_used_distance) {
+                use_it->second = distance;
+            }
+        }
+
+        bool all_found = true;
+        for (const auto &entry : next_use_distance) {
+            if (entry.second == never_used_distance) {
+                all_found = false;
+                break;
+            }
+        }
+        if (all_found) {
+            break;
+        }
+
+        for (int step = 0; step < buffer_sizes_ && state_it != buffer_states_.end(); step++) {
+            ++state_it;
         }
     }
 
-    if (must_join) {
-        joinAsyncEvictWriteback_();
-    }
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t lhs, std::size_t rhs) {
+        int lhs_partition = partition_ids[lhs];
+        int rhs_partition = partition_ids[rhs];
+        int64_t lhs_distance = next_use_distance[lhs_partition];
+        int64_t rhs_distance = next_use_distance[rhs_partition];
+        if (lhs_distance != rhs_distance) {
+            return lhs_distance < rhs_distance;
+        }
+        return lhs < rhs;
+    });
+    return order;
 }
 
 void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
@@ -1699,23 +1893,69 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
         return;
     }
 
+    std::vector<int> writeback_evict_ids = evict_ids;
+    std::vector<int64_t> writeback_row_offsets = row_offsets;
+    std::vector<int64_t> writeback_release_frames = release_frames;
+    std::vector<int64_t> writeback_source_frame_offsets = source_frame_offsets;
+    bool prioritized_source_writeback = frame_cache_prioritized_writeback_enabled() && expected_host_stage.defined() == false &&
+                                        source_frame_offsets.size() == evict_ids.size() && evict_ids.size() > 1;
+    if (prioritized_source_writeback) {
+        std::vector<std::size_t> order = prioritizedWritebackOrder_(evict_ids);
+        std::vector<int> ordered_evict_ids;
+        std::vector<int64_t> ordered_source_frame_offsets;
+        std::vector<int64_t> ordered_release_frames;
+        std::vector<int64_t> ordered_row_offsets;
+        ordered_evict_ids.reserve(evict_ids.size());
+        ordered_source_frame_offsets.reserve(source_frame_offsets.size());
+        if (release_frames.size() == evict_ids.size()) {
+            ordered_release_frames.reserve(release_frames.size());
+        }
+        ordered_row_offsets.reserve(evict_ids.size() + 1);
+        ordered_row_offsets.emplace_back(0);
+        for (std::size_t original_idx : order) {
+            int partition_id = evict_ids[original_idx];
+            ordered_evict_ids.push_back(partition_id);
+            ordered_source_frame_offsets.push_back(source_frame_offsets[original_idx]);
+            if (release_frames.size() == evict_ids.size()) {
+                ordered_release_frames.push_back(release_frames[original_idx]);
+            }
+            ordered_row_offsets.push_back(ordered_row_offsets.back() + partition_table_[partition_id]->partition_size_);
+        }
+        writeback_evict_ids = std::move(ordered_evict_ids);
+        writeback_row_offsets = std::move(ordered_row_offsets);
+        writeback_source_frame_offsets = std::move(ordered_source_frame_offsets);
+        if (release_frames.size() == evict_ids.size()) {
+            writeback_release_frames = std::move(ordered_release_frames);
+        }
+    }
+
     try {
-        joinAsyncEvictWriteback_();
+        waitForAsyncEvictWritebackSlot_();
     } catch (...) {
         destroy_source_event_if_owned();
         throw;
     }
+
+    auto writeback_task = std::make_unique<AsyncEvictWritebackTask>();
+    AsyncEvictWritebackTask *writeback_task_ptr = writeback_task.get();
+    std::vector<int> registered_writeback_ids = writeback_evict_ids;
     {
         std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
+        async_evict_writeback_active_count_++;
         async_evict_writeback_in_flight_ = true;
         async_evict_writeback_exception_ = nullptr;
-        async_evict_writeback_partition_ids_ = evict_ids;
+        for (int partition_id : registered_writeback_ids) {
+            async_evict_writeback_pending_partition_counts_[partition_id]++;
+        }
+        async_evict_writeback_tasks_.emplace_back(std::move(writeback_task));
     }
 
     try {
-        async_evict_writeback_thread_ =
-            std::thread([this, evict_ids, row_offsets, gpu_stage, expected_host_stage, release_frames, source_frame_offsets, source_ready_event,
-                         destroy_source_ready_event]() {
+        writeback_task_ptr->thread =
+            std::thread([this, task_ptr = writeback_task_ptr, evict_ids = std::move(writeback_evict_ids), row_offsets = std::move(writeback_row_offsets), gpu_stage,
+                         expected_host_stage, release_frames = std::move(writeback_release_frames),
+                         source_frame_offsets = std::move(writeback_source_frame_offsets), source_ready_event, destroy_source_ready_event,
+                         prioritized_source_writeback]() {
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double host_alloc_ms = 0.0;
@@ -1723,6 +1963,13 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
         double verify_host_copy_ms = 0.0;
         double host_storage_write_ms = 0.0;
         double verify_host_storage_ms = 0.0;
+        double dirty_count_ms = 0.0;
+        int64_t dirty_rows = -1;
+        bool skipped_clean_source_writeback = false;
+        bool sparse_dirty_source_writeback = false;
+        std::vector<torch::Tensor> dirty_local_indices_device;
+        std::vector<torch::Tensor> dirty_local_indices_cpu;
+        std::vector<int64_t> dirty_row_offsets;
         std::uintptr_t owned_source_ready_event = source_ready_event;
         auto destroy_owned_source_event = [&]() {
 #ifdef GEGE_CUDA
@@ -1733,21 +1980,148 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
             }
 #endif
         };
-        try {
-            torch::TensorOptions host_options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
-            if (use_pinned_host_buffer_) {
-                host_options = host_options.pinned_memory(true);
+        auto release_frame_for_index = [&](std::size_t idx) {
+            if (release_frames.size() != evict_ids.size()) {
+                return;
             }
+            int64_t frame = release_frames[idx];
+            std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+            if (std::find(free_physical_frames_.begin(), free_physical_frames_.end(), frame) == free_physical_frames_.end()) {
+                free_physical_frames_.push_back(frame);
+            }
+        };
+        auto clear_dirty_rows_for_index = [&](std::size_t idx) {
+            if (!dirty_row_mask_.defined() || source_frame_offsets.size() != evict_ids.size() || idx >= source_frame_offsets.size()) {
+                return;
+            }
+            int64_t source_start = source_frame_offsets[idx];
+            int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
+            if (source_start < 0 || source_rows <= 0) {
+                return;
+            }
+            dirty_row_mask_.slice(0, source_start, source_start + source_rows).zero_();
+        };
+        auto mark_partition_writeback_complete = [&](std::size_t idx) {
+            clear_dirty_rows_for_index(idx);
+            release_frame_for_index(idx);
+            {
+                std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
+                int partition_id = evict_ids[idx];
+                auto pending_it = async_evict_writeback_pending_partition_counts_.find(partition_id);
+                if (pending_it != async_evict_writeback_pending_partition_counts_.end()) {
+                    pending_it->second--;
+                    if (pending_it->second <= 0) {
+                        async_evict_writeback_pending_partition_counts_.erase(pending_it);
+                    }
+                }
+            }
+            async_evict_writeback_cv_.notify_all();
+        };
+        auto finish_writeback_task = [&](std::exception_ptr exception) {
+            {
+                std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
+                if (exception != nullptr && async_evict_writeback_exception_ == nullptr) {
+                    async_evict_writeback_exception_ = exception;
+                }
+                if (async_evict_writeback_active_count_ > 0) {
+                    async_evict_writeback_active_count_--;
+                }
+                async_evict_writeback_in_flight_ = async_evict_writeback_active_count_ > 0;
+                if (task_ptr != nullptr) {
+                    task_ptr->done = true;
+                }
+            }
+            async_evict_writeback_cv_.notify_all();
+        };
+        try {
             int64_t total_rows = 0;
             if (!row_offsets.empty()) {
                 total_rows = row_offsets.back();
             } else if (gpu_stage.defined()) {
                 total_rows = gpu_stage.size(0);
             }
-            torch::Tensor host_stage = torch::empty({total_rows, embedding_size_}, host_options);
+
+            if (mem_partition_buffer_dirty_writeback_enabled() && !source_frame_offsets.empty() && dirty_row_mask_.defined() &&
+                source_frame_offsets.size() == evict_ids.size() && row_offsets.size() == evict_ids.size() + 1) {
+                auto dirty_count_start = std::chrono::high_resolution_clock::now();
+                dirty_rows = 0;
+                dirty_local_indices_device.reserve(evict_ids.size());
+                dirty_local_indices_cpu.reserve(evict_ids.size());
+                dirty_row_offsets.reserve(evict_ids.size() + 1);
+                dirty_row_offsets.emplace_back(0);
+#ifdef GEGE_CUDA
+                if (dirty_row_mask_.device().is_cuda()) {
+                    c10::cuda::CUDAGuard device_guard(device_);
+                    auto dirty_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                    c10::cuda::CUDAStreamGuard stream_guard(dirty_stream);
+                    if (owned_source_ready_event != 0) {
+                        auto ready_event = reinterpret_cast<cudaEvent_t>(owned_source_ready_event);
+                        AT_CUDA_CHECK(cudaStreamWaitEvent(dirty_stream.stream(), ready_event, 0));
+                    }
+                    for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                        int64_t source_start = source_frame_offsets[idx];
+                        int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
+                        torch::Tensor dirty_local_device = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(dirty_row_mask_.device()));
+                        torch::Tensor dirty_local_cpu = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+                        if (source_rows > 0) {
+                            dirty_local_device = torch::nonzero(dirty_row_mask_.slice(0, source_start, source_start + source_rows)).flatten().to(torch::kInt64);
+                            dirty_local_cpu = dirty_local_device.to(torch::kCPU).contiguous();
+                            dirty_rows += dirty_local_device.numel();
+                        }
+                        dirty_local_indices_device.emplace_back(dirty_local_device);
+                        dirty_local_indices_cpu.emplace_back(dirty_local_cpu);
+                        dirty_row_offsets.emplace_back(dirty_rows);
+                    }
+                } else
+#endif
+                {
+                    for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                        int64_t source_start = source_frame_offsets[idx];
+                        int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
+                        torch::Tensor dirty_local_cpu = torch::empty({0}, torch::TensorOptions().dtype(torch::kInt64).device(torch::kCPU));
+                        if (source_rows > 0) {
+                            dirty_local_cpu = torch::nonzero(dirty_row_mask_.slice(0, source_start, source_start + source_rows)).flatten().to(torch::kInt64).contiguous();
+                            dirty_rows += dirty_local_cpu.numel();
+                        }
+                        dirty_local_indices_device.emplace_back(dirty_local_cpu);
+                        dirty_local_indices_cpu.emplace_back(dirty_local_cpu);
+                        dirty_row_offsets.emplace_back(dirty_rows);
+                    }
+                }
+                dirty_count_ms = elapsed_ms(dirty_count_start, std::chrono::high_resolution_clock::now());
+                skipped_clean_source_writeback = dirty_rows == 0;
+                int64_t max_percent = mem_partition_buffer_dirty_writeback_max_percent();
+                sparse_dirty_source_writeback = dirty_rows > 0 && !prioritized_source_writeback && total_rows > 0 &&
+                                                dirty_rows * 100 <= total_rows * max_percent;
+            }
+
+            if (skipped_clean_source_writeback) {
+                destroy_owned_source_event();
+                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                    mark_partition_writeback_complete(idx);
+                }
+                finish_writeback_task(nullptr);
+                if (partition_buffer_swap_timing_enabled()) {
+                    SPDLOG_INFO(
+                        "[partition-buffer-async-evict-writeback] storage={} this={} device={} evict_ids={} rows={} release_frames={} dirty_rows={} "
+                        "dirty_count_ms={:.3f} skipped_clean_source_writeback=true sparse_dirty_source_writeback=false total_ms={:.3f}",
+                        basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(evict_ids), total_rows,
+                        vector_prefix_string(release_frames), dirty_rows, dirty_count_ms,
+                        elapsed_ms(total_start, std::chrono::high_resolution_clock::now()));
+                }
+                return;
+            }
+
+            torch::TensorOptions host_options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
+            if (use_pinned_host_buffer_) {
+                host_options = host_options.pinned_memory(true);
+            }
+            int64_t host_stage_rows = sparse_dirty_source_writeback ? dirty_rows : total_rows;
+            torch::Tensor host_stage = torch::empty({host_stage_rows, embedding_size_}, host_options);
             auto after_host_alloc = std::chrono::high_resolution_clock::now();
             host_alloc_ms = elapsed_ms(phase_start, after_host_alloc);
             phase_start = after_host_alloc;
+            bool host_storage_written_inline = false;
 
 #ifdef GEGE_CUDA
             if (!source_frame_offsets.empty()) {
@@ -1759,18 +2133,73 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                     auto ready_event = reinterpret_cast<cudaEvent_t>(owned_source_ready_event);
                     AT_CUDA_CHECK(cudaStreamWaitEvent(copy_stream.stream(), ready_event, 0));
                 }
-                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
-                    torch::Tensor host_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
-                    int64_t source_start = source_frame_offsets[idx];
-                    int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
-                    torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
-                    if (non_blocking_host_copy) {
-                        host_view.copy_(gpu_view, true);
-                    } else {
-                        host_view.copy_(gpu_view);
+                if (sparse_dirty_source_writeback) {
+                    double sparse_gpu_to_host_ms = 0.0;
+                    for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                        int64_t dirty_start = dirty_row_offsets[idx];
+                        int64_t dirty_end = dirty_row_offsets[idx + 1];
+                        int64_t dirty_count = dirty_end - dirty_start;
+                        if (dirty_count <= 0) {
+                            continue;
+                        }
+                        torch::Tensor dirty_local = dirty_local_indices_device[idx].to(dirty_row_mask_.device());
+                        torch::Tensor host_view = host_stage.slice(0, dirty_start, dirty_end);
+                        int64_t source_start = source_frame_offsets[idx];
+                        int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
+                        torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
+                        auto copy_start = std::chrono::high_resolution_clock::now();
+                        torch::Tensor dirty_gpu_view = gpu_view.index_select(0, dirty_local);
+                        if (non_blocking_host_copy) {
+                            host_view.copy_(dirty_gpu_view, true);
+                        } else {
+                            host_view.copy_(dirty_gpu_view);
+                        }
+                        cudaStreamSynchronize(copy_stream.stream());
+                        sparse_gpu_to_host_ms += elapsed_ms(copy_start, std::chrono::high_resolution_clock::now());
                     }
+                    gpu_to_host_stage_ms = sparse_gpu_to_host_ms;
+                } else if (prioritized_source_writeback) {
+                    double inline_gpu_to_host_ms = 0.0;
+                    double inline_host_storage_ms = 0.0;
+                    host_storage_written_inline = true;
+                    for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                        torch::Tensor host_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
+                        int64_t source_start = source_frame_offsets[idx];
+                        int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
+                        torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
+                        auto copy_start = std::chrono::high_resolution_clock::now();
+                        if (non_blocking_host_copy) {
+                            host_view.copy_(gpu_view, true);
+                        } else {
+                            host_view.copy_(gpu_view);
+                        }
+                        cudaStreamSynchronize(copy_stream.stream());
+                        auto after_copy = std::chrono::high_resolution_clock::now();
+                        inline_gpu_to_host_ms += elapsed_ms(copy_start, after_copy);
+
+                        Partition *partition = partition_table_[evict_ids[idx]];
+                        auto write_start = after_copy;
+                        copyPartitionFromPinnedToHost_(partition, host_view);
+                        auto after_write = std::chrono::high_resolution_clock::now();
+                        inline_host_storage_ms += elapsed_ms(write_start, after_write);
+                        mark_partition_writeback_complete(idx);
+                    }
+                    gpu_to_host_stage_ms = inline_gpu_to_host_ms;
+                    host_storage_write_ms = inline_host_storage_ms;
+                } else {
+                    for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                        torch::Tensor host_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
+                        int64_t source_start = source_frame_offsets[idx];
+                        int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
+                        torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
+                        if (non_blocking_host_copy) {
+                            host_view.copy_(gpu_view, true);
+                        } else {
+                            host_view.copy_(gpu_view);
+                        }
+                    }
+                    cudaStreamSynchronize(copy_stream.stream());
                 }
-                cudaStreamSynchronize(copy_stream.stream());
             } else if (gpu_stage.device().is_cuda()) {
                 c10::cuda::CUDAGuard device_guard(device_);
                 bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(host_stage);
@@ -1792,7 +2221,9 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
 #endif
             destroy_owned_source_event();
             auto after_gpu_to_host = std::chrono::high_resolution_clock::now();
-            gpu_to_host_stage_ms = elapsed_ms(phase_start, after_gpu_to_host);
+            if (!host_storage_written_inline) {
+                gpu_to_host_stage_ms = elapsed_ms(phase_start, after_gpu_to_host);
+            }
             phase_start = after_gpu_to_host;
 
             if (expected_host_stage.defined()) {
@@ -1811,13 +2242,51 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
             verify_host_copy_ms = elapsed_ms(phase_start, after_host_copy_verify);
             phase_start = after_host_copy_verify;
 
-            for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
-                Partition *partition = partition_table_[evict_ids[idx]];
-                torch::Tensor stage_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
-                copyPartitionFromPinnedToHost_(partition, stage_view);
+            if (sparse_dirty_source_writeback) {
+                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                    int64_t dirty_start = dirty_row_offsets[idx];
+                    int64_t dirty_end = dirty_row_offsets[idx + 1];
+                    int64_t dirty_count = dirty_end - dirty_start;
+                    if (dirty_count <= 0) {
+                        mark_partition_writeback_complete(idx);
+                        continue;
+                    }
+                    Partition *partition = partition_table_[evict_ids[idx]];
+                    torch::Tensor stage_view = host_stage.slice(0, dirty_start, dirty_end);
+                    torch::Tensor dirty_local_cpu = dirty_local_indices_cpu[idx].to(torch::kCPU).to(torch::kInt64).contiguous();
+                    if (hasContiguousHostPartitionRange_(partition->partition_id_)) {
+                        torch::Tensor host_partition =
+                            data_storage_.narrow(0, contiguousHostPartitionStart_(partition->partition_id_), partition->partition_size_);
+                        if (mem_partition_buffer_host_storage_lock_enabled()) {
+                            std::lock_guard<std::mutex> lock(host_storage_lock_);
+                            host_partition.index_copy_(0, dirty_local_cpu, stage_view);
+                        } else {
+                            host_partition.index_copy_(0, dirty_local_cpu, stage_view);
+                        }
+                    } else {
+                        torch::Tensor global_ids =
+                            pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + partition->partition_size_).index_select(0, dirty_local_cpu);
+                        if (mem_partition_buffer_host_storage_lock_enabled()) {
+                            std::lock_guard<std::mutex> lock(host_storage_lock_);
+                            data_storage_.index_put_({global_ids}, stage_view);
+                        } else {
+                            data_storage_.index_put_({global_ids}, stage_view);
+                        }
+                    }
+                    mark_partition_writeback_complete(idx);
+                }
+            } else if (!host_storage_written_inline) {
+                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                    Partition *partition = partition_table_[evict_ids[idx]];
+                    torch::Tensor stage_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
+                    copyPartitionFromPinnedToHost_(partition, stage_view);
+                    mark_partition_writeback_complete(idx);
+                }
             }
             auto after_host_storage_write = std::chrono::high_resolution_clock::now();
-            host_storage_write_ms = elapsed_ms(phase_start, after_host_storage_write);
+            if (!host_storage_written_inline) {
+                host_storage_write_ms = elapsed_ms(phase_start, after_host_storage_write);
+            }
             phase_start = after_host_storage_write;
 
             if (expected_host_stage.defined()) {
@@ -1852,33 +2321,47 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                 }
             }
 
-            {
-                std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
-                async_evict_writeback_in_flight_ = false;
-                async_evict_writeback_exception_ = nullptr;
-            }
+            finish_writeback_task(nullptr);
             if (partition_buffer_swap_timing_enabled()) {
                 SPDLOG_INFO(
-                    "[partition-buffer-async-evict-writeback] storage={} this={} device={} evict_ids={} rows={} release_frames={} host_alloc_ms={:.3f} "
+                    "[partition-buffer-async-evict-writeback] storage={} this={} device={} evict_ids={} rows={} release_frames={} dirty_rows={} "
+                    "dirty_count_ms={:.3f} skipped_clean_source_writeback={} sparse_dirty_source_writeback={} host_alloc_ms={:.3f} "
                     "gpu_to_host_stage_ms={:.3f} verify_host_copy_ms={:.3f} host_storage_write_ms={:.3f} verify_host_storage_ms={:.3f} total_ms={:.3f}",
                     basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(evict_ids), total_rows,
-                    vector_prefix_string(release_frames), host_alloc_ms,
+                    vector_prefix_string(release_frames), dirty_rows, dirty_count_ms, skipped_clean_source_writeback, sparse_dirty_source_writeback, host_alloc_ms,
                     gpu_to_host_stage_ms, verify_host_copy_ms, host_storage_write_ms, verify_host_storage_ms,
                     elapsed_ms(total_start, std::chrono::high_resolution_clock::now()));
             }
         } catch (...) {
             destroy_owned_source_event();
-            std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
-            async_evict_writeback_in_flight_ = false;
-            async_evict_writeback_exception_ = std::current_exception();
+            finish_writeback_task(std::current_exception());
         }
         });
     } catch (...) {
         destroy_source_event_if_owned();
         std::lock_guard<std::mutex> lock(async_evict_writeback_lock_);
-        async_evict_writeback_in_flight_ = false;
+        if (async_evict_writeback_active_count_ > 0) {
+            async_evict_writeback_active_count_--;
+        }
+        async_evict_writeback_in_flight_ = async_evict_writeback_active_count_ > 0;
         async_evict_writeback_exception_ = nullptr;
-        async_evict_writeback_partition_ids_.clear();
+        for (int partition_id : registered_writeback_ids) {
+            auto pending_it = async_evict_writeback_pending_partition_counts_.find(partition_id);
+            if (pending_it != async_evict_writeback_pending_partition_counts_.end()) {
+                pending_it->second--;
+                if (pending_it->second <= 0) {
+                    async_evict_writeback_pending_partition_counts_.erase(pending_it);
+                }
+            }
+        }
+        auto task_it = std::find_if(async_evict_writeback_tasks_.begin(), async_evict_writeback_tasks_.end(),
+                                    [&](const std::unique_ptr<AsyncEvictWritebackTask> &task) {
+                                        return task.get() == writeback_task_ptr;
+                                    });
+        if (task_it != async_evict_writeback_tasks_.end()) {
+            async_evict_writeback_tasks_.erase(task_it);
+        }
+        async_evict_writeback_cv_.notify_all();
         throw;
     }
 }
@@ -1940,7 +2423,6 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
         async_admit_preload_cpu_to_gpu_ms_ = 0.0;
         async_admit_preload_total_ms_ = 0.0;
     }
-
     async_admit_preload_thread_ = std::thread([this, admit_ids, evict_slots]() {
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
@@ -2014,14 +2496,45 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                 }
             }
 
+            bool interleaved_hidden_h2d = false;
+            double interleaved_hidden_host_load_ms = 0.0;
+            double interleaved_hidden_cpu_to_gpu_ms = 0.0;
+#ifdef GEGE_CUDA
+            interleaved_hidden_h2d =
+                frame_cache_serialize_admit_h2d_enabled() && stage_rows == 0 && !hidden_publishes.empty() && device_.is_cuda();
+#endif
             for (const HiddenFramePublish &hidden_publish : hidden_publishes) {
                 Partition *hidden_partition = partition_table_[hidden_publish.partition_id];
                 int64_t hidden_offset = hidden_publish.frame * partition_size_;
                 torch::Tensor hidden_host_view = buffer_tensor_view_.slice(0, hidden_offset, hidden_offset + hidden_partition->partition_size_);
+                auto hidden_host_start = std::chrono::high_resolution_clock::now();
                 copyPartitionFromHostToPinned_(hidden_partition, hidden_host_view);
+                auto hidden_host_end = std::chrono::high_resolution_clock::now();
+                if (interleaved_hidden_h2d) {
+                    interleaved_hidden_host_load_ms += elapsed_ms(hidden_host_start, hidden_host_end);
+                }
+#ifdef GEGE_CUDA
+                if (interleaved_hidden_h2d) {
+                    auto hidden_h2d_start = std::chrono::high_resolution_clock::now();
+                    std::unique_lock<std::mutex> admit_h2d_lock(frame_cache_admit_h2d_mutex());
+                    c10::cuda::CUDAGuard device_guard(device_);
+                    auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                    c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                    torch::Tensor hidden_gpu_view =
+                        buffer_tensor_gpu_view_.slice(0, hidden_offset, hidden_offset + hidden_partition->partition_size_);
+                    bool hidden_non_blocking = tensor_supports_non_blocking_host_copy(hidden_host_view);
+                    if (hidden_non_blocking) {
+                        hidden_gpu_view.copy_(hidden_host_view, true);
+                    } else {
+                        hidden_gpu_view.copy_(hidden_host_view);
+                    }
+                    cudaStreamSynchronize(copy_stream.stream());
+                    interleaved_hidden_cpu_to_gpu_ms += elapsed_ms(hidden_h2d_start, std::chrono::high_resolution_clock::now());
+                }
+#endif
             }
             auto after_host = std::chrono::high_resolution_clock::now();
-            host_load_ms = elapsed_ms(phase_start, after_host);
+            host_load_ms = interleaved_hidden_h2d ? interleaved_hidden_host_load_ms : elapsed_ms(phase_start, after_host);
             phase_start = after_host;
 
             torch::Tensor gpu_stage;
@@ -2053,6 +2566,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                             async_admit_preload_in_flight_ = false;
                             async_admit_preload_exception_ = nullptr;
                         }
+                        flushPendingDelayedStaleWriteback_();
                             if (partition_buffer_swap_timing_enabled()) {
                                 SPDLOG_INFO(
                                 "[partition-buffer-preload-host-stage] storage={} this={} device={} admit_ids={} rows={} required_mib={:.3f} free_mib={:.3f}",
@@ -2067,6 +2581,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                         async_admit_preload_in_flight_ = false;
                         async_admit_preload_exception_ = nullptr;
                     }
+                    flushPendingDelayedStaleWriteback_();
                     if (partition_buffer_swap_timing_enabled()) {
                         SPDLOG_INFO(
                             "[partition-buffer-preload-skip] storage={} this={} device={} admit_ids={} rows={} required_mib={:.3f} free_mib={:.3f}",
@@ -2074,6 +2589,10 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                             bytes_to_mib(stage_required_bytes), stage_free_bytes >= 0 ? bytes_to_mib(stage_free_bytes) : -1.0);
                     }
                     return;
+                }
+                std::unique_lock<std::mutex> admit_h2d_lock;
+                if (frame_cache_serialize_admit_h2d_enabled() && !interleaved_hidden_h2d) {
+                    admit_h2d_lock = std::unique_lock<std::mutex>(frame_cache_admit_h2d_mutex());
                 }
                 auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
                 c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
@@ -2085,25 +2604,31 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                         gpu_stage.copy_(host_stage);
                     }
                 }
-                for (const HiddenFramePublish &hidden_publish : hidden_publishes) {
-                    Partition *hidden_partition = partition_table_[hidden_publish.partition_id];
-                    int64_t hidden_offset = hidden_publish.frame * partition_size_;
-                    torch::Tensor hidden_host_view = buffer_tensor_view_.slice(0, hidden_offset, hidden_offset + hidden_partition->partition_size_);
-                    torch::Tensor hidden_gpu_view = buffer_tensor_gpu_view_.slice(0, hidden_offset, hidden_offset + hidden_partition->partition_size_);
-                    bool hidden_non_blocking = tensor_supports_non_blocking_host_copy(hidden_host_view);
-                    if (hidden_non_blocking) {
-                        hidden_gpu_view.copy_(hidden_host_view, true);
-                    } else {
-                        hidden_gpu_view.copy_(hidden_host_view);
+                if (!interleaved_hidden_h2d) {
+                    for (const HiddenFramePublish &hidden_publish : hidden_publishes) {
+                        Partition *hidden_partition = partition_table_[hidden_publish.partition_id];
+                        int64_t hidden_offset = hidden_publish.frame * partition_size_;
+                        torch::Tensor hidden_gpu_view =
+                            buffer_tensor_gpu_view_.slice(0, hidden_offset, hidden_offset + hidden_partition->partition_size_);
+                        torch::Tensor hidden_host_view =
+                            buffer_tensor_view_.slice(0, hidden_offset, hidden_offset + hidden_partition->partition_size_);
+                        bool hidden_non_blocking = tensor_supports_non_blocking_host_copy(hidden_host_view);
+                        if (hidden_non_blocking) {
+                            hidden_gpu_view.copy_(hidden_host_view, true);
+                        } else {
+                            hidden_gpu_view.copy_(hidden_host_view);
+                        }
                     }
                 }
-                cudaStreamSynchronize(copy_stream.stream());
+                if (stage_rows > 0 || (!hidden_publishes.empty() && !interleaved_hidden_h2d)) {
+                    cudaStreamSynchronize(copy_stream.stream());
+                }
             }
 #else
             gpu_stage = host_stage.to(device_);
 #endif
             auto after_gpu = std::chrono::high_resolution_clock::now();
-            cpu_to_gpu_ms = elapsed_ms(phase_start, after_gpu);
+            cpu_to_gpu_ms = interleaved_hidden_cpu_to_gpu_ms + elapsed_ms(phase_start, after_gpu);
 
             {
                 std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
@@ -2119,6 +2644,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                 async_admit_preload_in_flight_ = false;
                 async_admit_preload_exception_ = nullptr;
             }
+            flushPendingDelayedStaleWriteback_();
         } catch (...) {
             std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
             async_admit_preload_valid_ = false;
@@ -2457,9 +2983,10 @@ void MemPartitionBuffer::indexAddMasked(torch::Tensor indices, torch::Tensor val
     }
 
 #ifdef GEGE_CUDA
+    bool active_mask_supported_dtype = active_mask.scalar_type() == torch::kUInt8 || active_mask.scalar_type() == torch::kBool;
     if (values.device().is_cuda() && indices.device().is_cuda() && active_mask.device().is_cuda() &&
         buffer_tensor_gpu_view_.device().is_cuda() && values.scalar_type() == torch::kFloat32 &&
-        buffer_tensor_gpu_view_.scalar_type() == torch::kFloat32 && active_mask.scalar_type() == torch::kUInt8) {
+        buffer_tensor_gpu_view_.scalar_type() == torch::kFloat32 && active_mask_supported_dtype) {
         bool verify_index_add = false;
         int64_t verify_id = -1;
         torch::Tensor active_rows;
@@ -2471,17 +2998,22 @@ void MemPartitionBuffer::indexAddMasked(torch::Tensor indices, torch::Tensor val
             verify_index_add = verify_id < fixed_buffer_masked_update_verify_max();
         }
         torch::Tensor storage_indices = translateLogicalIndicesToPhysical_(indices.to(torch::kInt64), "indexAddMasked");
+        torch::Tensor kernel_active_mask = active_mask.scalar_type() == torch::kUInt8 ? active_mask : active_mask.to(torch::kUInt8);
         if (verify_index_add) {
             torch::NoGradGuard no_grad;
-            active_rows = torch::nonzero(active_mask).flatten();
+            active_rows = torch::nonzero(kernel_active_mask).flatten();
             if (active_rows.numel() > 0) {
                 active_indices = storage_indices.index_select(0, active_rows);
                 active_values = values.index_select(0, active_rows).clone();
                 expected_values = buffer_tensor_gpu_view_.index_select(0, active_indices).clone() + active_values;
             }
         }
-        markDirtyRows_(storage_indices, active_mask);
-        active_masked_index_add_cuda(buffer_tensor_gpu_view_, storage_indices, values, active_mask);
+        torch::Tensor dirty_mask;
+        if (mem_partition_buffer_dirty_tracking_enabled()) {
+            ensureDirtyRowMaskAllocated_();
+            dirty_mask = dirty_row_mask_;
+        }
+        active_masked_index_add_cuda(buffer_tensor_gpu_view_, storage_indices, values, kernel_active_mask, dirty_mask);
         if (verify_index_add && active_rows.numel() > 0) {
             torch::Tensor actual_values = buffer_tensor_gpu_view_.index_select(0, active_indices);
             bool values_match = torch::allclose(actual_values, expected_values, 1e-5, 1e-6);
@@ -3119,7 +3651,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         {
             std::lock_guard<std::mutex> evict_lock(async_evict_writeback_lock_);
             async_evict_in_flight_before_swap = async_evict_writeback_in_flight_;
-            async_evict_in_flight_partitions_before_swap = static_cast<int64_t>(async_evict_writeback_partition_ids_.size());
+            async_evict_in_flight_partitions_before_swap = static_cast<int64_t>(async_evict_writeback_pending_partition_counts_.size());
         }
         if (log_timing) {
 #ifdef GEGE_CUDA
@@ -3204,7 +3736,9 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                     }
                 }
             }
-            if (!async_evict_writeback) {
+            bool skip_empty_evict_sync = delayed_stale_writeback && boundary_evict_ids.empty() &&
+                                         frame_cache_skip_empty_evict_sync_enabled();
+            if (!async_evict_writeback && !skip_empty_evict_sync) {
                 bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
                 if (non_blocking_host_copy) {
                     auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
@@ -3326,7 +3860,11 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 stale_partition->physical_frame_idx_ = -1;
             }
         }
-        clearDirtyRowsForSlots_(evict_slots, evict_ids);
+        if (delayed_stale_writeback) {
+            clearDirtyRowsForSlots_(boundary_evict_slots, boundary_evict_ids);
+        } else {
+            clearDirtyRowsForSlots_(evict_slots, evict_ids);
+        }
         if (log_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             evict_metadata_ms = elapsed_ms(phase_start, now);
@@ -3556,9 +4094,21 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 destroy_delayed_stale_ready_event = true;
             }
 #endif
-            startAsyncEvictWriteback_(delayed_stale_partition_ids, delayed_stale_row_offsets, torch::Tensor(), torch::Tensor(),
-                                      delayed_stale_old_frames, delayed_stale_source_offsets, delayed_stale_ready_event_handle,
-                                      destroy_delayed_stale_ready_event);
+            bool defer_stale_writeback = frame_cache_defer_stale_writeback_until_preload_enabled() &&
+                                         asyncAdmitPreloadEnabled_() && buffer_state_iterator_ != buffer_states_.end();
+            if (defer_stale_writeback) {
+                flushPendingDelayedStaleWriteback_();
+                pending_delayed_stale_partition_ids_ = delayed_stale_partition_ids;
+                pending_delayed_stale_row_offsets_ = delayed_stale_row_offsets;
+                pending_delayed_stale_release_frames_ = delayed_stale_old_frames;
+                pending_delayed_stale_source_offsets_ = delayed_stale_source_offsets;
+                pending_delayed_stale_ready_event_ = delayed_stale_ready_event_handle;
+                pending_delayed_stale_destroy_ready_event_ = destroy_delayed_stale_ready_event;
+            } else {
+                startAsyncEvictWriteback_(delayed_stale_partition_ids, delayed_stale_row_offsets, torch::Tensor(), torch::Tensor(),
+                                          delayed_stale_old_frames, delayed_stale_source_offsets, delayed_stale_ready_event_handle,
+                                          destroy_delayed_stale_ready_event);
+            }
         }
         if (frameCacheEnabled_()) {
             std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
@@ -3703,8 +4253,55 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
     }
 }
 
-void MemPartitionBuffer::sync() {
+double MemPartitionBuffer::copyGpuBufferToHostStaging_() {
+    if (!buffer_tensor_gpu_view_.defined() || !buffer_tensor_gpu_view_.device().is_cuda() || !buffer_tensor_view_.defined()) {
+        return 0.0;
+    }
+
+    auto copy_start = std::chrono::high_resolution_clock::now();
+#ifdef GEGE_CUDA
+    c10::cuda::CUDAGuard device_guard(device_);
+    int device_index = device_.index();
+    if (device_index < 0) {
+        device_index = c10::cuda::current_device();
+    }
+    cudaEvent_t ready_event = nullptr;
+    try {
+        auto current_stream = c10::cuda::getCurrentCUDAStream(device_index);
+        AT_CUDA_CHECK(cudaEventCreateWithFlags(&ready_event, cudaEventDisableTiming));
+        AT_CUDA_CHECK(cudaEventRecord(ready_event, current_stream.stream()));
+
+        bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
+        if (non_blocking_host_copy) {
+            auto copy_stream = c10::cuda::getStreamFromPool(false, device_index);
+            c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+            AT_CUDA_CHECK(cudaStreamWaitEvent(copy_stream.stream(), ready_event, 0));
+            buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach(), true);
+            AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
+        } else {
+            buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
+        }
+    } catch (...) {
+        if (ready_event != nullptr) {
+            static_cast<void>(cudaEventDestroy(ready_event));
+        }
+        throw;
+    }
+    if (ready_event != nullptr) {
+        AT_CUDA_CHECK(cudaEventDestroy(ready_event));
+    }
+#else
+    buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
+#endif
+    return elapsed_ms(copy_start, std::chrono::high_resolution_clock::now());
+}
+
+void MemPartitionBuffer::sync(bool host_staging_current) {
+    flushPendingDelayedStaleWriteback_();
     joinAsyncEvictWriteback_();
+    if (!host_staging_current) {
+        copyGpuBufferToHostStaging_();
+    }
     int64_t timing_id = -1;
     bool log_timing = should_log_partition_buffer_swap_timing(timing_id);
     auto t1 = std::chrono::high_resolution_clock::now();
@@ -3738,6 +4335,8 @@ void MemPartitionBuffer::sync() {
 
 
 void MemPartitionBuffer::setBufferOrdering(std::vector<torch::Tensor> buffer_states) {
+    joinAsyncAdmitPreload_();
+    joinAsyncEvictWriteback_();
     buffer_states_ = buffer_states;
     if (buffer_states_.empty()) {
         throw GegeRuntimeException("MemPartitionBuffer::setBufferOrdering requires at least one buffer state");
@@ -3770,8 +4369,8 @@ void MemPartitionBuffer::setBufferOrdering(std::vector<torch::Tensor> buffer_sta
 }
 
 void MemPartitionBuffer::unload(bool write) {
-
     if (loaded_) {
+        flushPendingDelayedStaleWriteback_();
         joinAsyncEvictWriteback_();
 #ifdef GEGE_CUDA
         if (storage_sync_before_swap_enabled()) {
@@ -3786,23 +4385,9 @@ void MemPartitionBuffer::unload(bool write) {
         auto phase_start = total_start;
         double gpu_to_cpu_ms = 0.0;
         if (write && buffer_tensor_gpu_view_.device().is_cuda()) {
-#ifdef GEGE_CUDA
-            c10::cuda::CUDAGuard device_guard(device_);
-            bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(buffer_tensor_view_);
-            if (non_blocking_host_copy) {
-                auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
-                c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
-                buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach(), true);
-                cudaStreamSynchronize(copy_stream.stream());
-            } else {
-                buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
-            }
-#else
-            buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
-#endif
+            gpu_to_cpu_ms = copyGpuBufferToHostStaging_();
             if (log_timing) {
                 auto now = std::chrono::high_resolution_clock::now();
-                gpu_to_cpu_ms = elapsed_ms(phase_start, now);
                 phase_start = now;
             }
             buff_mem_unload_ = buffer_tensor_view_.data_ptr();
@@ -3823,7 +4408,7 @@ void MemPartitionBuffer::unload(bool write) {
         }
 
         if (write) {
-            sync();
+            sync(true);
         } else if (buffer_state_.defined()) {
             auto active_state = buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
             auto *state_ptr = active_state.data_ptr<int64_t>();

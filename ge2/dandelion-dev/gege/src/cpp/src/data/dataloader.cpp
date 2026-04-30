@@ -140,6 +140,11 @@ bool fixed_buffer_compact_active_prefix_enabled() {
     return enabled;
 }
 
+bool prepared_batch_pipeline_enabled() {
+    static bool enabled = parse_env_flag("GEGE_PREPARED_BATCH_PIPELINE", false);
+    return enabled;
+}
+
 bool map_tensor_breakdown_enabled() {
     static bool enabled = parse_env_flag("GEGE_MAP_TENSOR_BREAKDOWN", false);
     return enabled;
@@ -1651,6 +1656,9 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                     device_swap_barrier_wait_ns_[device_idx] += swap_barrier_elapsed;
                 }
 
+                if (negative_sampler_ != nullptr) {
+                    negative_sampler_->resetPlanCache();
+                }
 #ifdef GEGE_CUDA
                 empty_cache_for_swap_device(devices_[device_idx]);
 #endif
@@ -1754,6 +1762,18 @@ bool DataLoader::hasNextBatch(int32_t device_idx) {
     bool ret = !all_reads_[device_idx];
     batch_lock_->unlock();
     return ret;
+}
+
+bool DataLoader::canPrepareNextBatchInCurrentState(int32_t device_idx) const {
+    if (device_idx < 0 || static_cast<std::size_t>(device_idx) >= all_batches_.size() ||
+        static_cast<std::size_t>(device_idx) >= batch_iterators_.size() ||
+        static_cast<std::size_t>(device_idx) >= all_reads_.size()) {
+        return false;
+    }
+    if (all_reads_[device_idx]) {
+        return false;
+    }
+    return batch_iterators_[device_idx] != all_batches_[device_idx].end();
 }
 
 void DataLoader::finishedBatch(int32_t device_idx) {
@@ -1920,6 +1940,13 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     MapTensorTiming map_tensor_timing;
     bool has_map_tensor_timing = false;
     bool collect_map_tensor_breakdown = map_tensor_breakdown_enabled() || run_stage_debug;
+    bool persist_mapper_outputs = prepared_batch_pipeline_enabled();
+    auto persist_mapping_tensor = [&](torch::Tensor tensor) {
+        if (persist_mapper_outputs && tensor.defined()) {
+            return tensor.clone();
+        }
+        return tensor;
+    };
 
     if (resident_local_lp_direct_enabled() && neighbor_sampler_ == nullptr && batch->streamed_edge_size_ > 0 &&
         graph_storage_->storage_ptrs_.node_embeddings != nullptr &&
@@ -2035,6 +2062,10 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
             batch->unique_node_active_mask_ = torch::Tensor();
             compact_active_elapsed = elapsed_ns(compact_active_start, std::chrono::high_resolution_clock::now());
         }
+        if (persist_mapper_outputs) {
+            batch->unique_node_indices_ = persist_mapping_tensor(batch->unique_node_indices_);
+            batch->unique_node_active_mask_ = persist_mapping_tensor(batch->unique_node_active_mask_);
+        }
 
         auto map_verify_start = std::chrono::high_resolution_clock::now();
         if (verify_node_mapping_enabled()) {
@@ -2057,11 +2088,11 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         dst_mapping = mapped_tensors[mapped_tensor_idx++];
 
         if (batch->src_neg_indices_.defined()) {
-            src_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->src_neg_indices_.sizes());
+            src_neg_mapping = persist_mapping_tensor(mapped_tensors[mapped_tensor_idx++].reshape(batch->src_neg_indices_.sizes()));
         }
 
         if (batch->dst_neg_indices_.defined()) {
-            dst_neg_mapping = mapped_tensors[mapped_tensor_idx++].reshape(batch->dst_neg_indices_.sizes());
+            dst_neg_mapping = persist_mapping_tensor(mapped_tensors[mapped_tensor_idx++].reshape(batch->dst_neg_indices_.sizes()));
         }
         auto remap_assign_end = std::chrono::high_resolution_clock::now();
         remap_assign_ms = elapsed_ms(remap_assign_start, remap_assign_end);

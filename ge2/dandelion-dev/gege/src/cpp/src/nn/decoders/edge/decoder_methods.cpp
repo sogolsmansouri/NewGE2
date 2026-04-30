@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <sstream>
@@ -878,7 +879,8 @@ std::tuple<torch::Tensor, torch::Tensor> prepare_pos_embeddings(shared_ptr<EdgeD
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_corrupt_forward(NegativeSamplingMethod negative_sampling_method, float negative_sampling_selected_ratio, shared_ptr<NegativeSampler> negative_sampler,
                                                                                                 shared_ptr<EdgeDecoder> decoder, torch::Tensor positive_edges, torch::Tensor node_embeddings, torch::Tensor dst_negs, torch::Tensor src_negs,
-                                                                                                torch::Tensor node_embeddings_g, torch::Tensor qual_embeddings) {
+                                                                                                torch::Tensor node_embeddings_g, torch::Tensor qual_embeddings,
+                                                                                                std::function<void()> post_gather_callback) {
     int64_t stage_debug_batch_id = -1;
     bool run_stage_debug = should_run_stage_debug(stage_debug_batch_id);
     auto decoder_total_start = std::chrono::high_resolution_clock::now();
@@ -972,6 +974,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> mod_node_
             "[stage-debug][decoder][batch {}][step 2] neg_gather ms={:.3f} dst_total={} dst_unique={} dst_dup={} src_total={} src_unique={} src_dup={}",
             stage_debug_batch_id, elapsed_ms(step_start, now), dst_total, dst_unique, dst_duplicates, src_total, src_unique, src_duplicates);
         step_start = now;
+    }
+
+    if (post_gather_callback) {
+        post_gather_callback();
     }
 
     int64_t csr_debug_batch_id = -1;

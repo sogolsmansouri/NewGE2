@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+
 #include "configuration/config.h"
 #include "data/batch.h"
 #include "data/samplers/negative.h"
@@ -34,9 +36,13 @@ class Model : public torch::nn::Module {
 
     torch::Tensor forward_nc(at::optional<torch::Tensor> node_embeddings, at::optional<torch::Tensor> node_features, DENSEGraph dense_graph, bool train);
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward_lp(shared_ptr<Batch> batch, bool train);
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> forward_lp(shared_ptr<Batch> batch, bool train,
+                                                                                      std::function<void()> post_decoder_gather_callback = nullptr);
 
     void train_batch(shared_ptr<Batch> batch, bool call_step = true);
+
+    void train_batch_with_callback(shared_ptr<Batch> batch, bool call_step, std::function<void()> post_forward_callback,
+                                   std::function<void()> post_decoder_gather_callback = nullptr);
 
     void evaluate_batch(shared_ptr<Batch> batch);
 

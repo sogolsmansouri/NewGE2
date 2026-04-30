@@ -1,5 +1,40 @@
 #include "nn/loss.h"
 
+#include <cmath>
+#include <cstdlib>
+#include <string>
+
+namespace {
+
+double softmax_negative_log_mass_bias() {
+    static double bias = []() {
+        const char *bias_raw = std::getenv("GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS");
+        if (bias_raw != nullptr && bias_raw[0] != '\0') {
+            try {
+                double parsed = std::stod(std::string(bias_raw));
+                return std::isfinite(parsed) ? parsed : 0.0;
+            } catch (...) {
+                return 0.0;
+            }
+        }
+
+        const char *scale_raw = std::getenv("GEGE_SOFTMAX_NEGATIVE_MASS_SCALE");
+        if (scale_raw != nullptr && scale_raw[0] != '\0') {
+            try {
+                double parsed = std::stod(std::string(scale_raw));
+                return parsed > 0.0 && std::isfinite(parsed) ? std::log(parsed) : 0.0;
+            } catch (...) {
+                return 0.0;
+            }
+        }
+
+        return 0.0;
+    }();
+    return bias;
+}
+
+}  // namespace
+
 void check_score_shapes(torch::Tensor pos_scores, torch::Tensor neg_scores) {
     if (!pos_scores.defined()) {
         throw UndefinedTensorException();
@@ -50,7 +85,12 @@ torch::Tensor SoftmaxCrossEntropy::operator()(torch::Tensor y_pred, torch::Tenso
     }
 
     check_score_shapes(y_pred, labels);
-    std::tie(y_pred, labels) = scores_to_labels(y_pred.unsqueeze(1), labels.logsumexp(1, true), false);
+    torch::Tensor negative_log_mass = labels.logsumexp(1, true);
+    double negative_bias = softmax_negative_log_mass_bias();
+    if (negative_bias != 0.0) {
+        negative_log_mass = negative_log_mass + negative_bias;
+    }
+    std::tie(y_pred, labels) = scores_to_labels(y_pred.unsqueeze(1), negative_log_mass, false);
 
     torch::nn::functional::CrossEntropyFuncOptions options;
     if (reduction_type_ == LossReduction::MEAN) {

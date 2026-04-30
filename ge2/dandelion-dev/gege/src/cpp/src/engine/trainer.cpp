@@ -3,22 +3,42 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cctype>
+#include <cstdlib>
+#include <functional>
+#include <future>
 #include <iomanip>
 #include <optional>
 #include <sstream>
+#include <string>
 #include <thread>
 #include <vector>
 
 #include "configuration/options.h"
 #include "reporting/logger.h"
 #ifdef GEGE_CUDA
+#include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
 #endif
 
 using std::get;
 using std::tie;
 
 namespace {
+
+bool env_flag_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    return normalized != "0" && normalized != "false" && normalized != "off" && normalized != "no";
+}
 
 int64_t elapsed_ns(std::chrono::high_resolution_clock::time_point start, std::chrono::high_resolution_clock::time_point end) {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -62,6 +82,92 @@ double spread_ms(const std::vector<int64_t> &values) {
     auto minmax = std::minmax_element(values.begin(), values.end());
     return ns_to_ms(*minmax.second - *minmax.first);
 }
+
+#ifdef GEGE_CUDA
+void record_tensor_on_current_stream(const torch::Tensor &tensor) {
+    if (!tensor.defined() || !tensor.is_cuda() || tensor.numel() == 0) {
+        return;
+    }
+
+    auto stream = c10::cuda::getCurrentCUDAStream(tensor.device().index());
+    c10::cuda::CUDACachingAllocator::recordStream(tensor.storage().data_ptr(), stream);
+}
+
+void record_tensor_vector_on_current_stream(const std::vector<torch::Tensor> &tensors) {
+    for (const auto &tensor : tensors) {
+        record_tensor_on_current_stream(tensor);
+    }
+}
+
+void record_graph_tensors_on_current_stream(const GegeGraph &graph) {
+    record_tensor_on_current_stream(graph.src_sorted_edges_);
+    record_tensor_on_current_stream(graph.dst_sorted_edges_);
+    record_tensor_on_current_stream(graph.active_in_memory_subgraph_);
+    record_tensor_on_current_stream(graph.node_ids_);
+    record_tensor_on_current_stream(graph.out_sorted_uniques_);
+    record_tensor_on_current_stream(graph.out_offsets_);
+    record_tensor_on_current_stream(graph.out_num_neighbors_);
+    record_tensor_on_current_stream(graph.in_sorted_uniques_);
+    record_tensor_on_current_stream(graph.in_offsets_);
+    record_tensor_on_current_stream(graph.in_num_neighbors_);
+    record_tensor_on_current_stream(graph.all_src_sorted_edges_);
+    record_tensor_on_current_stream(graph.all_dst_sorted_edges_);
+}
+
+void record_dense_graph_tensors_on_current_stream(const DENSEGraph &graph) {
+    record_graph_tensors_on_current_stream(graph);
+    record_tensor_on_current_stream(graph.hop_offsets_);
+    record_tensor_on_current_stream(graph.in_neighbors_mapping_);
+    record_tensor_on_current_stream(graph.out_neighbors_mapping_);
+    record_tensor_vector_on_current_stream(graph.in_neighbors_vec_);
+    record_tensor_vector_on_current_stream(graph.out_neighbors_vec_);
+    record_tensor_on_current_stream(graph.node_properties_);
+}
+
+void record_batch_tensors_on_current_stream(const shared_ptr<Batch> &batch) {
+    if (batch == nullptr) {
+        return;
+    }
+
+    record_tensor_on_current_stream(batch->root_node_indices_);
+    record_tensor_on_current_stream(batch->unique_node_indices_);
+    record_tensor_on_current_stream(batch->unique_node_active_mask_);
+    record_tensor_on_current_stream(batch->node_embeddings_);
+    record_tensor_on_current_stream(batch->node_gradients_);
+    record_tensor_on_current_stream(batch->node_embeddings_state_);
+    record_tensor_on_current_stream(batch->node_state_update_);
+    record_tensor_on_current_stream(batch->node_embeddings_g_);
+    record_tensor_on_current_stream(batch->node_gradients_g_);
+    record_tensor_on_current_stream(batch->node_embeddings_state_g_);
+    record_tensor_on_current_stream(batch->node_state_update_g_);
+    record_tensor_on_current_stream(batch->qual_embeddings_);
+    record_tensor_on_current_stream(batch->qual_gradients_);
+    record_tensor_on_current_stream(batch->qual_embeddings_state_);
+    record_tensor_on_current_stream(batch->qual_state_update_);
+    record_tensor_on_current_stream(batch->qual_indices_);
+    record_tensor_on_current_stream(batch->node_features_);
+    record_tensor_on_current_stream(batch->node_labels_);
+    record_tensor_on_current_stream(batch->src_neg_indices_mapping_);
+    record_tensor_on_current_stream(batch->dst_neg_indices_mapping_);
+    record_tensor_on_current_stream(batch->edges_);
+    record_tensor_on_current_stream(batch->resident_src_embeddings_);
+    record_tensor_on_current_stream(batch->resident_dst_embeddings_);
+    record_tensor_on_current_stream(batch->resident_src_neg_embeddings_);
+    record_tensor_on_current_stream(batch->resident_dst_neg_embeddings_);
+    record_tensor_on_current_stream(batch->resident_src_embeddings_state_);
+    record_tensor_on_current_stream(batch->resident_dst_embeddings_state_);
+    record_tensor_on_current_stream(batch->resident_src_neg_embeddings_state_);
+    record_tensor_on_current_stream(batch->resident_dst_neg_embeddings_state_);
+    record_dense_graph_tensors_on_current_stream(batch->dense_graph_);
+    record_tensor_on_current_stream(batch->encoded_uniques_);
+    record_tensor_on_current_stream(batch->neg_edges_);
+    record_tensor_on_current_stream(batch->rel_neg_indices_);
+    record_tensor_on_current_stream(batch->src_neg_indices_);
+    record_tensor_on_current_stream(batch->dst_neg_indices_);
+    record_tensor_on_current_stream(batch->src_neg_filter_);
+    record_tensor_on_current_stream(batch->dst_neg_filter_);
+}
+#endif
 
 // These timers bracket host-side regions in the multi-GPU training loop.
 // CUDA kernels may still execute asynchronously after the call returns.
@@ -231,6 +337,50 @@ void SynchronousTrainer::train(int num_epochs) {
         }
     };
     std::optional<int32_t> profiled_logical_lane = parse_optional_env_int("GEGE_PROFILE_LOGICAL_LANE");
+    const bool prepared_batch_pipeline_requested = env_flag_enabled("GEGE_PREPARED_BATCH_PIPELINE");
+    bool prepared_batch_pipeline_enabled = prepared_batch_pipeline_requested;
+    std::string prepared_batch_pipeline_disabled_reason;
+    if (prepared_batch_pipeline_enabled && learning_task_ != LearningTask::LINK_PREDICTION) {
+        prepared_batch_pipeline_enabled = false;
+        prepared_batch_pipeline_disabled_reason = "only link prediction is currently supported";
+    }
+    if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_ == nullptr) {
+        prepared_batch_pipeline_enabled = false;
+        prepared_batch_pipeline_disabled_reason = "graph storage is unavailable";
+    }
+    if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_->embeddingsOffDevice()) {
+        prepared_batch_pipeline_enabled = false;
+        prepared_batch_pipeline_disabled_reason = "off-device node embeddings would be read before prior updates finish";
+    }
+    if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_->embeddingsOffDeviceG()) {
+        prepared_batch_pipeline_enabled = false;
+        prepared_batch_pipeline_disabled_reason = "off-device generator embeddings would be read before prior updates finish";
+    }
+    if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_->storage_ptrs_.qual_embeddings != nullptr &&
+        dataloader_->graph_storage_->storage_ptrs_.qual_embeddings->device_ != torch::kCUDA) {
+        prepared_batch_pipeline_enabled = false;
+        prepared_batch_pipeline_disabled_reason = "off-device qualifier embeddings would be read before prior updates finish";
+    }
+    std::string prepared_batch_launch_stage = "after_fetch";
+    if (const char *launch_stage_env = std::getenv("GEGE_PREPARED_BATCH_PIPELINE_LAUNCH_STAGE")) {
+        prepared_batch_launch_stage = launch_stage_env;
+    }
+    if (prepared_batch_launch_stage != "after_fetch" &&
+        prepared_batch_launch_stage != "after_gpu_load" &&
+        prepared_batch_launch_stage != "after_decoder_gather" &&
+        prepared_batch_launch_stage != "after_forward" &&
+        prepared_batch_launch_stage != "after_compute") {
+        SPDLOG_WARN("Ignoring invalid GEGE_PREPARED_BATCH_PIPELINE_LAUNCH_STAGE={}; using after_fetch", prepared_batch_launch_stage);
+        prepared_batch_launch_stage = "after_fetch";
+    }
+    if (prepared_batch_pipeline_requested) {
+        if (prepared_batch_pipeline_enabled) {
+            SPDLOG_INFO("[prepared_batch_pipeline] enabled=1 mode=intra_state_async_prepare max_prefetch=1 launch_stage={}",
+                        prepared_batch_launch_stage);
+        } else {
+            SPDLOG_WARN("[prepared_batch_pipeline] enabled=0 reason={}", prepared_batch_pipeline_disabled_reason);
+        }
+    }
 
     if (!dataloader_->single_dataset_) {
         dataloader_->setTrainSet();
@@ -249,11 +399,85 @@ void SynchronousTrainer::train(int num_epochs) {
         dataloader_->resetPerfStats();
         timer.start();
         std::vector<SingleDeviceStateTiming> state_timings;
+        std::future<shared_ptr<Batch>> prepared_batch_future;
+        int64_t prepared_batch_launches = 0;
+        int64_t prepared_batch_hits = 0;
+        int64_t prepared_batch_direct_fetches = 0;
+        int64_t prepared_batch_boundary_blocks = 0;
+        int64_t prepared_batch_wait_ns = 0;
+        auto launch_prepared_batch = [&](bool wait_for_current_cuda_stream = false) {
+            if (!prepared_batch_pipeline_enabled || prepared_batch_future.valid()) {
+                return;
+            }
+            if (!dataloader_->canPrepareNextBatchInCurrentState()) {
+                prepared_batch_boundary_blocks++;
+                return;
+            }
+            prepared_batch_launches++;
+            auto loader = dataloader_;
+            std::uintptr_t wait_event_value = 0;
+#ifdef GEGE_CUDA
+            if (wait_for_current_cuda_stream && !loader->devices_.empty() && loader->devices_[0].is_cuda()) {
+                c10::cuda::CUDAGuard device_guard(loader->devices_[0]);
+                auto current_stream = c10::cuda::getCurrentCUDAStream(loader->devices_[0].index());
+                cudaEvent_t wait_event = nullptr;
+                AT_CUDA_CHECK(cudaEventCreateWithFlags(&wait_event, cudaEventDisableTiming));
+                AT_CUDA_CHECK(cudaEventRecord(wait_event, current_stream.stream()));
+                wait_event_value = reinterpret_cast<std::uintptr_t>(wait_event);
+            }
+#else
+            (void)wait_for_current_cuda_stream;
+#endif
+            prepared_batch_future = std::async(std::launch::async, [loader, wait_event_value]() {
+#ifdef GEGE_CUDA
+                auto destroy_wait_event = [&]() {
+                    if (wait_event_value != 0) {
+                        auto wait_event = reinterpret_cast<cudaEvent_t>(wait_event_value);
+                        cudaEventDestroy(wait_event);
+                    }
+                };
+                if (!loader->devices_.empty() && loader->devices_[0].is_cuda()) {
+                    try {
+                        c10::cuda::CUDAGuard device_guard(loader->devices_[0]);
+                        auto prepare_stream = c10::cuda::getStreamFromPool(false, loader->devices_[0].index());
+                        if (wait_event_value != 0) {
+                            auto wait_event = reinterpret_cast<cudaEvent_t>(wait_event_value);
+                            AT_CUDA_CHECK(cudaStreamWaitEvent(prepare_stream.stream(), wait_event, 0));
+                        }
+                        c10::cuda::CUDAStreamGuard stream_guard(prepare_stream);
+                        shared_ptr<Batch> batch = loader->getBatch();
+                        AT_CUDA_CHECK(cudaStreamSynchronize(prepare_stream.stream()));
+                        destroy_wait_event();
+                        return batch;
+                    } catch (...) {
+                        destroy_wait_event();
+                        throw;
+                    }
+                }
+                destroy_wait_event();
+#endif
+                return loader->getBatch();
+            });
+        };
+        auto fetch_batch = [&]() -> shared_ptr<Batch> {
+            if (prepared_batch_future.valid()) {
+                auto wait_start = std::chrono::high_resolution_clock::now();
+                shared_ptr<Batch> batch = prepared_batch_future.get();
+                prepared_batch_wait_ns += elapsed_ns(wait_start, std::chrono::high_resolution_clock::now());
+                prepared_batch_hits++;
+                return batch;
+            }
+            prepared_batch_direct_fetches++;
+            return dataloader_->getBatch();
+        };
         SPDLOG_INFO("################ Starting training epoch {} ################", dataloader_->getEpochsProcessed() + 1);
-        while (dataloader_->hasNextBatch()) {
+        while (prepared_batch_future.valid() || dataloader_->hasNextBatch()) {
             auto batch_fetch_start = std::chrono::high_resolution_clock::now();
-            shared_ptr<Batch> batch = dataloader_->getBatch();
+            shared_ptr<Batch> batch = fetch_batch();
             auto batch_fetch_end = std::chrono::high_resolution_clock::now();
+            if (batch == nullptr) {
+                break;
+            }
 
             int64_t state_idx = -1;
             if (!dataloader_->device_current_state_index_.empty()) {
@@ -267,6 +491,9 @@ void SynchronousTrainer::train(int num_epochs) {
             auto &state_timing = state_timings.back();
             state_timing.batch_count++;
             state_timing.batch_fetch_region_ns += elapsed_ns(batch_fetch_start, batch_fetch_end);
+            if (prepared_batch_launch_stage == "after_fetch") {
+                launch_prepared_batch();
+            }
 
             auto gpu_load_start = std::chrono::high_resolution_clock::now();
             if (dataloader_->graph_storage_->embeddingsOffDevice()) {
@@ -276,6 +503,14 @@ void SynchronousTrainer::train(int num_epochs) {
             }
             auto gpu_load_end = std::chrono::high_resolution_clock::now();
             state_timing.gpu_load_region_ns += elapsed_ns(gpu_load_start, gpu_load_end);
+#ifdef GEGE_CUDA
+            if (prepared_batch_pipeline_enabled) {
+                record_batch_tensors_on_current_stream(batch);
+            }
+#endif
+            if (prepared_batch_launch_stage == "after_gpu_load") {
+                launch_prepared_batch();
+            }
 
             if (batch->node_embeddings_.defined()) {
                 batch->node_embeddings_.requires_grad_();
@@ -287,9 +522,24 @@ void SynchronousTrainer::train(int num_epochs) {
             state_timing.map_region_ns += elapsed_ns(map_start, map_end);
 
             auto compute_start = std::chrono::high_resolution_clock::now();
-            model_->train_batch(batch);
+            std::function<void()> post_forward_callback;
+            std::function<void()> post_decoder_gather_callback;
+            if (prepared_batch_launch_stage == "after_decoder_gather") {
+                post_decoder_gather_callback = [&]() { launch_prepared_batch(true); };
+            }
+            if (prepared_batch_launch_stage == "after_forward") {
+                post_forward_callback = [&]() { launch_prepared_batch(true); };
+            }
+            if (post_forward_callback || post_decoder_gather_callback) {
+                model_->train_batch_with_callback(batch, true, post_forward_callback, post_decoder_gather_callback);
+            } else {
+                model_->train_batch(batch);
+            }
             auto compute_end = std::chrono::high_resolution_clock::now();
             state_timing.compute_region_ns += elapsed_ns(compute_start, compute_end);
+            if (prepared_batch_launch_stage == "after_compute") {
+                launch_prepared_batch();
+            }
 
             if (batch->node_gradients_.defined()) {
                 auto embedding_update_start = std::chrono::high_resolution_clock::now();
@@ -316,6 +566,11 @@ void SynchronousTrainer::train(int num_epochs) {
             }
 
             auto finalize_start = std::chrono::high_resolution_clock::now();
+#ifdef GEGE_CUDA
+            if (prepared_batch_pipeline_enabled) {
+                record_batch_tensors_on_current_stream(batch);
+            }
+#endif
             batch->clear();
             dataloader_->finishedBatch();
             auto finalize_end = std::chrono::high_resolution_clock::now();
@@ -347,6 +602,12 @@ void SynchronousTrainer::train(int num_epochs) {
         SPDLOG_INFO("{} per Second: {}", item_name, items_per_second);
 
         auto perf_stats = dataloader_->getPerfStats();
+        if (prepared_batch_pipeline_requested) {
+            SPDLOG_INFO(
+                "[perf][epoch {}][prepared_batch_pipeline] enabled={} launches={} hits={} direct_fetches={} boundary_blocks={} wait_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), prepared_batch_pipeline_enabled ? 1 : 0, prepared_batch_launches, prepared_batch_hits,
+                prepared_batch_direct_fetches, prepared_batch_boundary_blocks, ns_to_ms(prepared_batch_wait_ns));
+        }
         if (profiled_logical_lane.has_value() && !state_timings.empty()) {
             const std::vector<int64_t> *active_bucket_samples = nullptr;
             const std::vector<int64_t> *active_edge_samples = nullptr;

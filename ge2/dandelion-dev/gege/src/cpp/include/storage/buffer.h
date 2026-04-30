@@ -3,10 +3,13 @@
 #include "common/datatypes.h"
 #include "data/batch.h"
 
+#include <condition_variable>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 
 class Partition {
    public:
@@ -244,7 +247,7 @@ class MemPartitionBuffer : public PartitionBuffer {
 
     void setPermutation(torch::Tensor perm, torch::Tensor pos);
 
-    void sync();
+    void sync(bool host_staging_current = false);
 
     void resetFrameCachePerfStats() { frame_cache_perf_stats_ = FrameCachePerfStats(); }
 
@@ -283,13 +286,22 @@ class MemPartitionBuffer : public PartitionBuffer {
     torch::Tensor hostPartitionRows_(Partition *partition);
     void copyPartitionFromHostToPinned_(Partition *partition, torch::Tensor pinned_view);
     void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
+    double copyGpuBufferToHostStaging_();
     void startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots);
     void joinAsyncAdmitPreload_();
     bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
                                    int64_t *visible_install_rows = nullptr, int64_t *hidden_publish_rows = nullptr,
                                    int64_t *visible_install_parts = nullptr, int64_t *hidden_publish_parts = nullptr);
+    struct AsyncEvictWritebackTask {
+        std::thread thread;
+        bool done = false;
+    };
+    void reapCompletedAsyncEvictWritebacks_();
+    void waitForAsyncEvictWritebackSlot_();
     void joinAsyncEvictWriteback_();
     void joinAsyncEvictWritebackForPartitions_(const std::vector<int> &partition_ids);
+    void flushPendingDelayedStaleWriteback_();
+    std::vector<std::size_t> prioritizedWritebackOrder_(const std::vector<int> &partition_ids) const;
     void startAsyncEvictWriteback_(const std::vector<int> &evict_ids, const std::vector<int64_t> &row_offsets, torch::Tensor gpu_stage,
                                    torch::Tensor expected_host_stage = torch::Tensor(),
                                    std::vector<int64_t> release_frames = {},
@@ -324,15 +336,22 @@ class MemPartitionBuffer : public PartitionBuffer {
     torch::Tensor async_admit_preload_gpu_tensor_;
     std::vector<HiddenFramePublish> async_admit_preload_hidden_publishes_;
     std::vector<HiddenFramePublish> pending_hidden_publishes_;
+    std::vector<int> pending_delayed_stale_partition_ids_;
+    std::vector<int64_t> pending_delayed_stale_row_offsets_;
+    std::vector<int64_t> pending_delayed_stale_release_frames_;
+    std::vector<int64_t> pending_delayed_stale_source_offsets_;
+    std::uintptr_t pending_delayed_stale_ready_event_ = 0;
+    bool pending_delayed_stale_destroy_ready_event_ = false;
     double async_admit_preload_host_load_ms_ = 0.0;
     double async_admit_preload_cpu_to_gpu_ms_ = 0.0;
     double async_admit_preload_total_ms_ = 0.0;
-
     std::mutex host_storage_lock_;
     std::mutex async_evict_writeback_lock_;
-    std::thread async_evict_writeback_thread_;
+    std::condition_variable async_evict_writeback_cv_;
+    std::vector<std::unique_ptr<AsyncEvictWritebackTask>> async_evict_writeback_tasks_;
+    int async_evict_writeback_active_count_ = 0;
     bool async_evict_writeback_in_flight_ = false;
     std::exception_ptr async_evict_writeback_exception_ = nullptr;
-    std::vector<int> async_evict_writeback_partition_ids_;
+    std::unordered_map<int, int> async_evict_writeback_pending_partition_counts_;
     FrameCachePerfStats frame_cache_perf_stats_;
 };

@@ -589,6 +589,7 @@ __global__ void active_masked_index_add_kernel(float* target,
                                                const int64_t* indices,
                                                const float* values,
                                                const uint8_t* active_mask,
+                                               uint8_t* dirty_mask,
                                                int64_t rows,
                                                int64_t dim,
                                                int64_t target_rows) {
@@ -602,6 +603,9 @@ __global__ void active_masked_index_add_kernel(float* target,
     int64_t dst_row = indices[row];
     if (dst_row < 0 || dst_row >= target_rows) return;
     int64_t col = linear - row * dim;
+    if (dirty_mask != nullptr && col == 0) {
+        dirty_mask[dst_row] = uint8_t{1};
+    }
     target[dst_row * dim + col] += values[linear];
 }
 
@@ -1541,7 +1545,8 @@ std::tuple<torch::Tensor, torch::Tensor> active_masked_adagrad_cuda(torch::Tenso
 void active_masked_index_add_cuda(torch::Tensor target,
                                   torch::Tensor indices,
                                   torch::Tensor values,
-                                  torch::Tensor active_mask) {
+                                  torch::Tensor active_mask,
+                                  torch::Tensor dirty_mask) {
     TORCH_CHECK(target.is_cuda(), "active_masked_index_add_cuda expects a CUDA target");
     TORCH_CHECK(indices.is_cuda(), "active_masked_index_add_cuda expects CUDA indices");
     TORCH_CHECK(values.is_cuda(), "active_masked_index_add_cuda expects CUDA values");
@@ -1554,6 +1559,12 @@ void active_masked_index_add_cuda(torch::Tensor target,
     TORCH_CHECK(indices.dim() == 1 && active_mask.dim() == 1, "active_masked_index_add_cuda requires 1D indices/mask tensors");
     TORCH_CHECK(indices.size(0) == values.size(0) && active_mask.size(0) == values.size(0), "active_masked_index_add_cuda row counts must match");
     TORCH_CHECK(target.size(1) == values.size(1), "active_masked_index_add_cuda embedding dimensions must match");
+    if (dirty_mask.defined()) {
+        TORCH_CHECK(dirty_mask.is_cuda(), "active_masked_index_add_cuda dirty mask must be CUDA when defined");
+        TORCH_CHECK(dirty_mask.scalar_type() == torch::kUInt8, "active_masked_index_add_cuda dirty mask must be uint8");
+        TORCH_CHECK(dirty_mask.dim() == 1 && dirty_mask.size(0) == target.size(0),
+                    "active_masked_index_add_cuda dirty mask must match target rows");
+    }
 
     c10::cuda::CUDAGuard guard(target.device());
     auto stream = at::cuda::getCurrentCUDAStream(target.device().index()).stream();
@@ -1562,6 +1573,13 @@ void active_masked_index_add_cuda(torch::Tensor target,
     auto indices_contig = indices.contiguous();
     auto values_contig = values.contiguous();
     auto mask_contig = active_mask.contiguous();
+    uint8_t* dirty_mask_ptr = nullptr;
+    if (dirty_mask.defined()) {
+        auto dirty_mask_contig = dirty_mask.contiguous();
+        TORCH_CHECK(dirty_mask_contig.data_ptr<uint8_t>() == dirty_mask.data_ptr<uint8_t>(),
+                    "active_masked_index_add_cuda dirty mask must be contiguous");
+        dirty_mask_ptr = dirty_mask_contig.data_ptr<uint8_t>();
+    }
 
     int64_t rows = values_contig.size(0);
     int64_t dim = values_contig.size(1);
@@ -1573,6 +1591,7 @@ void active_masked_index_add_cuda(torch::Tensor target,
         indices_contig.data_ptr<int64_t>(),
         values_contig.data_ptr<float>(),
         mask_contig.data_ptr<uint8_t>(),
+        dirty_mask_ptr,
         rows,
         dim,
         target_contig.size(0));

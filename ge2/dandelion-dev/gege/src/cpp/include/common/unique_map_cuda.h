@@ -57,4 +57,5 @@ std::tuple<torch::Tensor, torch::Tensor> active_masked_adagrad_cuda(torch::Tenso
 void active_masked_index_add_cuda(torch::Tensor target,
                                   torch::Tensor indices,
                                   torch::Tensor values,
-                                  torch::Tensor active_mask);
+                                  torch::Tensor active_mask,
+                                  torch::Tensor dirty_mask = torch::Tensor());

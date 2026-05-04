@@ -1353,6 +1353,17 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         };
         if (delayed_stale_enabled && !hidden_publish_slots.empty()) {
+            const int64_t max_stale_backlog =
+                std::max<int64_t>(
+                    parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG",
+                                  static_cast<int64_t>(buffer->hidden_frame_capacity_)),
+                    0);
+            const int64_t stale_backlog_before_delay =
+                frame_cache_mapping ? std::max<int64_t>(
+                                          static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap, 0)
+                                    : 0;
+            int64_t remaining_delayed_stale_slots =
+                std::max<int64_t>(max_stale_backlog - stale_backlog_before_delay, 0);
             for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                 int evict_id = evict_ids[idx];
                 int64_t evict_slot = evict_slots[idx];
@@ -1363,11 +1374,15 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     (*next_required)[static_cast<std::size_t>(evict_id)] != 0) {
                     continue;
                 }
+                if (remaining_delayed_stale_slots <= 0) {
+                    continue;
+                }
                 Partition *partition = buffer->partition_table_[evict_id];
                 int64_t old_frame = buffer->logicalSlotToPhysicalFrame_(evict_slot);
                 delayed_stale_logical_slots.insert(evict_slot);
                 delayed_stale_entries.push_back(
                     {evict_slot, evict_id, partition->partition_size_, old_frame, old_frame * buffer->partition_size_});
+                remaining_delayed_stale_slots -= 1;
             }
             rebuild_delayed_stale_vectors();
         }

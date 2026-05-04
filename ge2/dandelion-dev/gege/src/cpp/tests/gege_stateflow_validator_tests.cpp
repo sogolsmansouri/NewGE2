@@ -132,6 +132,70 @@ void test_peer_aware_lane_matching_reduces_lane_matched_cost() {
                 "peer-aware lane-matched cost should not exceed the host-only cost");
 }
 
+void expect_lane_max_admits(const StateflowPlan &plan, int64_t max_admits) {
+    for (const auto &lane : plan.lanes) {
+        for (const auto &microstate : lane.microstates) {
+            if (microstate.microstate_id == 0) {
+                continue;
+            }
+            expect_true(microstate.admitted_partitions <= max_admits,
+                        "lane transition exceeded max admits");
+        }
+    }
+}
+
+StateflowPlan build_bounded_q4_multi_gpu_plan(int active_devices) {
+    constexpr int kNumPartitions = 32;
+    constexpr int kBufferCapacity = 4;
+    std::vector<int64_t> edge_bucket_sizes(static_cast<std::size_t>(kNumPartitions * kNumPartitions), 1);
+    std::vector<int64_t> partition_row_counts(static_cast<std::size_t>(kNumPartitions), 1024);
+    auto [buffer_states, edge_buckets] =
+        getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(kNumPartitions, kBufferCapacity, active_devices, edge_bucket_sizes);
+
+    ScopedEnvVar max_admits_env("GEGE_STATEFLOW_MAX_ADMITS", "3");
+    auto candidates =
+        enumerateMultiGpuStateflowPlans(buffer_states, edge_buckets, active_devices, edge_bucket_sizes, partition_row_counts, {});
+    for (const auto &candidate : candidates) {
+        if (candidate.family_variant == PlanVariant::MULTI_GPU_DISJOINT_ROUNDS ||
+            candidate.family_variant == PlanVariant::MULTI_GPU_LANE_MATCHED) {
+            return candidate;
+        }
+    }
+
+    std::string variants;
+    for (const auto &candidate : candidates) {
+        if (!variants.empty()) {
+            variants += ",";
+        }
+        variants += planVariantName(candidate.family_variant);
+    }
+    throw std::runtime_error("failed to build bounded q4 multi-GPU lane candidate; candidate_count=" +
+                             std::to_string(candidates.size()) + " variants=[" + variants + "]");
+}
+
+void test_bounded_q4_lane_matched_respects_three_admit_cap() {
+    auto two_gpu = build_bounded_q4_multi_gpu_plan(2);
+    expect_true(two_gpu.total_microstates >= 88 && two_gpu.total_microstates <= 120,
+                "expected p32/q4 bounded 2-GPU state count near the covering lower bound");
+    expect_true(two_gpu.total_bucket_assignments == 1024, "expected exact directed bucket count for 2-GPU plan");
+    expect_true(validateStateflowPlanExactSemantics(two_gpu), "2-GPU bounded q4 lane-matched plan should validate");
+    expect_lane_max_admits(two_gpu, 3);
+
+    auto three_gpu = build_bounded_q4_multi_gpu_plan(3);
+    expect_true(three_gpu.total_microstates >= 88 && three_gpu.total_microstates <= 120,
+                "expected p32/q4 bounded 3-GPU state count near the covering lower bound");
+    expect_true(three_gpu.total_bucket_assignments == 1024, "expected exact directed bucket count for 3-GPU plan");
+    expect_true(validateStateflowPlanExactSemantics(three_gpu), "3-GPU bounded q4 lane-matched plan should validate");
+    expect_lane_max_admits(three_gpu, 3);
+
+    auto four_gpu = build_bounded_q4_multi_gpu_plan(4);
+    expect_true(four_gpu.total_microstates >= 88 && four_gpu.total_microstates <= 120,
+                "expected p32/q4 bounded 4-GPU state count near the covering lower bound");
+    expect_true(four_gpu.total_bucket_assignments == 1024, "expected exact directed bucket count for 4-GPU plan");
+    expect_true(validateStateflowPlanExactSemantics(four_gpu), "4-GPU bounded q4 lane-matched plan should validate");
+    expect_lane_max_admits(four_gpu, 3);
+}
+
 }  // namespace
 
 int main() {
@@ -141,6 +205,7 @@ int main() {
         {"reject_bucket_coverage_gap", test_reject_bucket_coverage_gap},
         {"four_gpu_lane_matched_candidate_validates", test_four_gpu_lane_matched_candidate_validates},
         {"peer_aware_lane_matching_reduces_lane_matched_cost", test_peer_aware_lane_matching_reduces_lane_matched_cost},
+        {"bounded_q4_lane_matched_respects_three_admit_cap", test_bounded_q4_lane_matched_respects_three_admit_cap},
     };
 
     for (const auto &[name, test] : tests) {

@@ -1327,15 +1327,22 @@ void DataLoader::setBufferOrdering() {
             graph_storage_->clearStateflowPeerHandoffs();
             bool access_aware_state_generation = false;
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
+            bool bounded_greedy_cover_q4_requested = parse_env_flag("GEGE_BOUNDED_GREEDY_COVER_Q4", false);
             bool hybrid_cover_schedule_requested = parse_env_flag("GEGE_HYBRID_COVER", false);
             bool stateflow_lane_matching_requested = parse_env_flag(
                 "GEGE_STATEFLOW_LANE_MATCHING",
-                requested_active_devices > 1 && physical_devices > 1 && partition_buffer_peer_relay_requested());
+                requested_active_devices > 1 && physical_devices > 1 &&
+                    (partition_buffer_peer_relay_requested() || bounded_greedy_cover_q4_requested));
             bool hybrid_cover_geometry_supported =
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
                 !options->randomly_assign_edge_buckets && requested_active_devices == 1 && physical_devices == 1 &&
                 options->buffer_capacity == 4 && options->num_partitions >= 4 && options->num_partitions % 3 == 1;
             bool hybrid_cover_schedule_supported = hybrid_cover_schedule_requested && hybrid_cover_geometry_supported;
+            bool bounded_greedy_cover_q4_supported =
+                bounded_greedy_cover_q4_requested &&
+                options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
+                !options->randomly_assign_edge_buckets &&
+                options->buffer_capacity == 4;
             const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
             if (access_aware_state_generation_env != nullptr && access_aware_state_generation_env[0] != '\0' &&
                 std::string(access_aware_state_generation_env) != "0") {
@@ -1347,7 +1354,13 @@ void DataLoader::setBufferOrdering() {
             bool used_hybrid_cover_schedule = false;
             bool used_stateflow_planner = false;
             bool used_stateflow_lane_matching = false;
+            bool used_bounded_greedy_cover_q4 = false;
             bool stateflow_single_gpu_planner_requested = parse_env_flag("GEGE_STATEFLOW_PLANNER", false);
+            if (bounded_greedy_cover_q4_requested && !bounded_greedy_cover_q4_supported) {
+                SPDLOG_WARN(
+                    "Ignoring GEGE_BOUNDED_GREEDY_COVER_Q4 because it currently requires CUSTOM ordering, "
+                    "buffer_capacity=4, and no random bucket assignment");
+            }
             if (hybrid_cover_schedule_requested && !hybrid_cover_schedule_supported) {
                 SPDLOG_WARN(
                     "Ignoring GEGE_HYBRID_COVER because it currently requires CUSTOM ordering, 1 physical/logical device, "
@@ -1385,6 +1398,17 @@ void DataLoader::setBufferOrdering() {
                     used_hybrid_cover_schedule = stateflow_plan.family == PlanFamily::HYBRID_COVER;
                     used_stateflow_planner = true;
                 }
+            } else if (bounded_greedy_cover_q4_supported) {
+                auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
+                if (requested_active_devices > 1) {
+                    tup = getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(options->num_partitions, options->buffer_capacity,
+                                                                          requested_active_devices, edge_bucket_sizes);
+                } else {
+                    tup = getBoundedGreedyCoverEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, edge_bucket_sizes);
+                }
+                used_bounded_greedy_cover_q4 = true;
+                SPDLOG_INFO("Using bounded GREEDY_COVER q4 ordering for CUSTOM schedule with {} active device(s)",
+                            requested_active_devices);
             } else if (access_aware_state_generation && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM) {
                 tup = getAccessAwareCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices);
                 SPDLOG_INFO("Using access-aware state generation for CUSTOM ordering with {} logical device(s)", requested_active_devices);
@@ -1403,7 +1427,8 @@ void DataLoader::setBufferOrdering() {
             }
             buffer_states_ = std::get<0>(tup);
             edge_buckets_per_buffer_ = std::get<1>(tup);
-            if (!used_stateflow_planner && !used_optimized_custom_schedule && !used_hybrid_cover_schedule && single_gpu_gpu_aware_custom_enabled() &&
+            if (!used_stateflow_planner && !used_optimized_custom_schedule && !used_hybrid_cover_schedule &&
+                !used_bounded_greedy_cover_q4 && single_gpu_gpu_aware_custom_enabled() &&
                 requested_active_devices == 1 && physical_devices == 1 &&
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM && !options->randomly_assign_edge_buckets &&
                 buffer_states_.size() > 1 && edge_buckets_per_buffer_.size() == buffer_states_.size()) {
@@ -1512,15 +1537,20 @@ void DataLoader::setBufferOrdering() {
                                 requested_active_devices, used_optimized_custom_schedule);
                 }
             }
+            if (used_bounded_greedy_cover_q4 && requested_active_devices > 1 && !used_stateflow_lane_matching) {
+                throw GegeRuntimeException(
+                    "Bounded GREEDY_COVER q4 multi-GPU scheduling requires Stateflow lane matching; "
+                    "check GEGE_STATEFLOW_LANE_MATCHING, active device count, and per-lane max-admit constraints");
+            }
             if (!used_stateflow_planner && !access_aware_state_generation && !used_optimized_custom_schedule &&
-                !used_hybrid_cover_schedule && !used_stateflow_lane_matching) {
+                !used_hybrid_cover_schedule && !used_stateflow_lane_matching && !used_bounded_greedy_cover_q4) {
                 reorder_buffer_ordering(buffer_states_, edge_buckets_per_buffer_);
             }
             if (log_startup_timing) {
                 SPDLOG_INFO(
-                    "[startup-timing][DataLoader::setBufferOrdering] generated states={} buckets={} optimized_custom={} hybrid_cover={} stateflow_planner={} stateflow_lane_matching={} access_aware_state_generation={}",
+                    "[startup-timing][DataLoader::setBufferOrdering] generated states={} buckets={} optimized_custom={} hybrid_cover={} bounded_greedy_cover_q4={} stateflow_planner={} stateflow_lane_matching={} access_aware_state_generation={}",
                     buffer_states_.size(), edge_buckets_per_buffer_.size(), used_optimized_custom_schedule, used_hybrid_cover_schedule,
-                    used_stateflow_planner, used_stateflow_lane_matching, access_aware_state_generation);
+                    used_bounded_greedy_cover_q4, used_stateflow_planner, used_stateflow_lane_matching, access_aware_state_generation);
             }
             if (replay_logical_lane) {
                 if (profiled_logical_lane.value() >= requested_active_devices) {

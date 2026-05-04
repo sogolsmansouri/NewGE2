@@ -92,6 +92,7 @@ struct PlanCostBreakdown {
 struct LaneMatchCostConfig {
     int64_t peer_bandwidth_bps = 32000000000LL;
     int64_t host_bandwidth_bps = 16000000000LL;
+    int64_t max_admits_per_transition = -1;
     double imbalance_weight = 1.0;
     double boundary_weight = 1.0;
     bool allow_peer_relay = false;
@@ -239,6 +240,17 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomEdgeBucketOrde
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getGreedyCoverEdgeBucketOrdering(int num_partitions,
                                                                                           int buffer_capacity);
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEdgeBucketOrdering(
+    int num_partitions,
+    int buffer_capacity,
+    const vector<int64_t>& edge_bucket_sizes);
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(
+    int num_partitions,
+    int buffer_capacity,
+    int active_devices,
+    const vector<int64_t>& edge_bucket_sizes);
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getOptimizedCustomEdgeBucketOrdering(
     int num_partitions,

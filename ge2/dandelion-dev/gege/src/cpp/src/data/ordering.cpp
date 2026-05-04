@@ -69,6 +69,16 @@ bool contrastive_greedy_cover_ordering_enabled() {
     return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
 }
 
+bool bounded_greedy_cover_q4_enabled() {
+    const char *raw = std::getenv("GEGE_BOUNDED_GREEDY_COVER_Q4");
+    if (raw == nullptr) {
+        return false;
+    }
+
+    std::string value(raw);
+    return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
+}
+
 bool hybrid_cover_ordering_enabled() {
     const char *raw = std::getenv("GEGE_HYBRID_COVER");
     if (raw == nullptr) {
@@ -158,6 +168,8 @@ LaneMatchCostConfig lane_match_cost_config_from_env() {
         std::max<int64_t>(1, stateflow_env_int64("GEGE_STATEFLOW_PEER_BANDWIDTH_BPS", "STATEFLOW_PEER_BANDWIDTH_BPS", 32000000000LL));
     cfg.host_bandwidth_bps =
         std::max<int64_t>(1, stateflow_env_int64("GEGE_STATEFLOW_HOST_BANDWIDTH_BPS", "STATEFLOW_HOST_BANDWIDTH_BPS", 16000000000LL));
+    cfg.max_admits_per_transition =
+        stateflow_env_int64("GEGE_STATEFLOW_MAX_ADMITS", "STATEFLOW_MAX_ADMITS", bounded_greedy_cover_q4_enabled() ? 3 : -1);
     cfg.imbalance_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_IMBALANCE_WEIGHT", 1.0);
     cfg.boundary_weight = stateflow_cost_env("GEGE_STATEFLOW_LANE_BOUNDARY_WEIGHT", 1.0);
     cfg.allow_peer_relay =
@@ -1379,6 +1391,38 @@ int64_t state_access_overlap_score(const StateAccessSummary &lhs, const StateAcc
     return score;
 }
 
+int64_t state_access_overlap_count(const StateAccessSummary &lhs, const StateAccessSummary &rhs) {
+    std::size_t i = 0;
+    std::size_t j = 0;
+    int64_t overlap = 0;
+    while (i < lhs.partitions.size() && j < rhs.partitions.size()) {
+        if (lhs.partitions[i] == rhs.partitions[j]) {
+            overlap++;
+            i++;
+            j++;
+        } else if (lhs.partitions[i] < rhs.partitions[j]) {
+            i++;
+        } else {
+            j++;
+        }
+    }
+    return overlap;
+}
+
+int64_t state_access_admit_count(const StateAccessSummary &previous_state, const StateAccessSummary &next_state) {
+    return static_cast<int64_t>(next_state.partitions.size()) -
+           state_access_overlap_count(previous_state, next_state);
+}
+
+bool lane_transition_respects_max_admits(const StateAccessSummary &previous_state,
+                                         const StateAccessSummary &next_state,
+                                         const LaneMatchCostConfig &cfg) {
+    if (cfg.max_admits_per_transition < 0) {
+        return true;
+    }
+    return state_access_admit_count(previous_state, next_state) <= cfg.max_admits_per_transition;
+}
+
 struct GroupAlignmentResult {
     int64_t score = std::numeric_limits<int64_t>::min();
     std::vector<int64_t> ordered_group;
@@ -1515,6 +1559,10 @@ double lane_assignment_transition_cost(const StateAccessSummary &previous_state,
                                        const std::vector<int64_t> &partition_row_counts,
                                        const LaneMatchCostConfig &cfg,
                                        int64_t bytes_per_row) {
+    if (!lane_transition_respects_max_admits(previous_state, next_state, cfg)) {
+        return std::numeric_limits<double>::infinity();
+    }
+
     const int64_t host_bytes =
         handoff_bytes_host(next_state.partitions, previous_state.partitions, partition_row_counts, bytes_per_row);
     int64_t peer_bytes = 0;
@@ -1590,14 +1638,18 @@ LaneAlignmentResult search_best_lane_alignment_dp(const std::vector<int64_t> &pr
             continue;
         }
 
+        double step_cost = lane_assignment_transition_cost(summaries[prev_group[slot]], summaries[candidate_group[candidate_idx]],
+                                                           summaries, prev_group, slot, partition_row_counts, cfg, bytes_per_row);
+        if (step_cost == std::numeric_limits<double>::infinity()) {
+            continue;
+        }
+
         LaneAlignmentResult suffix = search_best_lane_alignment_dp(prev_group, candidate_group, summaries, partition_row_counts, cfg,
                                                                    bytes_per_row, used_mask | (1ULL << candidate_idx), memo);
         if (suffix.cost == std::numeric_limits<double>::infinity()) {
             continue;
         }
 
-        double step_cost = lane_assignment_transition_cost(summaries[prev_group[slot]], summaries[candidate_group[candidate_idx]],
-                                                           summaries, prev_group, slot, partition_row_counts, cfg, bytes_per_row);
         std::vector<int64_t> ordered_group;
         ordered_group.reserve(1 + suffix.ordered_group.size());
         ordered_group.emplace_back(candidate_group[candidate_idx]);
@@ -1626,12 +1678,24 @@ LaneAlignmentResult get_best_lane_alignment(const std::vector<int64_t> &prev_gro
     if (prev_group.empty()) {
         return LaneAlignmentResult{0.0, candidate_group};
     }
-    if (prev_group.size() != candidate_group.size() || candidate_group.size() >= 64) {
+    if (candidate_group.size() >= 64) {
+        return LaneAlignmentResult{};
+    }
+
+    std::vector<int64_t> prev_lane_prefix;
+    prev_lane_prefix.reserve(std::min(prev_group.size(), candidate_group.size()));
+    for (std::size_t idx = 0; idx < prev_group.size() && idx < candidate_group.size(); idx++) {
+        prev_lane_prefix.emplace_back(prev_group[idx]);
+    }
+    if (prev_lane_prefix.empty()) {
+        return LaneAlignmentResult{0.0, candidate_group};
+    }
+    if (prev_lane_prefix.size() != candidate_group.size()) {
         return LaneAlignmentResult{};
     }
 
     std::unordered_map<uint64_t, LaneAlignmentResult> memo;
-    return search_best_lane_alignment_dp(prev_group, candidate_group, summaries, partition_row_counts, cfg, bytes_per_row, 0ULL, memo);
+    return search_best_lane_alignment_dp(prev_lane_prefix, candidate_group, summaries, partition_row_counts, cfg, bytes_per_row, 0ULL, memo);
 }
 
 struct LaneGroupAssignmentResult {
@@ -1704,7 +1768,7 @@ LaneGroupAssignmentResult get_best_cost_aware_lane_group(const std::vector<std::
     if (remaining.empty()) {
         return best;
     }
-    if (target_group_size <= 1 || prev_group.size() != static_cast<std::size_t>(target_group_size)) {
+    if (prev_group.empty()) {
         GroupSearchResult greedy;
         std::vector<int64_t> current_group;
         current_group.reserve(std::min<std::size_t>(remaining.size(), static_cast<std::size_t>(std::max(target_group_size, 1))));
@@ -1723,6 +1787,9 @@ LaneGroupAssignmentResult get_best_cost_aware_lane_group(const std::vector<std::
                                  current_group, best);
 
     if (best.cost == std::numeric_limits<double>::infinity()) {
+        if (cfg.max_admits_per_transition >= 0) {
+            return best;
+        }
         GroupSearchResult greedy;
         current_group.clear();
         search_best_disjoint_group(compatible, remaining, prev_group, summaries, target_group_size, 0, current_group, greedy);
@@ -2072,6 +2139,9 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(E
             if (hybrid_cover_ordering_enabled()) {
                 return getHybridCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
             }
+            if (bounded_greedy_cover_q4_enabled()) {
+                return getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, {});
+            }
             if (contrastive_greedy_cover_ordering_enabled()) {
                 return getGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
             }
@@ -2258,6 +2328,907 @@ int state_overlap_count(const std::vector<int> &lhs, const std::vector<int> &rhs
         }
     }
     return overlap;
+}
+
+int64_t mark_state_buckets_covered(const std::vector<int> &state,
+                                   std::vector<uint8_t> &covered,
+                                   int num_partitions);
+
+std::vector<std::vector<int>> build_greedy_cover_state_set(int num_partitions, int buffer_capacity) {
+    std::vector<std::vector<int>> candidates;
+    std::vector<int> current;
+    build_greedy_cover_candidates(num_partitions, buffer_capacity, 0, current, candidates);
+    if (candidates.empty()) {
+        return {};
+    }
+
+    std::vector<uint8_t> covered(num_partitions * num_partitions, 0);
+    int64_t covered_count = 0;
+    const int64_t total_buckets = static_cast<int64_t>(num_partitions) * static_cast<int64_t>(num_partitions);
+    std::vector<std::vector<int>> buffer_states;
+    buffer_states.reserve(candidates.size());
+
+    while (covered_count < total_buckets) {
+        int64_t best_gain = -1;
+        int best_overlap = -1;
+        int64_t best_balance_score = std::numeric_limits<int64_t>::max();
+        int best_idx = -1;
+
+        for (int candidate_idx = 0; candidate_idx < static_cast<int>(candidates.size()); candidate_idx++) {
+            const auto &candidate = candidates[candidate_idx];
+            int64_t gain = count_uncovered_buckets_for_state(candidate, covered, num_partitions);
+            if (gain == 0) {
+                continue;
+            }
+
+            int overlap = buffer_states.empty() ? 0 : state_overlap_count(buffer_states.back(), candidate);
+            int64_t balance_score = 0;
+            for (auto partition : candidate) {
+                balance_score += partition;
+            }
+
+            if (gain > best_gain ||
+                (gain == best_gain && overlap > best_overlap) ||
+                (gain == best_gain && overlap == best_overlap && balance_score < best_balance_score)) {
+                best_gain = gain;
+                best_overlap = overlap;
+                best_balance_score = balance_score;
+                best_idx = candidate_idx;
+            }
+        }
+
+        if (best_idx < 0) {
+            SPDLOG_WARN("Greedy cover state-set generation stopped early: covered={} total={}", covered_count, total_buckets);
+            break;
+        }
+
+        auto state = candidates[best_idx];
+        covered_count += mark_state_buckets_covered(state, covered, num_partitions);
+        buffer_states.emplace_back(std::move(state));
+    }
+
+    return buffer_states;
+}
+
+std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> bounded_path_score(
+    const std::vector<int> &order,
+    const std::vector<std::vector<int>> &overlap) {
+    int64_t zero_overlap = 0;
+    int64_t total_overlap = 0;
+    int64_t overlap_three = 0;
+    int64_t overlap_two = 0;
+    int64_t overlap_one = 0;
+
+    for (std::size_t idx = 1; idx < order.size(); idx++) {
+        int value = overlap[order[idx - 1]][order[idx]];
+        total_overlap += value;
+        if (value == 0) {
+            zero_overlap++;
+        } else if (value == 1) {
+            overlap_one++;
+        } else if (value == 2) {
+            overlap_two++;
+        } else if (value == 3) {
+            overlap_three++;
+        }
+    }
+
+    return std::make_tuple(-zero_overlap, total_overlap, overlap_three, overlap_two, -overlap_one);
+}
+
+double bounded_path_score_scalar(const std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> &score) {
+    return static_cast<double>(std::get<0>(score)) * 1000000.0 +
+           static_cast<double>(std::get<1>(score)) * 1000.0 +
+           static_cast<double>(std::get<2>(score)) * 30.0 +
+           static_cast<double>(std::get<3>(score));
+}
+
+std::vector<int> build_bounded_greedy_path_once(const std::vector<std::vector<int>> &overlap,
+                                                std::mt19937_64 &rng,
+                                                int start_idx,
+                                                int candidate_pool) {
+    const int num_states = static_cast<int>(overlap.size());
+    if (num_states == 0) {
+        return {};
+    }
+
+    std::vector<uint8_t> used(num_states, 0);
+    std::vector<int> order;
+    order.reserve(num_states);
+    order.emplace_back(start_idx);
+    used[start_idx] = 1;
+
+    while (static_cast<int>(order.size()) < num_states) {
+        struct Option {
+            int overlap = 0;
+            int future_degree = 0;
+            uint64_t jitter = 0;
+            bool prepend = false;
+            int state_idx = -1;
+        };
+
+        std::vector<Option> options;
+        options.reserve(num_states * 2);
+        for (int side = 0; side < 2; side++) {
+            int endpoint = side == 0 ? order.front() : order.back();
+            for (int candidate = 0; candidate < num_states; candidate++) {
+                if (used[candidate] != 0) {
+                    continue;
+                }
+                int shared = overlap[endpoint][candidate];
+                if (shared <= 0) {
+                    continue;
+                }
+
+                int future_degree = 0;
+                for (int other = 0; other < num_states; other++) {
+                    if (other == candidate || used[other] != 0) {
+                        continue;
+                    }
+                    if (overlap[candidate][other] > 0) {
+                        future_degree++;
+                    }
+                }
+                options.push_back(Option{shared, future_degree, rng(), side == 0, candidate});
+            }
+        }
+
+        if (options.empty()) {
+            return {};
+        }
+
+        std::sort(options.begin(), options.end(), [](const Option &lhs, const Option &rhs) {
+            return std::make_tuple(lhs.overlap, lhs.future_degree, lhs.jitter) >
+                   std::make_tuple(rhs.overlap, rhs.future_degree, rhs.jitter);
+        });
+
+        int limit = std::min<int>(std::max(candidate_pool, 1), options.size());
+        std::uniform_int_distribution<int> pick_dist(0, limit - 1);
+        const auto chosen = options[pick_dist(rng)];
+        used[chosen.state_idx] = 1;
+        if (chosen.prepend) {
+            order.insert(order.begin(), chosen.state_idx);
+        } else {
+            order.emplace_back(chosen.state_idx);
+        }
+    }
+
+    return order;
+}
+
+std::vector<int> improve_bounded_greedy_path(std::vector<int> order,
+                                             const std::vector<std::vector<int>> &overlap,
+                                             std::mt19937_64 &rng,
+                                             int iterations) {
+    if (order.size() <= 2 || iterations <= 0) {
+        return order;
+    }
+
+    std::vector<int> best = order;
+    auto current_score = bounded_path_score(order, overlap);
+    auto best_score = current_score;
+    double temperature = 10.0;
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+
+    for (int iter = 0; iter < iterations; iter++) {
+        std::vector<int> candidate = order;
+        std::uniform_int_distribution<int> index_dist(0, static_cast<int>(order.size()) - 1);
+        int left = index_dist(rng);
+        int right = index_dist(rng);
+        if (left == right) {
+            continue;
+        }
+        if (left > right) {
+            std::swap(left, right);
+        }
+
+        if (iter % 3 == 0) {
+            std::reverse(candidate.begin() + left, candidate.begin() + right + 1);
+        } else if (iter % 3 == 1) {
+            int value = candidate[left];
+            candidate.erase(candidate.begin() + left);
+            int insert_pos = right;
+            if (insert_pos > static_cast<int>(candidate.size())) {
+                insert_pos = static_cast<int>(candidate.size());
+            }
+            candidate.insert(candidate.begin() + insert_pos, value);
+        } else {
+            std::swap(candidate[left], candidate[right]);
+        }
+
+        auto candidate_score = bounded_path_score(candidate, overlap);
+        const double delta = bounded_path_score_scalar(candidate_score) - bounded_path_score_scalar(current_score);
+        if (candidate_score > current_score || unit(rng) < std::exp(std::min(0.0, delta) / std::max(temperature, 1e-9))) {
+            order = std::move(candidate);
+            current_score = candidate_score;
+            if (current_score > best_score) {
+                best = order;
+                best_score = current_score;
+            }
+        }
+        temperature *= 0.9995;
+    }
+
+    return best;
+}
+
+std::vector<std::vector<int>> reorder_states_for_bounded_admits(const std::vector<std::vector<int>> &states,
+                                                                int max_admits) {
+    const int num_states = static_cast<int>(states.size());
+    if (num_states <= 2 || states.front().empty()) {
+        return states;
+    }
+
+    const int buffer_capacity = static_cast<int>(states.front().size());
+    const int min_overlap = std::max(0, buffer_capacity - max_admits);
+    std::vector<std::vector<int>> overlap(num_states, std::vector<int>(num_states, 0));
+    for (int lhs = 0; lhs < num_states; lhs++) {
+        for (int rhs = lhs + 1; rhs < num_states; rhs++) {
+            int shared = state_overlap_count(states[lhs], states[rhs]);
+            overlap[lhs][rhs] = shared;
+            overlap[rhs][lhs] = shared;
+        }
+    }
+
+    const int restarts = static_cast<int>(
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_GREEDY_RESTARTS", nullptr, 512)));
+    const int local_iterations = static_cast<int>(
+        std::max<int64_t>(0, stateflow_env_int64("GEGE_BOUNDED_GREEDY_LOCAL_ITERS", nullptr, 768)));
+    const int candidate_pool = static_cast<int>(
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_GREEDY_CANDIDATE_POOL", nullptr, 30)));
+    const int64_t seed = stateflow_env_int64("GEGE_BOUNDED_GREEDY_SEED", nullptr, 12345);
+
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+    std::vector<int> best_order;
+    std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t> best_score{
+        std::numeric_limits<int64_t>::min(), 0, 0, 0, 0};
+
+    for (int restart = 0; restart < restarts; restart++) {
+        int start_idx = restart % num_states;
+        if (restart >= num_states) {
+            std::uniform_int_distribution<int> start_dist(0, num_states - 1);
+            start_idx = start_dist(rng);
+        }
+
+        auto order = build_bounded_greedy_path_once(overlap, rng, start_idx, candidate_pool);
+        if (static_cast<int>(order.size()) != num_states) {
+            continue;
+        }
+        order = improve_bounded_greedy_path(std::move(order), overlap, rng, local_iterations);
+        auto score = bounded_path_score(order, overlap);
+        if (score > best_score) {
+            best_score = score;
+            best_order = std::move(order);
+        }
+    }
+
+    if (best_order.empty() || -std::get<0>(best_score) != 0) {
+        SPDLOG_WARN("Bounded greedy cover could not find a full overlap>={} path; falling back to max-overlap reorder",
+                    min_overlap);
+        return reorder_states_for_max_overlap(states);
+    }
+
+    std::vector<std::vector<int>> reordered;
+    reordered.reserve(states.size());
+    for (auto state_idx : best_order) {
+        reordered.emplace_back(states[state_idx]);
+    }
+    return reordered;
+}
+
+std::vector<std::vector<int>> p32_q4_bounded_greedy_cover_state_order() {
+    return {
+        {6, 17, 27, 28},
+        {3, 12, 25, 28},
+        {12, 21, 22, 28},
+        {7, 12, 22, 26},
+        {2, 7, 18, 20},
+        {1, 18, 24, 29},
+        {8, 15, 18, 25},
+        {0, 19, 20, 25},
+        {10, 14, 20, 25},
+        {13, 14, 20, 31},
+        {12, 13, 14, 15},
+        {2, 6, 9, 14},
+        {9, 14, 21, 24},
+        {5, 16, 24, 30},
+        {7, 13, 24, 28},
+        {6, 13, 17, 24},
+        {0, 17, 22, 24},
+        {9, 12, 17, 29},
+        {0, 5, 9, 12},
+        {4, 5, 6, 7},
+        {3, 6, 18, 21},
+        {4, 18, 27, 31},
+        {10, 17, 26, 31},
+        {9, 16, 26, 31},
+        {11, 12, 24, 31},
+        {24, 25, 26, 27},
+        {4, 21, 26, 29},
+        {5, 8, 26, 29},
+        {5, 8, 19, 31},
+        {6, 8, 21, 31},
+        {1, 6, 8, 12},
+        {8, 12, 20, 30},
+        {10, 12, 18, 30},
+        {10, 12, 16, 27},
+        {2, 4, 10, 12},
+        {4, 12, 19, 23},
+        {7, 9, 23, 25},
+        {5, 15, 23, 27},
+        {20, 23, 27, 29},
+        {14, 19, 27, 29},
+        {3, 13, 27, 29},
+        {0, 7, 27, 29},
+        {0, 7, 11, 14},
+        {0, 7, 30, 31},
+        {28, 29, 30, 31},
+        {2, 15, 30, 31},
+        {2, 15, 19, 24},
+        {1, 19, 26, 28},
+        {0, 1, 2, 3},
+        {1, 3, 23, 31},
+        {3, 10, 23, 24},
+        {0, 18, 23, 26},
+        {0, 4, 8, 28},
+        {4, 8, 20, 24},
+        {1, 4, 9, 13},
+        {9, 13, 16, 18},
+        {16, 17, 18, 19},
+        {4, 14, 16, 22},
+        {1, 22, 25, 31},
+        {1, 7, 15, 17},
+        {6, 15, 20, 26},
+        {10, 15, 22, 29},
+        {0, 6, 10, 13},
+        {6, 13, 22, 30},
+        {13, 19, 23, 30},
+        {6, 11, 19, 23},
+        {1, 11, 16, 20},
+        {0, 15, 16, 21},
+        {2, 16, 23, 28},
+        {6, 16, 25, 29},
+        {2, 11, 25, 29},
+        {2, 11, 13, 26},
+        {2, 11, 17, 21},
+        {20, 21, 22, 23},
+        {1, 21, 27, 30},
+        {9, 11, 27, 30},
+        {8, 9, 10, 11},
+        {9, 10, 20, 28},
+        {9, 11, 15, 28},
+        {3, 4, 11, 15},
+        {4, 17, 25, 30},
+        {8, 14, 17, 23},
+        {3, 14, 26, 30},
+        {3, 7, 8, 16},
+        {3, 5, 17, 20},
+        {5, 11, 18, 22},
+        {5, 14, 18, 28},
+        {1, 5, 10, 14},
+        {7, 10, 19, 21},
+        {5, 13, 21, 25},
+        {2, 5, 8, 13},
+        {2, 8, 22, 27},
+        {3, 9, 19, 22},
+    };
+}
+
+int64_t count_uncovered_diagonal_gain(const std::vector<int> &state,
+                                      const std::vector<uint8_t> &covered,
+                                      int num_partitions) {
+    int64_t gain = 0;
+    for (auto partition : state) {
+        if (partition >= 0 && partition < num_partitions &&
+            covered[partition * num_partitions + partition] == 0) {
+            gain++;
+        }
+    }
+    return gain;
+}
+
+bool state_conflicts_with_round_partitions(const std::vector<int> &state,
+                                           const std::vector<uint8_t> &round_partitions) {
+    for (auto partition : state) {
+        if (partition >= 0 && partition < static_cast<int>(round_partitions.size()) &&
+            round_partitions[partition] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void mark_round_partitions(const std::vector<int> &state,
+                           std::vector<uint8_t> &round_partitions) {
+    for (auto partition : state) {
+        if (partition >= 0 && partition < static_cast<int>(round_partitions.size())) {
+            round_partitions[partition] = 1;
+        }
+    }
+}
+
+struct BoundedMultiGpuRoundOption {
+    double score = 0.0;
+    int candidate_idx = -1;
+    int64_t uncovered_gain = 0;
+    int overlap = 0;
+};
+
+std::vector<std::vector<int>> build_bounded_multi_gpu_round_states(int num_partitions,
+                                                                    int buffer_capacity,
+                                                                    int active_devices,
+                                                                    int max_admits) {
+    std::vector<std::vector<int>> candidates;
+    std::vector<int> current;
+    build_greedy_cover_candidates(num_partitions, buffer_capacity, 0, current, candidates);
+    if (candidates.empty() || active_devices <= 1) {
+        return {};
+    }
+
+    if (active_devices * buffer_capacity > num_partitions) {
+        SPDLOG_WARN(
+            "Bounded multi-GPU q{} cover requires active_devices * buffer_capacity <= num_partitions for disjoint visible rounds; got active_devices={} num_partitions={}",
+            buffer_capacity, active_devices, num_partitions);
+        return {};
+    }
+
+    const int min_overlap = std::max(0, buffer_capacity - std::max(0, max_admits));
+    const int64_t total_buckets = static_cast<int64_t>(num_partitions) * static_cast<int64_t>(num_partitions);
+    const int64_t optimistic_round_capacity =
+        std::max<int64_t>(1, static_cast<int64_t>(active_devices) * buffer_capacity * buffer_capacity);
+    const int lower_bound_rounds =
+        static_cast<int>((total_buckets + optimistic_round_capacity - 1) / optimistic_round_capacity);
+    const int max_rounds = static_cast<int>(
+        std::max<int64_t>(lower_bound_rounds + 16,
+                          stateflow_env_int64("GEGE_BOUNDED_MULTI_GPU_MAX_ROUNDS", nullptr,
+                                              std::max<int64_t>(num_partitions * 4, lower_bound_rounds * 4))));
+    const int restarts = static_cast<int>(
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_MULTI_GPU_RESTARTS", nullptr, 12)));
+    const int topk = static_cast<int>(
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_MULTI_GPU_TOPK", nullptr, 64)));
+    const int64_t seed = stateflow_env_int64("GEGE_BOUNDED_MULTI_GPU_SEED", nullptr, 12345);
+
+    std::vector<std::vector<int>> best_states;
+    int64_t best_total_admits = std::numeric_limits<int64_t>::max();
+    int64_t best_total_overlap = std::numeric_limits<int64_t>::min();
+
+    for (int restart = 0; restart < restarts; restart++) {
+        std::mt19937_64 rng(static_cast<uint64_t>(seed + restart * 9973));
+        std::uniform_real_distribution<double> unit(0.0, 1.0);
+
+        std::vector<uint8_t> covered(num_partitions * num_partitions, 0);
+        int64_t covered_count = 0;
+        std::vector<std::vector<int>> lane_previous(active_devices);
+        std::vector<std::vector<int>> states;
+        states.reserve(static_cast<std::size_t>(max_rounds * active_devices));
+        int64_t total_admits = 0;
+        int64_t total_overlap = 0;
+        bool failed = false;
+
+        for (int round = 0; round < max_rounds && covered_count < total_buckets; round++) {
+            std::vector<int> lane_order(active_devices);
+            std::iota(lane_order.begin(), lane_order.end(), 0);
+            if (restart > 0) {
+                std::shuffle(lane_order.begin(), lane_order.end(), rng);
+            }
+
+            std::vector<int> chosen_by_lane(active_devices, -1);
+            std::vector<uint8_t> round_partitions(num_partitions, 0);
+
+            for (auto lane : lane_order) {
+                std::vector<BoundedMultiGpuRoundOption> options;
+                options.reserve(std::min<int>(topk * 4, candidates.size()));
+                for (int candidate_idx = 0; candidate_idx < static_cast<int>(candidates.size()); candidate_idx++) {
+                    const auto &candidate = candidates[candidate_idx];
+                    if (state_conflicts_with_round_partitions(candidate, round_partitions)) {
+                        continue;
+                    }
+
+                    int overlap = lane_previous[lane].empty()
+                                      ? 0
+                                      : state_overlap_count(lane_previous[lane], candidate);
+                    if (!lane_previous[lane].empty() && overlap < min_overlap) {
+                        continue;
+                    }
+
+                    int64_t uncovered_gain = count_uncovered_buckets_for_state(candidate, covered, num_partitions);
+                    int64_t diagonal_gain = count_uncovered_diagonal_gain(candidate, covered, num_partitions);
+                    double score = static_cast<double>(uncovered_gain) * 100000.0 +
+                                   static_cast<double>(diagonal_gain) * 1000.0 +
+                                   static_cast<double>(overlap) * 10.0;
+                    if (uncovered_gain == 0 && covered_count < total_buckets) {
+                        score -= 1000000.0;
+                    }
+                    if (restart > 0) {
+                        score += unit(rng);
+                    }
+
+                    options.push_back(BoundedMultiGpuRoundOption{score, candidate_idx, uncovered_gain, overlap});
+                }
+
+                if (options.empty()) {
+                    failed = true;
+                    break;
+                }
+
+                const int keep = std::min<int>(topk, options.size());
+                std::partial_sort(options.begin(), options.begin() + keep, options.end(),
+                                  [](const auto &lhs, const auto &rhs) {
+                                      if (lhs.score != rhs.score) {
+                                          return lhs.score > rhs.score;
+                                      }
+                                      return lhs.candidate_idx < rhs.candidate_idx;
+                                  });
+                options.resize(keep);
+
+                int option_idx = 0;
+                if (restart > 0 && options.size() > 1 && unit(rng) >= 0.7) {
+                    const int random_limit = std::min<int>(10, options.size());
+                    option_idx = static_cast<int>(unit(rng) * unit(rng) * random_limit);
+                    option_idx = std::min(option_idx, random_limit - 1);
+                }
+
+                const int candidate_idx = options[option_idx].candidate_idx;
+                chosen_by_lane[lane] = candidate_idx;
+                mark_round_partitions(candidates[candidate_idx], round_partitions);
+            }
+
+            if (failed) {
+                break;
+            }
+
+            for (int lane = 0; lane < active_devices; lane++) {
+                int candidate_idx = chosen_by_lane[lane];
+                if (candidate_idx < 0) {
+                    failed = true;
+                    break;
+                }
+
+                const auto &candidate = candidates[candidate_idx];
+                if (!lane_previous[lane].empty()) {
+                    int overlap = state_overlap_count(lane_previous[lane], candidate);
+                    total_overlap += overlap;
+                    total_admits += static_cast<int64_t>(buffer_capacity - overlap);
+                }
+                covered_count += mark_state_buckets_covered(candidate, covered, num_partitions);
+                states.emplace_back(candidate);
+                lane_previous[lane] = candidate;
+            }
+
+            if (failed) {
+                break;
+            }
+        }
+
+        if (failed || covered_count < total_buckets) {
+            continue;
+        }
+
+        if (best_states.empty() ||
+            states.size() < best_states.size() ||
+            (states.size() == best_states.size() && total_admits < best_total_admits) ||
+            (states.size() == best_states.size() && total_admits == best_total_admits &&
+             total_overlap > best_total_overlap)) {
+            best_states = std::move(states);
+            best_total_admits = total_admits;
+            best_total_overlap = total_overlap;
+        }
+    }
+
+    if (best_states.empty()) {
+        SPDLOG_WARN(
+            "Bounded multi-GPU q{} cover failed to find exact coverage with active_devices={} max_admits={} restarts={} max_rounds={}",
+            buffer_capacity, active_devices, max_admits, restarts, max_rounds);
+        return {};
+    }
+
+    SPDLOG_INFO(
+        "Bounded multi-GPU q{} cover selected states={} rounds={} active_devices={} max_admits={} lane_transition_admits={} lane_transition_overlap={}",
+        buffer_capacity, best_states.size(),
+        (static_cast<int64_t>(best_states.size()) + active_devices - 1) / active_devices,
+        active_devices, max_admits, best_total_admits, best_total_overlap);
+    return best_states;
+}
+
+vector<vector<std::pair<int, int>>> balancedAssignEdgeBucketsToBuffers(const vector<vector<int>> &buffer_states,
+                                                                       int num_partitions,
+                                                                       const vector<int64_t> &edge_bucket_sizes) {
+    if (buffer_states.empty()) {
+        return {};
+    }
+
+    const bool have_sizes = edge_bucket_sizes.size() == static_cast<std::size_t>(num_partitions * num_partitions);
+    std::vector<std::vector<uint8_t>> contains(buffer_states.size(), std::vector<uint8_t>(num_partitions, 0));
+    for (std::size_t state_idx = 0; state_idx < buffer_states.size(); state_idx++) {
+        for (auto partition : buffer_states[state_idx]) {
+            if (partition >= 0 && partition < num_partitions) {
+                contains[state_idx][partition] = 1;
+            }
+        }
+    }
+
+    struct BucketCandidate {
+        int src = 0;
+        int dst = 0;
+        int64_t weight = 1;
+    };
+    std::vector<BucketCandidate> buckets;
+    buckets.reserve(static_cast<std::size_t>(num_partitions) * static_cast<std::size_t>(num_partitions));
+    for (int src = 0; src < num_partitions; src++) {
+        for (int dst = 0; dst < num_partitions; dst++) {
+            int64_t weight = have_sizes ? edge_bucket_sizes[src * num_partitions + dst] : 1;
+            buckets.push_back(BucketCandidate{src, dst, weight});
+        }
+    }
+    std::sort(buckets.begin(), buckets.end(), [](const BucketCandidate &lhs, const BucketCandidate &rhs) {
+        return std::make_tuple(lhs.weight, lhs.src, lhs.dst) > std::make_tuple(rhs.weight, rhs.src, rhs.dst);
+    });
+
+    vector<vector<std::pair<int, int>>> edge_buckets_per_buffer(buffer_states.size());
+    std::vector<int64_t> assigned_weight(buffer_states.size(), 0);
+    std::vector<int64_t> assigned_count(buffer_states.size(), 0);
+    std::vector<std::vector<int>> compatible_states(static_cast<std::size_t>(num_partitions) *
+                                                    static_cast<std::size_t>(num_partitions));
+
+    for (const auto &bucket : buckets) {
+        int bucket_idx = bucket.src * num_partitions + bucket.dst;
+        int best_state = -1;
+        auto best_key = std::make_tuple(std::numeric_limits<int64_t>::max(),
+                                        std::numeric_limits<int64_t>::max(),
+                                        std::numeric_limits<int>::max());
+        for (int state_idx = 0; state_idx < static_cast<int>(buffer_states.size()); state_idx++) {
+            if (contains[state_idx][bucket.src] == 0 || contains[state_idx][bucket.dst] == 0) {
+                continue;
+            }
+            compatible_states[bucket_idx].emplace_back(state_idx);
+            auto key = std::make_tuple(assigned_weight[state_idx], assigned_count[state_idx], state_idx);
+            if (key < best_key) {
+                best_key = key;
+                best_state = state_idx;
+            }
+        }
+
+        if (best_state < 0) {
+            SPDLOG_WARN("Balanced bucket assignment found no compatible state for bucket ({},{}); falling back to first-cover assignment",
+                        bucket.src, bucket.dst);
+            return greedyAssignEdgeBucketsToBuffers(buffer_states, num_partitions);
+        }
+
+        edge_buckets_per_buffer[best_state].emplace_back(bucket.src, bucket.dst);
+        assigned_weight[best_state] += bucket.weight;
+        assigned_count[best_state]++;
+    }
+
+    const char *minmax_raw = std::getenv("GEGE_MINMAX_BUCKET_ASSIGNMENT");
+    bool minmax_enabled = have_sizes &&
+                          !(minmax_raw != nullptr &&
+                            (std::string(minmax_raw) == "0" || std::string(minmax_raw) == "false" ||
+                             std::string(minmax_raw) == "False" || std::string(minmax_raw) == "FALSE"));
+    if (minmax_enabled) {
+        auto sum_sq_load = [&assigned_weight]() {
+            long double value = 0.0L;
+            for (auto load : assigned_weight) {
+                value += static_cast<long double>(load) * static_cast<long double>(load);
+            }
+            return value;
+        };
+        auto current_max_load = [&assigned_weight]() {
+            return *std::max_element(assigned_weight.begin(), assigned_weight.end());
+        };
+        auto erase_bucket_from_state = [](vector<std::pair<int, int>> &state_buckets, const std::pair<int, int> &bucket) {
+            auto itr = std::find(state_buckets.begin(), state_buckets.end(), bucket);
+            if (itr != state_buckets.end()) {
+                state_buckets.erase(itr);
+            }
+        };
+        auto max_after_move = [&assigned_weight](int src_state, int dst_state, int64_t bucket_weight) {
+            int64_t max_load = 0;
+            for (int state_idx = 0; state_idx < static_cast<int>(assigned_weight.size()); state_idx++) {
+                int64_t load = assigned_weight[state_idx];
+                if (state_idx == src_state) {
+                    load -= bucket_weight;
+                } else if (state_idx == dst_state) {
+                    load += bucket_weight;
+                }
+                max_load = std::max(max_load, load);
+            }
+            return max_load;
+        };
+        auto sum_sq_after_move = [&assigned_weight](long double current_sum_sq,
+                                                    int src_state,
+                                                    int dst_state,
+                                                    int64_t bucket_weight) {
+            long double src_before = static_cast<long double>(assigned_weight[src_state]);
+            long double dst_before = static_cast<long double>(assigned_weight[dst_state]);
+            long double src_after = src_before - static_cast<long double>(bucket_weight);
+            long double dst_after = dst_before + static_cast<long double>(bucket_weight);
+            return current_sum_sq - src_before * src_before - dst_before * dst_before +
+                   src_after * src_after + dst_after * dst_after;
+        };
+
+        const int max_iterations = static_cast<int>(
+            std::max<int64_t>(1, stateflow_env_int64("GEGE_MINMAX_BUCKET_ASSIGNMENT_ITERS", nullptr, 10000)));
+        const int64_t initial_max_load = current_max_load();
+        const long double initial_sum_sq = sum_sq_load();
+        int64_t moves = 0;
+        for (int iteration = 0; iteration < max_iterations; iteration++) {
+            const int64_t current_max = current_max_load();
+            const long double current_sum_sq = sum_sq_load();
+
+            struct Move {
+                bool valid = false;
+                int64_t new_max = std::numeric_limits<int64_t>::max();
+                long double new_sum_sq = std::numeric_limits<long double>::infinity();
+                int64_t moved_weight = 0;
+                int src_state = -1;
+                int dst_state = -1;
+                std::pair<int, int> bucket{-1, -1};
+            };
+
+            Move best_move;
+            for (int src_state = 0; src_state < static_cast<int>(edge_buckets_per_buffer.size()); src_state++) {
+                if (assigned_weight[src_state] != current_max) {
+                    continue;
+                }
+                for (const auto &bucket : edge_buckets_per_buffer[src_state]) {
+                    int bucket_idx = bucket.first * num_partitions + bucket.second;
+                    int64_t bucket_weight = edge_bucket_sizes[bucket_idx];
+                    for (auto dst_state : compatible_states[bucket_idx]) {
+                        if (dst_state == src_state) {
+                            continue;
+                        }
+                        int64_t new_max = max_after_move(src_state, dst_state, bucket_weight);
+                        if (new_max > current_max) {
+                            continue;
+                        }
+                        long double new_sum_sq = sum_sq_after_move(current_sum_sq, src_state, dst_state, bucket_weight);
+                        if (new_max < current_max ||
+                            (new_max == current_max && new_sum_sq + 0.5L < current_sum_sq)) {
+                            if (!best_move.valid ||
+                                std::make_tuple(new_max, new_sum_sq, -bucket_weight, src_state, dst_state, bucket) <
+                                    std::make_tuple(best_move.new_max, best_move.new_sum_sq, -best_move.moved_weight,
+                                                    best_move.src_state, best_move.dst_state, best_move.bucket)) {
+                                best_move.valid = true;
+                                best_move.new_max = new_max;
+                                best_move.new_sum_sq = new_sum_sq;
+                                best_move.moved_weight = bucket_weight;
+                                best_move.src_state = src_state;
+                                best_move.dst_state = dst_state;
+                                best_move.bucket = bucket;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!best_move.valid) {
+                for (int src_state = 0; src_state < static_cast<int>(edge_buckets_per_buffer.size()); src_state++) {
+                    if (assigned_weight[src_state] < current_max - 1) {
+                        continue;
+                    }
+                    for (const auto &bucket : edge_buckets_per_buffer[src_state]) {
+                        int bucket_idx = bucket.first * num_partitions + bucket.second;
+                        int64_t bucket_weight = edge_bucket_sizes[bucket_idx];
+                        for (auto dst_state : compatible_states[bucket_idx]) {
+                            if (dst_state == src_state) {
+                                continue;
+                            }
+                            int64_t new_max = max_after_move(src_state, dst_state, bucket_weight);
+                            if (new_max > current_max) {
+                                continue;
+                            }
+                            long double new_sum_sq = sum_sq_after_move(current_sum_sq, src_state, dst_state, bucket_weight);
+                            if (new_sum_sq + 0.5L < current_sum_sq) {
+                                if (!best_move.valid ||
+                                    std::make_tuple(new_sum_sq, new_max, -bucket_weight, src_state, dst_state, bucket) <
+                                        std::make_tuple(best_move.new_sum_sq, best_move.new_max, -best_move.moved_weight,
+                                                        best_move.src_state, best_move.dst_state, best_move.bucket)) {
+                                    best_move.valid = true;
+                                    best_move.new_max = new_max;
+                                    best_move.new_sum_sq = new_sum_sq;
+                                    best_move.moved_weight = bucket_weight;
+                                    best_move.src_state = src_state;
+                                    best_move.dst_state = dst_state;
+                                    best_move.bucket = bucket;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!best_move.valid) {
+                break;
+            }
+
+            erase_bucket_from_state(edge_buckets_per_buffer[best_move.src_state], best_move.bucket);
+            edge_buckets_per_buffer[best_move.dst_state].emplace_back(best_move.bucket);
+            assigned_weight[best_move.src_state] -= best_move.moved_weight;
+            assigned_weight[best_move.dst_state] += best_move.moved_weight;
+            assigned_count[best_move.src_state]--;
+            assigned_count[best_move.dst_state]++;
+            moves++;
+        }
+        if (moves > 0) {
+            SPDLOG_INFO("Min-max bucket assignment moved {} buckets max_load {} -> {} sum_sq {:.3e} -> {:.3e}",
+                        moves, initial_max_load, current_max_load(), static_cast<double>(initial_sum_sq),
+                        static_cast<double>(sum_sq_load()));
+        }
+    }
+
+    return edge_buckets_per_buffer;
+}
+
+void log_cover_ordering_summary(const char *label,
+                                const std::vector<std::vector<int>> &buffer_states,
+                                const std::vector<std::vector<std::pair<int, int>>> &edge_buckets_per_buffer,
+                                int num_partitions,
+                                const std::vector<int64_t> &edge_bucket_sizes) {
+    const int buffer_capacity = buffer_states.empty() ? 0 : static_cast<int>(buffer_states.front().size());
+    std::vector<int64_t> overlap_hist(buffer_capacity + 1, 0);
+    std::vector<int64_t> admit_hist(buffer_capacity + 1, 0);
+    int64_t transition_admits = 0;
+    int64_t max_admits = 0;
+    for (std::size_t idx = 1; idx < buffer_states.size(); idx++) {
+        int overlap = state_overlap_count(buffer_states[idx - 1], buffer_states[idx]);
+        if (overlap >= 0 && overlap < static_cast<int>(overlap_hist.size())) {
+            overlap_hist[overlap]++;
+        }
+        int admits = buffer_capacity - overlap;
+        if (admits >= 0 && admits < static_cast<int>(admit_hist.size())) {
+            admit_hist[admits]++;
+        }
+        transition_admits += admits;
+        max_admits = std::max<int64_t>(max_admits, admits);
+    }
+
+    std::vector<int64_t> bucket_counts;
+    bucket_counts.reserve(edge_buckets_per_buffer.size());
+    int64_t total_buckets = 0;
+    int64_t min_edges = std::numeric_limits<int64_t>::max();
+    int64_t max_edges = 0;
+    int64_t total_edges = 0;
+    const bool have_sizes = edge_bucket_sizes.size() == static_cast<std::size_t>(num_partitions * num_partitions);
+    for (const auto &buckets : edge_buckets_per_buffer) {
+        bucket_counts.emplace_back(static_cast<int64_t>(buckets.size()));
+        total_buckets += static_cast<int64_t>(buckets.size());
+        int64_t state_edges = 0;
+        if (have_sizes) {
+            for (const auto &[src, dst] : buckets) {
+                state_edges += edge_bucket_sizes[src * num_partitions + dst];
+            }
+            min_edges = std::min(min_edges, state_edges);
+            max_edges = std::max(max_edges, state_edges);
+            total_edges += state_edges;
+        }
+    }
+    if (!have_sizes) {
+        min_edges = 0;
+    }
+
+    auto hist_to_string = [](const std::vector<int64_t> &hist) {
+        std::ostringstream oss;
+        oss << "[";
+        bool first = true;
+        for (std::size_t idx = 0; idx < hist.size(); idx++) {
+            if (hist[idx] == 0) {
+                continue;
+            }
+            if (!first) {
+                oss << ", ";
+            }
+            first = false;
+            oss << idx << ":" << hist[idx];
+        }
+        oss << "]";
+        return oss.str();
+    };
+
+    SPDLOG_INFO(
+        "{} states={} transitions={} total_buckets={} max_admits={} transition_admits={} overlap_hist={} admit_hist={} edge_total={} edge_min={} edge_max={}",
+        label, buffer_states.size(), buffer_states.size() > 0 ? buffer_states.size() - 1 : 0, total_buckets,
+        max_admits, transition_admits, hist_to_string(overlap_hist), hist_to_string(admit_hist),
+        total_edges, min_edges == std::numeric_limits<int64_t>::max() ? 0 : min_edges, max_edges);
 }
 
 void append_directed_anchor_pairs(const std::vector<int> &anchors, std::vector<std::pair<int, int>> &buckets) {
@@ -2802,6 +3773,23 @@ bool stateflow_plan_valid(const StateflowPlan &plan) {
         }
     }
     return false;
+}
+
+bool stateflow_plan_respects_max_admits(const StateflowPlan &plan, int64_t max_admits_per_transition) {
+    if (max_admits_per_transition < 0) {
+        return true;
+    }
+    for (const auto &lane : plan.lanes) {
+        for (const auto &microstate : lane.microstates) {
+            if (microstate.microstate_id == 0) {
+                continue;
+            }
+            if (microstate.admitted_partitions > max_admits_per_transition) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 StateflowPlan tensor_ordering_to_stateflow_plan(const std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> &ordering,
@@ -4248,13 +5236,35 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
     }
 
     std::vector<StateflowPlan> candidates;
+    const LaneMatchCostConfig lane_match_cfg = lane_match_cost_config_from_env();
+
+    std::vector<int64_t> identity_permutation(buffer_states.size());
+    std::iota(identity_permutation.begin(), identity_permutation.end(), 0);
+    StateflowPlan input_round_plan =
+        build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, identity_permutation, active_devices,
+                                                        PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
+                                                        partition_row_counts, layout);
+    if (stateflow_plan_valid(input_round_plan) &&
+        stateflow_plan_respects_max_admits(input_round_plan, lane_match_cfg.max_admits_per_transition) &&
+        validateStateflowPlanExactSemantics(input_round_plan)) {
+        score_stateflow_plan(input_round_plan, edge_bucket_sizes, layout);
+        SPDLOG_DEBUG(
+            "Stateflow multi-GPU candidate policy=input_rounds cost={:.3f} rounds={} loads={} boundaries={} "
+            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
+            input_round_plan.estimated_cost, input_round_plan.total_superstates, input_round_plan.total_partition_loads,
+            input_round_plan.boundary_count, input_round_plan.total_bucket_assignments, input_round_plan.estimated_bucket_edges,
+            overlap_histogram_string(input_round_plan));
+        candidates.emplace_back(std::move(input_round_plan));
+    }
 
     auto grouped_permutation = getDisjointBufferStatePermutation(buffer_states, active_devices);
     StateflowPlan grouped_plan =
         build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, grouped_permutation, active_devices,
                                                         PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
                                                         partition_row_counts, layout);
-    if (stateflow_plan_valid(grouped_plan) && validateStateflowPlanExactSemantics(grouped_plan)) {
+    if (stateflow_plan_valid(grouped_plan) &&
+        stateflow_plan_respects_max_admits(grouped_plan, lane_match_cfg.max_admits_per_transition) &&
+        validateStateflowPlanExactSemantics(grouped_plan)) {
         score_stateflow_plan(grouped_plan, edge_bucket_sizes, layout);
         SPDLOG_DEBUG(
             "Stateflow multi-GPU candidate policy=disjoint_rounds cost={:.3f} rounds={} loads={} boundaries={} "
@@ -4271,7 +5281,9 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                                                                                       lane_matched_permutation, active_devices,
                                                                                       PlanVariant::MULTI_GPU_LANE_MATCHED,
                                                                                       edge_bucket_sizes, partition_row_counts, layout);
-    if (stateflow_plan_valid(lane_matched_plan) && validateStateflowPlanExactSemantics(lane_matched_plan)) {
+    if (stateflow_plan_valid(lane_matched_plan) &&
+        stateflow_plan_respects_max_admits(lane_matched_plan, lane_match_cfg.max_admits_per_transition) &&
+        validateStateflowPlanExactSemantics(lane_matched_plan)) {
         score_stateflow_plan(lane_matched_plan, edge_bucket_sizes, layout);
         SPDLOG_DEBUG(
             "Stateflow multi-GPU candidate policy=lane_matched cost={:.3f} rounds={} loads={} boundaries={} "
@@ -4592,58 +5604,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getGreedyCoverEdgeBucke
         return convertEdgeBucketOrderToTensors({}, {});
     }
 
-    std::vector<std::vector<int>> candidates;
-    std::vector<int> current;
-    build_greedy_cover_candidates(num_partitions, buffer_capacity, 0, current, candidates);
-    if (candidates.empty()) {
-        return convertEdgeBucketOrderToTensors({}, {});
-    }
-
-    std::vector<uint8_t> covered(num_partitions * num_partitions, 0);
-    int64_t covered_count = 0;
-    const int64_t total_buckets = static_cast<int64_t>(num_partitions) * static_cast<int64_t>(num_partitions);
-    std::vector<std::vector<int>> buffer_states;
-    buffer_states.reserve(candidates.size());
-
-    while (covered_count < total_buckets) {
-        int64_t best_gain = -1;
-        int best_overlap = -1;
-        int64_t best_balance_score = std::numeric_limits<int64_t>::max();
-        int best_idx = -1;
-
-        for (int candidate_idx = 0; candidate_idx < static_cast<int>(candidates.size()); candidate_idx++) {
-            const auto &candidate = candidates[candidate_idx];
-            int64_t gain = count_uncovered_buckets_for_state(candidate, covered, num_partitions);
-            if (gain == 0) {
-                continue;
-            }
-
-            int overlap = buffer_states.empty() ? 0 : state_overlap_count(buffer_states.back(), candidate);
-            int64_t balance_score = 0;
-            for (auto partition : candidate) {
-                balance_score += partition;
-            }
-
-            if (gain > best_gain ||
-                (gain == best_gain && overlap > best_overlap) ||
-                (gain == best_gain && overlap == best_overlap && balance_score < best_balance_score)) {
-                best_gain = gain;
-                best_overlap = overlap;
-                best_balance_score = balance_score;
-                best_idx = candidate_idx;
-            }
-        }
-
-        if (best_idx < 0) {
-            SPDLOG_WARN("Greedy cover ordering stopped early: covered={} total={}", covered_count, total_buckets);
-            break;
-        }
-
-        auto state = candidates[best_idx];
-        covered_count += mark_state_buckets_covered(state, covered, num_partitions);
-        buffer_states.emplace_back(std::move(state));
-    }
-
+    std::vector<std::vector<int>> buffer_states = build_greedy_cover_state_set(num_partitions, buffer_capacity);
     double pre_reorder_retained_avg = 0.0;
     if (buffer_states.size() > 1) {
         int64_t pre_reorder_retained_total = 0;
@@ -4671,6 +5632,79 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getGreedyCoverEdgeBucke
     }
     SPDLOG_INFO("Generating GREEDY_COVER Ordering: states={} assigned_buckets={} retained_avg={:.3f} pre_reorder_retained_avg={:.3f}",
                 buffer_states.size(), assigned_buckets, retained_avg, pre_reorder_retained_avg);
+    return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
+}
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEdgeBucketOrdering(
+    int num_partitions,
+    int buffer_capacity,
+    const vector<int64_t> &edge_bucket_sizes) {
+    if (buffer_capacity != 4 || num_partitions <= 0 || buffer_capacity > num_partitions) {
+        SPDLOG_WARN("Bounded GREEDY_COVER q4 requires buffer_capacity=4 and valid num_partitions; got num_partitions={} buffer_capacity={}",
+                    num_partitions, buffer_capacity);
+        return getGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
+    }
+
+    std::vector<std::vector<int>> buffer_states =
+        num_partitions == 32 && buffer_capacity == 4
+            ? p32_q4_bounded_greedy_cover_state_order()
+            : build_greedy_cover_state_set(num_partitions, buffer_capacity);
+    if (buffer_states.empty()) {
+        return convertEdgeBucketOrderToTensors({}, {});
+    }
+
+    double pre_reorder_retained_avg = 0.0;
+    if (buffer_states.size() > 1) {
+        int64_t retained_total = 0;
+        for (std::size_t idx = 1; idx < buffer_states.size(); idx++) {
+            retained_total += state_overlap_count(buffer_states[idx - 1], buffer_states[idx]);
+        }
+        pre_reorder_retained_avg = static_cast<double>(retained_total) / static_cast<double>(buffer_states.size() - 1);
+    }
+
+    if (!(num_partitions == 32 && buffer_capacity == 4)) {
+        buffer_states = reorder_states_for_bounded_admits(buffer_states, 3);
+    }
+
+    int64_t retained_total = 0;
+    for (std::size_t idx = 1; idx < buffer_states.size(); idx++) {
+        retained_total += state_overlap_count(buffer_states[idx - 1], buffer_states[idx]);
+    }
+    double retained_avg = buffer_states.size() > 1
+                              ? static_cast<double>(retained_total) / static_cast<double>(buffer_states.size() - 1)
+                              : 0.0;
+
+    auto edge_buckets_per_buffer = balancedAssignEdgeBucketsToBuffers(buffer_states, num_partitions, edge_bucket_sizes);
+    log_cover_ordering_summary("Generating BOUNDED_GREEDY_COVER_Q4 Ordering", buffer_states, edge_buckets_per_buffer,
+                               num_partitions, edge_bucket_sizes);
+    SPDLOG_INFO("BOUNDED_GREEDY_COVER_Q4 retained_avg={:.3f} pre_reorder_retained_avg={:.3f}",
+                retained_avg, pre_reorder_retained_avg);
+    return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
+}
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(
+    int num_partitions,
+    int buffer_capacity,
+    int active_devices,
+    const vector<int64_t> &edge_bucket_sizes) {
+    if (buffer_capacity != 4 || num_partitions <= 0 || buffer_capacity > num_partitions || active_devices <= 1) {
+        SPDLOG_WARN(
+            "Bounded multi-GPU GREEDY_COVER q4 requires active_devices>1, buffer_capacity=4, and valid num_partitions; got active_devices={} num_partitions={} buffer_capacity={}",
+            active_devices, num_partitions, buffer_capacity);
+        return getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, edge_bucket_sizes);
+    }
+
+    const int max_admits = static_cast<int>(
+        std::min<int64_t>(buffer_capacity, std::max<int64_t>(0, stateflow_env_int64("GEGE_STATEFLOW_MAX_ADMITS",
+                                                                                   "STATEFLOW_MAX_ADMITS", 3))));
+    auto buffer_states = build_bounded_multi_gpu_round_states(num_partitions, buffer_capacity, active_devices, max_admits);
+    if (buffer_states.empty()) {
+        return getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, edge_bucket_sizes);
+    }
+
+    auto edge_buckets_per_buffer = balancedAssignEdgeBucketsToBuffers(buffer_states, num_partitions, edge_bucket_sizes);
+    log_cover_ordering_summary("Generating BOUNDED_MULTI_GPU_GREEDY_COVER_Q4 Ordering (legacy interleaved view)",
+                               buffer_states, edge_buckets_per_buffer, num_partitions, edge_bucket_sizes);
     return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
 }
 
@@ -5014,8 +6048,7 @@ std::vector<int64_t> getAccessAwareDisjointBufferStatePermutation(const vector<t
         int target_group_size = std::min<int>(active_devices, remaining.size());
         std::vector<int64_t> ordered_group;
         std::vector<int64_t> chosen_states;
-        if (solver == LaneMatchSolver::OPTIMAL2 && target_group_size >= 2 &&
-            previous_group.size() == static_cast<std::size_t>(target_group_size)) {
+        if (solver == LaneMatchSolver::OPTIMAL2 && !previous_group.empty()) {
             auto best_group =
                 get_best_cost_aware_lane_group(compatible, remaining, previous_group, summaries, partition_row_counts, lane_match_cfg,
                                                bytes_per_row, target_group_size);

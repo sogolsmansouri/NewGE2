@@ -1247,9 +1247,97 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         int64_t peer_copy_count = 0;
         int64_t host_fallback_count = 0;
         int64_t descriptor_mismatch_count = 0;
+        int64_t preload_visible_install_rows = 0;
+        int64_t hidden_publish_rows = 0;
+        int64_t preload_visible_install_parts = 0;
+        int64_t hidden_publish_parts = 0;
+        int64_t fallback_visible_admit_parts = 0;
+        int64_t fallback_visible_admit_rows = 0;
+        int64_t free_frames_before_swap = 0;
+        int64_t stale_backlog_frames_before_swap = 0;
+        int64_t free_frames_after_publish = 0;
+        int64_t stale_backlog_frames_after_publish = 0;
         bool submitted_peer_copy = false;
         bool peer_stream_armed = false;
         std::vector<bool> waited_on_source_ready(buffers_.size(), false);
+
+        if (frame_cache_mapping) {
+            std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+            free_frames_before_swap = static_cast<int64_t>(buffer->free_physical_frames_.size());
+            stale_backlog_frames_before_swap =
+                static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap;
+        }
+
+        std::unordered_set<int> preloaded_host_admit_ids;
+        if (multi_gpu_async_admit_preload_enabled()) {
+            std::vector<int> host_preload_admit_ids;
+            std::vector<int64_t> host_preload_slots;
+            host_preload_admit_ids.reserve(admit_ids.size());
+            host_preload_slots.reserve(evict_slots.size());
+            for (std::size_t idx = 0; idx < admit_ids.size(); idx++) {
+                int partition_id = admit_ids[idx];
+                int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
+                bool has_scheduled_peer_handoff = false;
+                if (stateflow_runtime_controlling) {
+                    auto handoff_it = stateflow_peer_handoff_index_per_device_[device_idx].find(handoff_key);
+                    has_scheduled_peer_handoff = handoff_it != stateflow_peer_handoff_index_per_device_[device_idx].end();
+                }
+                if (!has_scheduled_peer_handoff) {
+                    host_preload_admit_ids.push_back(partition_id);
+                    host_preload_slots.push_back(evict_slots[idx]);
+                }
+            }
+
+            if (!host_preload_admit_ids.empty()) {
+                double preload_wait_ms = 0.0;
+                if (buffer->consumeAsyncAdmitPreload_(host_preload_admit_ids, host_preload_slots, &preload_wait_ms,
+                                                      &preload_visible_install_rows, &hidden_publish_rows,
+                                                      &preload_visible_install_parts, &hidden_publish_parts)) {
+                    preloaded_host_admit_ids.insert(host_preload_admit_ids.begin(), host_preload_admit_ids.end());
+                }
+            }
+        }
+
+        std::unordered_set<int64_t> hidden_publish_slots;
+        hidden_publish_slots.reserve(buffer->pending_hidden_publishes_.size());
+        for (const auto &hidden_publish : buffer->pending_hidden_publishes_) {
+            hidden_publish_slots.insert(hidden_publish.logical_slot);
+        }
+
+        const bool delayed_stale_enabled =
+            frame_cache_mapping &&
+            multi_gpu_async_admit_preload_enabled() &&
+            parse_env_flag("GEGE_FRAME_CACHE_HIDDEN_ONLY_PRELOAD", false) &&
+            parse_env_flag("GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK", false) &&
+            !parse_env_flag("GEGE_SINGLE_GPU_ASYNC_EVICT_WRITEBACK", false);
+        std::unordered_set<int64_t> delayed_stale_logical_slots;
+        std::vector<int> delayed_stale_partition_ids;
+        std::vector<int64_t> delayed_stale_row_offsets;
+        std::vector<int64_t> delayed_stale_release_frames;
+        std::vector<int64_t> delayed_stale_source_offsets;
+        int64_t delayed_stale_rows = 0;
+        delayed_stale_row_offsets.emplace_back(0);
+        if (delayed_stale_enabled && !hidden_publish_slots.empty()) {
+            for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                int evict_id = evict_ids[idx];
+                int64_t evict_slot = evict_slots[idx];
+                if (hidden_publish_slots.find(evict_slot) == hidden_publish_slots.end()) {
+                    continue;
+                }
+                if (next_required != nullptr && evict_id >= 0 && evict_id < static_cast<int>(next_required->size()) &&
+                    (*next_required)[static_cast<std::size_t>(evict_id)] != 0) {
+                    continue;
+                }
+                Partition *partition = buffer->partition_table_[evict_id];
+                int64_t old_frame = buffer->logicalSlotToPhysicalFrame_(evict_slot);
+                delayed_stale_partition_ids.push_back(evict_id);
+                delayed_stale_logical_slots.insert(evict_slot);
+                delayed_stale_release_frames.push_back(old_frame);
+                delayed_stale_source_offsets.push_back(old_frame * buffer->partition_size_);
+                delayed_stale_rows += partition->partition_size_;
+                delayed_stale_row_offsets.push_back(delayed_stale_rows);
+            }
+        }
 
         for (int evict_id : evict_ids) {
             if (next_required != nullptr && evict_id >= 0 && evict_id < static_cast<int>(next_required->size()) &&
@@ -1259,6 +1347,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
 
             Partition *partition = buffer->partition_table_[evict_id];
             int64_t src_slot = partition->buffer_idx_;
+            if (delayed_stale_logical_slots.find(src_slot) != delayed_stale_logical_slots.end()) {
+                continue;
+            }
             int64_t buffer_offset = buffer->logicalSlotRowOffset_(src_slot);
             torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
             torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
@@ -1387,34 +1478,6 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 slot_to_partition[current_slot] = -1;
                 free_slots.emplace_back(current_slot);
                 current_slot_by_partition[partition_id] = scratch_slot;
-            }
-        }
-
-        std::unordered_set<int> preloaded_host_admit_ids;
-        if (multi_gpu_async_admit_preload_enabled()) {
-            std::vector<int> host_preload_admit_ids;
-            std::vector<int64_t> host_preload_slots;
-            host_preload_admit_ids.reserve(admit_ids.size());
-            host_preload_slots.reserve(evict_slots.size());
-            for (std::size_t idx = 0; idx < admit_ids.size(); idx++) {
-                int partition_id = admit_ids[idx];
-                int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
-                bool has_scheduled_peer_handoff = false;
-                if (stateflow_runtime_controlling) {
-                    auto handoff_it = stateflow_peer_handoff_index_per_device_[device_idx].find(handoff_key);
-                    has_scheduled_peer_handoff = handoff_it != stateflow_peer_handoff_index_per_device_[device_idx].end();
-                }
-                if (!has_scheduled_peer_handoff) {
-                    host_preload_admit_ids.push_back(partition_id);
-                    host_preload_slots.push_back(evict_slots[idx]);
-                }
-            }
-
-            if (!host_preload_admit_ids.empty()) {
-                double preload_wait_ms = 0.0;
-                if (buffer->consumeAsyncAdmitPreload_(host_preload_admit_ids, host_preload_slots, &preload_wait_ms)) {
-                    preloaded_host_admit_ids.insert(host_preload_admit_ids.begin(), host_preload_admit_ids.end());
-                }
             }
         }
 
@@ -1578,6 +1641,8 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 load_partition_from_host(dst_partition, cpu_view);
                 torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, dst_offset, dst_offset + rows);
                 gpu_view.copy_(cpu_view, true);
+                fallback_visible_admit_parts += 1;
+                fallback_visible_admit_rows += rows;
                 if (scheduled_handoff != nullptr) {
                     host_fallback_bytes += bytes;
                     host_fallback_count += 1;
@@ -1596,6 +1661,8 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         layout_ready_event.handle = nullptr;
         bool published_hidden_frames = false;
         if (!buffer->pending_hidden_publishes_.empty()) {
+            std::unordered_set<int64_t> delayed_release_frames(
+                delayed_stale_release_frames.begin(), delayed_stale_release_frames.end());
             std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
             for (const auto &hidden_publish : buffer->pending_hidden_publishes_) {
                 auto free_it = std::find(buffer->free_physical_frames_.begin(), buffer->free_physical_frames_.end(), hidden_publish.frame);
@@ -1607,7 +1674,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 int64_t published_old_frame =
                     buffer->logical_to_physical_frames_[static_cast<std::size_t>(hidden_publish.logical_slot)];
                 buffer->logical_to_physical_frames_[static_cast<std::size_t>(hidden_publish.logical_slot)] = hidden_publish.frame;
-                if (published_old_frame != hidden_publish.frame &&
+                const bool delay_old_frame_release =
+                    delayed_release_frames.find(published_old_frame) != delayed_release_frames.end();
+                if (!delay_old_frame_release && published_old_frame != hidden_publish.frame &&
                     std::find(buffer->free_physical_frames_.begin(), buffer->free_physical_frames_.end(), published_old_frame) ==
                         buffer->free_physical_frames_.end()) {
                     buffer->free_physical_frames_.push_back(published_old_frame);
@@ -1618,6 +1687,41 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         }
         if (frame_cache_mapping || published_hidden_frames) {
             buffer->refreshFrameCacheTensors_();
+        }
+        if (!delayed_stale_partition_ids.empty()) {
+            buffer->startAsyncEvictWriteback_(delayed_stale_partition_ids, delayed_stale_row_offsets, torch::Tensor(), torch::Tensor(),
+                                              delayed_stale_release_frames, delayed_stale_source_offsets);
+        }
+        if (frame_cache_mapping) {
+            std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+            free_frames_after_publish = static_cast<int64_t>(buffer->free_physical_frames_.size());
+            stale_backlog_frames_after_publish =
+                static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_after_publish;
+        }
+        if (frame_cache_mapping || multi_gpu_async_admit_preload_enabled()) {
+            buffer->frame_cache_perf_stats_.swap_samples += 1;
+            buffer->frame_cache_perf_stats_.visible_install_parts += preload_visible_install_parts;
+            buffer->frame_cache_perf_stats_.visible_install_rows += preload_visible_install_rows;
+            buffer->frame_cache_perf_stats_.hidden_publish_parts += hidden_publish_parts;
+            buffer->frame_cache_perf_stats_.hidden_publish_rows += hidden_publish_rows;
+            buffer->frame_cache_perf_stats_.fallback_visible_admit_parts += fallback_visible_admit_parts;
+            buffer->frame_cache_perf_stats_.fallback_visible_admit_rows += fallback_visible_admit_rows;
+            buffer->frame_cache_perf_stats_.partial_preload_swap_count +=
+                (fallback_visible_admit_parts > 0 && hidden_publish_parts > 0) ? 1 : 0;
+            buffer->frame_cache_perf_stats_.delayed_stale_writeback_swap_count +=
+                delayed_stale_partition_ids.empty() ? 0 : 1;
+            buffer->frame_cache_perf_stats_.async_admit_valid_before_swap_count +=
+                preloaded_host_admit_ids.empty() ? 0 : 1;
+            buffer->frame_cache_perf_stats_.reserved_preload_frames_sum +=
+                std::max<int64_t>(static_cast<int64_t>(buffer->hidden_frame_capacity_), 0);
+            buffer->frame_cache_perf_stats_.free_frames_before_swap_sum += std::max<int64_t>(free_frames_before_swap, 0);
+            buffer->frame_cache_perf_stats_.free_frames_after_publish_sum += std::max<int64_t>(free_frames_after_publish, 0);
+            buffer->frame_cache_perf_stats_.stale_backlog_before_swap_max =
+                std::max(buffer->frame_cache_perf_stats_.stale_backlog_before_swap_max,
+                         std::max<int64_t>(stale_backlog_frames_before_swap, 0));
+            buffer->frame_cache_perf_stats_.stale_backlog_after_publish_max =
+                std::max(buffer->frame_cache_perf_stats_.stale_backlog_after_publish_max,
+                         std::max<int64_t>(stale_backlog_frames_after_publish, 0));
         }
         if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_peer_bytes_executed_.size()) {
             device_peer_bytes_executed_[device_idx] += peer_bytes_executed;

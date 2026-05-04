@@ -1418,7 +1418,11 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                                 current_slot, partition_id, buffer->device_.index()));
             }
             if (evict_id_set.count(partition_id) > 0) {
-                free_slots.emplace_back(current_slot);
+                // Delayed-stale slots still own dirty GPU data until the async writeback releases
+                // their physical frames, so the retained-slot permutation must not borrow them as scratch.
+                if (delayed_stale_logical_slots.find(current_slot) == delayed_stale_logical_slots.end()) {
+                    free_slots.emplace_back(current_slot);
+                }
             } else {
                 slot_to_partition[current_slot] = partition_id;
                 current_slot_by_partition[partition_id] = current_slot;

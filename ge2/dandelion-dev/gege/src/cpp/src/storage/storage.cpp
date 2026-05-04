@@ -1315,8 +1315,31 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         std::vector<int64_t> delayed_stale_row_offsets;
         std::vector<int64_t> delayed_stale_release_frames;
         std::vector<int64_t> delayed_stale_source_offsets;
+        struct DelayedStaleWritebackEntry {
+            int64_t logical_slot = -1;
+            int partition_id = -1;
+            int64_t rows = 0;
+            int64_t release_frame = -1;
+            int64_t source_offset = -1;
+        };
+        std::vector<DelayedStaleWritebackEntry> delayed_stale_entries;
         int64_t delayed_stale_rows = 0;
         delayed_stale_row_offsets.emplace_back(0);
+        auto rebuild_delayed_stale_vectors = [&]() {
+            delayed_stale_partition_ids.clear();
+            delayed_stale_row_offsets.clear();
+            delayed_stale_release_frames.clear();
+            delayed_stale_source_offsets.clear();
+            delayed_stale_rows = 0;
+            delayed_stale_row_offsets.emplace_back(0);
+            for (const auto &entry : delayed_stale_entries) {
+                delayed_stale_partition_ids.push_back(entry.partition_id);
+                delayed_stale_release_frames.push_back(entry.release_frame);
+                delayed_stale_source_offsets.push_back(entry.source_offset);
+                delayed_stale_rows += entry.rows;
+                delayed_stale_row_offsets.push_back(delayed_stale_rows);
+            }
+        };
         if (delayed_stale_enabled && !hidden_publish_slots.empty()) {
             for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                 int evict_id = evict_ids[idx];
@@ -1330,13 +1353,11 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 }
                 Partition *partition = buffer->partition_table_[evict_id];
                 int64_t old_frame = buffer->logicalSlotToPhysicalFrame_(evict_slot);
-                delayed_stale_partition_ids.push_back(evict_id);
                 delayed_stale_logical_slots.insert(evict_slot);
-                delayed_stale_release_frames.push_back(old_frame);
-                delayed_stale_source_offsets.push_back(old_frame * buffer->partition_size_);
-                delayed_stale_rows += partition->partition_size_;
-                delayed_stale_row_offsets.push_back(delayed_stale_rows);
+                delayed_stale_entries.push_back(
+                    {evict_slot, evict_id, partition->partition_size_, old_frame, old_frame * buffer->partition_size_});
             }
+            rebuild_delayed_stale_vectors();
         }
 
         for (int evict_id : evict_ids) {
@@ -1367,6 +1388,31 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 write_partition_to_host(partition, cpu_view);
             }
         }
+
+        auto flush_delayed_stale_slot_for_scratch = [&](int64_t logical_slot) {
+            auto entry_it = std::find_if(delayed_stale_entries.begin(), delayed_stale_entries.end(),
+                                         [&](const DelayedStaleWritebackEntry &entry) {
+                                             return entry.logical_slot == logical_slot;
+                                         });
+            if (entry_it == delayed_stale_entries.end()) {
+                return false;
+            }
+
+            const DelayedStaleWritebackEntry entry = *entry_it;
+            Partition *partition = buffer->partition_table_[entry.partition_id];
+            torch::Tensor cpu_view =
+                buffer->buffer_tensor_view_.slice(0, entry.source_offset, entry.source_offset + entry.rows);
+            torch::Tensor gpu_view =
+                buffer->buffer_tensor_gpu_view_.slice(0, entry.source_offset, entry.source_offset + entry.rows);
+            cpu_view.copy_(gpu_view.detach(), true);
+            cudaStreamSynchronize(comm_stream.stream());
+            write_partition_to_host(partition, cpu_view);
+
+            delayed_stale_logical_slots.erase(logical_slot);
+            delayed_stale_entries.erase(entry_it);
+            rebuild_delayed_stale_vectors();
+            return true;
+        };
 
         auto move_partition_between_slots = [&](int partition_id, int64_t src_slot, int64_t dst_slot) {
             if (src_slot == dst_slot) {
@@ -1469,6 +1515,21 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
 
             if (!progressed) {
                 if (free_slots.empty()) {
+                    int64_t recovered_slot = -1;
+                    for (int partition_id : pending_moves) {
+                        int64_t target_slot = next_slot_by_partition.at(partition_id);
+                        if (delayed_stale_logical_slots.find(target_slot) != delayed_stale_logical_slots.end()) {
+                            recovered_slot = target_slot;
+                            break;
+                        }
+                    }
+                    if (recovered_slot < 0 && !delayed_stale_entries.empty()) {
+                        recovered_slot = delayed_stale_entries.front().logical_slot;
+                    }
+                    if (recovered_slot >= 0 && flush_delayed_stale_slot_for_scratch(recovered_slot)) {
+                        free_slots.emplace_back(recovered_slot);
+                        continue;
+                    }
                     throw GegeRuntimeException(
                         fmt::format("Stateflow peer relay has no free slot available to realize retained-slot permutation on device {}",
                                     buffer->device_.index()));

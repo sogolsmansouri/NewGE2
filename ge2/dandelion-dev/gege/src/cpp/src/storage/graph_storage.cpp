@@ -271,6 +271,8 @@ GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, shared_
     devices_ = devices_from_config(storage_config);
     active_edges_ = std::vector<EdgeList>(devices_.size());
     current_subgraph_states_ = std::vector<shared_ptr<InMemorySubgraphState>>(devices_.size());
+    next_subgraph_states_ = std::vector<shared_ptr<InMemorySubgraphState>>(devices_.size());
+    prefetch_complete_by_device_ = std::vector<uint8_t>(devices_.size(), 0);
 
     current_subgraph_state_ = nullptr;
     next_subgraph_state_ = nullptr;
@@ -314,6 +316,8 @@ GraphModelStorage::GraphModelStorage(GraphModelStoragePtrs storage_ptrs, bool pr
     prefetch_complete_ = false;
     subgraph_lock_ = new std::mutex();
     subgraph_cv_ = new std::condition_variable();
+    next_subgraph_states_ = std::vector<shared_ptr<InMemorySubgraphState>>(1);
+    prefetch_complete_by_device_ = std::vector<uint8_t>(1, 0);
 
     current_subgraph_state_ = nullptr;
     next_subgraph_state_ = nullptr;
@@ -336,6 +340,28 @@ GraphModelStorage::~GraphModelStorage() {
     
     delete subgraph_lock_;
     delete subgraph_cv_;
+}
+
+void GraphModelStorage::ensureSubgraphStateVectors_(int32_t device_idx) {
+    if (device_idx < 0) {
+        throw GegeRuntimeException(fmt::format("Invalid negative device index {} for in-memory subgraph state", device_idx));
+    }
+
+    std::size_t required_size = std::max<std::size_t>(1, static_cast<std::size_t>(device_idx) + 1);
+    required_size = std::max(required_size, devices_.size());
+    required_size = std::max(required_size, current_subgraph_states_.size());
+    required_size = std::max(required_size, next_subgraph_states_.size());
+    required_size = std::max(required_size, prefetch_complete_by_device_.size());
+
+    if (current_subgraph_states_.size() < required_size) {
+        current_subgraph_states_.resize(required_size);
+    }
+    if (next_subgraph_states_.size() < required_size) {
+        next_subgraph_states_.resize(required_size);
+    }
+    if (prefetch_complete_by_device_.size() < required_size) {
+        prefetch_complete_by_device_.resize(required_size, 0);
+    }
 }
 
 bool GraphModelStorage::shouldUsePartitionBufferLPFastPath_() {
@@ -950,6 +976,7 @@ bool GraphModelStorage::embeddingsOffDeviceG() {
 }
 
 void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, torch::Device device, int32_t device_idx) {
+    ensureSubgraphStateVectors_(device_idx);
     if (useInMemorySubGraph()) {
         int64_t timing_id = -1;
         bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
@@ -1225,6 +1252,7 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
 }
 
 void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
+    ensureSubgraphStateVectors_(device_idx);
     int64_t outer_timing_id = -1;
     bool log_outer_timing = should_log_partition_buffer_pipeline_timing(outer_timing_id);
     auto outer_total_start = std::chrono::high_resolution_clock::now();
@@ -1238,9 +1266,15 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
     double admit_preload_start_ms = 0.0;
 
     if (prefetch_) {
+        shared_ptr<InMemorySubgraphState> prefetched_subgraph_state = nullptr;
         // wait until the prefetching has been completed
-        std::unique_lock lock(*subgraph_lock_);
-        subgraph_cv_->wait(lock, [this] { return prefetch_complete_ == true; });
+        {
+            std::unique_lock lock(*subgraph_lock_);
+            subgraph_cv_->wait(lock, [this, device_idx] {
+                return prefetch_complete_by_device_[device_idx] != 0 && next_subgraph_states_[device_idx] != nullptr;
+            });
+            prefetched_subgraph_state = next_subgraph_states_[device_idx];
+        }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             prefetch_wait_ms = elapsed_graph_storage_ms(outer_phase_start, now);
@@ -1248,25 +1282,34 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         }
         // need to wait for the subgraph to be prefetched to perform the swap, otherwise the prefetched buffer_index_map may be incorrect
         auto t1 = std::chrono::high_resolution_clock::now();
-        performSwap();
+        performSwap(device_idx);
         auto t2 = std::chrono::high_resolution_clock::now();
         perform_swap_ms = elapsed_graph_storage_ms(t1, t2);
         outer_phase_start = t2;
-        // free previous subgraph
-        current_subgraph_state_->in_memory_subgraph_ = nullptr;
-        current_subgraph_state_ = nullptr;
+        {
+            std::lock_guard lock(*subgraph_lock_);
+            auto previous_subgraph_state = current_subgraph_states_[device_idx];
+            if (previous_subgraph_state != nullptr) {
+                previous_subgraph_state->in_memory_subgraph_ = nullptr;
+            }
 
-        current_subgraph_state_ = next_subgraph_state_;
-        current_subgraph_states_[device_idx] = current_subgraph_state_;
-        next_subgraph_state_ = nullptr;
-        prefetch_complete_ = false;
+            current_subgraph_state_ = prefetched_subgraph_state;
+            current_subgraph_states_[device_idx] = prefetched_subgraph_state;
+            next_subgraph_states_[device_idx] = nullptr;
+            if (device_idx == 0) {
+                next_subgraph_state_ = nullptr;
+            }
+            prefetch_complete_by_device_[device_idx] = 0;
+            prefetch_complete_ = std::any_of(prefetch_complete_by_device_.begin(), prefetch_complete_by_device_.end(),
+                                             [](uint8_t complete) { return complete != 0; });
+        }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             state_publish_ms = elapsed_graph_storage_ms(outer_phase_start, now);
             outer_phase_start = now;
         }
 
-        if (hasSwap()) {
+        if (hasSwap(device_idx)) {
             // update next_subgraph_state_ in background
             getNextSubGraph(device_idx);
         }
@@ -1275,7 +1318,7 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
             next_prefetch_start_ms = elapsed_graph_storage_ms(outer_phase_start, now);
             outer_phase_start = now;
         }
-        if (hasSwap()) {
+        if (hasSwap(device_idx)) {
             startAsyncAdmitPreload_(device_idx);
         }
         if (log_outer_timing) {
@@ -1351,10 +1394,21 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
 }
 
 void GraphModelStorage::getNextSubGraph(int32_t device_idx) {
+    ensureSubgraphStateVectors_(device_idx);
     std::pair<std::vector<int>, std::vector<int>> next_swap_ids = getNextSwapIds(device_idx);
-    next_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
-    next_subgraph_state_->in_memory_subgraph_ = nullptr;
-    std::thread(&GraphModelStorage::updateInMemorySubGraph_, this, next_subgraph_state_, next_swap_ids, device_idx).detach();
+    auto next_subgraph_state = std::make_shared<InMemorySubgraphState>();
+    next_subgraph_state->in_memory_subgraph_ = nullptr;
+    {
+        std::lock_guard lock(*subgraph_lock_);
+        next_subgraph_states_[device_idx] = next_subgraph_state;
+        prefetch_complete_by_device_[device_idx] = 0;
+        prefetch_complete_ = std::any_of(prefetch_complete_by_device_.begin(), prefetch_complete_by_device_.end(),
+                                         [](uint8_t complete) { return complete != 0; });
+        if (device_idx == 0) {
+            next_subgraph_state_ = next_subgraph_state;
+        }
+    }
+    std::thread(&GraphModelStorage::updateInMemorySubGraph_, this, next_subgraph_state, next_swap_ids, device_idx).detach();
 }
 
 bool GraphModelStorage::waitForSubgraphPrefetchComplete(const std::atomic<bool> *stop_flag) {
@@ -1363,9 +1417,12 @@ bool GraphModelStorage::waitForSubgraphPrefetchComplete(const std::atomic<bool> 
     }
     std::unique_lock<std::mutex> lock(*subgraph_lock_);
     subgraph_cv_->wait(lock, [this, stop_flag] {
-        return prefetch_complete_ == true || (stop_flag != nullptr && stop_flag->load(std::memory_order_relaxed));
+        return std::any_of(prefetch_complete_by_device_.begin(), prefetch_complete_by_device_.end(),
+                           [](uint8_t complete) { return complete != 0; }) ||
+               (stop_flag != nullptr && stop_flag->load(std::memory_order_relaxed));
     });
-    return prefetch_complete_ == true;
+    return std::any_of(prefetch_complete_by_device_.begin(), prefetch_complete_by_device_.end(),
+                       [](uint8_t complete) { return complete != 0; });
 }
 
 void GraphModelStorage::notifySubgraphPrefetchWaiters() {
@@ -1380,14 +1437,21 @@ shared_ptr<InMemorySubgraphState> GraphModelStorage::getPrefetchedNextSubgraphSt
         return next_subgraph_state_;
     }
     std::lock_guard<std::mutex> lock(*subgraph_lock_);
+    for (std::size_t device_idx = 0; device_idx < next_subgraph_states_.size(); device_idx++) {
+        if (device_idx < prefetch_complete_by_device_.size() && prefetch_complete_by_device_[device_idx] != 0 &&
+            next_subgraph_states_[device_idx] != nullptr) {
+            return next_subgraph_states_[device_idx];
+        }
+    }
+    for (const auto &next_subgraph_state : next_subgraph_states_) {
+        if (next_subgraph_state != nullptr) {
+            return next_subgraph_state;
+        }
+    }
     return next_subgraph_state_;
 }
 
 void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState> subgraph, std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx) {
-    if (prefetch_) {
-        subgraph_lock_->lock();
-    }
-
     int64_t timing_id = -1;
     bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
     auto total_start = std::chrono::high_resolution_clock::now();
@@ -1399,6 +1463,9 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
 
     std::vector<int> evict_partition_ids = std::get<0>(swap_ids);
     std::vector<int> admit_partition_ids = std::get<1>(swap_ids);
+    if (current_subgraph_states_[device_idx] == nullptr) {
+        throw GegeRuntimeException(fmt::format("Missing current in-memory subgraph state for device {}", device_idx));
+    }
 
     torch::Tensor admit_ids_tensor = torch::tensor(admit_partition_ids, torch::kCPU);
 
@@ -1483,6 +1550,38 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     retained_partition_ids.reserve(static_cast<std::size_t>(old_in_mem_partition_ids.numel()));
     for (int64_t i = 0; i < old_in_mem_partition_ids.numel(); i++) {
         retained_partition_ids.emplace_back(static_cast<int>(old_in_mem_partition_ids_accessor[i]));
+    }
+    std::unordered_map<int, int> retained_partition_seen;
+    retained_partition_seen.reserve(retained_partition_ids.size());
+    for (int partition_id : retained_partition_ids) {
+        auto inserted = retained_partition_seen.emplace(partition_id, 1);
+        if (!inserted.second) {
+            throw GegeRuntimeException(
+                fmt::format("Duplicate retained partition {} during in-memory subgraph update for device {}", partition_id, device_idx));
+        }
+    }
+    std::unordered_map<int, int> admit_partition_seen;
+    admit_partition_seen.reserve(admit_partition_ids.size());
+    for (int partition_id : admit_partition_ids) {
+        auto inserted = admit_partition_seen.emplace(partition_id, 1);
+        if (!inserted.second) {
+            throw GegeRuntimeException(
+                fmt::format("Duplicate admitted partition {} during in-memory subgraph update for device {}", partition_id, device_idx));
+        }
+        if (retained_partition_seen.find(partition_id) != retained_partition_seen.end()) {
+            throw GegeRuntimeException(fmt::format(
+                "Admitted partition {} is already resident during in-memory subgraph update for device {}", partition_id, device_idx));
+        }
+    }
+    std::unordered_map<int64_t, int64_t> new_partition_positions;
+    new_partition_positions.reserve(static_cast<std::size_t>(new_in_mem_partition_ids.numel()));
+    for (int64_t i = 0; i < new_in_mem_partition_ids.numel(); i++) {
+        auto inserted = new_partition_positions.emplace(new_in_mem_partition_ids_accessor[i], i);
+        if (!inserted.second) {
+            throw GegeRuntimeException(fmt::format(
+                "Duplicate resident partition {} during in-memory subgraph update for device {} (positions {} and {})",
+                new_in_mem_partition_ids_accessor[i], device_idx, inserted.first->second, i));
+        }
     }
 
     // get new incoming edge buckets
@@ -1786,8 +1885,14 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
     }
 
     if (prefetch_) {
-        prefetch_complete_ = true;
-        subgraph_lock_->unlock();
+        {
+            std::lock_guard lock(*subgraph_lock_);
+            prefetch_complete_by_device_[device_idx] = 1;
+            prefetch_complete_ = true;
+            if (device_idx == 0) {
+                next_subgraph_state_ = subgraph;
+            }
+        }
         subgraph_cv_->notify_all();
     }
 }

@@ -65,6 +65,8 @@ class GraphModelStorage {
     torch::Tensor mapEdgesWithPartitionSlots_(torch::Tensor edges, torch::Tensor partition_to_buffer_slot, int64_t partition_size,
                                               torch::Device device);
 
+    void ensureSubgraphStateVectors_(int32_t device_idx = 0);
+
     void startAsyncAdmitPreload_(int32_t device_idx = 0);
     int64_t num_nodes_;
     int64_t num_edges_;
@@ -90,8 +92,10 @@ class GraphModelStorage {
     shared_ptr<InMemorySubgraphState> current_subgraph_state_;
     std::vector<shared_ptr<InMemorySubgraphState>> current_subgraph_states_;
     shared_ptr<InMemorySubgraphState> next_subgraph_state_;
+    std::vector<shared_ptr<InMemorySubgraphState>> next_subgraph_states_;
     bool prefetch_;
     bool prefetch_complete_;
+    std::vector<uint8_t> prefetch_complete_by_device_;
 
     GraphModelStoragePtrs storage_ptrs_;
     bool full_graph_evaluation_;
@@ -117,8 +121,9 @@ class GraphModelStorage {
     void getNextSubGraph(int32_t device_idx = 0);
 
     /**
-     * Wait until the background prefetch builder has finished populating `next_subgraph_state_`.
-     * Only meaningful when `prefetch_` is enabled and a prefetch is in flight.
+     * Wait until at least one background prefetch builder has finished populating a
+     * per-device next subgraph state. Only meaningful when `prefetch_` is enabled
+     * and a prefetch is in flight.
      */
     bool waitForSubgraphPrefetchComplete(const std::atomic<bool> *stop_flag = nullptr);
 

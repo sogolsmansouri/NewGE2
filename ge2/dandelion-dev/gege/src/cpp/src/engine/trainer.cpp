@@ -184,6 +184,11 @@ struct DeviceEpochTiming {
     int64_t dense_sync_wait_excl_all_reduce_ns = 0;
     int64_t dense_sync_all_reduce_ns = 0;
     int64_t finalize_region_ns = 0;
+    int64_t prepared_batch_launches = 0;
+    int64_t prepared_batch_hits = 0;
+    int64_t prepared_batch_direct_fetches = 0;
+    int64_t prepared_batch_boundary_blocks = 0;
+    int64_t prepared_batch_wait_ns = 0;
 };
 
 struct SingleDeviceStateTiming {
@@ -792,6 +797,46 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
         if (dataloader_->training_config_ != nullptr) {
             dense_sync_batches = std::max(dataloader_->training_config_->dense_sync_batches, 1);
         }
+        const bool prepared_batch_pipeline_requested =
+            env_flag_enabled("GEGE_PREPARED_BATCH_PIPELINE") || env_flag_enabled("GEGE_MULTI_GPU_PREPARED_BATCH_PIPELINE");
+        bool prepared_batch_pipeline_enabled = prepared_batch_pipeline_requested;
+        std::string prepared_batch_pipeline_disabled_reason;
+        if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_ == nullptr) {
+            prepared_batch_pipeline_enabled = false;
+            prepared_batch_pipeline_disabled_reason = "graph storage is unavailable";
+        }
+        if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_->embeddingsOffDevice()) {
+            prepared_batch_pipeline_enabled = false;
+            prepared_batch_pipeline_disabled_reason = "off-device node embeddings would be read before prior updates finish";
+        }
+        if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_->embeddingsOffDeviceG()) {
+            prepared_batch_pipeline_enabled = false;
+            prepared_batch_pipeline_disabled_reason = "off-device generator embeddings would be read before prior updates finish";
+        }
+        if (prepared_batch_pipeline_enabled && dataloader_->graph_storage_->storage_ptrs_.qual_embeddings != nullptr &&
+            dataloader_->graph_storage_->storage_ptrs_.qual_embeddings->device_ != torch::kCUDA) {
+            prepared_batch_pipeline_enabled = false;
+            prepared_batch_pipeline_disabled_reason = "off-device qualifier embeddings would be read before prior updates finish";
+        }
+        std::string prepared_batch_launch_stage = "after_fetch";
+        if (const char *launch_stage_env = std::getenv("GEGE_MULTI_GPU_PREPARED_BATCH_PIPELINE_LAUNCH_STAGE")) {
+            prepared_batch_launch_stage = launch_stage_env;
+        } else if (const char *launch_stage_env = std::getenv("GEGE_PREPARED_BATCH_PIPELINE_LAUNCH_STAGE")) {
+            prepared_batch_launch_stage = launch_stage_env;
+        }
+        if (prepared_batch_launch_stage != "after_fetch" && prepared_batch_launch_stage != "after_gpu_load" &&
+            prepared_batch_launch_stage != "after_compute") {
+            SPDLOG_WARN("Ignoring invalid multi-GPU prepared batch launch stage {}; using after_fetch", prepared_batch_launch_stage);
+            prepared_batch_launch_stage = "after_fetch";
+        }
+        if (prepared_batch_pipeline_requested) {
+            if (prepared_batch_pipeline_enabled) {
+                SPDLOG_INFO("[multi_gpu_prepared_batch_pipeline] enabled=1 mode=per_device_async_prepare max_prefetch=1 launch_stage={}",
+                            prepared_batch_launch_stage);
+            } else {
+                SPDLOG_WARN("[multi_gpu_prepared_batch_pipeline] enabled=0 reason={}", prepared_batch_pipeline_disabled_reason);
+            }
+        }
         std::vector<std::thread> threads;
 
         SPDLOG_INFO("################ Starting training epoch {} ################", dataloader_->getEpochsProcessed() + 1);
@@ -799,13 +844,57 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     model_->device_models_.size());
         for (int32_t device_idx = 0; device_idx < model_->device_models_.size(); device_idx++) {
             threads.emplace_back(std::thread([this, &need_sync, &sync_round, &all_reduce_ns, &all_reduce_calls, &device_timings, &sync_batch_counts,
-                                              &sync_round_all_reduce_ns, dense_sync_batches, device_idx] {
+                                              &sync_round_all_reduce_ns, dense_sync_batches, prepared_batch_pipeline_enabled,
+                                              prepared_batch_launch_stage, device_idx] {
                 int64_t local_batches_since_sync = 0;
-                while (dataloader_->hasNextBatch(device_idx)) {
+                std::future<shared_ptr<Batch>> prepared_batch_future;
+                auto launch_prepared_batch = [&]() {
+                    if (!prepared_batch_pipeline_enabled || prepared_batch_future.valid()) {
+                        return;
+                    }
+                    if (!dataloader_->canPrepareNextBatchInCurrentState(device_idx)) {
+                        device_timings[device_idx].prepared_batch_boundary_blocks++;
+                        return;
+                    }
+                    device_timings[device_idx].prepared_batch_launches++;
+                    auto loader = dataloader_;
+                    prepared_batch_future = std::async(std::launch::async, [loader, device_idx]() {
+#ifdef GEGE_CUDA
+                        if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < loader->devices_.size() &&
+                            loader->devices_[device_idx].is_cuda()) {
+                            c10::cuda::CUDAGuard device_guard(loader->devices_[device_idx]);
+                            auto prepare_stream = c10::cuda::getStreamFromPool(false, loader->devices_[device_idx].index());
+                            c10::cuda::CUDAStreamGuard stream_guard(prepare_stream);
+                            shared_ptr<Batch> batch = loader->getBatch(c10::nullopt, false, device_idx);
+                            AT_CUDA_CHECK(cudaStreamSynchronize(prepare_stream.stream()));
+                            return batch;
+                        }
+#endif
+                        return loader->getBatch(c10::nullopt, false, device_idx);
+                    });
+                };
+                auto fetch_batch = [&]() -> shared_ptr<Batch> {
+                    if (prepared_batch_future.valid()) {
+                        auto wait_start = std::chrono::high_resolution_clock::now();
+                        shared_ptr<Batch> batch = prepared_batch_future.get();
+                        device_timings[device_idx].prepared_batch_wait_ns += elapsed_ns(wait_start, std::chrono::high_resolution_clock::now());
+                        device_timings[device_idx].prepared_batch_hits++;
+                        return batch;
+                    }
+                    device_timings[device_idx].prepared_batch_direct_fetches++;
+                    return dataloader_->getBatch(c10::nullopt, false, device_idx);
+                };
+                while (prepared_batch_future.valid() || dataloader_->hasNextBatch(device_idx)) {
                     auto batch_fetch_start = std::chrono::high_resolution_clock::now();
-                    shared_ptr<Batch> batch = dataloader_->getBatch(c10::nullopt, false, device_idx);
+                    shared_ptr<Batch> batch = fetch_batch();
                     auto batch_fetch_end = std::chrono::high_resolution_clock::now();
+                    if (batch == nullptr) {
+                        break;
+                    }
                     device_timings[device_idx].batch_fetch_region_ns += elapsed_ns(batch_fetch_start, batch_fetch_end);
+                    if (prepared_batch_launch_stage == "after_fetch") {
+                        launch_prepared_batch();
+                    }
 
                     bool has_relation = (batch->edges_.size(1) == 3);
 
@@ -813,6 +902,14 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     dataloader_->loadGPUParameters(batch, device_idx);
                     auto gpu_load_end = std::chrono::high_resolution_clock::now();
                     device_timings[device_idx].gpu_load_region_ns += elapsed_ns(gpu_load_start, gpu_load_end);
+#ifdef GEGE_CUDA
+                    if (prepared_batch_pipeline_enabled) {
+                        record_batch_tensors_on_current_stream(batch);
+                    }
+#endif
+                    if (prepared_batch_launch_stage == "after_gpu_load") {
+                        launch_prepared_batch();
+                    }
 
                     if (batch->node_embeddings_.defined()) {
                         batch->node_embeddings_.requires_grad_();
@@ -827,6 +924,9 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     model_->device_models_[device_idx]->train_batch(batch, false);
                     auto compute_end = std::chrono::high_resolution_clock::now();
                     device_timings[device_idx].compute_region_ns += elapsed_ns(compute_start, compute_end);
+                    if (prepared_batch_launch_stage == "after_compute") {
+                        launch_prepared_batch();
+                    }
 
                     if (batch->node_gradients_.defined()) {
                         auto embedding_update_start = std::chrono::high_resolution_clock::now();
@@ -1045,6 +1145,16 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                 perf_stats.peer_relay.descriptor_mismatch_count,
                 ns_to_ms(perf_stats.peer_relay.peer_sync_wait_ns));
         }
+        if (prepared_batch_pipeline_requested) {
+            SPDLOG_INFO(
+                "[perf][epoch {}][prepared_batch] enabled={} launches={} hits={} direct_fetches={} boundary_blocks={} wait_ms={:.3f}",
+                dataloader_->getEpochsProcessed(), prepared_batch_pipeline_enabled ? 1 : 0,
+                sum_member(device_timings, &DeviceEpochTiming::prepared_batch_launches),
+                sum_member(device_timings, &DeviceEpochTiming::prepared_batch_hits),
+                sum_member(device_timings, &DeviceEpochTiming::prepared_batch_direct_fetches),
+                sum_member(device_timings, &DeviceEpochTiming::prepared_batch_boundary_blocks),
+                ns_to_ms(sum_member(device_timings, &DeviceEpochTiming::prepared_batch_wait_ns)));
+        }
         SPDLOG_INFO(
             "[perf][epoch {}][batch_fetch] total_ms={:.3f} get_next_batch_ms={:.3f} get_next_direct_ms={:.3f} get_next_swap_path_ms={:.3f} get_next_swap_overhead_ms={:.3f} edge_sample_ms={:.3f} node_sample_ms={:.3f} load_cpu_parameters_ms={:.3f} device_prepare_ms={:.3f} perform_map_ms={:.3f} overhead_ms={:.3f}",
             dataloader_->getEpochsProcessed(), ns_to_ms(sum_member(device_timings, &DeviceEpochTiming::batch_fetch_region_ns)),
@@ -1125,6 +1235,12 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                 dataloader_->getEpochsProcessed(), device_idx, ns_to_ms(timing.batch_fetch_region_ns), ns_to_ms(get_next_batch), ns_to_ms(get_next_direct),
                 ns_to_ms(get_next_swap_path), ns_to_ms(get_next_swap_overhead), ns_to_ms(edge_sample), ns_to_ms(node_sample),
                 ns_to_ms(load_cpu_parameters), ns_to_ms(device_prepare), ns_to_ms(perform_map), ns_to_ms(get_batch_overhead));
+            if (prepared_batch_pipeline_requested) {
+                SPDLOG_INFO(
+                    "[perf][epoch {}][gpu {}][prepared_batch] launches={} hits={} direct_fetches={} boundary_blocks={} wait_ms={:.3f}",
+                    dataloader_->getEpochsProcessed(), device_idx, timing.prepared_batch_launches, timing.prepared_batch_hits,
+                    timing.prepared_batch_direct_fetches, timing.prepared_batch_boundary_blocks, ns_to_ms(timing.prepared_batch_wait_ns));
+            }
             SPDLOG_INFO(
                 "[perf][epoch {}][gpu {}][edge_sample] total_ms={:.3f} get_edges_ms={:.3f} negative_sample_ms={:.3f} collect_ids_ms={:.3f} map_lookup_ms={:.3f} compact_active_ms={:.3f} verify_ms={:.3f} remap_assign_ms={:.3f} finalize_ms={:.3f} unaccounted_ms={:.3f}",
                 dataloader_->getEpochsProcessed(), device_idx, ns_to_ms(edge_sample), ns_to_ms(edge_get_edges), ns_to_ms(edge_negative_sample),

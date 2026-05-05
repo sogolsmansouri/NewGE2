@@ -21,6 +21,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime_api.h>
 #endif
 
 using std::get;
@@ -829,10 +830,11 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
             SPDLOG_WARN("Ignoring invalid multi-GPU prepared batch launch stage {}; using after_fetch", prepared_batch_launch_stage);
             prepared_batch_launch_stage = "after_fetch";
         }
+        const bool prepared_batch_low_priority = env_flag_enabled("GEGE_MULTI_GPU_PREPARED_BATCH_LOW_PRIORITY");
         if (prepared_batch_pipeline_requested) {
             if (prepared_batch_pipeline_enabled) {
-                SPDLOG_INFO("[multi_gpu_prepared_batch_pipeline] enabled=1 mode=per_device_async_prepare max_prefetch=1 launch_stage={}",
-                            prepared_batch_launch_stage);
+                SPDLOG_INFO("[multi_gpu_prepared_batch_pipeline] enabled=1 mode=per_device_async_prepare max_prefetch=1 launch_stage={} low_priority={}",
+                            prepared_batch_launch_stage, prepared_batch_low_priority ? 1 : 0);
             } else {
                 SPDLOG_WARN("[multi_gpu_prepared_batch_pipeline] enabled=0 reason={}", prepared_batch_pipeline_disabled_reason);
             }
@@ -845,9 +847,23 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
         for (int32_t device_idx = 0; device_idx < model_->device_models_.size(); device_idx++) {
             threads.emplace_back(std::thread([this, &need_sync, &sync_round, &all_reduce_ns, &all_reduce_calls, &device_timings, &sync_batch_counts,
                                               &sync_round_all_reduce_ns, dense_sync_batches, prepared_batch_pipeline_enabled,
-                                              prepared_batch_launch_stage, device_idx] {
+                                              prepared_batch_launch_stage, prepared_batch_low_priority, device_idx] {
                 int64_t local_batches_since_sync = 0;
                 std::future<shared_ptr<Batch>> prepared_batch_future;
+                std::uintptr_t low_priority_prepare_stream_value = 0;
+#ifdef GEGE_CUDA
+                if (prepared_batch_pipeline_enabled && prepared_batch_low_priority &&
+                    device_idx >= 0 && static_cast<std::size_t>(device_idx) < dataloader_->devices_.size() &&
+                    dataloader_->devices_[device_idx].is_cuda()) {
+                    c10::cuda::CUDAGuard device_guard(dataloader_->devices_[device_idx]);
+                    int least_priority = 0;
+                    int greatest_priority = 0;
+                    AT_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
+                    cudaStream_t low_priority_stream = nullptr;
+                    AT_CUDA_CHECK(cudaStreamCreateWithPriority(&low_priority_stream, cudaStreamNonBlocking, least_priority));
+                    low_priority_prepare_stream_value = reinterpret_cast<std::uintptr_t>(low_priority_stream);
+                }
+#endif
                 auto launch_prepared_batch = [&]() {
                     if (!prepared_batch_pipeline_enabled || prepared_batch_future.valid()) {
                         return;
@@ -858,12 +874,17 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     }
                     device_timings[device_idx].prepared_batch_launches++;
                     auto loader = dataloader_;
-                    prepared_batch_future = std::async(std::launch::async, [loader, device_idx]() {
+                    auto prepare_stream_value = low_priority_prepare_stream_value;
+                    prepared_batch_future = std::async(std::launch::async, [loader, prepare_stream_value, device_idx]() {
 #ifdef GEGE_CUDA
                         if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < loader->devices_.size() &&
                             loader->devices_[device_idx].is_cuda()) {
                             c10::cuda::CUDAGuard device_guard(loader->devices_[device_idx]);
-                            auto prepare_stream = c10::cuda::getStreamFromPool(false, loader->devices_[device_idx].index());
+                            c10::cuda::CUDAStream prepare_stream = prepare_stream_value != 0
+                                                                        ? c10::cuda::getStreamFromExternal(
+                                                                              reinterpret_cast<cudaStream_t>(prepare_stream_value),
+                                                                              loader->devices_[device_idx].index())
+                                                                        : c10::cuda::getStreamFromPool(false, loader->devices_[device_idx].index());
                             c10::cuda::CUDAStreamGuard stream_guard(prepare_stream);
                             shared_ptr<Batch> batch = loader->getBatch(c10::nullopt, false, device_idx);
                             AT_CUDA_CHECK(cudaStreamSynchronize(prepare_stream.stream()));
@@ -1007,6 +1028,12 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     device_timings[device_idx].finalize_region_ns += elapsed_ns(finalize_start, finalize_end);
                     device_timings[device_idx].batch_count++;
                 }
+#ifdef GEGE_CUDA
+                if (low_priority_prepare_stream_value != 0) {
+                    c10::cuda::CUDAGuard device_guard(dataloader_->devices_[device_idx]);
+                    AT_CUDA_CHECK(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(low_priority_prepare_stream_value)));
+                }
+#endif
             }));
         }
         for (auto &thread : threads) {

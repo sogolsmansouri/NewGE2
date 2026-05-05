@@ -850,7 +850,7 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                                               prepared_batch_launch_stage, prepared_batch_low_priority, device_idx] {
                 int64_t local_batches_since_sync = 0;
                 std::future<shared_ptr<Batch>> prepared_batch_future;
-                std::uintptr_t low_priority_prepare_stream_value = 0;
+                int prepare_stream_priority = 0;
 #ifdef GEGE_CUDA
                 if (prepared_batch_pipeline_enabled && prepared_batch_low_priority &&
                     device_idx >= 0 && static_cast<std::size_t>(device_idx) < dataloader_->devices_.size() &&
@@ -859,9 +859,7 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     int least_priority = 0;
                     int greatest_priority = 0;
                     AT_CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
-                    cudaStream_t low_priority_stream = nullptr;
-                    AT_CUDA_CHECK(cudaStreamCreateWithPriority(&low_priority_stream, cudaStreamNonBlocking, least_priority));
-                    low_priority_prepare_stream_value = reinterpret_cast<std::uintptr_t>(low_priority_stream);
+                    prepare_stream_priority = least_priority;
                 }
 #endif
                 auto launch_prepared_batch = [&]() {
@@ -874,17 +872,15 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     }
                     device_timings[device_idx].prepared_batch_launches++;
                     auto loader = dataloader_;
-                    auto prepare_stream_value = low_priority_prepare_stream_value;
-                    prepared_batch_future = std::async(std::launch::async, [loader, prepare_stream_value, device_idx]() {
+                    auto low_priority = prepared_batch_low_priority;
+                    auto priority = prepare_stream_priority;
+                    prepared_batch_future = std::async(std::launch::async, [loader, low_priority, priority, device_idx]() {
 #ifdef GEGE_CUDA
                         if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < loader->devices_.size() &&
                             loader->devices_[device_idx].is_cuda()) {
                             c10::cuda::CUDAGuard device_guard(loader->devices_[device_idx]);
-                            c10::cuda::CUDAStream prepare_stream = prepare_stream_value != 0
-                                                                        ? c10::cuda::getStreamFromExternal(
-                                                                              reinterpret_cast<cudaStream_t>(prepare_stream_value),
-                                                                              loader->devices_[device_idx].index())
-                                                                        : c10::cuda::getStreamFromPool(false, loader->devices_[device_idx].index());
+                            auto prepare_stream = low_priority ? c10::cuda::getStreamFromPool(priority, loader->devices_[device_idx].index())
+                                                               : c10::cuda::getStreamFromPool(false, loader->devices_[device_idx].index());
                             c10::cuda::CUDAStreamGuard stream_guard(prepare_stream);
                             shared_ptr<Batch> batch = loader->getBatch(c10::nullopt, false, device_idx);
                             AT_CUDA_CHECK(cudaStreamSynchronize(prepare_stream.stream()));
@@ -1028,12 +1024,6 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
                     device_timings[device_idx].finalize_region_ns += elapsed_ns(finalize_start, finalize_end);
                     device_timings[device_idx].batch_count++;
                 }
-#ifdef GEGE_CUDA
-                if (low_priority_prepare_stream_value != 0) {
-                    c10::cuda::CUDAGuard device_guard(dataloader_->devices_[device_idx]);
-                    AT_CUDA_CHECK(cudaStreamDestroy(reinterpret_cast<cudaStream_t>(low_priority_prepare_stream_value)));
-                }
-#endif
             }));
         }
         for (auto &thread : threads) {

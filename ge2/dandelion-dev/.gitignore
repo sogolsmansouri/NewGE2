@@ -1,6 +1,10 @@
 build/
 datasets/
 gege/*.log
+gege/build-*/
+experiment_logs/*.log
+experiment_logs/*.svg
+experiment_outputs/
 *.swp
 *.swo
 gege/examples/configuration/*.yaml

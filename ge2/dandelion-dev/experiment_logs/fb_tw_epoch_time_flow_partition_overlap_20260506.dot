@@ -1,0 +1,198 @@
+digraph EpochTimeFlow {
+  graph [
+    rankdir=LR,
+    bgcolor="white",
+    pad=0.35,
+    nodesep=0.55,
+    ranksep=0.72,
+    fontname="Arial",
+    fontsize=18,
+    labelloc=t,
+    label="FB vs TW Epoch-Time Flow: Single-GPU Partition-Side Overlap"
+  ];
+
+  node [
+    shape=rect,
+    style="rounded,filled",
+    fontname="Arial",
+    fontsize=13,
+    margin="0.12,0.08",
+    penwidth=1.6
+  ];
+
+  edge [
+    fontname="Arial",
+    fontsize=11,
+    arrowsize=0.75,
+    penwidth=1.4,
+    color="#4A5568"
+  ];
+
+  legend_critical [
+    label="critical path",
+    fillcolor="#EAF3FF",
+    color="#2F6FDB"
+  ];
+  legend_overlap [
+    label="overlapped partition work",
+    fillcolor="#EAF8ED",
+    color="#2E7D32",
+    style="rounded,filled,dashed"
+  ];
+  legend_swap [
+    label="swap boundary",
+    fillcolor="#FFF4E0",
+    color="#C07C00"
+  ];
+  legend_off [
+    label="prepared-batch trainer pipeline OFF",
+    fillcolor="#F5F5F5",
+    color="#8A8A8A"
+  ];
+
+  legend_critical -> legend_overlap [style=invis];
+  legend_overlap -> legend_swap [style=invis];
+  legend_swap -> legend_off [style=invis];
+
+  subgraph cluster_fb {
+    label="FB p32 q4, epoch 2: 103.580 s";
+    color="#B8C7E0";
+    penwidth=1.4;
+    style="rounded";
+    fontsize=16;
+    fontname="Arial";
+
+    fb_fetch [
+      label="batch fetch / edge sampling\n37.901 s counter\nedge_sample 21.824 s",
+      fillcolor="#EAF3FF",
+      color="#2F6FDB"
+    ];
+
+    fb_train [
+      label="visible state training\n93 states\n304.7M positive edges",
+      fillcolor="#EAF3FF",
+      color="#2F6FDB"
+    ];
+
+    fb_swap [
+      label="92 swap boundaries\npublish hidden frames\nswap_update 15.960 s",
+      fillcolor="#FFF4E0",
+      color="#C07C00"
+    ];
+
+    fb_preload [
+      label="async admit preload\n228 admitted partitions\n6 hidden frames\nvalid before every swap",
+      fillcolor="#EAF8ED",
+      color="#2E7D32",
+      style="rounded,filled,dashed"
+    ];
+
+    fb_writeback [
+      label="delayed stale writeback\n92 swaps\nold frames copied back async",
+      fillcolor="#EAF8ED",
+      color="#2E7D32",
+      style="rounded,filled,dashed"
+    ];
+
+    fb_ok [
+      label="no visible fallback\npreload_miss=0\npartial_preload=0",
+      fillcolor="#F1FFF4",
+      color="#2E7D32"
+    ];
+
+    fb_ns [
+      label="negative sampling\n10.652 s counter\ninside edge_sample",
+      fillcolor="#F6FAFF",
+      color="#7AA7E8"
+    ];
+
+    fb_fetch -> fb_train [label="batches feed compute"];
+    fb_ns -> fb_fetch [label="nested"];
+    fb_preload -> fb_train [label="overlaps current state", style=dashed, color="#2E7D32"];
+    fb_train -> fb_swap [label="state boundary"];
+    fb_swap -> fb_preload [label="next admits"];
+    fb_swap -> fb_writeback [label="stale frames"];
+    fb_writeback -> fb_train [label="overlaps next state", style=dashed, color="#2E7D32"];
+    fb_preload -> fb_ok [color="#2E7D32"];
+  }
+
+  subgraph cluster_tw {
+    label="TW p16 q4, epoch 2: 151.878 s";
+    color="#B8C7E0";
+    penwidth=1.4;
+    style="rounded";
+    fontsize=16;
+    fontname="Arial";
+
+    tw_stream [
+      label="bucket-streaming LP path\nin-memory partition-buffer batches",
+      fillcolor="#EAF3FF",
+      color="#2F6FDB"
+    ];
+
+    tw_fetch [
+      label="batch fetch / edge sampling\n39.114 s counter\nedge_sample 39.050 s",
+      fillcolor="#EAF3FF",
+      color="#2F6FDB"
+    ];
+
+    tw_train [
+      label="visible state training\n24 states\n1.468B positive edges",
+      fillcolor="#EAF3FF",
+      color="#2F6FDB"
+    ];
+
+    tw_swap [
+      label="23 swap boundaries\npublish hidden frames\nswap_update 28 ms",
+      fillcolor="#FFF4E0",
+      color="#C07C00"
+    ];
+
+    tw_preload [
+      label="async admit preload\n52 admitted partitions\n3 hidden frames\nvalid before every swap",
+      fillcolor="#EAF8ED",
+      color="#2E7D32",
+      style="rounded,filled,dashed"
+    ];
+
+    tw_writeback [
+      label="delayed stale writeback\n23 swaps\nold frames copied back async",
+      fillcolor="#EAF8ED",
+      color="#2E7D32",
+      style="rounded,filled,dashed"
+    ];
+
+    tw_ok [
+      label="no visible fallback\npreload_miss=0\npartial_preload=0\nfixed by hidden_frames=3",
+      fillcolor="#F1FFF4",
+      color="#2E7D32"
+    ];
+
+    tw_ns [
+      label="negative sampling\n14.559 s counter\ninside edge_sample",
+      fillcolor="#F6FAFF",
+      color="#7AA7E8"
+    ];
+
+    tw_stream -> tw_fetch [label="feeds"];
+    tw_fetch -> tw_train [label="batches feed compute"];
+    tw_ns -> tw_fetch [label="nested"];
+    tw_preload -> tw_train [label="overlaps current state", style=dashed, color="#2E7D32"];
+    tw_train -> tw_swap [label="state boundary"];
+    tw_swap -> tw_preload [label="next admits"];
+    tw_swap -> tw_writeback [label="stale frames"];
+    tw_writeback -> tw_train [label="overlaps next state", style=dashed, color="#2E7D32"];
+    tw_preload -> tw_ok [color="#2E7D32"];
+  }
+
+  note [
+    label="Main difference: FB has more state transitions and visible swap-update time; TW now has no partition fallback and is dominated by edge sampling / negative sampling / compute over many more edges.",
+    shape=note,
+    fillcolor="#FFFCEB",
+    color="#B08A00",
+    fontsize=13
+  ];
+
+  fb_ok -> note [style=invis];
+  tw_ok -> note [style=invis];
+}

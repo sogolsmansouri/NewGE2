@@ -456,6 +456,7 @@ struct ActiveEdgeBucketSelection {
     int64_t state_idx = -1;
     std::string resident_partitions = "-";
     int64_t num_active_buckets = 0;
+    torch::Tensor edge_bucket_ids;
     torch::Tensor in_memory_edge_bucket_idx;
     torch::Tensor edge_bucket_sizes;
 };
@@ -464,6 +465,178 @@ struct StreamedEdgeSlice {
     int64_t start = 0;
     int64_t size = 0;
 };
+
+struct BucketCoverageState {
+    int64_t epoch = -1;
+    int64_t states_seen = 0;
+    int64_t unique_buckets_seen = 0;
+    int64_t total_states = 0;
+    int64_t total_buckets = 0;
+    int64_t num_partitions = 0;
+    bool summary_logged = false;
+    std::vector<uint8_t> state_seen;
+    std::vector<uint8_t> bucket_seen;
+};
+
+bool bucket_coverage_log_enabled() {
+    static bool enabled = parse_env_flag("GEGE_BUCKET_COVERAGE_LOG", false);
+    return enabled;
+}
+
+bool bucket_coverage_state_log_enabled() {
+    static bool enabled = parse_env_flag("GEGE_BUCKET_COVERAGE_LOG_STATES", false);
+    return enabled;
+}
+
+std::map<std::pair<DataLoader *, int32_t>, BucketCoverageState> &bucket_coverage_states() {
+    static std::map<std::pair<DataLoader *, int32_t>, BucketCoverageState> states;
+    return states;
+}
+
+std::string format_ranges(const std::vector<int64_t> &ids) {
+    if (ids.empty()) {
+        return "-";
+    }
+
+    std::ostringstream oss;
+    int64_t range_start = ids[0];
+    int64_t previous = ids[0];
+    bool first = true;
+    auto flush_range = [&]() {
+        if (!first) {
+            oss << ",";
+        }
+        first = false;
+        if (range_start == previous) {
+            oss << range_start;
+        } else {
+            oss << range_start << "-" << previous;
+        }
+    };
+
+    for (std::size_t i = 1; i < ids.size(); i++) {
+        if (ids[i] == previous + 1) {
+            previous = ids[i];
+            continue;
+        }
+        flush_range();
+        range_start = ids[i];
+        previous = ids[i];
+    }
+    flush_range();
+    return oss.str();
+}
+
+std::vector<int64_t> collect_bucket_ids(const std::vector<uint8_t> &seen, bool want_seen) {
+    std::vector<int64_t> ids;
+    for (std::size_t i = 0; i < seen.size(); i++) {
+        if ((seen[i] != 0) == want_seen) {
+            ids.emplace_back(static_cast<int64_t>(i));
+        }
+    }
+    return ids;
+}
+
+std::vector<int64_t> collect_diagonal_bucket_ids(const std::vector<uint8_t> &seen, int64_t num_partitions, bool want_seen) {
+    std::vector<int64_t> ids;
+    if (num_partitions <= 0) {
+        return ids;
+    }
+    for (int64_t partition = 0; partition < num_partitions; partition++) {
+        int64_t bucket_id = partition * num_partitions + partition;
+        if (bucket_id >= 0 && static_cast<std::size_t>(bucket_id) < seen.size() &&
+            ((seen[static_cast<std::size_t>(bucket_id)] != 0) == want_seen)) {
+            ids.emplace_back(bucket_id);
+        }
+    }
+    return ids;
+}
+
+void maybe_log_bucket_coverage_summary(DataLoader *loader, int32_t device_idx, BucketCoverageState &state, bool force) {
+    if (state.summary_logged || loader == nullptr) {
+        return;
+    }
+    if (!force && state.states_seen < state.total_states) {
+        return;
+    }
+
+    auto seen_buckets = collect_bucket_ids(state.bucket_seen, true);
+    auto missing_buckets = collect_bucket_ids(state.bucket_seen, false);
+    auto seen_diagonal_buckets = collect_diagonal_bucket_ids(state.bucket_seen, state.num_partitions, true);
+    auto missing_diagonal_buckets = collect_diagonal_bucket_ids(state.bucket_seen, state.num_partitions, false);
+
+    SPDLOG_INFO(
+        "[bucket_coverage][phase={}][epoch {}][device {}] states={}/{} unique_buckets={}/{} diagonal_buckets={}/{} bucket_ranges={} missing_bucket_ranges={} diagonal_bucket_ids={} missing_diagonal_bucket_ids={}",
+        loader->train_ ? "train" : "eval", state.epoch, device_idx, state.states_seen, state.total_states,
+        state.unique_buckets_seen, state.total_buckets, seen_diagonal_buckets.size(), state.num_partitions,
+        format_ranges(seen_buckets), format_ranges(missing_buckets), format_ranges(seen_diagonal_buckets),
+        format_ranges(missing_diagonal_buckets));
+    state.summary_logged = true;
+}
+
+void record_bucket_coverage(DataLoader *loader, int32_t device_idx, const ActiveEdgeBucketSelection &selection) {
+    if (!bucket_coverage_log_enabled() || loader == nullptr || loader->graph_storage_ == nullptr ||
+        !selection.edge_bucket_ids.defined()) {
+        return;
+    }
+
+    int64_t total_states = static_cast<int64_t>(loader->edge_buckets_per_buffer_.size());
+    if (total_states <= 0) {
+        return;
+    }
+
+    int64_t total_buckets = 0;
+    if (loader->graph_storage_->storage_ptrs_.edges != nullptr) {
+        total_buckets = static_cast<int64_t>(loader->graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes().size());
+    }
+    if (total_buckets <= 0) {
+        return;
+    }
+
+    int64_t num_partitions = loader->graph_storage_->getNumPartitions();
+    int64_t epoch = loader->epochs_processed_ + 1;
+    auto &state = bucket_coverage_states()[{loader, device_idx}];
+    if (state.epoch != epoch || state.total_states != total_states || state.total_buckets != total_buckets) {
+        state = BucketCoverageState{};
+        state.epoch = epoch;
+        state.total_states = total_states;
+        state.total_buckets = total_buckets;
+        state.num_partitions = num_partitions;
+        state.state_seen.assign(static_cast<std::size_t>(total_states), 0);
+        state.bucket_seen.assign(static_cast<std::size_t>(total_buckets), 0);
+    }
+
+    if (selection.state_idx >= 0 && selection.state_idx < state.total_states) {
+        std::size_t state_index = static_cast<std::size_t>(selection.state_idx);
+        if (state.state_seen[state_index] == 0) {
+            state.state_seen[state_index] = 1;
+            state.states_seen++;
+        }
+    }
+
+    torch::Tensor bucket_ids = selection.edge_bucket_ids.reshape({-1}).to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto bucket_ids_accessor = bucket_ids.accessor<int64_t, 1>();
+    for (int64_t i = 0; i < bucket_ids.size(0); i++) {
+        int64_t bucket_id = bucket_ids_accessor[i];
+        if (bucket_id < 0 || bucket_id >= state.total_buckets) {
+            continue;
+        }
+        std::size_t bucket_index = static_cast<std::size_t>(bucket_id);
+        if (state.bucket_seen[bucket_index] == 0) {
+            state.bucket_seen[bucket_index] = 1;
+            state.unique_buckets_seen++;
+        }
+    }
+
+    if (bucket_coverage_state_log_enabled()) {
+        SPDLOG_INFO(
+            "[bucket_coverage_state][phase={}][epoch {}][device {}] state_idx={} resident_partitions={} active_buckets={} bucket_ids={}",
+            loader->train_ ? "train" : "eval", state.epoch, device_idx, selection.state_idx,
+            selection.resident_partitions, selection.num_active_buckets, format_tensor_values(selection.edge_bucket_ids));
+    }
+
+    maybe_log_bucket_coverage_summary(loader, device_idx, state, false);
+}
 
 ActiveEdgeBucketSelection resolve_active_edge_bucket_selection(DataLoader *loader, int32_t device_idx) {
     ActiveEdgeBucketSelection selection;
@@ -486,6 +659,7 @@ ActiveEdgeBucketSelection resolve_active_edge_bucket_selection(DataLoader *loade
     int num_partitions = loader->graph_storage_->getNumPartitions();
     selection.num_active_buckets = edge_bucket_ids.size(0);
     edge_bucket_ids = edge_bucket_ids.select(1, 0) * num_partitions + edge_bucket_ids.select(1, 1);
+    selection.edge_bucket_ids = edge_bucket_ids;
     selection.in_memory_edge_bucket_idx = torch::empty({edge_bucket_ids.size(0)}, edge_bucket_ids.options());
     selection.edge_bucket_sizes = torch::empty({edge_bucket_ids.size(0)}, edge_bucket_ids.options());
 
@@ -1102,6 +1276,7 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
             bucket_lookup_ms, gather_ms, shuffle_ms, elapsed_ms(total_start, now));
     }
     record_active_edge_state(this, device_idx, selection, active_edges.defined() ? active_edges.size(0) : 0);
+    record_bucket_coverage(this, device_idx, selection);
     graph_storage_->setActiveEdges(active_edges, device_idx);
 }
 
@@ -1150,6 +1325,7 @@ void DataLoader::initializeBatches(bool prepare_encode, int32_t device_idx) {
                 int64_t block_size = bucket_streaming_block_size(batch_size_);
                 streamed_slices = build_streamed_edge_slices(this, device_idx, selection, block_size);
                 record_active_edge_state(this, device_idx, selection, num_items);
+                record_bucket_coverage(this, device_idx, selection);
                 graph_storage_->setActiveEdges(torch::Tensor(), device_idx);
             } else {
                 setActiveEdges(device_idx);

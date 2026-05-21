@@ -78,6 +78,8 @@ fi
 
 export PATH="${PY_ENV}/bin:${PATH}"
 export LD_LIBRARY_PATH="${PY_ENV}/lib:${LD_LIBRARY_PATH:-}"
+export GEGE_NO_BINDINGS="${GEGE_NO_BINDINGS:-1}"
+export PYTHONPATH="${ROOT}/build_ge2env_ge2py39/package/build/lib${PYTHONPATH:+:${PYTHONPATH}}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 export GEGE_TRAIN_BIN="$TRAIN_BIN"

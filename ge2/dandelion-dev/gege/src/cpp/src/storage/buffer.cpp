@@ -13,6 +13,7 @@
 #include <sstream>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <functional>
 #include <future>
@@ -184,6 +185,11 @@ bool local_id_validate_enabled_storage() {
 int64_t frame_cache_hidden_frames() {
     static int64_t hidden_frames = std::max<int64_t>(parse_env_int("GEGE_FRAME_CACHE_HIDDEN_FRAMES", 0), 0);
     return hidden_frames;
+}
+
+bool frame_cache_auto_pipeline_frames_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES", false);
+    return enabled;
 }
 
 bool frame_cache_hidden_only_preload_enabled() {
@@ -1354,7 +1360,7 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     }
 
     hidden_frame_capacity_ =
-        ((single_gpu_gpu_aware_custom_enabled() && buffer_sizes_ == 1 && device_.is_cuda()) ||
+        ((buffer_sizes_ == 1 && device_.is_cuda() && frame_cache_hidden_frames() > 0) ||
          (multi_gpu_async_admit_preload_enabled() && buffer_sizes_ > 1 && device_.is_cuda()))
             ? static_cast<int>(frame_cache_hidden_frames())
             : 0;
@@ -1383,6 +1389,8 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
 
 MemPartitionBuffer::~MemPartitionBuffer() {
     joinAsyncAdmitPreload_();
+    // Launch any deferred stale writeback before joining evict tasks on teardown.
+    flushPendingDelayedStaleWriteback_();
     joinAsyncEvictWriteback_();
     unload(true);
     // free(buff_mem_);
@@ -1392,12 +1400,18 @@ MemPartitionBuffer::~MemPartitionBuffer() {
 
 bool MemPartitionBuffer::frameCacheEnabled_() const { return hidden_frame_capacity_ > 0; }
 
+int64_t MemPartitionBuffer::frameCacheMaxStaleBacklog_() const {
+    int64_t default_backlog =
+        frame_cache_auto_max_stale_backlog_ >= 0 ? frame_cache_auto_max_stale_backlog_ : static_cast<int64_t>(hidden_frame_capacity_);
+    return std::max<int64_t>(parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG", default_backlog), 0);
+}
+
 bool MemPartitionBuffer::asyncAdmitPreloadEnabled_() const {
     if (!device_.is_cuda()) {
         return false;
     }
     if (buffer_sizes_ == 1) {
-        return single_gpu_async_admit_preload_enabled() && single_gpu_gpu_aware_custom_enabled();
+        return single_gpu_async_admit_preload_enabled() || hidden_frame_capacity_ > 0;
     }
     return multi_gpu_async_admit_preload_enabled();
 }
@@ -1427,6 +1441,102 @@ void MemPartitionBuffer::resetFrameCacheState_() {
         }
     }
     refreshFrameCacheTensors_();
+}
+
+bool MemPartitionBuffer::hasDeviceResidentFrames() const {
+    if (!device_.is_cuda() || !buffer_tensor_gpu_view_.defined() || !buffer_tensor_gpu_view_.device().is_cuda()) {
+        return false;
+    }
+    if (frameCacheEnabled_()) {
+        return logical_to_physical_frame_device_.defined() && logical_to_physical_frame_device_.device().is_cuda();
+    }
+    return true;
+}
+
+void MemPartitionBuffer::autoConfigureFrameCacheFromOrdering_() {
+    frame_cache_auto_max_transition_admits_ = 0;
+    frame_cache_auto_max_stale_backlog_ = -1;
+    if (!frame_cache_auto_pipeline_frames_enabled()) {
+        return;
+    }
+    if (!asyncAdmitPreloadEnabled_()) {
+        SPDLOG_WARN("[frame_cache_auto] requested but async admit preload is disabled for device={} buffer_sizes={}", device_.str(), buffer_sizes_);
+        return;
+    }
+    if (buffer_tensor_view_.defined() || buffer_tensor_gpu_view_.defined()) {
+        throw GegeRuntimeException(
+            "GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES requires frame-cache sizing before MemPartitionBuffer backing tensors are allocated");
+    }
+
+    int device_index = device_.index();
+    if (device_index < 0) {
+        throw GegeRuntimeException("GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES requires a concrete CUDA device index");
+    }
+    const std::size_t stride = static_cast<std::size_t>(std::max(buffer_sizes_, 1));
+    std::size_t idx = static_cast<std::size_t>(device_index);
+    if (idx >= buffer_states_.size()) {
+        throw GegeRuntimeException("GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES could not find a buffer state for the current device");
+    }
+
+    auto state_ids = [](const torch::Tensor &state) {
+        std::vector<int64_t> ids;
+        if (!state.defined() || state.numel() == 0) {
+            return ids;
+        }
+        torch::Tensor state_cpu = state.to(torch::kCPU).to(torch::kInt64).contiguous();
+        auto *ptr = state_cpu.data_ptr<int64_t>();
+        ids.reserve(static_cast<std::size_t>(state_cpu.numel()));
+        for (int64_t i = 0; i < state_cpu.numel(); i++) {
+            if (ptr[i] >= 0) {
+                ids.emplace_back(ptr[i]);
+            }
+        }
+        return ids;
+    };
+
+    int64_t max_transition_admits = 0;
+    int64_t transition_count = 0;
+    int64_t max_visible_slots = 0;
+    for (; idx < buffer_states_.size(); idx += stride) {
+        std::vector<int64_t> current_ids = state_ids(buffer_states_[idx]);
+        max_visible_slots = std::max<int64_t>(max_visible_slots, static_cast<int64_t>(current_ids.size()));
+        if (idx + stride >= buffer_states_.size()) {
+            break;
+        }
+        std::vector<int64_t> next_ids = state_ids(buffer_states_[idx + stride]);
+        max_visible_slots = std::max<int64_t>(max_visible_slots, static_cast<int64_t>(next_ids.size()));
+
+        std::unordered_set<int64_t> current_set(current_ids.begin(), current_ids.end());
+        int64_t admits = 0;
+        for (int64_t partition_id : next_ids) {
+            if (current_set.find(partition_id) == current_set.end()) {
+                admits += 1;
+            }
+        }
+        max_transition_admits = std::max(max_transition_admits, admits);
+        transition_count += 1;
+    }
+
+    const int64_t preload_frames = max_transition_admits;
+    const int64_t stale_frames = max_transition_admits;
+    const int64_t extra_frames = preload_frames + stale_frames;
+    frame_cache_auto_max_transition_admits_ = max_transition_admits;
+    frame_cache_auto_max_stale_backlog_ = stale_frames;
+    hidden_frame_capacity_ = static_cast<int>(extra_frames);
+    physical_frame_capacity_ = capacity_ + hidden_frame_capacity_;
+    resetFrameCacheState_();
+
+    const char *manual_hidden = std::getenv("GEGE_FRAME_CACHE_HIDDEN_FRAMES");
+    if (manual_hidden != nullptr) {
+        SPDLOG_WARN("[frame_cache_auto] overriding GEGE_FRAME_CACHE_HIDDEN_FRAMES={} with schedule-derived extra_frames={}", manual_hidden,
+                    extra_frames);
+    }
+    double frame_mib = static_cast<double>(partition_size_) * static_cast<double>(embedding_size_) *
+                       static_cast<double>(dtype_size_) / (1024.0 * 1024.0);
+    SPDLOG_INFO("[frame_cache_auto] device={} visible_capacity={} max_visible_slots={} transitions={} max_transition_admits={} "
+                "preload_frames={} stale_frames={} extra_frames={} physical_frames={} frame_mib={:.3f}",
+                device_.str(), capacity_, max_visible_slots, transition_count, max_transition_admits, preload_frames, stale_frames,
+                extra_frames, physical_frame_capacity_, frame_mib);
 }
 
 int64_t MemPartitionBuffer::logicalSlotToPhysicalFrame_(int64_t logical_slot) const {
@@ -2396,7 +2506,6 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
     }
 
     joinAsyncAdmitPreload_();
-
     if (admit_ids.empty() || admit_ids.size() != evict_slots.size()) {
         std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
         async_admit_preload_valid_ = false;
@@ -2446,6 +2555,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                         free_count = free_physical_frames_.size();
                     }
                     if (free_count < target_hidden_count) {
+                        flushPendingDelayedStaleWriteback_();
                         joinAsyncEvictWriteback_();
                     }
                 }
@@ -3582,22 +3692,34 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             std::lock_guard<std::mutex> preload_lock(async_admit_preload_lock_);
             if (async_admit_preload_valid_ && !async_admit_preload_hidden_publishes_.empty() && async_admit_preload_admit_ids_.empty() &&
                 async_admit_preload_evict_slots_.empty()) {
-                delayed_stale_row_offsets.emplace_back(0);
-                delayed_stale_writeback = true;
-                for (const HiddenFramePublish &hidden_publish : async_admit_preload_hidden_publishes_) {
-                    auto slot_it = std::find(evict_slots.begin(), evict_slots.end(), hidden_publish.logical_slot);
-                    if (slot_it == evict_slots.end()) {
-                        delayed_stale_writeback = false;
-                        break;
+                int64_t stale_backlog_before_delay = 0;
+                if (frameCacheEnabled_()) {
+                    std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+                    stale_backlog_before_delay =
+                        std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) -
+                                              static_cast<int64_t>(free_physical_frames_.size()),
+                                          0);
+                }
+                int64_t remaining_delayed_stale_slots =
+                    std::max<int64_t>(frameCacheMaxStaleBacklog_() - stale_backlog_before_delay, 0);
+                if (remaining_delayed_stale_slots >= static_cast<int64_t>(async_admit_preload_hidden_publishes_.size())) {
+                    delayed_stale_row_offsets.emplace_back(0);
+                    delayed_stale_writeback = true;
+                    for (const HiddenFramePublish &hidden_publish : async_admit_preload_hidden_publishes_) {
+                        auto slot_it = std::find(evict_slots.begin(), evict_slots.end(), hidden_publish.logical_slot);
+                        if (slot_it == evict_slots.end()) {
+                            delayed_stale_writeback = false;
+                            break;
+                        }
+                        std::size_t idx = static_cast<std::size_t>(std::distance(evict_slots.begin(), slot_it));
+                        delayed_stale_partition_ids.push_back(evict_ids[idx]);
+                        delayed_stale_logical_slots.push_back(hidden_publish.logical_slot);
+                        int64_t old_frame = logicalSlotToPhysicalFrame_(hidden_publish.logical_slot);
+                        delayed_stale_old_frames.push_back(old_frame);
+                        delayed_stale_source_offsets.push_back(old_frame * partition_size_);
+                        delayed_stale_rows += partition_table_[evict_ids[idx]]->partition_size_;
+                        delayed_stale_row_offsets.push_back(delayed_stale_row_offsets.back() + partition_table_[evict_ids[idx]]->partition_size_);
                     }
-                    std::size_t idx = static_cast<std::size_t>(std::distance(evict_slots.begin(), slot_it));
-                    delayed_stale_partition_ids.push_back(evict_ids[idx]);
-                    delayed_stale_logical_slots.push_back(hidden_publish.logical_slot);
-                    int64_t old_frame = logicalSlotToPhysicalFrame_(hidden_publish.logical_slot);
-                    delayed_stale_old_frames.push_back(old_frame);
-                    delayed_stale_source_offsets.push_back(old_frame * partition_size_);
-                    delayed_stale_rows += partition_table_[evict_ids[idx]]->partition_size_;
-                    delayed_stale_row_offsets.push_back(delayed_stale_row_offsets.back() + partition_table_[evict_ids[idx]]->partition_size_);
                 }
                 if (!delayed_stale_writeback) {
                     delayed_stale_partition_ids.clear();
@@ -4361,6 +4483,7 @@ void MemPartitionBuffer::setBufferOrdering(std::vector<torch::Tensor> buffer_sta
     }
 
     buffer_state_ = *buffer_state_iterator_;
+    autoConfigureFrameCacheFromOrdering_();
 
     for (int i = 0; i < buffer_sizes_ && buffer_state_iterator_ != buffer_states_.end(); i++) {
         ++buffer_state_iterator_;

@@ -1353,11 +1353,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         };
         if (delayed_stale_enabled && !hidden_publish_slots.empty()) {
-            const int64_t max_stale_backlog =
-                std::max<int64_t>(
-                    parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG",
-                                  static_cast<int64_t>(buffer->hidden_frame_capacity_)),
-                    0);
+            const int64_t max_stale_backlog = buffer->frameCacheMaxStaleBacklog_();
             const int64_t stale_backlog_before_delay =
                 frame_cache_mapping ? std::max<int64_t>(
                                           static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap, 0)
@@ -1995,7 +1991,7 @@ torch::Tensor MemPartitionBufferStorage::indexRead(Indices indices) {
 }
 
 torch::Tensor MemPartitionBufferStorage::indexRead(Indices indices, int32_t device_idx) { 
-    if(device_ == torch::kCUDA) {
+    if (device_idx >= 0 && device_idx < static_cast<int32_t>(buffers_.size()) && buffers_[device_idx]->hasDeviceResidentFrames()) {
         return buffers_[device_idx]->indexRead(indices);
     } else { 
         if (indices.sizes().size() != 1) {
@@ -2011,6 +2007,12 @@ torch::Tensor MemPartitionBufferStorage::indexRead(Indices indices, int32_t devi
     }
 }
 
+bool MemPartitionBufferStorage::hasDeviceResidentFrames(int32_t device_idx) const {
+    if (device_idx < 0 || device_idx >= static_cast<int32_t>(buffers_.size()) || buffers_[device_idx] == nullptr) {
+        return false;
+    }
+    return buffers_[device_idx]->hasDeviceResidentFrames();
+}
 
 void MemPartitionBufferStorage::indexAdd(Indices indices, torch::Tensor values) { 
     return buffers_[0]->indexAdd(indices, values); 

@@ -71,6 +71,12 @@ void expect_false(bool condition, const std::string &message) {
     }
 }
 
+std::vector<int64_t> tensor_to_vector(torch::Tensor tensor) {
+    tensor = tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
+    auto *data = tensor.data_ptr<int64_t>();
+    return std::vector<int64_t>(data, data + tensor.numel());
+}
+
 void test_reject_cross_lane_handoff_in_lane_plan() {
     auto plan = build_valid_multi_gpu_plan(PlanVariant::MULTI_GPU_DISJOINT_ROUNDS);
     expect_true(validateStateflowPlanExactSemantics(plan), "baseline disjoint plan should validate");
@@ -144,6 +150,115 @@ void expect_lane_max_admits(const StateflowPlan &plan, int64_t max_admits) {
     }
 }
 
+void expect_tensor_schedule_max_admits(const std::vector<torch::Tensor> &buffer_states,
+                                       int64_t buffer_capacity,
+                                       int64_t max_admits) {
+    for (std::size_t state_idx = 1; state_idx < buffer_states.size(); state_idx++) {
+        auto previous = tensor_to_vector(buffer_states[state_idx - 1]);
+        auto current = tensor_to_vector(buffer_states[state_idx]);
+        int64_t shared = 0;
+        for (auto lhs : previous) {
+            for (auto rhs : current) {
+                if (lhs == rhs) {
+                    shared++;
+                    break;
+                }
+            }
+        }
+        expect_true(buffer_capacity - shared <= max_admits,
+                    "single-GPU transition exceeded max admits");
+    }
+}
+
+void expect_tensor_schedule_max_admit_run(const std::vector<torch::Tensor> &buffer_states,
+                                          int64_t buffer_capacity,
+                                          int64_t max_admits,
+                                          int64_t max_run) {
+    int64_t current_run = 0;
+    int64_t observed_max_run = 0;
+    for (std::size_t state_idx = 1; state_idx < buffer_states.size(); state_idx++) {
+        auto previous = tensor_to_vector(buffer_states[state_idx - 1]);
+        auto current = tensor_to_vector(buffer_states[state_idx]);
+        int64_t shared = 0;
+        for (auto lhs : previous) {
+            for (auto rhs : current) {
+                if (lhs == rhs) {
+                    shared++;
+                    break;
+                }
+            }
+        }
+        if (buffer_capacity - shared == max_admits) {
+            current_run++;
+            observed_max_run = std::max(observed_max_run, current_run);
+        } else {
+            current_run = 0;
+        }
+    }
+    expect_true(observed_max_run <= max_run,
+                "single-GPU bounded schedule clustered too many max-admit swaps");
+}
+
+void expect_exact_diagonal_bucket_coverage(const std::vector<torch::Tensor> &edge_buckets,
+                                           int num_partitions) {
+    std::vector<int64_t> bucket_counts(static_cast<std::size_t>(num_partitions * num_partitions), 0);
+    for (const auto &bucket_tensor : edge_buckets) {
+        if (!bucket_tensor.defined() || bucket_tensor.numel() == 0) {
+            continue;
+        }
+        auto values = tensor_to_vector(bucket_tensor);
+        expect_true(values.size() % 2 == 0, "edge bucket tensor should contain src,dst pairs");
+        for (std::size_t idx = 0; idx + 1 < values.size(); idx += 2) {
+            int64_t src = values[idx];
+            int64_t dst = values[idx + 1];
+            expect_true(src >= 0 && src < num_partitions && dst >= 0 && dst < num_partitions,
+                        "edge bucket id out of range");
+            bucket_counts[static_cast<std::size_t>(src * num_partitions + dst)]++;
+        }
+    }
+
+    for (int src = 0; src < num_partitions; src++) {
+        for (int dst = 0; dst < num_partitions; dst++) {
+            expect_true(bucket_counts[static_cast<std::size_t>(src * num_partitions + dst)] == 1,
+                        "directed bucket should be assigned exactly once");
+        }
+        expect_true(bucket_counts[static_cast<std::size_t>(src * num_partitions + src)] == 1,
+                    "diagonal bucket should be assigned exactly once");
+    }
+}
+
+void test_bounded_q4_scheduler_trains_diagonal_buckets_once() {
+    constexpr int kNumPartitions = 32;
+    constexpr int kBufferCapacity = 4;
+
+    ScopedEnvVar max_admits_env("GEGE_STATEFLOW_MAX_ADMITS", "3");
+    ScopedEnvVar minmax_env("GEGE_MINMAX_BUCKET_ASSIGNMENT", "1");
+    std::vector<int64_t> edge_bucket_sizes(static_cast<std::size_t>(kNumPartitions * kNumPartitions), 1);
+    auto [buffer_states, edge_buckets] =
+        getBoundedGreedyCoverEdgeBucketOrdering(kNumPartitions, kBufferCapacity, edge_bucket_sizes);
+
+    expect_true(buffer_states.size() == edge_buckets.size(), "state and edge-bucket schedule sizes should match");
+    expect_exact_diagonal_bucket_coverage(edge_buckets, kNumPartitions);
+    expect_tensor_schedule_max_admits(buffer_states, kBufferCapacity, 3);
+    expect_tensor_schedule_max_admit_run(buffer_states, kBufferCapacity, 3, 6);
+}
+
+void test_bounded_q4_scheduler_is_parameterized() {
+    constexpr int kNumPartitions = 20;
+    constexpr int kBufferCapacity = 4;
+
+    ScopedEnvVar max_admits_env("GEGE_STATEFLOW_MAX_ADMITS", "3");
+    ScopedEnvVar minmax_env("GEGE_MINMAX_BUCKET_ASSIGNMENT", "1");
+    std::vector<int64_t> edge_bucket_sizes(static_cast<std::size_t>(kNumPartitions * kNumPartitions), 1);
+    auto [buffer_states, edge_buckets] =
+        getBoundedGreedyCoverEdgeBucketOrdering(kNumPartitions, kBufferCapacity, edge_bucket_sizes);
+
+    expect_true(buffer_states.size() == edge_buckets.size(), "state and edge-bucket schedule sizes should match");
+    expect_true(!buffer_states.empty(), "parameterized bounded scheduler should produce states");
+    expect_exact_diagonal_bucket_coverage(edge_buckets, kNumPartitions);
+    expect_tensor_schedule_max_admits(buffer_states, kBufferCapacity, 3);
+}
+
 StateflowPlan build_bounded_q4_multi_gpu_plan(int active_devices) {
     constexpr int kNumPartitions = 32;
     constexpr int kBufferCapacity = 4;
@@ -205,6 +320,8 @@ int main() {
         {"reject_bucket_coverage_gap", test_reject_bucket_coverage_gap},
         {"four_gpu_lane_matched_candidate_validates", test_four_gpu_lane_matched_candidate_validates},
         {"peer_aware_lane_matching_reduces_lane_matched_cost", test_peer_aware_lane_matching_reduces_lane_matched_cost},
+        {"bounded_q4_scheduler_trains_diagonal_buckets_once", test_bounded_q4_scheduler_trains_diagonal_buckets_once},
+        {"bounded_q4_scheduler_is_parameterized", test_bounded_q4_scheduler_is_parameterized},
         {"bounded_q4_lane_matched_respects_three_admit_cap", test_bounded_q4_lane_matched_respects_three_admit_cap},
     };
 

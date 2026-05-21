@@ -126,6 +126,11 @@ bool startup_timing_enabled() {
     return enabled;
 }
 
+bool start_admit_preload_after_active_edges_enabled() {
+    static bool enabled = parse_graph_storage_env_flag("GEGE_START_ADMIT_PRELOAD_AFTER_ACTIVE_EDGES", false);
+    return enabled;
+}
+
 bool remap_validate_slots_enabled() {
     static bool enabled = parse_graph_storage_env_flag("GEGE_REMAP_VALIDATE_SLOTS", false);
     return enabled;
@@ -426,7 +431,7 @@ torch::Tensor GraphModelStorage::getGlobalToLocalMapForValidation_(bool get_curr
     throw GegeRuntimeException("Dense global-to-local map unavailable for current storage backend");
 }
 
-void GraphModelStorage::startAsyncAdmitPreload_(int32_t device_idx) {
+void GraphModelStorage::startAsyncAdmitPreload(int32_t device_idx) {
     if (storage_ptrs_.node_embeddings != nullptr && instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
         std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->startAsyncAdmitPreload(device_idx);
     }
@@ -959,6 +964,9 @@ void GraphModelStorage::updateAddNodeEmbeddingStateG(Indices indices, torch::Ten
 
 bool GraphModelStorage::embeddingsOffDevice() {
     if (storage_ptrs_.node_embeddings != nullptr) {
+        if (canUseResidentLocalLPDirect(0)) {
+            return false;
+        }
         return storage_ptrs_.node_embeddings->device_ != torch::kCUDA;
     } else if (storage_ptrs_.node_features != nullptr) {
         return storage_ptrs_.node_features->device_ != torch::kCUDA;
@@ -973,6 +981,28 @@ bool GraphModelStorage::embeddingsOffDeviceG() {
     } else {
         return false;
     }
+}
+
+bool GraphModelStorage::canUseResidentLocalLPDirect(int32_t device_idx) {
+    if (storage_ptrs_.node_embeddings == nullptr) {
+        return false;
+    }
+    if (instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+        if (!partitionBufferLPFastPathEnabled()) {
+            return false;
+        }
+        auto node_buffer = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings);
+        if (node_buffer == nullptr || !node_buffer->hasDeviceResidentFrames(device_idx)) {
+            return false;
+        }
+        if (train_ && storage_ptrs_.node_optimizer_state != nullptr &&
+            instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state)) {
+            auto state_buffer = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state);
+            return state_buffer != nullptr && state_buffer->hasDeviceResidentFrames(device_idx);
+        }
+        return true;
+    }
+    return storage_ptrs_.node_embeddings->device_ == torch::kCUDA;
 }
 
 void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, torch::Device device, int32_t device_idx) {
@@ -991,7 +1021,7 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
         current_subgraph_states_[device_idx] = nullptr;
         current_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
 
-        buffer_state = buffer_state.to(torch::kInt64);
+        buffer_state = buffer_state.to(torch::kInt64).contiguous();
 
         int buffer_size = buffer_state.size(0);
         int num_edge_buckets_in_mem = buffer_size * buffer_size;
@@ -999,6 +1029,31 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
 
         torch::Tensor new_in_mem_partition_ids = buffer_state;
         auto new_in_mem_partition_ids_accessor = new_in_mem_partition_ids.accessor<int64_t, 1>();
+
+        if (buffer_state.dim() != 1) {
+            throw GegeRuntimeException(fmt::format(
+                "initializeInMemorySubGraph expected a 1-D buffer state, got dim={}", buffer_state.dim()));
+        }
+        if (buffer_size <= 0) {
+            throw GegeRuntimeException("initializeInMemorySubGraph received an empty buffer state");
+        }
+        for (int i = 0; i < buffer_size; i++) {
+            int64_t partition_id = new_in_mem_partition_ids_accessor[i];
+            if (partition_id < 0 || partition_id >= num_partitions) {
+                std::ostringstream state_stream;
+                state_stream << "[";
+                for (int slot = 0; slot < buffer_size; slot++) {
+                    if (slot > 0) {
+                        state_stream << ", ";
+                    }
+                    state_stream << new_in_mem_partition_ids_accessor[slot];
+                }
+                state_stream << "]";
+                throw GegeRuntimeException(fmt::format(
+                    "initializeInMemorySubGraph received invalid partition id {} at slot {} for num_partitions={} buffer_state={}",
+                    partition_id, i, num_partitions, state_stream.str()));
+            }
+        }
 
         torch::Tensor in_mem_edge_bucket_ids = torch::zeros({num_edge_buckets_in_mem}, torch::kInt64);
         torch::Tensor in_mem_edge_bucket_sizes = torch::zeros({num_edge_buckets_in_mem}, torch::kInt64);
@@ -1010,6 +1065,12 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
 
         // TODO we don't need to do this every time
         std::vector<int64_t> edge_bucket_sizes_ = storage_ptrs_.edges->getEdgeBucketSizes();
+        int64_t expected_edge_buckets = static_cast<int64_t>(num_partitions) * static_cast<int64_t>(num_partitions);
+        if (static_cast<int64_t>(edge_bucket_sizes_.size()) < expected_edge_buckets) {
+            throw GegeRuntimeException(fmt::format(
+                "initializeInMemorySubGraph has {} edge bucket sizes but expected at least {} for num_partitions={}",
+                edge_bucket_sizes_.size(), expected_edge_buckets, num_partitions));
+        }
         torch::Tensor edge_bucket_sizes = torch::from_blob(edge_bucket_sizes_.data(), {(int)edge_bucket_sizes_.size()}, torch::kInt64);
         torch::Tensor edge_bucket_ends_disk = edge_bucket_sizes.cumsum(0);
         torch::Tensor edge_bucket_starts_disk = edge_bucket_ends_disk - edge_bucket_sizes;
@@ -1212,7 +1273,7 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
             }
         }
         if (hasSwap(device_idx)) {
-            startAsyncAdmitPreload_(device_idx);
+            startAsyncAdmitPreload(device_idx);
         }
     } else {
         current_subgraph_state_ = std::make_shared<InMemorySubgraphState>();
@@ -1319,7 +1380,7 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
             outer_phase_start = now;
         }
         if (hasSwap(device_idx)) {
-            startAsyncAdmitPreload_(device_idx);
+            startAsyncAdmitPreload(device_idx);
         }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -1355,8 +1416,8 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         t2 = std::chrono::high_resolution_clock::now();
         subgraph_update_ms = elapsed_graph_storage_ms(t1, t2);
         outer_phase_start = t2;
-        if (hasSwap(device_idx)) {
-            startAsyncAdmitPreload_(device_idx);
+        if (hasSwap(device_idx) && !start_admit_preload_after_active_edges_enabled()) {
+            startAsyncAdmitPreload(device_idx);
         }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();

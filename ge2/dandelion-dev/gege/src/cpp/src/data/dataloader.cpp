@@ -155,6 +155,11 @@ bool resident_local_lp_direct_enabled() {
     return enabled;
 }
 
+bool start_admit_preload_after_active_edges_enabled() {
+    static bool enabled = parse_env_flag("GEGE_START_ADMIT_PRELOAD_AFTER_ACTIVE_EDGES", false);
+    return enabled;
+}
+
 bool single_gpu_gpu_aware_custom_enabled() {
     static bool enabled = parse_env_flag("GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM", false);
     return enabled;
@@ -1715,6 +1720,9 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                     device_swap_rebuild_ns_[device_idx] += swap_rebuild_elapsed;
                 }
                 add_perf_sample(device_swap_rebuild_samples_ns_, device_idx, swap_rebuild_elapsed);
+                if (start_admit_preload_after_active_edges_enabled() && graph_storage_->hasSwap(device_idx)) {
+                    graph_storage_->startAsyncAdmitPreload(device_idx);
+                }
                 if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_current_state_index_.size() &&
                     device_current_state_index_[device_idx] >= 0) {
                     int64_t state_sequence = -1;
@@ -1978,9 +1986,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         return tensor;
     };
 
-    if (resident_local_lp_direct_enabled() && neighbor_sampler_ == nullptr && batch->streamed_edge_size_ > 0 &&
+    if (resident_local_lp_direct_enabled() && negative_sampling_method_ == NegativeSamplingMethod::RNS && neighbor_sampler_ == nullptr &&
         graph_storage_->storage_ptrs_.node_embeddings != nullptr &&
-        graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA &&
+        graph_storage_->canUseResidentLocalLPDirect(device_idx) &&
         (batch->edges_.size(1) == 2 || batch->edges_.size(1) == 3)) {
         auto finalize_start = std::chrono::high_resolution_clock::now();
         batch->resident_local_lp_direct_ = true;
@@ -2370,7 +2378,8 @@ void DataLoader::loadGPUParameters(shared_ptr<Batch> batch, int32_t device_idx) 
 
 void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t device_idx) {
     if (gpu) {
-        if (graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA) {
+        if (graph_storage_->storage_ptrs_.node_embeddings->device_ == torch::kCUDA ||
+            graph_storage_->canUseResidentLocalLPDirect(device_idx)) {
             bool use_masked_update = fixed_buffer_masked_update_enabled() &&
                                      batch->unique_node_active_mask_.defined() &&
                                      batch->unique_node_active_mask_.numel() == batch->unique_node_indices_.numel() &&
@@ -2396,7 +2405,8 @@ void DataLoader::updateEmbeddings(shared_ptr<Batch> batch, bool gpu, int32_t dev
         }
     } else {
         batch->host_transfer_.synchronize();
-        if (graph_storage_->storage_ptrs_.node_embeddings->device_ != torch::kCUDA) {
+        if (graph_storage_->storage_ptrs_.node_embeddings->device_ != torch::kCUDA &&
+            !graph_storage_->canUseResidentLocalLPDirect(device_idx)) {
             graph_storage_->updateAddNodeEmbeddings(batch->unique_node_indices_, batch->node_gradients_);
             graph_storage_->updateAddNodeEmbeddingState(batch->unique_node_indices_, batch->node_state_update_);
         }

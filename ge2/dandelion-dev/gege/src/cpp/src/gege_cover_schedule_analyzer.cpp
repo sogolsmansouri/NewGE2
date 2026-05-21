@@ -13,7 +13,7 @@ namespace {
 void print_usage(const char *prog) {
     std::cerr << "Usage: " << prog
               << " <ordering> <num_partitions> <buffer_capacity> <fine_to_coarse_ratio> <num_cache_partitions>"
-                 " <randomly_assign_edge_buckets:0|1> <active_devices> [--verbose] [--seed <int64>] [--regroup]\n";
+                 " <randomly_assign_edge_buckets:0|1> <active_devices> [--verbose] [--dump-buckets] [--seed <int64>] [--regroup]\n";
 }
 
 std::vector<int64_t> tensor_to_vector(torch::Tensor tensor) {
@@ -52,12 +52,15 @@ int main(int argc, char **argv) {
     }
 
     bool verbose = false;
+    bool dump_buckets = false;
     bool regroup = false;
     int64_t seed = 12345;
     for (int i = 8; i < argc; i++) {
         std::string arg = argv[i];
         if (arg == "--verbose") {
             verbose = true;
+        } else if (arg == "--dump-buckets") {
+            dump_buckets = true;
         } else if (arg == "--seed" && (i + 1) < argc) {
             seed = std::stoll(argv[++i]);
         } else if (arg == "--regroup") {
@@ -79,14 +82,21 @@ int main(int argc, char **argv) {
     auto ordering_result = getEdgeBucketOrdering(ordering, num_partitions, buffer_capacity, fine_to_coarse_ratio,
                                                  num_cache_partitions, randomly_assign_edge_buckets);
     auto buffer_states = std::get<0>(ordering_result);
+    auto edge_buckets_per_buffer = std::get<1>(ordering_result);
     if (regroup) {
         auto permutation = getDisjointBufferStatePermutation(buffer_states, active_devices);
         std::vector<torch::Tensor> reordered;
+        std::vector<torch::Tensor> reordered_buckets;
         reordered.reserve(buffer_states.size());
+        reordered_buckets.reserve(edge_buckets_per_buffer.size());
         for (auto idx : permutation) {
             reordered.emplace_back(buffer_states[idx]);
+            if (idx < static_cast<int64_t>(edge_buckets_per_buffer.size())) {
+                reordered_buckets.emplace_back(edge_buckets_per_buffer[idx]);
+            }
         }
         buffer_states = std::move(reordered);
+        edge_buckets_per_buffer = std::move(reordered_buckets);
     }
 
     if (buffer_states.empty()) {
@@ -142,6 +152,33 @@ int main(int argc, char **argv) {
     }
 
     double mean_pairwise_overlap = total_pairs > 0 ? static_cast<double>(total_pairwise_overlap) / static_cast<double>(total_pairs) : 0.0;
+
+    if (dump_buckets) {
+        for (std::size_t state_idx = 0; state_idx < buffer_states.size(); state_idx++) {
+            auto partitions = tensor_to_vector(buffer_states[state_idx]);
+            std::cout << "state " << state_idx << " partitions=[";
+            for (std::size_t idx = 0; idx < partitions.size(); idx++) {
+                if (idx > 0) {
+                    std::cout << ",";
+                }
+                std::cout << partitions[idx];
+            }
+            std::cout << "]";
+
+            std::vector<int64_t> buckets;
+            if (state_idx < edge_buckets_per_buffer.size() && edge_buckets_per_buffer[state_idx].defined()) {
+                buckets = tensor_to_vector(edge_buckets_per_buffer[state_idx]);
+            }
+            std::cout << " assigned_buckets=" << (buckets.size() / 2) << " buckets=[";
+            for (std::size_t idx = 0; idx + 1 < buckets.size(); idx += 2) {
+                if (idx > 0) {
+                    std::cout << ",";
+                }
+                std::cout << "(" << buckets[idx] << "," << buckets[idx + 1] << ")";
+            }
+            std::cout << "]\n";
+        }
+    }
 
     std::cout << "ordering_states=" << buffer_states.size() << "\n";
     std::cout << "active_devices=" << active_devices << "\n";

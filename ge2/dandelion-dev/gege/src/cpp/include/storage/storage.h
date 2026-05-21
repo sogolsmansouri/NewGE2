@@ -176,6 +176,8 @@ class MemPartitionBufferStorage : public Storage {
 
     void indexAddMasked(Indices indices, torch::Tensor values, torch::Tensor active_mask, int32_t device_idx);
 
+    bool hasDeviceResidentFrames(int32_t device_idx = 0) const;
+
     Indices getRandomIds(int64_t size, int32_t device_idx = 0) { return buffers_[device_idx]->getRandomIds(size); }
 
     bool hasSwap(int32_t device_idx = 0) { return buffers_[device_idx]->hasSwap(); }

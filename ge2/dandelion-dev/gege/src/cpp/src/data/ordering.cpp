@@ -8,6 +8,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <numeric>
@@ -71,6 +72,16 @@ bool contrastive_greedy_cover_ordering_enabled() {
 
 bool bounded_greedy_cover_q4_enabled() {
     const char *raw = std::getenv("GEGE_BOUNDED_GREEDY_COVER_Q4");
+    if (raw == nullptr) {
+        return false;
+    }
+
+    std::string value(raw);
+    return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
+}
+
+bool bounded_greedy_cover_reverse_enabled() {
+    const char *raw = std::getenv("GEGE_BOUNDED_GREEDY_COVER_REVERSE");
     if (raw == nullptr) {
         return false;
     }
@@ -2192,7 +2203,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> convertEdgeBucketOrderT
         ret_edge_buckets_per_buffer.emplace_back(tmp);
     }
 
-    return std::forward_as_tuple(ret_buffer_states, ret_edge_buckets_per_buffer);
+    return std::make_tuple(std::move(ret_buffer_states), std::move(ret_edge_buckets_per_buffer));
 }
 
 vector<vector<int>> getBetaOrderingHelper(int num_partitions, int buffer_capacity) {
@@ -2334,6 +2345,100 @@ int64_t mark_state_buckets_covered(const std::vector<int> &state,
                                    std::vector<uint8_t> &covered,
                                    int num_partitions);
 
+std::vector<std::vector<int>> load_bounded_state_order_file(const char *path,
+                                                            int num_partitions,
+                                                            int buffer_capacity) {
+    if (path == nullptr || std::string(path).empty()) {
+        return {};
+    }
+
+    std::ifstream input(path);
+    if (!input.is_open()) {
+        SPDLOG_WARN("Could not open GEGE_BOUNDED_STATE_ORDER_FILE='{}'; using generated bounded schedule", path);
+        return {};
+    }
+
+    std::vector<std::vector<int>> states;
+    std::string line;
+    int line_number = 0;
+    while (std::getline(input, line)) {
+        line_number++;
+        std::size_t begin = line.find("state=[");
+        if (begin == std::string::npos) {
+            begin = line.find('[');
+        } else {
+            begin += std::string("state=").size();
+        }
+        if (begin == std::string::npos) {
+            continue;
+        }
+        std::size_t end = line.find(']', begin);
+        if (end == std::string::npos) {
+            continue;
+        }
+
+        std::vector<int> state;
+        std::string token;
+        for (std::size_t idx = begin + 1; idx < end; idx++) {
+            char ch = line[idx];
+            if ((ch >= '0' && ch <= '9') || ch == '-') {
+                token.push_back(ch);
+            } else if (!token.empty()) {
+                state.emplace_back(std::stoi(token));
+                token.clear();
+            }
+        }
+        if (!token.empty()) {
+            state.emplace_back(std::stoi(token));
+        }
+
+        if (state.empty()) {
+            continue;
+        }
+        if (static_cast<int>(state.size()) != buffer_capacity) {
+            SPDLOG_WARN("Ignoring GEGE_BOUNDED_STATE_ORDER_FILE='{}': line {} has {} partitions, expected {}",
+                        path, line_number, state.size(), buffer_capacity);
+            return {};
+        }
+        std::vector<int> sorted_state = state;
+        std::sort(sorted_state.begin(), sorted_state.end());
+        if (std::adjacent_find(sorted_state.begin(), sorted_state.end()) != sorted_state.end()) {
+            SPDLOG_WARN("Ignoring GEGE_BOUNDED_STATE_ORDER_FILE='{}': line {} has duplicate partitions",
+                        path, line_number);
+            return {};
+        }
+        for (int partition : state) {
+            if (partition < 0 || partition >= num_partitions) {
+                SPDLOG_WARN("Ignoring GEGE_BOUNDED_STATE_ORDER_FILE='{}': line {} has partition {} outside [0,{})",
+                            path, line_number, partition, num_partitions);
+                return {};
+            }
+        }
+        states.emplace_back(std::move(state));
+    }
+
+    if (states.empty()) {
+        SPDLOG_WARN("GEGE_BOUNDED_STATE_ORDER_FILE='{}' did not contain any states; using generated bounded schedule", path);
+        return {};
+    }
+
+    std::vector<uint8_t> covered(static_cast<std::size_t>(num_partitions) * static_cast<std::size_t>(num_partitions), 0);
+    int64_t covered_count = 0;
+    for (const auto &state : states) {
+        covered_count += mark_state_buckets_covered(state, covered, num_partitions);
+    }
+    const int64_t total_buckets = static_cast<int64_t>(num_partitions) * static_cast<int64_t>(num_partitions);
+    if (covered_count != total_buckets) {
+        SPDLOG_WARN("Ignoring GEGE_BOUNDED_STATE_ORDER_FILE='{}': covers {} directed buckets, expected {}",
+                    path, covered_count, total_buckets);
+        return {};
+    }
+
+    SPDLOG_INFO("Loaded bounded state order from '{}' states={} total_buckets={}",
+                path, states.size(), covered_count);
+    return states;
+}
+
 std::vector<std::vector<int>> build_greedy_cover_state_set(int num_partitions, int buffer_capacity) {
     std::vector<std::vector<int>> candidates;
     std::vector<int> current;
@@ -2426,7 +2531,8 @@ double bounded_path_score_scalar(const std::tuple<int64_t, int64_t, int64_t, int
 std::vector<int> build_bounded_greedy_path_once(const std::vector<std::vector<int>> &overlap,
                                                 std::mt19937_64 &rng,
                                                 int start_idx,
-                                                int candidate_pool) {
+                                                int candidate_pool,
+                                                int min_overlap) {
     const int num_states = static_cast<int>(overlap.size());
     if (num_states == 0) {
         return {};
@@ -2456,7 +2562,7 @@ std::vector<int> build_bounded_greedy_path_once(const std::vector<std::vector<in
                     continue;
                 }
                 int shared = overlap[endpoint][candidate];
-                if (shared <= 0) {
+                if (shared < min_overlap) {
                     continue;
                 }
 
@@ -2465,7 +2571,7 @@ std::vector<int> build_bounded_greedy_path_once(const std::vector<std::vector<in
                     if (other == candidate || used[other] != 0) {
                         continue;
                     }
-                    if (overlap[candidate][other] > 0) {
+                    if (overlap[candidate][other] >= min_overlap) {
                         future_degree++;
                     }
                 }
@@ -2496,10 +2602,635 @@ std::vector<int> build_bounded_greedy_path_once(const std::vector<std::vector<in
     return order;
 }
 
+bool bounded_path_respects_min_overlap(const std::vector<int> &order,
+                                       const std::vector<std::vector<int>> &overlap,
+                                       int min_overlap) {
+    if (order.size() <= 1) {
+        return true;
+    }
+    for (std::size_t idx = 1; idx < order.size(); idx++) {
+        if (overlap[order[idx - 1]][order[idx]] < min_overlap) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int path_internal_overlap(const std::vector<int> &path,
+                          const std::vector<std::vector<int>> &overlap) {
+    int total = 0;
+    for (std::size_t idx = 1; idx < path.size(); idx++) {
+        total += overlap[path[idx - 1]][path[idx]];
+    }
+    return total;
+}
+
+struct BoundedPathRuntimeScore {
+    int64_t below_min_overlap = 0;
+    int64_t total_overlap = 0;
+    int64_t strong_transition_count = 0;
+    int64_t max_min_overlap_run = 0;
+    int64_t min_overlap_run_sum_sq = 0;
+    int64_t max_window_admits = 0;
+    int64_t short_evict_reuse_count3 = 0;
+    int64_t short_evict_reuse_count5 = 0;
+    int64_t short_evict_reuse_transitions3 = 0;
+    int64_t capped_evict_reuse_distance_sum = 0;
+};
+
+BoundedPathRuntimeScore bounded_path_runtime_score(const std::vector<int> &order,
+                                                   const std::vector<std::vector<int>> &overlap,
+                                                   const std::vector<std::vector<int>> &states,
+                                                   int min_overlap,
+                                                   int buffer_capacity) {
+    BoundedPathRuntimeScore score;
+    int64_t current_min_run = 0;
+    std::vector<int64_t> admits;
+    admits.reserve(order.size() > 0 ? order.size() - 1 : 0);
+
+    for (std::size_t idx = 1; idx < order.size(); idx++) {
+        const int shared = overlap[order[idx - 1]][order[idx]];
+        score.total_overlap += shared;
+        if (shared < min_overlap) {
+            score.below_min_overlap += 1;
+        }
+        if (shared > min_overlap) {
+            score.strong_transition_count += 1;
+        }
+        if (shared == min_overlap) {
+            current_min_run += 1;
+        } else {
+            if (current_min_run > 0) {
+                score.max_min_overlap_run = std::max(score.max_min_overlap_run, current_min_run);
+                score.min_overlap_run_sum_sq += current_min_run * current_min_run;
+                current_min_run = 0;
+            }
+        }
+        admits.emplace_back(std::max<int64_t>(0, static_cast<int64_t>(buffer_capacity - shared)));
+    }
+    if (current_min_run > 0) {
+        score.max_min_overlap_run = std::max(score.max_min_overlap_run, current_min_run);
+        score.min_overlap_run_sum_sq += current_min_run * current_min_run;
+    }
+
+    const int window = static_cast<int>(
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_RUNTIME_BALANCE_WINDOW", nullptr, 10)));
+    int64_t window_sum = 0;
+    for (std::size_t idx = 0; idx < admits.size(); idx++) {
+        window_sum += admits[idx];
+        if (idx >= static_cast<std::size_t>(window)) {
+            window_sum -= admits[idx - static_cast<std::size_t>(window)];
+        }
+        score.max_window_admits = std::max(score.max_window_admits, window_sum);
+    }
+
+    const int64_t short_reuse_window3 =
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_RUNTIME_SHORT_REUSE_WINDOW3", nullptr, 3));
+    const int64_t short_reuse_window5 =
+        std::max<int64_t>(short_reuse_window3,
+                          stateflow_env_int64("GEGE_BOUNDED_RUNTIME_SHORT_REUSE_WINDOW5", nullptr, 5));
+    const int64_t reuse_distance_cap =
+        std::max<int64_t>(short_reuse_window5, stateflow_env_int64("GEGE_BOUNDED_RUNTIME_REUSE_DISTANCE_CAP", nullptr, 12));
+    for (std::size_t idx = 0; idx + 1 < order.size(); idx++) {
+        bool transition_has_short_reuse = false;
+        for (auto partition : states[order[idx]]) {
+            if (std::find(states[order[idx + 1]].begin(), states[order[idx + 1]].end(), partition) !=
+                states[order[idx + 1]].end()) {
+                continue;
+            }
+
+            int64_t next_use_distance = std::numeric_limits<int64_t>::max() / 4;
+            for (std::size_t future = idx + 2; future < order.size(); future++) {
+                if (std::find(states[order[future]].begin(), states[order[future]].end(), partition) !=
+                    states[order[future]].end()) {
+                    next_use_distance = static_cast<int64_t>(future - (idx + 1));
+                    break;
+                }
+            }
+            if (next_use_distance <= short_reuse_window3) {
+                score.short_evict_reuse_count3 += 1;
+                transition_has_short_reuse = true;
+            }
+            if (next_use_distance <= short_reuse_window5) {
+                score.short_evict_reuse_count5 += 1;
+            }
+            score.capped_evict_reuse_distance_sum += std::min<int64_t>(next_use_distance, reuse_distance_cap);
+        }
+        if (transition_has_short_reuse) {
+            score.short_evict_reuse_transitions3 += 1;
+        }
+    }
+    return score;
+}
+
+std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+           int64_t, int64_t, int64_t, int64_t, int64_t>
+bounded_path_runtime_score_key(const BoundedPathRuntimeScore &score, int64_t target_min_overlap_run) {
+    const int64_t run_over_target = std::max<int64_t>(score.max_min_overlap_run - target_min_overlap_run, 0);
+    return std::make_tuple(-score.below_min_overlap,
+                           score.total_overlap,
+                           score.strong_transition_count,
+                           -run_over_target,
+                           -score.short_evict_reuse_count3,
+                           -score.short_evict_reuse_transitions3,
+                           -score.short_evict_reuse_count5,
+                           score.capped_evict_reuse_distance_sum,
+                           -score.max_min_overlap_run,
+                           -score.min_overlap_run_sum_sq,
+                           -score.max_window_admits);
+}
+
+double bounded_path_runtime_score_scalar(const BoundedPathRuntimeScore &score,
+                                         int64_t target_min_overlap_run) {
+    const int64_t run_over_target = std::max<int64_t>(score.max_min_overlap_run - target_min_overlap_run, 0);
+    return static_cast<double>(-score.below_min_overlap) * 1.0e12 +
+           static_cast<double>(score.total_overlap) * 1.0e9 +
+           static_cast<double>(score.strong_transition_count) * 1.0e6 -
+           static_cast<double>(run_over_target) * 1.0e5 -
+           static_cast<double>(score.short_evict_reuse_count3) * 1.0e4 -
+           static_cast<double>(score.short_evict_reuse_transitions3) * 1.0e3 -
+           static_cast<double>(score.short_evict_reuse_count5) * 100.0 +
+           static_cast<double>(score.capped_evict_reuse_distance_sum) -
+           static_cast<double>(score.max_min_overlap_run) * 10.0 -
+           static_cast<double>(score.min_overlap_run_sum_sq) -
+           static_cast<double>(score.max_window_admits);
+}
+
+std::vector<int> improve_bounded_path_runtime_balance(std::vector<int> order,
+                                                      const std::vector<std::vector<int>> &overlap,
+                                                      const std::vector<std::vector<int>> &states,
+                                                      int min_overlap,
+                                                      int buffer_capacity) {
+    if (order.size() <= 2) {
+        return order;
+    }
+
+    const int64_t iterations =
+        std::max<int64_t>(0, stateflow_env_int64("GEGE_BOUNDED_RUNTIME_BALANCE_ITERS", nullptr, 200000));
+    if (iterations == 0) {
+        return order;
+    }
+
+    const int64_t target_min_overlap_run =
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_RUNTIME_BALANCE_TARGET_RUN", nullptr, 6));
+    const int64_t seed = stateflow_env_int64("GEGE_BOUNDED_RUNTIME_BALANCE_SEED", nullptr, 12345);
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+    std::uniform_real_distribution<double> unit(0.0, 1.0);
+
+    std::vector<int> current = order;
+    auto current_score = bounded_path_runtime_score(current, overlap, states, min_overlap, buffer_capacity);
+    auto current_key = bounded_path_runtime_score_key(current_score, target_min_overlap_run);
+    std::vector<int> best = current;
+    auto best_score = current_score;
+    auto best_key = current_key;
+
+    auto validate_candidate = [&](const std::vector<int> &candidate) {
+        return static_cast<int>(candidate.size()) == static_cast<int>(order.size()) &&
+               bounded_path_respects_min_overlap(candidate, overlap, min_overlap);
+    };
+
+    const std::vector<int> segment_lengths{1, 1, 1, 2, 2, 3, 4, 5, 8, 12};
+    for (int64_t iter = 0; iter < iterations; iter++) {
+        std::vector<int> candidate = current;
+        const int op = static_cast<int>(rng() % 4);
+        const int n = static_cast<int>(candidate.size());
+
+        if (op == 0) {
+            const int segment_length = segment_lengths[static_cast<std::size_t>(rng() % segment_lengths.size())];
+            if (segment_length >= n) {
+                continue;
+            }
+            std::uniform_int_distribution<int> begin_dist(0, n - segment_length);
+            const int begin = begin_dist(rng);
+            std::vector<int> segment(candidate.begin() + begin, candidate.begin() + begin + segment_length);
+            std::vector<int> rest;
+            rest.reserve(candidate.size() - segment.size());
+            rest.insert(rest.end(), candidate.begin(), candidate.begin() + begin);
+            rest.insert(rest.end(), candidate.begin() + begin + segment_length, candidate.end());
+            if ((rng() % 5) == 0) {
+                std::reverse(segment.begin(), segment.end());
+            }
+            if (!bounded_path_respects_min_overlap(segment, overlap, min_overlap)) {
+                continue;
+            }
+            std::uniform_int_distribution<int> pos_dist(0, static_cast<int>(rest.size()));
+            const int position = pos_dist(rng);
+            if (position > 0 && overlap[rest[position - 1]][segment.front()] < min_overlap) {
+                continue;
+            }
+            if (position < static_cast<int>(rest.size()) && overlap[segment.back()][rest[position]] < min_overlap) {
+                continue;
+            }
+            candidate.clear();
+            candidate.reserve(order.size());
+            candidate.insert(candidate.end(), rest.begin(), rest.begin() + position);
+            candidate.insert(candidate.end(), segment.begin(), segment.end());
+            candidate.insert(candidate.end(), rest.begin() + position, rest.end());
+        } else if (op == 1) {
+            std::uniform_int_distribution<int> index_dist(0, n - 1);
+            int left = index_dist(rng);
+            int right = index_dist(rng);
+            if (left == right) {
+                continue;
+            }
+            if (left > right) {
+                std::swap(left, right);
+            }
+            if (right - left > 20) {
+                continue;
+            }
+            std::reverse(candidate.begin() + left, candidate.begin() + right + 1);
+        } else if (op == 2) {
+            std::uniform_int_distribution<int> index_dist(0, n - 1);
+            int left = index_dist(rng);
+            int right = index_dist(rng);
+            if (left == right) {
+                continue;
+            }
+            std::swap(candidate[left], candidate[right]);
+        } else {
+            std::uniform_int_distribution<int> index_dist(0, n - 1);
+            int removed_idx = index_dist(rng);
+            int removed = candidate[removed_idx];
+            candidate.erase(candidate.begin() + removed_idx);
+            std::vector<int> positions;
+            positions.reserve(candidate.size() + 1);
+            for (int position = 0; position <= static_cast<int>(candidate.size()); position++) {
+                if (position > 0 && overlap[candidate[position - 1]][removed] < min_overlap) {
+                    continue;
+                }
+                if (position < static_cast<int>(candidate.size()) && overlap[removed][candidate[position]] < min_overlap) {
+                    continue;
+                }
+                positions.emplace_back(position);
+            }
+            if (positions.empty()) {
+                continue;
+            }
+            const int position = positions[static_cast<std::size_t>(rng() % positions.size())];
+            candidate.insert(candidate.begin() + position, removed);
+        }
+
+        if (!validate_candidate(candidate)) {
+            continue;
+        }
+
+        auto candidate_score = bounded_path_runtime_score(candidate, overlap, states, min_overlap, buffer_capacity);
+        auto candidate_key = bounded_path_runtime_score_key(candidate_score, target_min_overlap_run);
+        if (candidate_key >= current_key) {
+            current = std::move(candidate);
+            current_score = candidate_score;
+            current_key = candidate_key;
+            if (current_key > best_key) {
+                best = current;
+                best_score = current_score;
+                best_key = current_key;
+            }
+            continue;
+        }
+
+        const double delta =
+            bounded_path_runtime_score_scalar(candidate_score, target_min_overlap_run) -
+            bounded_path_runtime_score_scalar(current_score, target_min_overlap_run);
+        const double temperature = std::max(1.0, 1000.0 * std::pow(0.999995, static_cast<double>(iter)));
+        if (unit(rng) < std::exp(std::min(0.0, delta) / temperature)) {
+            current = std::move(candidate);
+            current_score = candidate_score;
+            current_key = candidate_key;
+        }
+    }
+
+    return best;
+}
+
+std::vector<int> longest_strong_path_in_subset(const std::vector<std::vector<int>> &strong_adj,
+                                               const std::vector<std::vector<int>> &overlap,
+                                               const std::vector<uint8_t> &allowed,
+                                               int64_t dfs_budget) {
+    const int num_states = static_cast<int>(strong_adj.size());
+    int allowed_count = 0;
+    for (auto value : allowed) {
+        allowed_count += value != 0 ? 1 : 0;
+    }
+    if (allowed_count <= 0) {
+        return {};
+    }
+
+    std::vector<int> starts;
+    starts.reserve(static_cast<std::size_t>(allowed_count));
+    for (int state_idx = 0; state_idx < num_states; state_idx++) {
+        if (allowed[state_idx] != 0) {
+            starts.emplace_back(state_idx);
+        }
+    }
+    auto remaining_degree = [&](int state_idx, const std::vector<uint8_t> &used) {
+        int degree = 0;
+        for (auto neighbor : strong_adj[state_idx]) {
+            if (allowed[neighbor] != 0 && used[neighbor] == 0) {
+                degree++;
+            }
+        }
+        return degree;
+    };
+    std::vector<uint8_t> empty_used(static_cast<std::size_t>(num_states), 0);
+    std::sort(starts.begin(), starts.end(), [&](int lhs, int rhs) {
+        return std::make_tuple(remaining_degree(lhs, empty_used), lhs) <
+               std::make_tuple(remaining_degree(rhs, empty_used), rhs);
+    });
+
+    std::vector<int> best_path;
+    std::vector<int> path;
+    std::vector<uint8_t> used(static_cast<std::size_t>(num_states), 0);
+    int64_t expansions = 0;
+    dfs_budget = std::max<int64_t>(1, dfs_budget);
+
+    std::function<bool(int, int)> dfs = [&](int current, int used_count) {
+        expansions++;
+        if (path.size() > best_path.size() ||
+            (path.size() == best_path.size() &&
+             path_internal_overlap(path, overlap) > path_internal_overlap(best_path, overlap))) {
+            best_path = path;
+        }
+        if (static_cast<int>(best_path.size()) == allowed_count) {
+            return true;
+        }
+        if (expansions >= dfs_budget) {
+            return false;
+        }
+        if (static_cast<int>(path.size()) + (allowed_count - used_count) <= static_cast<int>(best_path.size())) {
+            return false;
+        }
+
+        std::vector<int> options;
+        for (auto neighbor : strong_adj[current]) {
+            if (allowed[neighbor] != 0 && used[neighbor] == 0) {
+                options.emplace_back(neighbor);
+            }
+        }
+        std::sort(options.begin(), options.end(), [&](int lhs, int rhs) {
+            return std::make_tuple(remaining_degree(lhs, used), -overlap[current][lhs], lhs) <
+                   std::make_tuple(remaining_degree(rhs, used), -overlap[current][rhs], rhs);
+        });
+
+        for (auto next : options) {
+            used[next] = 1;
+            path.emplace_back(next);
+            if (dfs(next, used_count + 1)) {
+                return true;
+            }
+            path.pop_back();
+            used[next] = 0;
+            if (expansions >= dfs_budget) {
+                break;
+            }
+        }
+        return false;
+    };
+
+    for (auto start : starts) {
+        std::fill(used.begin(), used.end(), 0);
+        path.clear();
+        used[start] = 1;
+        path.emplace_back(start);
+        if (dfs(start, 1)) {
+            break;
+        }
+        if (expansions >= dfs_budget && !best_path.empty()) {
+            break;
+        }
+    }
+
+    return best_path;
+}
+
+std::vector<int> build_strong_path_cover_order(const std::vector<std::vector<int>> &overlap,
+                                               int min_overlap,
+                                               int buffer_capacity) {
+    const int num_states = static_cast<int>(overlap.size());
+    if (num_states <= 2) {
+        std::vector<int> order(num_states);
+        std::iota(order.begin(), order.end(), 0);
+        return order;
+    }
+
+    const int strong_overlap = std::min(buffer_capacity, min_overlap + 1);
+    if (strong_overlap <= min_overlap) {
+        return {};
+    }
+
+    std::vector<std::vector<int>> strong_adj(static_cast<std::size_t>(num_states));
+    for (int lhs = 0; lhs < num_states; lhs++) {
+        for (int rhs = lhs + 1; rhs < num_states; rhs++) {
+            if (overlap[lhs][rhs] >= strong_overlap) {
+                strong_adj[lhs].emplace_back(rhs);
+                strong_adj[rhs].emplace_back(lhs);
+            }
+        }
+    }
+    for (auto &neighbors : strong_adj) {
+        std::sort(neighbors.begin(), neighbors.end());
+    }
+
+    std::vector<std::vector<int>> components;
+    std::vector<uint8_t> visited(static_cast<std::size_t>(num_states), 0);
+    for (int state_idx = 0; state_idx < num_states; state_idx++) {
+        if (visited[state_idx] != 0) {
+            continue;
+        }
+        std::vector<int> stack{state_idx};
+        std::vector<int> component;
+        visited[state_idx] = 1;
+        while (!stack.empty()) {
+            int current = stack.back();
+            stack.pop_back();
+            component.emplace_back(current);
+            for (auto neighbor : strong_adj[current]) {
+                if (visited[neighbor] == 0) {
+                    visited[neighbor] = 1;
+                    stack.emplace_back(neighbor);
+                }
+            }
+        }
+        components.emplace_back(std::move(component));
+    }
+    std::sort(components.begin(), components.end(), [](const auto &lhs, const auto &rhs) {
+        return std::make_tuple(lhs.size(), lhs.empty() ? 0 : -lhs.front()) >
+               std::make_tuple(rhs.size(), rhs.empty() ? 0 : -rhs.front());
+    });
+
+    const int64_t dfs_budget = std::max<int64_t>(
+        1, stateflow_env_int64("GEGE_BOUNDED_STRONG_PATH_DFS_BUDGET", nullptr, 250000));
+    std::vector<std::vector<int>> fragments;
+    for (const auto &component : components) {
+        std::vector<uint8_t> remaining(static_cast<std::size_t>(num_states), 0);
+        int remaining_count = 0;
+        for (auto state_idx : component) {
+            remaining[state_idx] = 1;
+            remaining_count++;
+        }
+
+        while (remaining_count > 0) {
+            std::vector<int> fragment = longest_strong_path_in_subset(strong_adj, overlap, remaining, dfs_budget);
+            if (fragment.empty()) {
+                for (auto state_idx : component) {
+                    if (remaining[state_idx] != 0) {
+                        fragment = {state_idx};
+                        break;
+                    }
+                }
+            }
+            if (fragment.empty()) {
+                return {};
+            }
+            for (auto state_idx : fragment) {
+                if (remaining[state_idx] != 0) {
+                    remaining[state_idx] = 0;
+                    remaining_count--;
+                }
+            }
+            fragments.emplace_back(std::move(fragment));
+        }
+    }
+
+    std::sort(fragments.begin(), fragments.end(), [&](const auto &lhs, const auto &rhs) {
+        return std::make_tuple(lhs.size(), path_internal_overlap(lhs, overlap), lhs.empty() ? 0 : -lhs.front()) >
+               std::make_tuple(rhs.size(), path_internal_overlap(rhs, overlap), rhs.empty() ? 0 : -rhs.front());
+    });
+
+    std::vector<int> order;
+    for (const auto &fragment : fragments) {
+        struct InsertCandidate {
+            bool valid = false;
+            int delta = std::numeric_limits<int>::min();
+            int internal_overlap = 0;
+            int position = 0;
+            bool reversed = false;
+            std::vector<int> fragment;
+        };
+
+        InsertCandidate best;
+        for (int reverse_flag = 0; reverse_flag < 2; reverse_flag++) {
+            std::vector<int> oriented = fragment;
+            if (reverse_flag != 0) {
+                std::reverse(oriented.begin(), oriented.end());
+            }
+            int internal = path_internal_overlap(oriented, overlap);
+            for (int position = 0; position <= static_cast<int>(order.size()); position++) {
+                bool valid = true;
+                int delta = internal;
+                if (!order.empty()) {
+                    if (position > 0 && overlap[order[position - 1]][oriented.front()] < min_overlap) {
+                        valid = false;
+                    }
+                    if (position < static_cast<int>(order.size()) &&
+                        overlap[oriented.back()][order[position]] < min_overlap) {
+                        valid = false;
+                    }
+                    if (!valid) {
+                        continue;
+                    }
+                    if (position > 0) {
+                        delta += overlap[order[position - 1]][oriented.front()];
+                    }
+                    if (position < static_cast<int>(order.size())) {
+                        delta += overlap[oriented.back()][order[position]];
+                    }
+                    if (position > 0 && position < static_cast<int>(order.size())) {
+                        delta -= overlap[order[position - 1]][order[position]];
+                    }
+                }
+
+                auto key = std::make_tuple(delta, internal, static_cast<int>(oriented.size()), -position, -reverse_flag);
+                auto best_key = std::make_tuple(best.delta, best.internal_overlap, static_cast<int>(best.fragment.size()),
+                                                -best.position, best.reversed ? -1 : 0);
+                if (!best.valid || key > best_key) {
+                    best.valid = true;
+                    best.delta = delta;
+                    best.internal_overlap = internal;
+                    best.position = position;
+                    best.reversed = reverse_flag != 0;
+                    best.fragment = oriented;
+                }
+            }
+        }
+
+        if (!best.valid) {
+            return {};
+        }
+        order.insert(order.begin() + best.position, best.fragment.begin(), best.fragment.end());
+    }
+
+    if (static_cast<int>(order.size()) != num_states || !bounded_path_respects_min_overlap(order, overlap, min_overlap)) {
+        return {};
+    }
+
+    const int max_passes = static_cast<int>(
+        std::max<int64_t>(0, stateflow_env_int64("GEGE_BOUNDED_PATH_INSERT_LOCAL_PASSES", nullptr, 4)));
+    const std::vector<int> segment_lengths{1, 2, 3, 4, 5, 8, 12, 20};
+    for (int pass = 0; pass < max_passes; pass++) {
+        bool improved = false;
+        auto current_score = bounded_path_score(order, overlap);
+        for (auto requested_length : segment_lengths) {
+            int segment_length = std::min<int>(requested_length, order.size());
+            if (segment_length <= 0) {
+                continue;
+            }
+            for (int begin = 0; begin + segment_length <= static_cast<int>(order.size()); begin++) {
+                std::vector<int> segment(order.begin() + begin, order.begin() + begin + segment_length);
+                std::vector<int> rest;
+                rest.reserve(order.size() - segment.size());
+                rest.insert(rest.end(), order.begin(), order.begin() + begin);
+                rest.insert(rest.end(), order.begin() + begin + segment_length, order.end());
+
+                for (int reverse_flag = 0; reverse_flag < 2; reverse_flag++) {
+                    std::vector<int> oriented = segment;
+                    if (reverse_flag != 0) {
+                        std::reverse(oriented.begin(), oriented.end());
+                    }
+                    for (int position = 0; position <= static_cast<int>(rest.size()); position++) {
+                        if (reverse_flag == 0 && position == begin) {
+                            continue;
+                        }
+                        std::vector<int> candidate;
+                        candidate.reserve(order.size());
+                        candidate.insert(candidate.end(), rest.begin(), rest.begin() + position);
+                        candidate.insert(candidate.end(), oriented.begin(), oriented.end());
+                        candidate.insert(candidate.end(), rest.begin() + position, rest.end());
+                        if (!bounded_path_respects_min_overlap(candidate, overlap, min_overlap)) {
+                            continue;
+                        }
+                        auto candidate_score = bounded_path_score(candidate, overlap);
+                        if (candidate_score > current_score) {
+                            order = std::move(candidate);
+                            improved = true;
+                            break;
+                        }
+                    }
+                    if (improved) {
+                        break;
+                    }
+                }
+                if (improved) {
+                    break;
+                }
+            }
+            if (improved) {
+                break;
+            }
+        }
+        if (!improved) {
+            break;
+        }
+    }
+
+    return bounded_path_respects_min_overlap(order, overlap, min_overlap) ? order : std::vector<int>{};
+}
+
 std::vector<int> improve_bounded_greedy_path(std::vector<int> order,
                                              const std::vector<std::vector<int>> &overlap,
                                              std::mt19937_64 &rng,
-                                             int iterations) {
+                                             int iterations,
+                                             int min_overlap) {
     if (order.size() <= 2 || iterations <= 0) {
         return order;
     }
@@ -2534,6 +3265,9 @@ std::vector<int> improve_bounded_greedy_path(std::vector<int> order,
             candidate.insert(candidate.begin() + insert_pos, value);
         } else {
             std::swap(candidate[left], candidate[right]);
+        }
+        if (!bounded_path_respects_min_overlap(candidate, overlap, min_overlap)) {
+            continue;
         }
 
         auto candidate_score = bounded_path_score(candidate, overlap);
@@ -2570,6 +3304,39 @@ std::vector<std::vector<int>> reorder_states_for_bounded_admits(const std::vecto
         }
     }
 
+    auto convert_order_to_states = [&](const std::vector<int> &order) {
+        std::vector<std::vector<int>> reordered;
+        reordered.reserve(states.size());
+        for (auto state_idx : order) {
+            reordered.emplace_back(states[state_idx]);
+        }
+        return reordered;
+    };
+
+    std::vector<int> strong_order;
+    if (stateflow_env_bool("GEGE_BOUNDED_STRONG_PATH_REORDER", nullptr, true)) {
+        strong_order = build_strong_path_cover_order(overlap, min_overlap, buffer_capacity);
+    }
+    if (static_cast<int>(strong_order.size()) == num_states &&
+        bounded_path_respects_min_overlap(strong_order, overlap, min_overlap)) {
+        strong_order = improve_bounded_path_runtime_balance(std::move(strong_order), overlap, states, min_overlap, buffer_capacity);
+        auto score = bounded_path_score(strong_order, overlap);
+        auto runtime_score = bounded_path_runtime_score(strong_order, overlap, states, min_overlap, buffer_capacity);
+        const int64_t transition_overlap = std::get<1>(score);
+        const int64_t transition_admits =
+            static_cast<int64_t>(std::max(0, num_states - 1)) * static_cast<int64_t>(buffer_capacity) -
+            transition_overlap;
+        SPDLOG_INFO(
+            "Bounded greedy cover dynamic strong-path reorder selected states={} max_admits={} min_overlap={} transition_admits={} transition_overlap={} overlap_hist=[1:{}, 2:{}, 3:{}] max_min_overlap_run={} min_overlap_run_sum_sq={} max_window_admits={} short_reuse3={} short_reuse3_transitions={} short_reuse5={} capped_reuse_distance={}",
+            num_states, max_admits, min_overlap, transition_admits, transition_overlap,
+            -std::get<4>(score), std::get<3>(score), std::get<2>(score),
+            runtime_score.max_min_overlap_run, runtime_score.min_overlap_run_sum_sq,
+            runtime_score.max_window_admits, runtime_score.short_evict_reuse_count3,
+            runtime_score.short_evict_reuse_transitions3, runtime_score.short_evict_reuse_count5,
+            runtime_score.capped_evict_reuse_distance_sum);
+        return convert_order_to_states(strong_order);
+    }
+
     const int restarts = static_cast<int>(
         std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_GREEDY_RESTARTS", nullptr, 512)));
     const int local_iterations = static_cast<int>(
@@ -2590,11 +3357,14 @@ std::vector<std::vector<int>> reorder_states_for_bounded_admits(const std::vecto
             start_idx = start_dist(rng);
         }
 
-        auto order = build_bounded_greedy_path_once(overlap, rng, start_idx, candidate_pool);
+        auto order = build_bounded_greedy_path_once(overlap, rng, start_idx, candidate_pool, min_overlap);
         if (static_cast<int>(order.size()) != num_states) {
             continue;
         }
-        order = improve_bounded_greedy_path(std::move(order), overlap, rng, local_iterations);
+        order = improve_bounded_greedy_path(std::move(order), overlap, rng, local_iterations, min_overlap);
+        if (!bounded_path_respects_min_overlap(order, overlap, min_overlap)) {
+            continue;
+        }
         auto score = bounded_path_score(order, overlap);
         if (score > best_score) {
             best_score = score;
@@ -2608,110 +3378,8 @@ std::vector<std::vector<int>> reorder_states_for_bounded_admits(const std::vecto
         return reorder_states_for_max_overlap(states);
     }
 
-    std::vector<std::vector<int>> reordered;
-    reordered.reserve(states.size());
-    for (auto state_idx : best_order) {
-        reordered.emplace_back(states[state_idx]);
-    }
-    return reordered;
-}
-
-std::vector<std::vector<int>> p32_q4_bounded_greedy_cover_state_order() {
-    return {
-        {6, 17, 27, 28},
-        {3, 12, 25, 28},
-        {12, 21, 22, 28},
-        {7, 12, 22, 26},
-        {2, 7, 18, 20},
-        {1, 18, 24, 29},
-        {8, 15, 18, 25},
-        {0, 19, 20, 25},
-        {10, 14, 20, 25},
-        {13, 14, 20, 31},
-        {12, 13, 14, 15},
-        {2, 6, 9, 14},
-        {9, 14, 21, 24},
-        {5, 16, 24, 30},
-        {7, 13, 24, 28},
-        {6, 13, 17, 24},
-        {0, 17, 22, 24},
-        {9, 12, 17, 29},
-        {0, 5, 9, 12},
-        {4, 5, 6, 7},
-        {3, 6, 18, 21},
-        {4, 18, 27, 31},
-        {10, 17, 26, 31},
-        {9, 16, 26, 31},
-        {11, 12, 24, 31},
-        {24, 25, 26, 27},
-        {4, 21, 26, 29},
-        {5, 8, 26, 29},
-        {5, 8, 19, 31},
-        {6, 8, 21, 31},
-        {1, 6, 8, 12},
-        {8, 12, 20, 30},
-        {10, 12, 18, 30},
-        {10, 12, 16, 27},
-        {2, 4, 10, 12},
-        {4, 12, 19, 23},
-        {7, 9, 23, 25},
-        {5, 15, 23, 27},
-        {20, 23, 27, 29},
-        {14, 19, 27, 29},
-        {3, 13, 27, 29},
-        {0, 7, 27, 29},
-        {0, 7, 11, 14},
-        {0, 7, 30, 31},
-        {28, 29, 30, 31},
-        {2, 15, 30, 31},
-        {2, 15, 19, 24},
-        {1, 19, 26, 28},
-        {0, 1, 2, 3},
-        {1, 3, 23, 31},
-        {3, 10, 23, 24},
-        {0, 18, 23, 26},
-        {0, 4, 8, 28},
-        {4, 8, 20, 24},
-        {1, 4, 9, 13},
-        {9, 13, 16, 18},
-        {16, 17, 18, 19},
-        {4, 14, 16, 22},
-        {1, 22, 25, 31},
-        {1, 7, 15, 17},
-        {6, 15, 20, 26},
-        {10, 15, 22, 29},
-        {0, 6, 10, 13},
-        {6, 13, 22, 30},
-        {13, 19, 23, 30},
-        {6, 11, 19, 23},
-        {1, 11, 16, 20},
-        {0, 15, 16, 21},
-        {2, 16, 23, 28},
-        {6, 16, 25, 29},
-        {2, 11, 25, 29},
-        {2, 11, 13, 26},
-        {2, 11, 17, 21},
-        {20, 21, 22, 23},
-        {1, 21, 27, 30},
-        {9, 11, 27, 30},
-        {8, 9, 10, 11},
-        {9, 10, 20, 28},
-        {9, 11, 15, 28},
-        {3, 4, 11, 15},
-        {4, 17, 25, 30},
-        {8, 14, 17, 23},
-        {3, 14, 26, 30},
-        {3, 7, 8, 16},
-        {3, 5, 17, 20},
-        {5, 11, 18, 22},
-        {5, 14, 18, 28},
-        {1, 5, 10, 14},
-        {7, 10, 19, 21},
-        {5, 13, 21, 25},
-        {2, 5, 8, 13},
-        {2, 8, 22, 27},
-        {3, 9, 19, 22},
-    };
+    best_order = improve_bounded_path_runtime_balance(std::move(best_order), overlap, states, min_overlap, buffer_capacity);
+    return convert_order_to_states(best_order);
 }
 
 int64_t count_uncovered_diagonal_gain(const std::vector<int> &state,
@@ -2736,6 +3404,93 @@ bool state_conflicts_with_round_partitions(const std::vector<int> &state,
         }
     }
     return false;
+}
+
+std::vector<std::vector<int>> build_bounded_single_gpu_cover_states(int num_partitions,
+                                                                    int buffer_capacity,
+                                                                    int max_admits) {
+    std::vector<std::vector<int>> candidates;
+    std::vector<int> current;
+    build_greedy_cover_candidates(num_partitions, buffer_capacity, 0, current, candidates);
+    if (candidates.empty()) {
+        return {};
+    }
+
+    const int min_overlap = std::max(0, buffer_capacity - std::max(0, max_admits));
+    const int64_t total_buckets = static_cast<int64_t>(num_partitions) * static_cast<int64_t>(num_partitions);
+    std::vector<uint8_t> covered(num_partitions * num_partitions, 0);
+    int64_t covered_count = 0;
+    std::vector<std::vector<int>> states;
+    states.reserve(static_cast<std::size_t>(std::max(num_partitions * 4, 32)));
+
+    const int max_states = static_cast<int>(
+        std::max<int64_t>(num_partitions * num_partitions,
+                          stateflow_env_int64("GEGE_BOUNDED_SINGLE_GPU_MAX_STATES", nullptr,
+                                              std::max<int64_t>(num_partitions * 8, 128))));
+
+    while (covered_count < total_buckets && static_cast<int>(states.size()) < max_states) {
+        int best_idx = -1;
+        int64_t best_gain = -1;
+        int64_t best_diagonal_gain = -1;
+        int best_overlap = -1;
+        int64_t best_balance_score = std::numeric_limits<int64_t>::max();
+
+        for (int candidate_idx = 0; candidate_idx < static_cast<int>(candidates.size()); candidate_idx++) {
+            const auto &candidate = candidates[candidate_idx];
+            int overlap = states.empty() ? buffer_capacity : state_overlap_count(states.back(), candidate);
+            if (!states.empty() && overlap < min_overlap) {
+                continue;
+            }
+
+            int64_t gain = count_uncovered_buckets_for_state(candidate, covered, num_partitions);
+            if (gain <= 0) {
+                continue;
+            }
+            int64_t diagonal_gain = count_uncovered_diagonal_gain(candidate, covered, num_partitions);
+            int64_t balance_score = 0;
+            for (auto partition : candidate) {
+                balance_score += partition;
+            }
+
+            if (gain > best_gain ||
+                (gain == best_gain && diagonal_gain > best_diagonal_gain) ||
+                (gain == best_gain && diagonal_gain == best_diagonal_gain && overlap > best_overlap) ||
+                (gain == best_gain && diagonal_gain == best_diagonal_gain && overlap == best_overlap &&
+                 balance_score < best_balance_score)) {
+                best_idx = candidate_idx;
+                best_gain = gain;
+                best_diagonal_gain = diagonal_gain;
+                best_overlap = overlap;
+                best_balance_score = balance_score;
+            }
+        }
+
+        if (best_idx < 0) {
+            SPDLOG_WARN("Bounded single-GPU q{} cover stalled under max_admits={} after states={} covered={} total={}",
+                        buffer_capacity, max_admits, states.size(), covered_count, total_buckets);
+            return {};
+        }
+
+        states.emplace_back(candidates[best_idx]);
+        covered_count += mark_state_buckets_covered(states.back(), covered, num_partitions);
+    }
+
+    if (covered_count < total_buckets) {
+        SPDLOG_WARN("Bounded single-GPU q{} cover exceeded max_states={} under max_admits={} covered={} total={}",
+                    buffer_capacity, max_states, max_admits, covered_count, total_buckets);
+        return {};
+    }
+
+    int64_t transition_admits = 0;
+    int64_t transition_overlap = 0;
+    for (std::size_t idx = 1; idx < states.size(); idx++) {
+        int overlap = state_overlap_count(states[idx - 1], states[idx]);
+        transition_overlap += overlap;
+        transition_admits += buffer_capacity - overlap;
+    }
+    SPDLOG_INFO("Bounded single-GPU q{} cover selected states={} max_admits={} transition_admits={} transition_overlap={}",
+                buffer_capacity, states.size(), max_admits, transition_admits, transition_overlap);
+    return states;
 }
 
 void mark_round_partitions(const std::vector<int> &state,
@@ -2932,7 +3687,8 @@ std::vector<std::vector<int>> build_bounded_multi_gpu_round_states(int num_parti
 
 vector<vector<std::pair<int, int>>> balancedAssignEdgeBucketsToBuffers(const vector<vector<int>> &buffer_states,
                                                                        int num_partitions,
-                                                                       const vector<int64_t> &edge_bucket_sizes) {
+                                                                       const vector<int64_t> &edge_bucket_sizes,
+                                                                       int initial_state_count = 1) {
     if (buffer_states.empty()) {
         return {};
     }
@@ -2969,6 +3725,54 @@ vector<vector<std::pair<int, int>>> balancedAssignEdgeBucketsToBuffers(const vec
     std::vector<int64_t> assigned_count(buffer_states.size(), 0);
     std::vector<std::vector<int>> compatible_states(static_cast<std::size_t>(num_partitions) *
                                                     static_cast<std::size_t>(num_partitions));
+    std::vector<int> fixed_bucket_state(static_cast<std::size_t>(num_partitions) *
+                                        static_cast<std::size_t>(num_partitions), -1);
+
+    const char *pin_initial_raw = std::getenv("GEGE_PIN_INITIAL_BUCKET_ASSIGNMENT");
+    const bool pin_initial_buckets =
+        pin_initial_raw != nullptr &&
+        !(std::string(pin_initial_raw) == "0" || std::string(pin_initial_raw) == "false" ||
+          std::string(pin_initial_raw) == "False" || std::string(pin_initial_raw) == "FALSE");
+    if (pin_initial_buckets) {
+        // Opt-in debug mode: force buckets first visible in an initial lane
+        // state to be trained there. The default min-max assignment is still
+        // exact and avoids coupling coverage correctness to first visibility.
+        int clamped_initial_states =
+            std::min<int>(std::max(1, initial_state_count), static_cast<int>(buffer_states.size()));
+        for (int state_idx = 0; state_idx < clamped_initial_states; state_idx++) {
+            for (int src = 0; src < num_partitions; src++) {
+                if (contains[state_idx][src] == 0) {
+                    continue;
+                }
+                for (int dst = 0; dst < num_partitions; dst++) {
+                    if (contains[state_idx][dst] == 0) {
+                        continue;
+                    }
+                    int bucket_idx = src * num_partitions + dst;
+                    if (fixed_bucket_state[bucket_idx] < 0) {
+                        fixed_bucket_state[bucket_idx] = state_idx;
+                    }
+                }
+            }
+        }
+    }
+
+    auto assign_bucket_to_state = [&](int state_idx, const BucketCandidate &bucket) {
+        if (state_idx < 0 || state_idx >= static_cast<int>(edge_buckets_per_buffer.size())) {
+            return;
+        }
+        edge_buckets_per_buffer[state_idx].emplace_back(bucket.src, bucket.dst);
+        assigned_weight[state_idx] += bucket.weight;
+        assigned_count[state_idx]++;
+    };
+
+    for (const auto &bucket : buckets) {
+        int bucket_idx = bucket.src * num_partitions + bucket.dst;
+        int fixed_state = fixed_bucket_state[bucket_idx];
+        if (fixed_state >= 0) {
+            assign_bucket_to_state(fixed_state, bucket);
+        }
+    }
 
     for (const auto &bucket : buckets) {
         int bucket_idx = bucket.src * num_partitions + bucket.dst;
@@ -2988,15 +3792,17 @@ vector<vector<std::pair<int, int>>> balancedAssignEdgeBucketsToBuffers(const vec
             }
         }
 
+        if (fixed_bucket_state[bucket_idx] >= 0) {
+            continue;
+        }
+
         if (best_state < 0) {
             SPDLOG_WARN("Balanced bucket assignment found no compatible state for bucket ({},{}); falling back to first-cover assignment",
                         bucket.src, bucket.dst);
             return greedyAssignEdgeBucketsToBuffers(buffer_states, num_partitions);
         }
 
-        edge_buckets_per_buffer[best_state].emplace_back(bucket.src, bucket.dst);
-        assigned_weight[best_state] += bucket.weight;
-        assigned_count[best_state]++;
+        assign_bucket_to_state(best_state, bucket);
     }
 
     const char *minmax_raw = std::getenv("GEGE_MINMAX_BUCKET_ASSIGNMENT");
@@ -3072,9 +3878,12 @@ vector<vector<std::pair<int, int>>> balancedAssignEdgeBucketsToBuffers(const vec
                 }
                 for (const auto &bucket : edge_buckets_per_buffer[src_state]) {
                     int bucket_idx = bucket.first * num_partitions + bucket.second;
+                    if (fixed_bucket_state[bucket_idx] == src_state) {
+                        continue;
+                    }
                     int64_t bucket_weight = edge_bucket_sizes[bucket_idx];
                     for (auto dst_state : compatible_states[bucket_idx]) {
-                        if (dst_state == src_state) {
+                        if (dst_state == src_state || fixed_bucket_state[bucket_idx] >= 0) {
                             continue;
                         }
                         int64_t new_max = max_after_move(src_state, dst_state, bucket_weight);
@@ -3108,9 +3917,12 @@ vector<vector<std::pair<int, int>>> balancedAssignEdgeBucketsToBuffers(const vec
                     }
                     for (const auto &bucket : edge_buckets_per_buffer[src_state]) {
                         int bucket_idx = bucket.first * num_partitions + bucket.second;
+                        if (fixed_bucket_state[bucket_idx] == src_state) {
+                            continue;
+                        }
                         int64_t bucket_weight = edge_bucket_sizes[bucket_idx];
                         for (auto dst_state : compatible_states[bucket_idx]) {
-                            if (dst_state == src_state) {
+                            if (dst_state == src_state || fixed_bucket_state[bucket_idx] >= 0) {
                                 continue;
                             }
                             int64_t new_max = max_after_move(src_state, dst_state, bucket_weight);
@@ -5645,10 +6457,23 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
         return getGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
     }
 
+    const int requested_max_admits = static_cast<int>(
+        std::min<int64_t>(buffer_capacity,
+                          std::max<int64_t>(0, stateflow_env_int64("GEGE_STATEFLOW_MAX_ADMITS",
+                                                                    "STATEFLOW_MAX_ADMITS", 3))));
     std::vector<std::vector<int>> buffer_states =
-        num_partitions == 32 && buffer_capacity == 4
-            ? p32_q4_bounded_greedy_cover_state_order()
-            : build_greedy_cover_state_set(num_partitions, buffer_capacity);
+        load_bounded_state_order_file(std::getenv("GEGE_BOUNDED_STATE_ORDER_FILE"), num_partitions, buffer_capacity);
+    const bool loaded_state_order = !buffer_states.empty();
+    if (!loaded_state_order) {
+        buffer_states = build_greedy_cover_state_set(num_partitions, buffer_capacity);
+    }
+    if (requested_max_admits < 3) {
+        auto constrained_states =
+            build_bounded_single_gpu_cover_states(num_partitions, buffer_capacity, requested_max_admits);
+        if (!constrained_states.empty()) {
+            buffer_states = std::move(constrained_states);
+        }
+    }
     if (buffer_states.empty()) {
         return convertEdgeBucketOrderToTensors({}, {});
     }
@@ -5662,8 +6487,12 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
         pre_reorder_retained_avg = static_cast<double>(retained_total) / static_cast<double>(buffer_states.size() - 1);
     }
 
-    if (!(num_partitions == 32 && buffer_capacity == 4)) {
-        buffer_states = reorder_states_for_bounded_admits(buffer_states, 3);
+    if (!loaded_state_order && requested_max_admits >= 3 && requested_max_admits < buffer_capacity) {
+        buffer_states = reorder_states_for_bounded_admits(buffer_states, requested_max_admits);
+    }
+    if (bounded_greedy_cover_reverse_enabled()) {
+        std::reverse(buffer_states.begin(), buffer_states.end());
+        SPDLOG_INFO("Reversed BOUNDED_GREEDY_COVER_Q4 state order");
     }
 
     int64_t retained_total = 0;
@@ -5702,7 +6531,8 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMu
         return getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, edge_bucket_sizes);
     }
 
-    auto edge_buckets_per_buffer = balancedAssignEdgeBucketsToBuffers(buffer_states, num_partitions, edge_bucket_sizes);
+    auto edge_buckets_per_buffer =
+        balancedAssignEdgeBucketsToBuffers(buffer_states, num_partitions, edge_bucket_sizes, active_devices);
     log_cover_ordering_summary("Generating BOUNDED_MULTI_GPU_GREEDY_COVER_Q4 Ordering (legacy interleaved view)",
                                buffer_states, edge_buckets_per_buffer, num_partitions, edge_bucket_sizes);
     return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);

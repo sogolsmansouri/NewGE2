@@ -67,7 +67,6 @@ class GraphModelStorage {
 
     void ensureSubgraphStateVectors_(int32_t device_idx = 0);
 
-    void startAsyncAdmitPreload_(int32_t device_idx = 0);
     int64_t num_nodes_;
     int64_t num_edges_;
     bool partition_buffer_lp_fast_path_enabled_;
@@ -117,6 +116,8 @@ class GraphModelStorage {
     void updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState> subgraph, std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx = 0);
 
     void updateInMemorySubGraph(int32_t device_idx = 0);
+
+    void startAsyncAdmitPreload(int32_t device_idx = 0);
 
     void getNextSubGraph(int32_t device_idx = 0);
 
@@ -214,6 +215,8 @@ class GraphModelStorage {
     bool embeddingsOffDevice();
 
     bool embeddingsOffDeviceG();
+
+    bool canUseResidentLocalLPDirect(int32_t device_idx = 0);
 
     void sortAllEdges(int32_t device_idx = 0);
 

@@ -249,6 +249,8 @@ class MemPartitionBuffer : public PartitionBuffer {
 
     void sync(bool host_staging_current = false);
 
+    bool hasDeviceResidentFrames() const;
+
     void resetFrameCachePerfStats() { frame_cache_perf_stats_ = FrameCachePerfStats(); }
 
     FrameCachePerfStats getFrameCachePerfStats() const { return frame_cache_perf_stats_; }
@@ -274,8 +276,10 @@ class MemPartitionBuffer : public PartitionBuffer {
     void ensureBackingTensorsAllocated_();
     void resetFrameCacheState_();
     void refreshFrameCacheTensors_();
+    void autoConfigureFrameCacheFromOrdering_();
     bool asyncAdmitPreloadEnabled_() const;
     bool frameCacheEnabled_() const;
+    int64_t frameCacheMaxStaleBacklog_() const;
     int64_t logicalSlotToPhysicalFrame_(int64_t logical_slot) const;
     int64_t logicalSlotRowOffset_(int64_t logical_slot) const;
     int64_t partitionRowOffset_(const Partition *partition) const;
@@ -316,6 +320,8 @@ class MemPartitionBuffer : public PartitionBuffer {
     bool use_pinned_host_buffer_ = true;
     int physical_frame_capacity_ = 0;
     int hidden_frame_capacity_ = 0;
+    int64_t frame_cache_auto_max_transition_admits_ = 0;
+    int64_t frame_cache_auto_max_stale_backlog_ = -1;
     std::vector<int64_t> logical_to_physical_frames_;
     std::vector<int64_t> free_physical_frames_;
     std::mutex free_physical_frames_lock_;

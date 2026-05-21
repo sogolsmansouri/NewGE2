@@ -443,6 +443,9 @@ bool can_use_manual_dot_rns_update(const shared_ptr<EdgeDecoder> &edge_decoder, 
     if (!batch->edges_.defined() || !(batch->edges_.size(1) == 2 || batch->edges_.size(1) == 3)) {
         return false;
     }
+    if (batch->edges_.size(1) == 3) {
+        return false;
+    }
     if (!batch->node_embeddings_.defined() || !batch->node_embeddings_state_.defined() ||
         !batch->unique_node_indices_.defined()) {
         return false;

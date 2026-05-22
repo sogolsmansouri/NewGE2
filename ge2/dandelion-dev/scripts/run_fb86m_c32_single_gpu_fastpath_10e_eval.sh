@@ -63,6 +63,40 @@ require_path "$CONFIG_TEMPLATE"
 require_executable "$TRAIN_BIN"
 require_executable "$EVAL_BIN"
 
+if [[ ! -f "$EVAL_DS/edges/train_edges.bin" ]]; then
+  MERGED_EVAL_DS="${GEGE_MERGED_EVAL_DS:-/mnt/local/${USER}/datasets/freebase86m_32p_paper_10k_eval_merged}"
+  mkdir -p "$MERGED_EVAL_DS/edges" "$MERGED_EVAL_DS/nodes"
+  ln -sfn "$TRAIN_DS/edges/train_edges.bin" "$MERGED_EVAL_DS/edges/train_edges.bin"
+  ln -sfn "$TRAIN_DS/edges/train_partition_offsets.txt" "$MERGED_EVAL_DS/edges/train_partition_offsets.txt"
+  ln -sfn "$TRAIN_DS/edges/validation_edges.bin" "$MERGED_EVAL_DS/edges/validation_edges.bin"
+  ln -sfn "$TRAIN_DS/edges/relation_mapping.txt" "$MERGED_EVAL_DS/edges/relation_mapping.txt"
+  ln -sfn "$TRAIN_DS/nodes/node_mapping.txt" "$MERGED_EVAL_DS/nodes/node_mapping.txt"
+  ln -sfn "$EVAL_DS/edges/test_edges.bin" "$MERGED_EVAL_DS/edges/test_edges.bin"
+  ln -sfn "$TRAIN_DS/entity2id.txt" "$MERGED_EVAL_DS/entity2id.txt"
+  ln -sfn "$TRAIN_DS/relation2id.txt" "$MERGED_EVAL_DS/relation2id.txt"
+  python3 - "$TRAIN_DS/dataset.yaml" "$MERGED_EVAL_DS" "$EVAL_DS/edges/test_edges.bin" <<'PY'
+import pathlib
+import sys
+
+import yaml
+
+train_yaml = pathlib.Path(sys.argv[1])
+merged_dir = pathlib.Path(sys.argv[2])
+test_edges = pathlib.Path(sys.argv[3])
+
+with train_yaml.open("r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+config["dataset_dir"] = str(merged_dir) + "/"
+config["num_test"] = test_edges.stat().st_size // 12
+config["initialized"] = True
+
+with (merged_dir / "dataset.yaml").open("w", encoding="utf-8") as f:
+    yaml.safe_dump(config, f, sort_keys=False)
+PY
+  EVAL_DS="$MERGED_EVAL_DS"
+fi
+
 mkdir -p "$LOG_DIR" "$RUN_ROOT" "$ROOT/datasets"
 ln -sfn "$EVAL_DS" "$ROOT/datasets/freebase86m_16p_paper_10k_eval"
 

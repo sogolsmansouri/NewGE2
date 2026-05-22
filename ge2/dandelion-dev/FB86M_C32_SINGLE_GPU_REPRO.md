@@ -142,6 +142,34 @@ CSV record:
 /home/smansou2/fb86m_training_eval_results.csv
 ```
 
+## Recorded Eval Result
+
+Eval retry:
+
+```text
+fb86m_p32_q4_1gpu_c32_fastpath_10e_eval_55a63a7_20260521_182154_eval_retry_merged_20260522_113420
+```
+
+Paper-10k exact filtered result:
+
+```text
+Link Prediction: 20000 edges evaluated
+Mean Rank: 3562151.470450
+MRR: 0.406830
+Hits@1: 0.336400
+Hits@3: 0.443900
+Hits@5: 0.488600
+Hits@10: 0.541750
+Hits@50: 0.637800
+Hits@100: 0.666650
+```
+
+Eval log:
+
+```bash
+/mnt/local/smansou2/ge2_logs/fb86m_p32_q4_1gpu_c32_fastpath_10e_eval_55a63a7_20260521_182154/fb86m_p32_q4_1gpu_c32_fastpath_10e_eval_55a63a7_20260521_182154_eval_retry_merged_20260522_113420.log
+```
+
 ## Notes
 
 - The checkpoint in `/dev/shm` is volatile. If the allocation or node state is

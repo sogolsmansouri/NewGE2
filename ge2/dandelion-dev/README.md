@@ -19,6 +19,12 @@ GE^2
         $ gege_preprocess --dataset twitter --output_dir datasets/twitter -ds 0.9 0.05 0.05 --num_partition 16
         $ CUDA_VISIBLE_DEVICES=0,1 gege_train gege/configs/fb15k.yaml
 
+### Reproduction Notes
+
+- [FB86M_C32_SINGLE_GPU_REPRO.md](FB86M_C32_SINGLE_GPU_REPRO.md) records the
+  ARC c32 Freebase86M p32 q4 single-GPU 10-epoch timing and
+  eval-only-from-checkpoint workflow.
+
 
 #### Acknowledgements
 

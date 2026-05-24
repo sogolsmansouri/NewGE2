@@ -24,6 +24,9 @@ GE^2
 - [FB86M_C32_SINGLE_GPU_REPRO.md](FB86M_C32_SINGLE_GPU_REPRO.md) records the
   ARC c32 Freebase86M p32 q4 single-GPU 10-epoch timing and
   eval-only-from-checkpoint workflow.
+- [FB86M_2GPU_RUN_TAGS.md](FB86M_2GPU_RUN_TAGS.md) tags the c32/ARC
+  Freebase86M 2-GPU runs as correct, invalid, or current repro attempts, with
+  the timing/config differences recorded.
 
 
 #### Acknowledgements

@@ -21,6 +21,10 @@ struct Args {
     bool all_candidates = false;
     bool include_microstates = false;
     bool emit_json = false;
+    int active_devices = 1;
+    int64_t embedding_dim = 100;
+    int64_t dtype_size = 4;
+    int64_t optimizer_state_multiplier = 2;
     std::string force_family;
     std::string force_variant;
     double alpha = 1.0;
@@ -33,6 +37,7 @@ void print_usage(const char *prog) {
     std::cerr << "Usage: " << prog
               << " <dataset_dir> <num_partitions> <buffer_capacity>"
                  " [--random] [--no-hybrid] [--all-candidates] [--include-microstates] [--json]"
+                 " [--multi-gpu <devices>] [--embedding-dim <int>] [--dtype-size <int>] [--optimizer-state-multiplier <int>]"
                  " [--force-family <name>] [--force-variant <name>]"
                  " [--alpha <double>] [--beta <double>] [--gamma <double>] [--delta <double>]\n";
 }
@@ -60,6 +65,14 @@ Args parse_args(int argc, char **argv) {
             args.include_microstates = true;
         } else if (arg == "--json") {
             args.emit_json = true;
+        } else if (arg == "--multi-gpu" && idx + 1 < argc) {
+            args.active_devices = std::stoi(argv[++idx]);
+        } else if (arg == "--embedding-dim" && idx + 1 < argc) {
+            args.embedding_dim = std::max<int64_t>(1, std::stoll(argv[++idx]));
+        } else if (arg == "--dtype-size" && idx + 1 < argc) {
+            args.dtype_size = std::max<int64_t>(1, std::stoll(argv[++idx]));
+        } else if (arg == "--optimizer-state-multiplier" && idx + 1 < argc) {
+            args.optimizer_state_multiplier = std::max<int64_t>(1, std::stoll(argv[++idx]));
         } else if (arg == "--force-family" && idx + 1 < argc) {
             args.force_family = argv[++idx];
         } else if (arg == "--force-variant" && idx + 1 < argc) {
@@ -151,6 +164,10 @@ int main(int argc, char **argv) {
         }
         auto edge_bucket_sizes = read_bucket_sizes(args.dataset_dir, args.num_partitions);
         auto partition_row_counts = computePartitionRowCounts(read_num_nodes(args.dataset_dir), args.num_partitions);
+        PlanEmbeddingLayout embedding_layout;
+        embedding_layout.embedding_dim = args.embedding_dim;
+        embedding_layout.dtype_size = args.dtype_size;
+        embedding_layout.optimizer_state_multiplier = args.optimizer_state_multiplier;
 
         set_weight_env("GEGE_STATEFLOW_COST_ALPHA", args.alpha);
         set_weight_env("GEGE_STATEFLOW_COST_BETA", args.beta);
@@ -165,6 +182,68 @@ int main(int argc, char **argv) {
             if (setenv("GEGE_STATEFLOW_FORCE_VARIANT", args.force_variant.c_str(), 1) != 0) {
                 throw std::runtime_error("Failed to set GEGE_STATEFLOW_FORCE_VARIANT");
             }
+        }
+
+        if (args.active_devices > 1) {
+            auto ordering = getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(args.num_partitions, args.buffer_capacity,
+                                                                            args.active_devices, edge_bucket_sizes);
+            auto buffer_states = std::get<0>(ordering);
+            auto edge_buckets_per_buffer = std::get<1>(ordering);
+            if (buffer_states.empty() || edge_buckets_per_buffer.empty()) {
+                std::cerr << "No multi-GPU buffer states produced\n";
+                return 1;
+            }
+            if (args.all_candidates) {
+                auto plans = enumerateMultiGpuStateflowPlans(buffer_states, edge_buckets_per_buffer,
+                                                             args.active_devices, edge_bucket_sizes,
+                                                             partition_row_counts, embedding_layout);
+                if (args.emit_json) {
+                    std::cout << "[";
+                    for (std::size_t idx = 0; idx < plans.size(); idx++) {
+                        if (idx > 0) {
+                            std::cout << ",";
+                        }
+                        std::cout << stateflowPlanToJson(plans[idx], args.include_microstates);
+                    }
+                    std::cout << "]\n";
+                    return 0;
+                }
+
+                std::cout << "dataset_dir=" << args.dataset_dir << "\n";
+                std::cout << "num_partitions=" << args.num_partitions << "\n";
+                std::cout << "buffer_capacity=" << args.buffer_capacity << "\n";
+                std::cout << "active_devices=" << args.active_devices << "\n";
+                std::cout << "weights={alpha:" << args.alpha << ",beta:" << args.beta
+                          << ",gamma:" << args.gamma << ",delta:" << args.delta << "}\n";
+                std::cout << "candidate_count=" << plans.size() << "\n";
+                for (std::size_t idx = 0; idx < plans.size(); idx++) {
+                    std::cout << "\n[candidate " << idx << "]\n";
+                    std::cout << stateflowPlanToText(plans[idx], args.include_microstates);
+                }
+                return 0;
+            }
+
+            StateflowPlan plan = compileMultiGpuStateflowPlan(buffer_states, edge_buckets_per_buffer,
+                                                              args.active_devices, edge_bucket_sizes,
+                                                              partition_row_counts, embedding_layout);
+            if (plan.family == PlanFamily::UNKNOWN) {
+                std::cerr << "No valid multi-GPU Stateflow plan produced\n";
+                return 1;
+            }
+
+            if (args.emit_json) {
+                std::cout << stateflowPlanToJson(plan, args.include_microstates) << "\n";
+                return 0;
+            }
+
+            std::cout << "dataset_dir=" << args.dataset_dir << "\n";
+            std::cout << "num_partitions=" << args.num_partitions << "\n";
+            std::cout << "buffer_capacity=" << args.buffer_capacity << "\n";
+            std::cout << "active_devices=" << args.active_devices << "\n";
+            std::cout << "weights={alpha:" << args.alpha << ",beta:" << args.beta
+                      << ",gamma:" << args.gamma << ",delta:" << args.delta << "}\n";
+            std::cout << stateflowPlanToText(plan, args.include_microstates);
+            return 0;
         }
 
         if (args.all_candidates) {

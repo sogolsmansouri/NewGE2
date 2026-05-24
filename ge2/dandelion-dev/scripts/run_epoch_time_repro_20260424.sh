@@ -129,11 +129,14 @@ if [[ "$DATASET" == "fb" ]]; then
     DEFAULT_FRAME_CACHE_HIDDEN_FRAMES=0
   else
     DEFAULT_FRAME_CACHE_HIDDEN_FRAMES=1
-    # FB p32 uses ~2 GiB per embedding+optimizer partition.  On a
-    # 24 GiB GPU, five hidden frames hide most next-admit waits while
-    # leaving materially more headroom than the full depth-6 pipeline.
+    # FB p32 uses ~2 GiB per embedding+optimizer partition.  The optimal-88
+    # q4 path needs depth 6 to keep admits overlapped; use depth 5 for the
+    # older/generated schedules unless the caller overrides this explicitly.
     if grep -Eq 'num_partitions:[[:space:]]*32' "$TMP_CFG"; then
       DEFAULT_FRAME_CACHE_HIDDEN_FRAMES=5
+      if [[ "${GEGE_BOUNDED_Q4_OPTIMAL88:-0}" == "1" ]]; then
+        DEFAULT_FRAME_CACHE_HIDDEN_FRAMES=6
+      fi
       DEFAULT_FRAME_CACHE_SERIALIZE_ADMIT_H2D=1
       DEFAULT_FRAME_CACHE_PRIORITIZED_WRITEBACK=1
       DEFAULT_SOFTMAX_NEGATIVE_MASS_SCALE=8

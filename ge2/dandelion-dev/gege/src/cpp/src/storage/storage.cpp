@@ -1415,7 +1415,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         }
 
         if (!host_evict_ids.empty()) {
-            cudaStreamSynchronize(comm_stream.stream());
+            AT_CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
             for (int partition_id : host_evict_ids) {
                 Partition *partition = buffer->partition_table_[partition_id];
                 int64_t src_slot = partition->buffer_idx_;
@@ -1441,7 +1441,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             torch::Tensor gpu_view =
                 buffer->buffer_tensor_gpu_view_.slice(0, entry.source_offset, entry.source_offset + entry.rows);
             cpu_view.copy_(gpu_view.detach(), true);
-            cudaStreamSynchronize(comm_stream.stream());
+            AT_CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
             write_partition_to_host(partition, cpu_view);
 
             delayed_stale_logical_slots.erase(logical_slot);
@@ -1813,10 +1813,10 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         }
 
-        cudaStreamSynchronize(comm_stream.stream());
+        AT_CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
         if (submitted_peer_copy && device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_peer_sync_wait_ns_.size()) {
             auto peer_sync_start = std::chrono::high_resolution_clock::now();
-            cudaStreamSynchronize(peer_stream.stream());
+            AT_CUDA_CHECK(cudaStreamSynchronize(peer_stream.stream()));
             device_peer_sync_wait_ns_[device_idx] +=
                 std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::high_resolution_clock::now() - peer_sync_start).count();
         }

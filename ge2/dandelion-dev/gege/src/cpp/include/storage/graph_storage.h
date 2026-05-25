@@ -484,14 +484,19 @@ class GraphModelStorage {
                     thread.join();
                 }
             }
+            if (thread_exception != nullptr) {
+#ifdef GEGE_CUDA
+                if (swap_ready_event != nullptr) {
+                    static_cast<void>(cudaEventDestroy(swap_ready_event));
+                }
+#endif
+                std::rethrow_exception(thread_exception);
+            }
 #ifdef GEGE_CUDA
             if (swap_ready_event != nullptr) {
                 AT_CUDA_CHECK(cudaEventDestroy(swap_ready_event));
             }
 #endif
-            if (thread_exception != nullptr) {
-                std::rethrow_exception(thread_exception);
-            }
 
             // std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)->performNextSwap(device_idx);
             // if (storage_ptrs_.node_optimizer_state != nullptr && train_) {

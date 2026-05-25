@@ -2602,15 +2602,10 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                     }
                 }
                 if (!hidden_publishes.empty()) {
-                    if (frame_cache_hidden_only_preload_enabled()) {
-                        stage_admit_ids.clear();
-                        stage_evict_slots.clear();
-                    } else {
-                        stage_admit_ids.erase(stage_admit_ids.begin(),
-                                              stage_admit_ids.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
-                        stage_evict_slots.erase(stage_evict_slots.begin(),
-                                                stage_evict_slots.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
-                    }
+                    stage_admit_ids.erase(stage_admit_ids.begin(),
+                                          stage_admit_ids.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
+                    stage_evict_slots.erase(stage_evict_slots.begin(),
+                                            stage_evict_slots.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
                 }
             }
             int64_t stage_rows = partition_rows_for_ids(stage_admit_ids, partition_table_);

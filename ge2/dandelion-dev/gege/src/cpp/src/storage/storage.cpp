@@ -1296,8 +1296,20 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     has_scheduled_peer_handoff = handoff_it != stateflow_peer_handoff_index_per_device_[device_idx].end();
                 }
                 if (!has_scheduled_peer_handoff) {
+                    int64_t target_slot =
+                        (partition_id >= 0 && partition_id < static_cast<int>(next_slot_by_partition.size()))
+                            ? next_slot_by_partition[static_cast<std::size_t>(partition_id)]
+                            : -1;
+                    if (target_slot < 0) {
+                        target_slot = idx < evict_slots.size() ? evict_slots[idx] : -1;
+                    }
+                    if (target_slot < 0) {
+                        throw GegeRuntimeException(
+                            fmt::format("Stateflow peer relay could not determine preload target slot for partition {} on device {}",
+                                        partition_id, buffer->device_.index()));
+                    }
                     host_preload_admit_ids.push_back(partition_id);
-                    host_preload_slots.push_back(evict_slots[idx]);
+                    host_preload_slots.push_back(target_slot);
                 }
             }
 
@@ -1476,7 +1488,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         std::vector<int64_t> current_slot_by_partition(static_cast<std::size_t>(partition_count), -1);
         if (frame_cache_mapping) {
             std::vector<int64_t> retained_frame_by_partition(static_cast<std::size_t>(partition_count), -1);
-            std::vector<int64_t> original_frame_by_slot(static_cast<std::size_t>(previous_state.numel()), -1);
+            std::vector<int64_t> reusable_evicted_frames;
             auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
             for (int64_t slot = 0; slot < previous_state.numel(); slot++) {
                 int partition_id = static_cast<int>(previous_state_ptr[slot]);
@@ -1486,11 +1498,28 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                                     partition_id, buffer->device_.index()));
                 }
                 int64_t frame = buffer->logicalSlotToPhysicalFrame_(slot);
-                original_frame_by_slot[static_cast<std::size_t>(slot)] = frame;
                 if (evict_partition_mask[static_cast<std::size_t>(partition_id)] == 0) {
                     retained_frame_by_partition[static_cast<std::size_t>(partition_id)] = frame;
+                } else if (delayed_stale_logical_slots.find(slot) == delayed_stale_logical_slots.end()) {
+                    reusable_evicted_frames.push_back(frame);
                 }
             }
+            std::size_t reusable_frame_cursor = 0;
+            auto take_reusable_frame = [&]() -> int64_t {
+                if (reusable_frame_cursor < reusable_evicted_frames.size()) {
+                    return reusable_evicted_frames[reusable_frame_cursor++];
+                }
+                while (!delayed_stale_entries.empty()) {
+                    int64_t logical_slot = delayed_stale_entries.front().logical_slot;
+                    int64_t release_frame = delayed_stale_entries.front().release_frame;
+                    if (flush_delayed_stale_slot_for_scratch(logical_slot)) {
+                        return release_frame;
+                    }
+                }
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer relay has no reusable evicted frame for admitted partition on device {}",
+                                buffer->device_.index()));
+            };
             for (int64_t slot = 0; slot < next_state.numel(); slot++) {
                 int partition_id = static_cast<int>(next_state_ptr[slot]);
                 int64_t retained_frame = retained_frame_by_partition[static_cast<std::size_t>(partition_id)];
@@ -1498,11 +1527,12 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     buffer->logical_to_physical_frames_[static_cast<std::size_t>(slot)] = retained_frame;
                     current_slot_by_partition[static_cast<std::size_t>(partition_id)] = slot;
                 } else {
-                    // Admitted partitions either publish a hidden frame later or copy into the
-                    // original evict-slot frame. Keeping that original frame here preserves the
-                    // stale source until hidden publish/writeback decides whether to release it.
-                    buffer->logical_to_physical_frames_[static_cast<std::size_t>(slot)] =
-                        original_frame_by_slot[static_cast<std::size_t>(slot)];
+                    // Retained partitions may move logical slots. Therefore an admitted logical
+                    // slot cannot safely inherit the frame that used to live at the same slot: that
+                    // frame may now be owned by a retained partition. Assign each admitted slot a
+                    // frame from an actually evicted partition; hidden publishes will replace and
+                    // release this frame later, while visible host/peer admits copy into it.
+                    buffer->logical_to_physical_frames_[static_cast<std::size_t>(slot)] = take_reusable_frame();
                 }
             }
         } else {

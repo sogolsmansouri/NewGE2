@@ -1420,12 +1420,11 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                                     : 0;
             int64_t remaining_delayed_stale_slots =
                 std::max<int64_t>(max_stale_backlog - stale_backlog_before_delay, 0);
+            remaining_delayed_stale_slots =
+                std::min<int64_t>(remaining_delayed_stale_slots, static_cast<int64_t>(hidden_publish_slots.size()));
             for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                 int evict_id = evict_ids[idx];
                 int64_t evict_slot = evict_slots[idx];
-                if (hidden_publish_slots.find(evict_slot) == hidden_publish_slots.end()) {
-                    continue;
-                }
                 if (next_required != nullptr && evict_id >= 0 && evict_id < static_cast<int>(next_required->size()) &&
                     (*next_required)[static_cast<std::size_t>(evict_id)] != 0) {
                     continue;
@@ -1552,6 +1551,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 }
             }
             std::size_t reusable_frame_cursor = 0;
+            std::size_t delayed_stale_frame_cursor = 0;
             auto take_reusable_frame = [&]() -> int64_t {
                 if (reusable_frame_cursor < reusable_evicted_frames.size()) {
                     return reusable_evicted_frames[reusable_frame_cursor++];
@@ -1574,6 +1574,12 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     buffer->logical_to_physical_frames_[static_cast<std::size_t>(slot)] = retained_frame;
                     current_slot_by_partition[static_cast<std::size_t>(partition_id)] = slot;
                 } else {
+                    if (hidden_publish_slots.find(slot) != hidden_publish_slots.end() &&
+                        delayed_stale_frame_cursor < delayed_stale_entries.size()) {
+                        buffer->logical_to_physical_frames_[static_cast<std::size_t>(slot)] =
+                            delayed_stale_entries[delayed_stale_frame_cursor++].release_frame;
+                        continue;
+                    }
                     // Retained partitions may move logical slots. Therefore an admitted logical
                     // slot cannot safely inherit the frame that used to live at the same slot: that
                     // frame may now be owned by a retained partition. Assign each admitted slot a

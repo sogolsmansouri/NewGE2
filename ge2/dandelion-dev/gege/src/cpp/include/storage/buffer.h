@@ -291,7 +291,9 @@ class MemPartitionBuffer : public PartitionBuffer {
     void copyPartitionFromHostToPinned_(Partition *partition, torch::Tensor pinned_view);
     void copyPartitionFromPinnedToHost_(Partition *partition, torch::Tensor pinned_view);
     double copyGpuBufferToHostStaging_();
-    void startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots);
+    void startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots,
+                                        int64_t reserved_hidden_frames = 0);
+    void releaseReservedHiddenFrames_(const std::vector<HiddenFramePublish> &publishes);
     void joinAsyncAdmitPreload_();
     bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
                                    int64_t *visible_install_rows = nullptr, int64_t *hidden_publish_rows = nullptr,

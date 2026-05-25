@@ -250,6 +250,7 @@ class MemPartitionBufferStorage : public Storage {
     std::vector<std::vector<uint8_t>> stateflow_global_next_required_by_round_;
     std::vector<std::unordered_map<int64_t, torch::Tensor>> peer_relay_source_scratch_tensors_;
     std::vector<std::unordered_map<int64_t, torch::Tensor>> peer_relay_source_scratch_pool_tensors_;
+    std::vector<std::unordered_map<int64_t, int64_t>> peer_relay_source_scratch_frames_;
     std::vector<std::vector<int64_t>> peer_relay_source_slot_snapshots_;
     std::vector<std::vector<int64_t>> peer_relay_source_scratch_rounds_;
     std::vector<std::uintptr_t> peer_relay_source_ready_events_;

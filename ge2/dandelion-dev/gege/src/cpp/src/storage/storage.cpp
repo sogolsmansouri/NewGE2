@@ -708,6 +708,7 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
     peer_relay_runtime_enabled_ = false;
     peer_relay_source_scratch_tensors_.clear();
     peer_relay_source_scratch_pool_tensors_.clear();
+    peer_relay_source_scratch_frames_.clear();
     peer_relay_source_slot_snapshots_.clear();
     peer_relay_source_scratch_rounds_.clear();
 #if defined(GEGE_CUDA)
@@ -827,6 +828,7 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
 
     peer_relay_source_scratch_tensors_.resize(devices_.size());
     peer_relay_source_scratch_pool_tensors_.resize(devices_.size());
+    peer_relay_source_scratch_frames_.resize(devices_.size());
     peer_relay_source_slot_snapshots_.assign(devices_.size(),
                                              std::vector<int64_t>(static_cast<std::size_t>(options_->num_partitions), -1));
     peer_relay_source_scratch_rounds_.assign(devices_.size(),
@@ -1160,6 +1162,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
     };
 
     auto &published_source_scratch = peer_relay_source_scratch_tensors_[device_idx];
+    auto &published_source_scratch_frames = peer_relay_source_scratch_frames_[device_idx];
 
     {
         c10::cuda::CUDAGuard device_guard(buffer->device_);
@@ -1183,6 +1186,27 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             // scratch_rounds no longer matches the requested transition round.
             published_source_scratch.clear();
             source_scratch_pool.clear();
+            if (frame_cache_mapping && !published_source_scratch_frames.empty()) {
+                std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+                for (const auto &[partition_id, frame] : published_source_scratch_frames) {
+                    if (frame < buffer->capacity_ || frame >= buffer->physical_frame_capacity_) {
+                        continue;
+                    }
+                    bool frame_is_visible = false;
+                    for (int64_t mapped_frame : buffer->logical_to_physical_frames_) {
+                        if (mapped_frame == frame) {
+                            frame_is_visible = true;
+                            break;
+                        }
+                    }
+                    if (!frame_is_visible &&
+                        std::find(buffer->free_physical_frames_.begin(), buffer->free_physical_frames_.end(), frame) ==
+                            buffer->free_physical_frames_.end()) {
+                        buffer->free_physical_frames_.push_back(frame);
+                    }
+                }
+                published_source_scratch_frames.clear();
+            }
 
             auto &slot_snapshot = peer_relay_source_slot_snapshots_[device_idx];
             std::fill(slot_snapshot.begin(), slot_snapshot.end(), -1);
@@ -1224,13 +1248,31 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 torch::Tensor src_view = buffer->buffer_tensor_gpu_view_.slice(0, src_offset, src_offset + rows);
                 try {
                     torch::Tensor source_scratch;
-                    auto pool_it = source_scratch_pool.find(handoff.partition_id);
-                    if (pool_it != source_scratch_pool.end() && pool_it->second.defined() && pool_it->second.size(0) == rows &&
-                        pool_it->second.size(1) == dim1_size_ && pool_it->second.scalar_type() == src_view.scalar_type()) {
-                        source_scratch = pool_it->second;
+                    if (frame_cache_mapping) {
+                        int64_t scratch_frame = -1;
+                        {
+                            std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+                            if (!buffer->free_physical_frames_.empty()) {
+                                scratch_frame = buffer->free_physical_frames_.back();
+                                buffer->free_physical_frames_.pop_back();
+                            }
+                        }
+                        if (scratch_frame < 0) {
+                            continue;
+                        }
+                        int64_t scratch_offset = scratch_frame * buffer->partition_size_;
+                        source_scratch =
+                            buffer->buffer_tensor_gpu_view_.slice(0, scratch_offset, scratch_offset + rows);
+                        published_source_scratch_frames[handoff.partition_id] = scratch_frame;
                     } else {
-                        source_scratch = torch::empty({rows, dim1_size_}, src_view.options());
-                        source_scratch_pool[handoff.partition_id] = source_scratch;
+                        auto pool_it = source_scratch_pool.find(handoff.partition_id);
+                        if (pool_it != source_scratch_pool.end() && pool_it->second.defined() && pool_it->second.size(0) == rows &&
+                            pool_it->second.size(1) == dim1_size_ && pool_it->second.scalar_type() == src_view.scalar_type()) {
+                            source_scratch = pool_it->second;
+                        } else {
+                            source_scratch = torch::empty({rows, dim1_size_}, src_view.options());
+                            source_scratch_pool[handoff.partition_id] = source_scratch;
+                        }
                     }
                     source_scratch.copy_(src_view, true);
                     published_source_scratch[handoff.partition_id] = source_scratch;
@@ -2035,7 +2077,20 @@ void MemPartitionBufferStorage::startAsyncAdmitPreload(int32_t device_idx) {
         }
     }
 
-    buffer->startAsyncAdmitPreloadForPlan_(host_preload_admit_ids, host_preload_slots);
+    std::unordered_set<int> outgoing_peer_scratch_partitions;
+    if (transition_round_idx >= 0) {
+        for (const auto &handoff_index : stateflow_peer_handoff_index_per_device_) {
+            for (const auto &[handoff_key, handoff] : handoff_index) {
+                if (handoff.round_idx == transition_round_idx && handoff.src_lane_id == device_idx) {
+                    outgoing_peer_scratch_partitions.insert(handoff.partition_id);
+                }
+            }
+        }
+    }
+
+    buffer->startAsyncAdmitPreloadForPlan_(
+        host_preload_admit_ids, host_preload_slots,
+        static_cast<int64_t>(outgoing_peer_scratch_partitions.size()));
 }
 
 torch::Tensor MemPartitionBufferStorage::indexRead(Indices indices) { 

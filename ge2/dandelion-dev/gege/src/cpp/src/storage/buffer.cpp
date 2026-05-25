@@ -2499,7 +2499,31 @@ void MemPartitionBuffer::startAsyncAdmitPreload() {
     startAsyncAdmitPreloadForPlan_(admit_ids, evict_slots);
 }
 
-void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots) {
+void MemPartitionBuffer::releaseReservedHiddenFrames_(const std::vector<HiddenFramePublish> &publishes) {
+    if (publishes.empty() || !frameCacheEnabled_()) {
+        return;
+    }
+    std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+    for (const HiddenFramePublish &publish : publishes) {
+        if (publish.frame < capacity_ || publish.frame >= physical_frame_capacity_) {
+            continue;
+        }
+        bool frame_is_visible = false;
+        for (int64_t mapped_frame : logical_to_physical_frames_) {
+            if (mapped_frame == publish.frame) {
+                frame_is_visible = true;
+                break;
+            }
+        }
+        if (!frame_is_visible &&
+            std::find(free_physical_frames_.begin(), free_physical_frames_.end(), publish.frame) == free_physical_frames_.end()) {
+            free_physical_frames_.push_back(publish.frame);
+        }
+    }
+}
+
+void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots,
+                                                        int64_t reserved_hidden_frames) {
     if (!asyncAdmitPreloadEnabled_() || !loaded_ || !buffer_state_.defined() || buffer_state_iterator_ == buffer_states_.end() ||
         !buffer_tensor_gpu_view_.defined() || !data_storage_.defined()) {
         return;
@@ -2532,16 +2556,16 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
         async_admit_preload_cpu_to_gpu_ms_ = 0.0;
         async_admit_preload_total_ms_ = 0.0;
     }
-    async_admit_preload_thread_ = std::thread([this, admit_ids, evict_slots]() {
+    async_admit_preload_thread_ = std::thread([this, admit_ids, evict_slots, reserved_hidden_frames]() {
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double host_load_ms = 0.0;
         double cpu_to_gpu_ms = 0.0;
+        std::vector<HiddenFramePublish> hidden_publishes;
 
         try {
             joinAsyncEvictWritebackForPartitions_(admit_ids);
 
-            std::vector<HiddenFramePublish> hidden_publishes;
             std::vector<int> stage_admit_ids = admit_ids;
             std::vector<int64_t> stage_evict_slots = evict_slots;
             if (frameCacheEnabled_() && !admit_ids.empty()) {
@@ -2561,13 +2585,19 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                 }
                 {
                     std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
-                    const std::size_t hidden_count = std::min<std::size_t>(free_physical_frames_.size(), target_hidden_count);
+                    const std::size_t reserved_count =
+                        static_cast<std::size_t>(std::max<int64_t>(reserved_hidden_frames, 0));
+                    const std::size_t available_count =
+                        free_physical_frames_.size() > reserved_count ? free_physical_frames_.size() - reserved_count : 0;
+                    const std::size_t hidden_count = std::min<std::size_t>(available_count, target_hidden_count);
                     hidden_publishes.reserve(hidden_count);
                     for (std::size_t idx = 0; idx < hidden_count; idx++) {
+                        int64_t frame = free_physical_frames_.back();
+                        free_physical_frames_.pop_back();
                         hidden_publishes.push_back(HiddenFramePublish{
                             admit_ids[idx],
                             evict_slots[idx],
-                            free_physical_frames_[free_physical_frames_.size() - 1 - idx],
+                            frame,
                         });
                     }
                 }
@@ -2686,6 +2716,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                         return;
                     }
                     {
+                        releaseReservedHiddenFrames_(hidden_publishes);
                         std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
                         async_admit_preload_valid_ = false;
                         async_admit_preload_in_flight_ = false;
@@ -2756,6 +2787,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
             }
             flushPendingDelayedStaleWriteback_();
         } catch (...) {
+            releaseReservedHiddenFrames_(hidden_publishes);
             std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
             async_admit_preload_valid_ = false;
             async_admit_preload_in_flight_ = false;
@@ -2801,6 +2833,7 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
         std::vector<int64_t> expected_stage_slots = evict_slots;
         if (!hidden_publishes.empty()) {
             if (hidden_publishes.size() > expected_stage_admit_ids.size() || hidden_publishes.size() > expected_stage_slots.size()) {
+                releaseReservedHiddenFrames_(hidden_publishes);
                 async_admit_preload_valid_ = false;
                 async_admit_preload_hidden_publishes_.clear();
                 return false;
@@ -2808,6 +2841,7 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
             for (std::size_t idx = 0; idx < hidden_publishes.size(); idx++) {
                 if (expected_stage_admit_ids[idx] != hidden_publishes[idx].partition_id ||
                     expected_stage_slots[idx] != hidden_publishes[idx].logical_slot) {
+                    releaseReservedHiddenFrames_(hidden_publishes);
                     async_admit_preload_valid_ = false;
                     async_admit_preload_hidden_publishes_.clear();
                     return false;
@@ -2821,7 +2855,8 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
 
         bool stage_matches = async_admit_preload_valid_ && async_admit_preload_admit_ids_ == expected_stage_admit_ids &&
                              async_admit_preload_evict_slots_ == expected_stage_slots;
-        if (!stage_matches && hidden_publishes.empty()) {
+        if (!stage_matches) {
+            releaseReservedHiddenFrames_(hidden_publishes);
             async_admit_preload_valid_ = false;
             async_admit_preload_hidden_publishes_.clear();
             return false;
@@ -2896,7 +2931,7 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
             hidden_frames.push_back(hidden_publish.frame);
         }
         SPDLOG_INFO("[partition-buffer-preload-consume] storage={} this={} device={} admit_ids={} rows={} visible_install_parts={} visible_install_rows={} hidden_publish_parts={} hidden_publish_rows={} hidden_publish_partitions={} hidden_publish_slots={} hidden_publish_frames={} preload_host_load_ms={:.3f} preload_cpu_to_gpu_ms={:.3f} preload_total_ms={:.3f} preload_install_ms={:.3f}",
-                    basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(admit_ids), gpu_stage.size(0),
+                    basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(admit_ids), install_rows,
                     stage_admit_ids.size(), install_rows, hidden_publishes.size(), hidden_rows,
                     vector_prefix_string(hidden_ids), vector_prefix_string(hidden_slots), vector_prefix_string(hidden_frames),
                     preload_host_load_ms, preload_cpu_to_gpu_ms, preload_total_ms, preload_install_ms);

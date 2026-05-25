@@ -1243,12 +1243,17 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 }
             }
 
+            if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < peer_relay_source_ready_events_.size() &&
+                peer_relay_source_ready_events_[device_idx] != 0) {
+                auto ready_event = reinterpret_cast<cudaEvent_t>(peer_relay_source_ready_events_[device_idx]);
+                AT_CUDA_CHECK(cudaEventRecord(ready_event, comm_stream.stream()));
+            }
+            // The destination lane can observe published_rounds_ without a new
+            // condition-variable notification if its wait predicate is already
+            // true. Keep the round unpublished until the source scratch stream
+            // has completed, otherwise the peer copy can wait on a stale event.
+            AT_CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
             peer_relay_source_published_rounds_[device_idx] = transition_round_idx;
-        }
-        if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < peer_relay_source_ready_events_.size() &&
-            peer_relay_source_ready_events_[device_idx] != 0) {
-            auto ready_event = reinterpret_cast<cudaEvent_t>(peer_relay_source_ready_events_[device_idx]);
-            AT_CUDA_CHECK(cudaEventRecord(ready_event, comm_stream.stream()));
         }
         publish_cv->notify_all();
 

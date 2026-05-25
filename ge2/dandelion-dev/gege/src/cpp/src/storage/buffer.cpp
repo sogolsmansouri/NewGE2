@@ -2308,7 +2308,7 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                             host_view.copy_(gpu_view);
                         }
                     }
-                    cudaStreamSynchronize(copy_stream.stream());
+                    AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
                 }
             } else if (gpu_stage.device().is_cuda()) {
                 c10::cuda::CUDAGuard device_guard(device_);
@@ -2317,7 +2317,7 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                     auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
                     c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
                     host_stage.copy_(gpu_stage, true);
-                    cudaStreamSynchronize(copy_stream.stream());
+                    AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
                 } else {
                     host_stage.copy_(gpu_stage);
                 }
@@ -2638,7 +2638,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                     } else {
                         hidden_gpu_view.copy_(hidden_host_view);
                     }
-                    cudaStreamSynchronize(copy_stream.stream());
+                    AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
                     interleaved_hidden_cpu_to_gpu_ms += elapsed_ms(hidden_h2d_start, std::chrono::high_resolution_clock::now());
                 }
 #endif
@@ -2731,7 +2731,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                     }
                 }
                 if (stage_rows > 0 || (!hidden_publishes.empty() && !interleaved_hidden_h2d)) {
-                    cudaStreamSynchronize(copy_stream.stream());
+                    AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
                 }
             }
 #else
@@ -2870,7 +2870,7 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
             torch::Tensor src_view = gpu_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
             dst_view.copy_(src_view, true);
         }
-        cudaStreamSynchronize(copy_stream.stream());
+        AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
 #else
         for (std::size_t idx = 0; idx < row_offsets.size() - 1; idx++) {
             Partition *partition = partition_table_[stage_admit_ids[idx]];

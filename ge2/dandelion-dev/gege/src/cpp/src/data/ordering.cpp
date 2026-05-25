@@ -1936,18 +1936,13 @@ TwoGpuTransitionCost two_gpu_transition_cost(const TwoGpuRoundPair &prev_round,
         }
     }
 
-    const long double peer_equivalent = static_cast<long double>(
-        peer_bytes_as_host_equivalent(cost.peer_bytes, cfg));
-    cost.score = static_cast<long double>(cost.host_bytes) + peer_equivalent;
-    if (cost.bad_lane_transitions > 0) {
-        const int64_t bytes_basis = bytes_per_row > 0 ? bytes_per_row : int64_t{1};
-        cost.score += static_cast<long double>(cost.bad_lane_transitions) *
-                      static_cast<long double>(bytes_basis) * 1000000000000.0L;
-    }
-    // Slot churn is not fully captured by host/peer bytes. Keep it a small tie-breaker so the
-    // search prefers same-lane retention when two plans move comparable bytes.
-    cost.score += static_cast<long double>(cost.lane_admits) *
-                  stateflow_cost_env("GEGE_BOUNDED_Q4_OPTIMAL88_2GPU_ADMIT_WEIGHT", 0.01);
+    // For Opt88 lane matching, peer relay is a residency classification, not a
+    // bandwidth objective: retain same-lane partitions first, then avoid host
+    // admits when the previous round already has the partition on the other GPU.
+    cost.score = static_cast<long double>(cost.bad_lane_transitions) * 1000000000000.0L +
+                 static_cast<long double>(cost.lane_admits) * 1000000.0L +
+                 static_cast<long double>(cost.host_partitions) * 1000.0L +
+                 static_cast<long double>(cost.max_lane_admits);
     return cost;
 }
 
@@ -1955,25 +1950,25 @@ bool two_gpu_path_cost_less(const TwoGpuPathCost &lhs, const TwoGpuPathCost &rhs
     if (lhs.bad_lane_transitions != rhs.bad_lane_transitions) {
         return lhs.bad_lane_transitions < rhs.bad_lane_transitions;
     }
-    if (lhs.score != rhs.score) {
-        return lhs.score < rhs.score;
-    }
-    if (lhs.host_bytes != rhs.host_bytes) {
-        return lhs.host_bytes < rhs.host_bytes;
-    }
     if (lhs.lane_admits != rhs.lane_admits) {
         return lhs.lane_admits < rhs.lane_admits;
     }
-    if (lhs.peer_bytes != rhs.peer_bytes) {
-        return lhs.peer_bytes < rhs.peer_bytes;
+    if (lhs.host_partitions != rhs.host_partitions) {
+        return lhs.host_partitions < rhs.host_partitions;
     }
     if (lhs.max_lane_admits != rhs.max_lane_admits) {
         return lhs.max_lane_admits < rhs.max_lane_admits;
     }
-    if (lhs.lane_edge_imbalance != rhs.lane_edge_imbalance) {
-        return lhs.lane_edge_imbalance < rhs.lane_edge_imbalance;
+    if (lhs.same_overlap != rhs.same_overlap) {
+        return lhs.same_overlap > rhs.same_overlap;
     }
-    return lhs.same_overlap > rhs.same_overlap;
+    if (lhs.host_bytes != rhs.host_bytes) {
+        return lhs.host_bytes < rhs.host_bytes;
+    }
+    if (lhs.peer_bytes != rhs.peer_bytes) {
+        return lhs.peer_bytes < rhs.peer_bytes;
+    }
+    return lhs.score < rhs.score;
 }
 
 TwoGpuPathCost evaluate_two_gpu_oriented_path(const std::vector<TwoGpuRoundPair> &oriented_rounds,
@@ -2007,11 +2002,6 @@ TwoGpuPathCost evaluate_two_gpu_oriented_path(const std::vector<TwoGpuRoundPair>
         path_cost.score += step.score;
     }
 
-    if (path_cost.lane_edge_imbalance > 0) {
-        path_cost.score += static_cast<long double>(cfg.imbalance_weight) *
-                           static_cast<long double>(path_cost.lane_edge_imbalance) *
-                           stateflow_cost_env("GEGE_BOUNDED_Q4_OPTIMAL88_2GPU_LANE_EDGE_WEIGHT", 1e-7);
-    }
     return path_cost;
 }
 
@@ -2029,6 +2019,8 @@ TwoGpuTransitionCost best_two_gpu_pair_transition_cost(const TwoGpuRoundPair &pr
     p0.bad_lane_transitions = c0.bad_lane_transitions;
     p0.host_bytes = c0.host_bytes;
     p0.peer_bytes = c0.peer_bytes;
+    p0.host_partitions = c0.host_partitions;
+    p0.peer_partitions = c0.peer_partitions;
     p0.lane_admits = c0.lane_admits;
     p0.same_overlap = c0.same_overlap;
     p0.max_lane_admits = c0.max_lane_admits;
@@ -2037,6 +2029,8 @@ TwoGpuTransitionCost best_two_gpu_pair_transition_cost(const TwoGpuRoundPair &pr
     p1.bad_lane_transitions = c1.bad_lane_transitions;
     p1.host_bytes = c1.host_bytes;
     p1.peer_bytes = c1.peer_bytes;
+    p1.host_partitions = c1.host_partitions;
+    p1.peer_partitions = c1.peer_partitions;
     p1.lane_admits = c1.lane_admits;
     p1.same_overlap = c1.same_overlap;
     p1.max_lane_admits = c1.max_lane_admits;
@@ -2126,6 +2120,8 @@ std::vector<TwoGpuRoundPair> greedy_order_two_gpu_pairs(const std::vector<TwoGpu
             current_key.bad_lane_transitions = cost.bad_lane_transitions;
             current_key.host_bytes = cost.host_bytes;
             current_key.peer_bytes = cost.peer_bytes;
+            current_key.host_partitions = cost.host_partitions;
+            current_key.peer_partitions = cost.peer_partitions;
             current_key.lane_admits = cost.lane_admits;
             current_key.same_overlap = cost.same_overlap;
             current_key.max_lane_admits = cost.max_lane_admits;
@@ -2134,6 +2130,8 @@ std::vector<TwoGpuRoundPair> greedy_order_two_gpu_pairs(const std::vector<TwoGpu
             best_key.bad_lane_transitions = best_cost.bad_lane_transitions;
             best_key.host_bytes = best_cost.host_bytes;
             best_key.peer_bytes = best_cost.peer_bytes;
+            best_key.host_partitions = best_cost.host_partitions;
+            best_key.peer_partitions = best_cost.peer_partitions;
             best_key.lane_admits = best_cost.lane_admits;
             best_key.same_overlap = best_cost.same_overlap;
             best_key.max_lane_admits = best_cost.max_lane_admits;
@@ -2354,6 +2352,178 @@ std::vector<int64_t> getOptimal88TwoGpuLaneMatchedPermutation(const vector<torch
         best_path.cost.host_bytes, best_path.cost.peer_bytes, best_path.cost.lane_edge_imbalance);
 
     return permutation;
+}
+
+vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::Tensor> &buffer_states,
+                                                           const std::vector<int64_t> &permutation,
+                                                           int num_partitions,
+                                                           const vector<int64_t> &edge_bucket_sizes) {
+    if (buffer_states.empty() || permutation.size() != buffer_states.size() ||
+        permutation.size() % 2 != 0 || num_partitions <= 0) {
+        return {};
+    }
+
+    const bool have_sizes = edge_bucket_sizes.size() == static_cast<std::size_t>(num_partitions * num_partitions);
+    std::vector<std::vector<uint8_t>> contains(buffer_states.size(), std::vector<uint8_t>(num_partitions, 0));
+    for (std::size_t state_idx = 0; state_idx < buffer_states.size(); state_idx++) {
+        auto partitions = tensor_to_partitions(buffer_states[state_idx]);
+        for (auto partition : partitions) {
+            if (partition >= 0 && partition < num_partitions) {
+                contains[state_idx][partition] = 1;
+            }
+        }
+    }
+
+    std::vector<int64_t> position_of_state(buffer_states.size(), -1);
+    for (std::size_t pos = 0; pos < permutation.size(); pos++) {
+        const int64_t state_idx = permutation[pos];
+        if (state_idx < 0 || state_idx >= static_cast<int64_t>(buffer_states.size()) ||
+            position_of_state[static_cast<std::size_t>(state_idx)] >= 0) {
+            return {};
+        }
+        position_of_state[static_cast<std::size_t>(state_idx)] = static_cast<int64_t>(pos);
+    }
+
+    const std::size_t num_rounds = permutation.size() / 2;
+    const int num_buckets = num_partitions * num_partitions;
+    std::vector<int64_t> bucket_weight(static_cast<std::size_t>(num_buckets), 1);
+    std::vector<std::vector<int>> compatible_states(static_cast<std::size_t>(num_buckets));
+    for (int src = 0; src < num_partitions; src++) {
+        for (int dst = 0; dst < num_partitions; dst++) {
+            const int bucket_idx = src * num_partitions + dst;
+            bucket_weight[static_cast<std::size_t>(bucket_idx)] =
+                have_sizes ? edge_bucket_sizes[static_cast<std::size_t>(bucket_idx)] : 1;
+            for (int state_idx = 0; state_idx < static_cast<int>(buffer_states.size()); state_idx++) {
+                if (contains[state_idx][src] != 0 && contains[state_idx][dst] != 0) {
+                    compatible_states[static_cast<std::size_t>(bucket_idx)].emplace_back(state_idx);
+                }
+            }
+            if (compatible_states[static_cast<std::size_t>(bucket_idx)].empty()) {
+                SPDLOG_WARN("Round-balanced 2-GPU bucket assignment found no compatible state for bucket ({},{})",
+                            src, dst);
+                return {};
+            }
+        }
+    }
+
+    std::vector<int> owner(static_cast<std::size_t>(num_buckets), -1);
+    vector<vector<std::pair<int, int>>> assigned_buckets(buffer_states.size());
+    std::vector<int64_t> assigned_weight(buffer_states.size(), 0);
+    std::vector<int64_t> assigned_count(buffer_states.size(), 0);
+    std::vector<std::vector<int64_t>> round_lane_weight(num_rounds, std::vector<int64_t>(2, 0));
+
+    auto add_bucket_to_state = [&](int bucket_idx, int state_idx, int sign) {
+        const int64_t pos = position_of_state[static_cast<std::size_t>(state_idx)];
+        const std::size_t round_idx = static_cast<std::size_t>(pos / 2);
+        const std::size_t lane_idx = static_cast<std::size_t>(pos % 2);
+        const int64_t weight = bucket_weight[static_cast<std::size_t>(bucket_idx)] * sign;
+        assigned_weight[static_cast<std::size_t>(state_idx)] += weight;
+        assigned_count[static_cast<std::size_t>(state_idx)] += sign;
+        round_lane_weight[round_idx][lane_idx] += weight;
+    };
+
+    for (int bucket_idx = 0; bucket_idx < num_buckets; bucket_idx++) {
+        int best_state = compatible_states[static_cast<std::size_t>(bucket_idx)].front();
+        for (auto state_idx : compatible_states[static_cast<std::size_t>(bucket_idx)]) {
+            if (state_idx < best_state) {
+                best_state = state_idx;
+            }
+        }
+        owner[static_cast<std::size_t>(bucket_idx)] = best_state;
+        add_bucket_to_state(bucket_idx, best_state, 1);
+    }
+
+    auto round_delta = [&round_lane_weight](std::size_t round_idx) {
+        return std::llabs(round_lane_weight[round_idx][0] - round_lane_weight[round_idx][1]);
+    };
+    auto imbalance_key = [&round_lane_weight, &round_delta]() {
+        int64_t max_delta = 0;
+        int64_t total_delta = 0;
+        for (std::size_t round_idx = 0; round_idx < round_lane_weight.size(); round_idx++) {
+            const int64_t delta = round_delta(round_idx);
+            max_delta = std::max(max_delta, delta);
+            total_delta += delta;
+        }
+        return std::make_pair(max_delta, total_delta);
+    };
+
+    std::vector<int> bucket_order(num_buckets);
+    std::iota(bucket_order.begin(), bucket_order.end(), 0);
+    std::sort(bucket_order.begin(), bucket_order.end(), [&](int lhs, int rhs) {
+        return std::make_tuple(bucket_weight[static_cast<std::size_t>(lhs)], lhs) >
+               std::make_tuple(bucket_weight[static_cast<std::size_t>(rhs)], rhs);
+    });
+
+    const int max_iterations = static_cast<int>(
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_Q4_2GPU_ROUND_BALANCE_ITERS", nullptr, 10000)));
+    auto initial_key = imbalance_key();
+    int64_t moves = 0;
+    for (int iteration = 0; iteration < max_iterations; iteration++) {
+        auto current_key = imbalance_key();
+        struct Move {
+            bool valid = false;
+            int bucket_idx = -1;
+            int src_state = -1;
+            int dst_state = -1;
+            std::pair<int64_t, int64_t> key{std::numeric_limits<int64_t>::max(),
+                                            std::numeric_limits<int64_t>::max()};
+        };
+        Move best_move;
+        for (auto bucket_idx : bucket_order) {
+            const int src_state = owner[static_cast<std::size_t>(bucket_idx)];
+            for (auto dst_state : compatible_states[static_cast<std::size_t>(bucket_idx)]) {
+                if (dst_state == src_state) {
+                    continue;
+                }
+                add_bucket_to_state(bucket_idx, src_state, -1);
+                add_bucket_to_state(bucket_idx, dst_state, 1);
+                auto candidate_key = imbalance_key();
+                add_bucket_to_state(bucket_idx, dst_state, -1);
+                add_bucket_to_state(bucket_idx, src_state, 1);
+                if (candidate_key < current_key &&
+                    (!best_move.valid ||
+                     std::make_tuple(candidate_key.first, candidate_key.second,
+                                     -bucket_weight[static_cast<std::size_t>(bucket_idx)], src_state, dst_state, bucket_idx) <
+                         std::make_tuple(best_move.key.first, best_move.key.second,
+                                         -bucket_weight[static_cast<std::size_t>(best_move.bucket_idx)],
+                                         best_move.src_state, best_move.dst_state, best_move.bucket_idx))) {
+                    best_move.valid = true;
+                    best_move.bucket_idx = bucket_idx;
+                    best_move.src_state = src_state;
+                    best_move.dst_state = dst_state;
+                    best_move.key = candidate_key;
+                }
+            }
+        }
+        if (!best_move.valid) {
+            break;
+        }
+        add_bucket_to_state(best_move.bucket_idx, best_move.src_state, -1);
+        add_bucket_to_state(best_move.bucket_idx, best_move.dst_state, 1);
+        owner[static_cast<std::size_t>(best_move.bucket_idx)] = best_move.dst_state;
+        moves++;
+    }
+
+    for (int bucket_idx = 0; bucket_idx < num_buckets; bucket_idx++) {
+        const int state_idx = owner[static_cast<std::size_t>(bucket_idx)];
+        assigned_buckets[static_cast<std::size_t>(state_idx)].emplace_back(bucket_idx / num_partitions,
+                                                                           bucket_idx % num_partitions);
+    }
+    auto final_key = imbalance_key();
+    SPDLOG_INFO("Round-balanced 2-GPU bucket assignment moved={} max_round_delta {} -> {} total_round_delta {} -> {}",
+                moves, initial_key.first, final_key.first, initial_key.second, final_key.second);
+
+    vector<torch::Tensor> ret_edge_buckets_per_buffer;
+    ret_edge_buckets_per_buffer.reserve(assigned_buckets.size());
+    for (const auto &edge_buckets : assigned_buckets) {
+        torch::Tensor tmp = torch::zeros({static_cast<int64_t>(edge_buckets.size()), 2}, torch::kInt64);
+        for (int64_t idx = 0; idx < static_cast<int64_t>(edge_buckets.size()); idx++) {
+            tmp[idx][0] = edge_buckets[static_cast<std::size_t>(idx)].first;
+            tmp[idx][1] = edge_buckets[static_cast<std::size_t>(idx)].second;
+        }
+        ret_edge_buckets_per_buffer.emplace_back(tmp);
+    }
+    return ret_edge_buckets_per_buffer;
 }
 
 struct MultiGpuRoundGroup {
@@ -7321,8 +7491,21 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                                                                                      edge_bucket_sizes, partition_row_counts, layout,
                                                                                      active_devices);
         if (!optimal88_permutation.empty()) {
+            const vector<torch::Tensor> *optimal88_edge_buckets = &edge_buckets_per_buffer;
+            vector<torch::Tensor> round_balanced_edge_buckets;
+            if (active_devices == 2) {
+                round_balanced_edge_buckets =
+                    assignRoundBalancedTwoGpuEdgeBuckets(buffer_states, optimal88_permutation,
+                                                         static_cast<int>(edge_bucket_sizes.empty()
+                                                                              ? 0
+                                                                              : std::llround(std::sqrt(static_cast<long double>(edge_bucket_sizes.size())))),
+                                                         edge_bucket_sizes);
+                if (!round_balanced_edge_buckets.empty()) {
+                    optimal88_edge_buckets = &round_balanced_edge_buckets;
+                }
+            }
             StateflowPlan optimal88_plan =
-                build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer,
+                build_multi_gpu_stateflow_plan_from_permutation(buffer_states, *optimal88_edge_buckets,
                                                                 optimal88_permutation, active_devices,
                                                                 PlanVariant::MULTI_GPU_OPTIMAL88_LANE_MATCHED,
                                                                 edge_bucket_sizes, partition_row_counts, layout);
@@ -7336,6 +7519,12 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                     optimal88_plan.estimated_cost, optimal88_plan.total_superstates, optimal88_plan.total_partition_loads,
                     optimal88_plan.boundary_count, optimal88_plan.total_bucket_assignments, optimal88_plan.estimated_bucket_edges,
                     overlap_histogram_string(optimal88_plan));
+                if (active_devices == 2) {
+                    SPDLOG_INFO("Using Optimal88 2-GPU lane-matched plan as the selected bounded q4 schedule");
+                    std::vector<StateflowPlan> optimal88_only;
+                    optimal88_only.emplace_back(std::move(optimal88_plan));
+                    return optimal88_only;
+                }
                 candidates.emplace_back(std::move(optimal88_plan));
             }
         }
@@ -8219,7 +8408,8 @@ std::vector<std::vector<int>> apply_bounded_order(const std::vector<std::vector<
 std::vector<std::vector<int>> build_weighted_optimal88_q4_states(int num_partitions,
                                                                  int buffer_capacity,
                                                                  int max_admits,
-                                                                 const std::vector<int64_t> &edge_bucket_sizes) {
+                                                                 const std::vector<int64_t> &edge_bucket_sizes,
+                                                                 bool use_load_tiebreaker) {
     if (num_partitions != 32 || buffer_capacity != 4 || max_admits < 3) {
         SPDLOG_WARN(
             "Ignoring GEGE_BOUNDED_Q4_OPTIMAL88=1: requires num_partitions=32 buffer_capacity=4 max_admits>=3; got num_partitions={} buffer_capacity={} max_admits={}",
@@ -8257,7 +8447,17 @@ std::vector<std::vector<int>> build_weighted_optimal88_q4_states(int num_partiti
         SPDLOG_WARN("Dynamic p32/q4 88-state scheduler could not order initial affine cover");
         return {};
     }
-    auto current_load = score_bounded_q4_balanced_load(current_states, num_partitions, edge_bucket_sizes, minmax_iters);
+    auto load_score_for = [&](const std::vector<std::vector<int>> &states) {
+        Bounded88LoadScore load;
+        if (use_load_tiebreaker) {
+            return score_bounded_q4_balanced_load(states, num_partitions, edge_bucket_sizes, minmax_iters);
+        }
+        load.max_load = 0;
+        load.sum_sq = 0.0L;
+        return load;
+    };
+
+    auto current_load = load_score_for(current_states);
     auto current_pairs = bounded_pair_counts_for_states(current_states, num_partitions);
     auto best_states = current_states;
     auto best_path = current_path;
@@ -8277,8 +8477,8 @@ std::vector<std::vector<int>> build_weighted_optimal88_q4_states(int num_partiti
         const bool above_target = target_admits > 0 && admits > target_admits;
         return std::make_tuple(admits,
                                -path.transition_overlap,
-                               above_target ? int64_t{0} : load.max_load,
-                               above_target ? 0.0L : load.sum_sq);
+                               use_load_tiebreaker && !above_target ? load.max_load : int64_t{0},
+                               use_load_tiebreaker && !above_target ? load.sum_sq : 0.0L);
     };
     auto current_key = score_key(current_states, current_load, current_path);
     auto best_key = current_key;
@@ -8299,7 +8499,7 @@ std::vector<std::vector<int>> build_weighted_optimal88_q4_states(int num_partiti
         if (candidate_path.order.empty() || candidate_path.transition_overlap < min_path_overlap) {
             continue;
         }
-        auto candidate_load = score_bounded_q4_balanced_load(candidate_states, num_partitions, edge_bucket_sizes, minmax_iters);
+        auto candidate_load = load_score_for(candidate_states);
         auto candidate_key = score_key(candidate_states, candidate_load, candidate_path);
         if (candidate_key <= current_key || unit(rng) < 0.01) {
             current_states = candidate_states;
@@ -8323,8 +8523,9 @@ std::vector<std::vector<int>> build_weighted_optimal88_q4_states(int num_partiti
 
     const int64_t final_admits = transition_admits_for_path(best_states, best_path);
     SPDLOG_INFO(
-        "Dynamic p32/q4 88-state bounded scheduler selected states={} tested={} accepted={} transition_overlap={} transition_admits={} load_max={} load_sq={:.3e}",
+        "Dynamic p32/q4 88-state bounded scheduler selected states={} tested={} accepted={} transition_overlap={} transition_admits={} load_tiebreaker={} load_max={} load_sq={:.3e}",
         best_states.size(), tested, accepted, best_path.transition_overlap, final_admits,
+        use_load_tiebreaker,
         best_load.max_load == std::numeric_limits<int64_t>::max() ? int64_t{0} : best_load.max_load,
         static_cast<double>(best_load.sum_sq));
 
@@ -8503,7 +8704,8 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
     bool loaded_state_order = false;
     if (bounded_q4_optimal88_enabled()) {
         buffer_states = build_weighted_optimal88_q4_states(num_partitions, buffer_capacity,
-                                                           requested_max_admits, edge_bucket_sizes);
+                                                           requested_max_admits, edge_bucket_sizes,
+                                                           false);
         loaded_state_order = !buffer_states.empty();
     }
     if (buffer_states.empty()) {
@@ -8576,7 +8778,8 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMu
     std::vector<std::vector<int>> buffer_states;
     if ((active_devices == 2 || active_devices == 4) && bounded_q4_optimal88_enabled()) {
         buffer_states = build_weighted_optimal88_q4_states(num_partitions, buffer_capacity,
-                                                           std::max(max_admits, 3), edge_bucket_sizes);
+                                                           std::max(max_admits, 3), edge_bucket_sizes,
+                                                           false);
         if (!buffer_states.empty()) {
             SPDLOG_INFO("Using Optimal88 p32/q4 state cover as bounded multi-GPU input states={}", buffer_states.size());
         }
@@ -8588,8 +8791,14 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMu
         return getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, edge_bucket_sizes);
     }
 
-    auto edge_buckets_per_buffer =
-        balancedAssignEdgeBucketsToBuffers(buffer_states, num_partitions, edge_bucket_sizes, active_devices);
+    vector<vector<std::pair<int, int>>> edge_buckets_per_buffer;
+    if (active_devices == 2) {
+        SPDLOG_INFO("Using first-cover edge-bucket assignment for 2-GPU bounded q4 schedule");
+        edge_buckets_per_buffer = greedyAssignEdgeBucketsToBuffers(buffer_states, num_partitions);
+    } else {
+        edge_buckets_per_buffer =
+            balancedAssignEdgeBucketsToBuffers(buffer_states, num_partitions, edge_bucket_sizes, active_devices);
+    }
     log_cover_ordering_summary("Generating BOUNDED_MULTI_GPU_GREEDY_COVER_Q4 Ordering (legacy interleaved view)",
                                buffer_states, edge_buckets_per_buffer, num_partitions, edge_bucket_sizes);
     return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);

@@ -1977,6 +1977,19 @@ void MemPartitionBufferStorage::startAsyncAdmitPreload(int32_t device_idx) {
     int64_t transition_round_idx =
         static_cast<std::size_t>(device_idx) < stateflow_transition_counts_.size() ? stateflow_transition_counts_[device_idx] + 1 : -1;
 
+    auto next_state = (*buffer->buffer_state_iterator_).to(torch::kCPU).to(torch::kInt64).contiguous();
+    const int64_t partition_count = static_cast<int64_t>(buffer->partition_table_.size());
+    std::vector<int64_t> next_slot_by_partition(static_cast<std::size_t>(partition_count), -1);
+    auto *next_state_ptr = next_state.data_ptr<int64_t>();
+    for (int64_t slot = 0; slot < next_state.numel(); slot++) {
+        int64_t partition_id = next_state_ptr[slot];
+        if (partition_id < 0 || partition_id >= partition_count) {
+            throw GegeRuntimeException(
+                fmt::format("MemPartitionBufferStorage::startAsyncAdmitPreload encountered invalid next-state partition {}", partition_id));
+        }
+        next_slot_by_partition[static_cast<std::size_t>(partition_id)] = slot;
+    }
+
     std::vector<int64_t> evict_slots;
     evict_slots.reserve(evict_ids.size());
     for (int evict_id : evict_ids) {
@@ -2000,8 +2013,20 @@ void MemPartitionBufferStorage::startAsyncAdmitPreload(int32_t device_idx) {
             has_scheduled_peer_handoff = handoff_it != stateflow_peer_handoff_index_per_device_[device_idx].end();
         }
         if (!has_scheduled_peer_handoff) {
+            int64_t target_slot =
+                (partition_id >= 0 && partition_id < static_cast<int>(next_slot_by_partition.size()))
+                    ? next_slot_by_partition[static_cast<std::size_t>(partition_id)]
+                    : -1;
+            if (target_slot < 0) {
+                target_slot = idx < evict_slots.size() ? evict_slots[idx] : -1;
+            }
+            if (target_slot < 0) {
+                throw GegeRuntimeException(
+                    fmt::format("Stateflow peer relay could not determine preload target slot for partition {} on device {}",
+                                partition_id, buffer->device_.index()));
+            }
             host_preload_admit_ids.push_back(partition_id);
-            host_preload_slots.push_back(evict_slots[idx]);
+            host_preload_slots.push_back(target_slot);
         }
     }
 

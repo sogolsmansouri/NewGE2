@@ -1272,6 +1272,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         bool submitted_peer_copy = false;
         bool peer_stream_armed = false;
         std::vector<bool> waited_on_source_ready(buffers_.size(), false);
+        std::vector<torch::Tensor> peer_copy_lifetime_holds;
 
         if (frame_cache_mapping) {
             std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
@@ -1753,6 +1754,10 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                                             partition_id, src_buffer->device_.index(), buffer->device_.index(),
                                             cudaGetErrorString(status)));
                         }
+                        // The source lane may advance and clear its published scratch map before
+                        // this destination stream is synchronized. Hold an owning Tensor reference
+                        // locally so the async peer copy cannot observe freed source storage.
+                        peer_copy_lifetime_holds.emplace_back(src_scratch);
                         used_peer_copy = true;
                         submitted_peer_copy = true;
                         peer_bytes_executed += bytes;

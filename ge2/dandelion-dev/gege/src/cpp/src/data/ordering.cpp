@@ -19,6 +19,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #ifdef GEGE_OMP
 #include "omp.h"
@@ -218,7 +219,7 @@ int64_t plan_embedding_bytes_per_row(const PlanEmbeddingLayout &layout) {
 }
 
 int64_t optimal88_peer_handoff_budget(int active_devices) {
-    const int64_t default_budget = active_devices == 2 ? 52 : -1;
+    const int64_t default_budget = active_devices == 2 ? 51 : -1;
     if (active_devices == 2) {
         return stateflow_env_int64("GEGE_BOUNDED_Q4_OPTIMAL88_2GPU_MAX_PEER_HANDOFFS", nullptr,
                                    stateflow_env_int64("GEGE_BOUNDED_Q4_OPTIMAL88_MAX_PEER_HANDOFFS", nullptr,
@@ -1964,9 +1965,6 @@ bool two_gpu_path_cost_less(const TwoGpuPathCost &lhs, const TwoGpuPathCost &rhs
     if (lhs.bad_lane_transitions != rhs.bad_lane_transitions) {
         return lhs.bad_lane_transitions < rhs.bad_lane_transitions;
     }
-    if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
-        return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
-    }
     if (lhs.peer_partitions_over_budget != rhs.peer_partitions_over_budget) {
         return lhs.peer_partitions_over_budget < rhs.peer_partitions_over_budget;
     }
@@ -1981,6 +1979,9 @@ bool two_gpu_path_cost_less(const TwoGpuPathCost &lhs, const TwoGpuPathCost &rhs
     }
     if (lhs.same_overlap != rhs.same_overlap) {
         return lhs.same_overlap > rhs.same_overlap;
+    }
+    if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
+        return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
     }
     if (lhs.host_bytes != rhs.host_bytes) {
         return lhs.host_bytes < rhs.host_bytes;
@@ -2327,6 +2328,73 @@ std::vector<int64_t> getOptimal88TwoGpuLaneMatchedPermutation(const vector<torch
 
     TwoGpuOrientedPath best_path;
     bool have_best = false;
+    auto try_oriented_rounds = [&](std::vector<TwoGpuRoundPair> oriented_rounds) {
+        if (oriented_rounds.size() * 2 != buffer_states.size()) {
+            return;
+        }
+        std::vector<uint8_t> seen(buffer_states.size(), 0);
+        for (const auto &round : oriented_rounds) {
+            if (round.lhs < 0 || round.rhs < 0 ||
+                round.lhs >= static_cast<int64_t>(buffer_states.size()) ||
+                round.rhs >= static_cast<int64_t>(buffer_states.size()) ||
+                seen[static_cast<std::size_t>(round.lhs)] != 0 ||
+                seen[static_cast<std::size_t>(round.rhs)] != 0 ||
+                !two_gpu_pair_valid(round, summaries)) {
+                return;
+            }
+            seen[static_cast<std::size_t>(round.lhs)] = 1;
+            seen[static_cast<std::size_t>(round.rhs)] = 1;
+        }
+        TwoGpuOrientedPath candidate;
+        candidate.ordered_pairs = oriented_rounds;
+        candidate.oriented_rounds = std::move(oriented_rounds);
+        candidate.cost =
+            evaluate_two_gpu_oriented_path(candidate.oriented_rounds, summaries, partition_row_counts, cfg, bytes_per_row);
+        if (!have_best || two_gpu_path_cost_less(candidate.cost, best_path.cost)) {
+            best_path = std::move(candidate);
+            have_best = true;
+        }
+    };
+    auto find_state_with_partitions = [&](std::vector<int64_t> partitions,
+                                          const std::vector<uint8_t> &seen) -> int64_t {
+        std::sort(partitions.begin(), partitions.end());
+        for (std::size_t idx = 0; idx < summaries.size(); idx++) {
+            if (seen[idx] != 0) {
+                continue;
+            }
+            if (summaries[idx].partitions == partitions) {
+                return static_cast<int64_t>(idx);
+            }
+        }
+        return -1;
+    };
+    using PartitionRound = std::pair<std::vector<int64_t>, std::vector<int64_t>>;
+    auto try_partition_rounds = [&](const std::vector<PartitionRound> &partition_rounds) {
+        if (partition_rounds.size() * 2 != buffer_states.size()) {
+            return;
+        }
+        std::vector<uint8_t> seen(buffer_states.size(), 0);
+        std::vector<TwoGpuRoundPair> oriented_rounds;
+        oriented_rounds.reserve(partition_rounds.size());
+        for (const auto &round : partition_rounds) {
+            TwoGpuRoundPair pair;
+            pair.lhs = find_state_with_partitions(round.first, seen);
+            if (pair.lhs < 0) {
+                return;
+            }
+            seen[static_cast<std::size_t>(pair.lhs)] = 1;
+            pair.rhs = find_state_with_partitions(round.second, seen);
+            if (pair.rhs < 0) {
+                return;
+            }
+            seen[static_cast<std::size_t>(pair.rhs)] = 1;
+            if (!two_gpu_pair_valid(pair, summaries)) {
+                return;
+            }
+            oriented_rounds.emplace_back(pair);
+        }
+        try_oriented_rounds(std::move(oriented_rounds));
+    };
     auto try_matching = [&](std::vector<TwoGpuRoundPair> pairs) {
         if (pairs.size() * 2 != buffer_states.size()) {
             return;
@@ -2344,6 +2412,57 @@ std::vector<int64_t> getOptimal88TwoGpuLaneMatchedPermutation(const vector<torch
             have_best = true;
         }
     };
+
+    // Seed the search with the best known Opt88 2-GPU schedule over this
+    // cover: 186 host admits, 51 peer admits, and 237 total lane admits. Store
+    // it by partition set rather than state index so the seed remains valid if
+    // the 88-state cover construction order changes.
+    try_partition_rounds(std::vector<PartitionRound>{
+        {{24, 25, 26, 27}, {2, 6, 10, 14}},
+        {{4, 15, 16, 27}, {7, 10, 20, 25}},
+        {{0, 1, 27, 29}, {2, 4, 18, 20}},
+        {{0, 1, 26, 28}, {18, 23, 24, 29}},
+        {{9, 14, 27, 28}, {8, 15, 26, 29}},
+        {{4, 13, 21, 28}, {6, 7, 26, 29}},
+        {{4, 6, 7, 28}, {5, 14, 17, 26}},
+        {{5, 6, 7, 27}, {4, 9, 23, 26}},
+        {{1, 5, 9, 13}, {6, 15, 23, 30}},
+        {{3, 6, 9, 12}, {2, 5, 16, 23}},
+        {{3, 14, 16, 29}, {2, 5, 25, 31}},
+        {{14, 16, 18, 19}, {9, 15, 25, 31}},
+        {{6, 13, 18, 25}, {16, 21, 26, 31}},
+        {{6, 11, 21, 24}, {1, 8, 16, 25}},
+        {{8, 14, 24, 30}, {0, 6, 16, 22}},
+        {{4, 5, 24, 30}, {2, 9, 22, 29}},
+        {{1, 15, 22, 24}, {7, 9, 16, 30}},
+        {{18, 22, 26, 30}, {9, 10, 11, 16}},
+        {{1, 12, 18, 31}, {10, 11, 17, 23}},
+        {{1, 4, 11, 14}, {10, 12, 26, 28}},
+        {{12, 13, 14, 15}, {1, 10, 21, 30}},
+        {{12, 13, 16, 17}, {0, 5, 10, 15}},
+        {{0, 13, 19, 30}, {5, 8, 10, 22}},
+        {{0, 9, 17, 19}, {8, 11, 22, 27}},
+        {{9, 17, 18, 24}, {11, 13, 27, 29}},
+        {{17, 20, 27, 30}, {10, 13, 24, 31}},
+        {{6, 8, 17, 31}, {16, 20, 24, 28}},
+        {{1, 6, 19, 20}, {28, 29, 30, 31}},
+        {{8, 9, 20, 21}, {1, 2, 3, 30}},
+        {{14, 15, 20, 21}, {0, 2, 3, 24}},
+        {{3, 5, 19, 21}, {0, 14, 23, 25}},
+        {{5, 12, 20, 29}, {7, 14, 22, 31}},
+        {{4, 10, 19, 29}, {0, 11, 20, 31}},
+        {{0, 4, 8, 12}, {5, 11, 18, 28}},
+        {{7, 12, 19, 24}, {3, 8, 23, 28}},
+        {{19, 23, 27, 31}, {3, 7, 11, 15}},
+        {{1, 7, 17, 23}, {2, 11, 19, 26}},
+        {{2, 7, 8, 13}, {11, 12, 25, 30}},
+        {{2, 12, 21, 27}, {19, 22, 25, 28}},
+        {{3, 10, 18, 27}, {12, 21, 22, 23}},
+        {{0, 7, 18, 21}, {13, 20, 22, 23}},
+        {{17, 21, 25, 29}, {3, 13, 20, 26}},
+        {{2, 15, 17, 28}, {3, 4, 25, 31}},
+        {{8, 15, 18, 19}, {3, 4, 17, 22}},
+    });
 
     try_matching(build_farthest_two_gpu_matching(summaries));
     for (int restart = 0; restart < restarts; restart++) {

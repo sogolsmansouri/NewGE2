@@ -217,6 +217,18 @@ int64_t plan_embedding_bytes_per_row(const PlanEmbeddingLayout &layout) {
            std::max<int64_t>(layout.optimizer_state_multiplier, 1);
 }
 
+int64_t optimal88_peer_handoff_budget(int active_devices) {
+    const int64_t default_budget = active_devices == 2 ? 52 : -1;
+    if (active_devices == 2) {
+        return stateflow_env_int64("GEGE_BOUNDED_Q4_OPTIMAL88_2GPU_MAX_PEER_HANDOFFS", nullptr,
+                                   stateflow_env_int64("GEGE_BOUNDED_Q4_OPTIMAL88_MAX_PEER_HANDOFFS", nullptr,
+                                                       default_budget));
+    }
+    return stateflow_env_int64("GEGE_BOUNDED_Q4_OPTIMAL88_MULTIGPU_MAX_PEER_HANDOFFS", nullptr,
+                               stateflow_env_int64("GEGE_BOUNDED_Q4_OPTIMAL88_MAX_PEER_HANDOFFS", nullptr,
+                                                   default_budget));
+}
+
 int64_t partition_transfer_bytes(int64_t partition_id,
                                  const std::vector<int64_t> &partition_row_counts,
                                  int64_t bytes_per_row) {
@@ -1876,6 +1888,7 @@ struct TwoGpuPathCost {
     int64_t max_lane_admits = 0;
     int64_t bad_lane_transitions = 0;
     int64_t first_transition_peer_partitions = 0;
+    int64_t peer_partitions_over_budget = 0;
     int64_t lane_edge_imbalance = 0;
     long double score = 0.0L;
 };
@@ -1954,6 +1967,9 @@ bool two_gpu_path_cost_less(const TwoGpuPathCost &lhs, const TwoGpuPathCost &rhs
     if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
         return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
     }
+    if (lhs.peer_partitions_over_budget != rhs.peer_partitions_over_budget) {
+        return lhs.peer_partitions_over_budget < rhs.peer_partitions_over_budget;
+    }
     if (lhs.host_partitions != rhs.host_partitions) {
         return lhs.host_partitions < rhs.host_partitions;
     }
@@ -2007,6 +2023,11 @@ TwoGpuPathCost evaluate_two_gpu_oriented_path(const std::vector<TwoGpuRoundPair>
         path_cost.max_lane_admits = std::max(path_cost.max_lane_admits, step.max_lane_admits);
         path_cost.bad_lane_transitions += step.bad_lane_transitions;
         path_cost.score += step.score;
+    }
+
+    const int64_t peer_budget = optimal88_peer_handoff_budget(2);
+    if (peer_budget >= 0) {
+        path_cost.peer_partitions_over_budget = std::max<int64_t>(path_cost.peer_partitions - peer_budget, 0);
     }
 
     return path_cost;
@@ -2352,9 +2373,10 @@ std::vector<int64_t> getOptimal88TwoGpuLaneMatchedPermutation(const vector<torch
     }
 
     SPDLOG_INFO(
-        "Optimal88 2-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} first_transition_peer_handoffs={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
+        "Optimal88 2-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} peer_handoffs_over_budget={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} first_transition_peer_handoffs={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
         best_path.oriented_rounds.size(), buffer_states.size(), best_path.cost.host_partitions,
-        best_path.cost.peer_partitions, best_path.cost.lane_admits, best_path.cost.same_overlap,
+        best_path.cost.peer_partitions, best_path.cost.peer_partitions_over_budget,
+        best_path.cost.lane_admits, best_path.cost.same_overlap,
         best_path.cost.max_lane_admits, best_path.cost.bad_lane_transitions,
         best_path.cost.first_transition_peer_partitions,
         best_path.cost.host_bytes, best_path.cost.peer_bytes, best_path.cost.lane_edge_imbalance);
@@ -2571,6 +2593,7 @@ struct MultiGpuPathCost {
     int64_t max_lane_admits = 0;
     int64_t bad_lane_transitions = 0;
     int64_t first_transition_peer_partitions = 0;
+    int64_t peer_partitions_over_budget = 0;
     int64_t lane_edge_imbalance = 0;
     long double score = 0.0L;
 };
@@ -2587,6 +2610,9 @@ bool multi_gpu_path_cost_less(const MultiGpuPathCost &lhs, const MultiGpuPathCos
     }
     if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
         return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
+    }
+    if (lhs.peer_partitions_over_budget != rhs.peer_partitions_over_budget) {
+        return lhs.peer_partitions_over_budget < rhs.peer_partitions_over_budget;
     }
     if (lhs.host_partitions != rhs.host_partitions) {
         return lhs.host_partitions < rhs.host_partitions;
@@ -2762,6 +2788,11 @@ MultiGpuPathCost evaluate_multi_gpu_oriented_path(const std::vector<MultiGpuRoun
         path_cost.max_lane_admits = std::max(path_cost.max_lane_admits, step.max_lane_admits);
         path_cost.bad_lane_transitions += step.bad_lane_transitions;
         path_cost.score += step.score;
+    }
+
+    const int64_t peer_budget = optimal88_peer_handoff_budget(static_cast<int>(lanes));
+    if (peer_budget >= 0) {
+        path_cost.peer_partitions_over_budget = std::max<int64_t>(path_cost.peer_partitions - peer_budget, 0);
     }
 
     return path_cost;
@@ -3195,9 +3226,10 @@ std::vector<int64_t> getOptimal88MultiGpuLaneMatchedPermutation(const vector<tor
     }
 
     SPDLOG_INFO(
-        "Optimal88 {}-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} first_transition_peer_handoffs={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
+        "Optimal88 {}-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} peer_handoffs_over_budget={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} first_transition_peer_handoffs={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
         active_devices, best_path.oriented_rounds.size(), buffer_states.size(), best_path.cost.host_partitions,
-        best_path.cost.peer_partitions, best_path.cost.lane_admits, best_path.cost.same_overlap,
+        best_path.cost.peer_partitions, best_path.cost.peer_partitions_over_budget,
+        best_path.cost.lane_admits, best_path.cost.same_overlap,
         best_path.cost.max_lane_admits, best_path.cost.bad_lane_transitions,
         best_path.cost.first_transition_peer_partitions,
         best_path.cost.host_bytes, best_path.cost.peer_bytes, best_path.cost.lane_edge_imbalance);

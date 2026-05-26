@@ -1407,10 +1407,12 @@ MemPartitionBuffer::~MemPartitionBuffer() {
 bool MemPartitionBuffer::frameCacheEnabled_() const { return hidden_frame_capacity_ > 0; }
 
 int64_t MemPartitionBuffer::frameCacheMaxStaleBacklog_() const {
+    const int64_t default_manual_backlog =
+        buffer_sizes_ > 1 ? 1 : static_cast<int64_t>(hidden_frame_capacity_);
     int64_t default_backlog =
         frame_cache_auto_max_stale_backlog_ >= 0
             ? frame_cache_auto_max_stale_backlog_
-            : static_cast<int64_t>(hidden_frame_capacity_);
+            : default_manual_backlog;
     int64_t requested = parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG", default_backlog);
     return std::min<int64_t>(std::max<int64_t>(requested, 0), static_cast<int64_t>(hidden_frame_capacity_));
 }

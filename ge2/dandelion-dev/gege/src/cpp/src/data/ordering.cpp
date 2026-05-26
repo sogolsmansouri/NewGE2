@@ -1936,12 +1936,12 @@ TwoGpuTransitionCost two_gpu_transition_cost(const TwoGpuRoundPair &prev_round,
         }
     }
 
-    // For Opt88 lane matching, peer relay is a residency classification, not a
-    // bandwidth objective: retain same-lane partitions first, then avoid host
-    // admits when the previous round already has the partition on the other GPU.
+    // For Opt88 lane matching, host admits are the expensive critical-path
+    // movement. Keep the per-lane admit cap first, then minimize CPU->GPU
+    // admits before minimizing total lane admits/peer relay.
     cost.score = static_cast<long double>(cost.bad_lane_transitions) * 1000000000000.0L +
-                 static_cast<long double>(cost.lane_admits) * 1000000.0L +
-                 static_cast<long double>(cost.host_partitions) * 1000.0L +
+                 static_cast<long double>(cost.host_partitions) * 1000000.0L +
+                 static_cast<long double>(cost.lane_admits) * 1000.0L +
                  static_cast<long double>(cost.max_lane_admits);
     return cost;
 }
@@ -1950,11 +1950,11 @@ bool two_gpu_path_cost_less(const TwoGpuPathCost &lhs, const TwoGpuPathCost &rhs
     if (lhs.bad_lane_transitions != rhs.bad_lane_transitions) {
         return lhs.bad_lane_transitions < rhs.bad_lane_transitions;
     }
-    if (lhs.lane_admits != rhs.lane_admits) {
-        return lhs.lane_admits < rhs.lane_admits;
-    }
     if (lhs.host_partitions != rhs.host_partitions) {
         return lhs.host_partitions < rhs.host_partitions;
+    }
+    if (lhs.lane_admits != rhs.lane_admits) {
+        return lhs.lane_admits < rhs.lane_admits;
     }
     if (lhs.max_lane_admits != rhs.max_lane_admits) {
         return lhs.max_lane_admits < rhs.max_lane_admits;
@@ -2354,12 +2354,15 @@ std::vector<int64_t> getOptimal88TwoGpuLaneMatchedPermutation(const vector<torch
     return permutation;
 }
 
-vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::Tensor> &buffer_states,
-                                                           const std::vector<int64_t> &permutation,
-                                                           int num_partitions,
-                                                           const vector<int64_t> &edge_bucket_sizes) {
+vector<torch::Tensor> assignRoundBalancedMultiGpuEdgeBuckets(const vector<torch::Tensor> &buffer_states,
+                                                             const std::vector<int64_t> &permutation,
+                                                             int active_devices,
+                                                             int num_partitions,
+                                                             const vector<int64_t> &edge_bucket_sizes) {
     if (buffer_states.empty() || permutation.size() != buffer_states.size() ||
-        permutation.size() % 2 != 0 || num_partitions <= 0) {
+        active_devices <= 1 ||
+        permutation.size() % static_cast<std::size_t>(active_devices) != 0 ||
+        num_partitions <= 0) {
         return {};
     }
 
@@ -2384,7 +2387,7 @@ vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::T
         position_of_state[static_cast<std::size_t>(state_idx)] = static_cast<int64_t>(pos);
     }
 
-    const std::size_t num_rounds = permutation.size() / 2;
+    const std::size_t num_rounds = permutation.size() / static_cast<std::size_t>(active_devices);
     const int num_buckets = num_partitions * num_partitions;
     std::vector<int64_t> bucket_weight(static_cast<std::size_t>(num_buckets), 1);
     std::vector<std::vector<int>> compatible_states(static_cast<std::size_t>(num_buckets));
@@ -2399,8 +2402,8 @@ vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::T
                 }
             }
             if (compatible_states[static_cast<std::size_t>(bucket_idx)].empty()) {
-                SPDLOG_WARN("Round-balanced 2-GPU bucket assignment found no compatible state for bucket ({},{})",
-                            src, dst);
+                SPDLOG_WARN("Round-balanced {}-GPU bucket assignment found no compatible state for bucket ({},{})",
+                            active_devices, src, dst);
                 return {};
             }
         }
@@ -2410,12 +2413,13 @@ vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::T
     vector<vector<std::pair<int, int>>> assigned_buckets(buffer_states.size());
     std::vector<int64_t> assigned_weight(buffer_states.size(), 0);
     std::vector<int64_t> assigned_count(buffer_states.size(), 0);
-    std::vector<std::vector<int64_t>> round_lane_weight(num_rounds, std::vector<int64_t>(2, 0));
+    std::vector<std::vector<int64_t>> round_lane_weight(num_rounds,
+                                                        std::vector<int64_t>(static_cast<std::size_t>(active_devices), 0));
 
     auto add_bucket_to_state = [&](int bucket_idx, int state_idx, int sign) {
         const int64_t pos = position_of_state[static_cast<std::size_t>(state_idx)];
-        const std::size_t round_idx = static_cast<std::size_t>(pos / 2);
-        const std::size_t lane_idx = static_cast<std::size_t>(pos % 2);
+        const std::size_t round_idx = static_cast<std::size_t>(pos / active_devices);
+        const std::size_t lane_idx = static_cast<std::size_t>(pos % active_devices);
         const int64_t weight = bucket_weight[static_cast<std::size_t>(bucket_idx)] * sign;
         assigned_weight[static_cast<std::size_t>(state_idx)] += weight;
         assigned_count[static_cast<std::size_t>(state_idx)] += sign;
@@ -2434,7 +2438,13 @@ vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::T
     }
 
     auto round_delta = [&round_lane_weight](std::size_t round_idx) {
-        return std::llabs(round_lane_weight[round_idx][0] - round_lane_weight[round_idx][1]);
+        auto minmax = std::minmax_element(round_lane_weight[round_idx].begin(),
+                                          round_lane_weight[round_idx].end());
+        if (minmax.first == round_lane_weight[round_idx].end() ||
+            minmax.second == round_lane_weight[round_idx].end()) {
+            return int64_t{0};
+        }
+        return *minmax.second - *minmax.first;
     };
     auto imbalance_key = [&round_lane_weight, &round_delta]() {
         int64_t max_delta = 0;
@@ -2455,7 +2465,8 @@ vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::T
     });
 
     const int max_iterations = static_cast<int>(
-        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_Q4_2GPU_ROUND_BALANCE_ITERS", nullptr, 10000)));
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_Q4_MULTIGPU_ROUND_BALANCE_ITERS",
+                                                "GEGE_BOUNDED_Q4_2GPU_ROUND_BALANCE_ITERS", 10000)));
     auto initial_key = imbalance_key();
     int64_t moves = 0;
     for (int iteration = 0; iteration < max_iterations; iteration++) {
@@ -2510,8 +2521,8 @@ vector<torch::Tensor> assignRoundBalancedTwoGpuEdgeBuckets(const vector<torch::T
                                                                            bucket_idx % num_partitions);
     }
     auto final_key = imbalance_key();
-    SPDLOG_INFO("Round-balanced 2-GPU bucket assignment moved={} max_round_delta {} -> {} total_round_delta {} -> {}",
-                moves, initial_key.first, final_key.first, initial_key.second, final_key.second);
+    SPDLOG_INFO("Round-balanced {}-GPU bucket assignment moved={} max_round_delta {} -> {} total_round_delta {} -> {}",
+                active_devices, moves, initial_key.first, final_key.first, initial_key.second, final_key.second);
 
     vector<torch::Tensor> ret_edge_buckets_per_buffer;
     ret_edge_buckets_per_buffer.reserve(assigned_buckets.size());
@@ -2565,25 +2576,25 @@ bool multi_gpu_path_cost_less(const MultiGpuPathCost &lhs, const MultiGpuPathCos
     if (lhs.bad_lane_transitions != rhs.bad_lane_transitions) {
         return lhs.bad_lane_transitions < rhs.bad_lane_transitions;
     }
-    if (lhs.score != rhs.score) {
-        return lhs.score < rhs.score;
-    }
-    if (lhs.host_bytes != rhs.host_bytes) {
-        return lhs.host_bytes < rhs.host_bytes;
+    if (lhs.host_partitions != rhs.host_partitions) {
+        return lhs.host_partitions < rhs.host_partitions;
     }
     if (lhs.lane_admits != rhs.lane_admits) {
         return lhs.lane_admits < rhs.lane_admits;
     }
-    if (lhs.peer_bytes != rhs.peer_bytes) {
-        return lhs.peer_bytes < rhs.peer_bytes;
-    }
     if (lhs.max_lane_admits != rhs.max_lane_admits) {
         return lhs.max_lane_admits < rhs.max_lane_admits;
     }
-    if (lhs.lane_edge_imbalance != rhs.lane_edge_imbalance) {
-        return lhs.lane_edge_imbalance < rhs.lane_edge_imbalance;
+    if (lhs.same_overlap != rhs.same_overlap) {
+        return lhs.same_overlap > rhs.same_overlap;
     }
-    return lhs.same_overlap > rhs.same_overlap;
+    if (lhs.host_bytes != rhs.host_bytes) {
+        return lhs.host_bytes < rhs.host_bytes;
+    }
+    if (lhs.peer_bytes != rhs.peer_bytes) {
+        return lhs.peer_bytes < rhs.peer_bytes;
+    }
+    return lhs.score < rhs.score;
 }
 
 MultiGpuPathCost path_cost_from_transition(const MultiGpuTransitionCost &transition) {
@@ -2692,17 +2703,13 @@ MultiGpuTransitionCost multi_gpu_transition_cost(const MultiGpuRoundGroup &prev_
         }
     }
 
-    const long double peer_equivalent = static_cast<long double>(
-        peer_bytes_as_host_equivalent(cost.peer_bytes, cfg));
-    cost.score = static_cast<long double>(cost.host_bytes) + peer_equivalent;
-    if (cost.bad_lane_transitions > 0) {
-        const int64_t bytes_basis = bytes_per_row > 0 ? bytes_per_row : int64_t{1};
-        cost.score += static_cast<long double>(cost.bad_lane_transitions) *
-                      static_cast<long double>(bytes_basis) * 1000000000000.0L;
-    }
-    cost.score += static_cast<long double>(cost.lane_admits) *
-                  stateflow_cost_env("GEGE_BOUNDED_Q4_OPTIMAL88_MULTIGPU_ADMIT_WEIGHT",
-                                     stateflow_cost_env("GEGE_BOUNDED_Q4_OPTIMAL88_2GPU_ADMIT_WEIGHT", 0.01));
+    // Runtime-oriented Opt88 objective: keep transitions feasible for the
+    // per-lane admit cap, then minimize CPU->GPU admits. Peer relay still
+    // counts as lane movement, but it should not dominate host movement.
+    cost.score = static_cast<long double>(cost.bad_lane_transitions) * 1000000000000.0L +
+                 static_cast<long double>(cost.host_partitions) * 1000000.0L +
+                 static_cast<long double>(cost.lane_admits) * 1000.0L +
+                 static_cast<long double>(cost.max_lane_admits);
     return cost;
 }
 
@@ -2742,12 +2749,6 @@ MultiGpuPathCost evaluate_multi_gpu_oriented_path(const std::vector<MultiGpuRoun
         path_cost.score += step.score;
     }
 
-    if (path_cost.lane_edge_imbalance > 0) {
-        path_cost.score += static_cast<long double>(cfg.imbalance_weight) *
-                           static_cast<long double>(path_cost.lane_edge_imbalance) *
-                           stateflow_cost_env("GEGE_BOUNDED_Q4_OPTIMAL88_MULTIGPU_LANE_EDGE_WEIGHT",
-                                              stateflow_cost_env("GEGE_BOUNDED_Q4_OPTIMAL88_2GPU_LANE_EDGE_WEIGHT", 1e-7));
-    }
     return path_cost;
 }
 
@@ -7493,13 +7494,13 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
         if (!optimal88_permutation.empty()) {
             const vector<torch::Tensor> *optimal88_edge_buckets = &edge_buckets_per_buffer;
             vector<torch::Tensor> round_balanced_edge_buckets;
-            if (active_devices == 2) {
+            if (active_devices == 2 || active_devices == 4) {
                 round_balanced_edge_buckets =
-                    assignRoundBalancedTwoGpuEdgeBuckets(buffer_states, optimal88_permutation,
-                                                         static_cast<int>(edge_bucket_sizes.empty()
-                                                                              ? 0
-                                                                              : std::llround(std::sqrt(static_cast<long double>(edge_bucket_sizes.size())))),
-                                                         edge_bucket_sizes);
+                    assignRoundBalancedMultiGpuEdgeBuckets(buffer_states, optimal88_permutation, active_devices,
+                                                           static_cast<int>(edge_bucket_sizes.empty()
+                                                                                ? 0
+                                                                                : std::llround(std::sqrt(static_cast<long double>(edge_bucket_sizes.size())))),
+                                                           edge_bucket_sizes);
                 if (!round_balanced_edge_buckets.empty()) {
                     optimal88_edge_buckets = &round_balanced_edge_buckets;
                 }
@@ -7519,8 +7520,9 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                     optimal88_plan.estimated_cost, optimal88_plan.total_superstates, optimal88_plan.total_partition_loads,
                     optimal88_plan.boundary_count, optimal88_plan.total_bucket_assignments, optimal88_plan.estimated_bucket_edges,
                     overlap_histogram_string(optimal88_plan));
-                if (active_devices == 2) {
-                    SPDLOG_INFO("Using Optimal88 2-GPU lane-matched plan as the selected bounded q4 schedule");
+                if (active_devices == 2 || active_devices == 4) {
+                    SPDLOG_INFO("Using Optimal88 {}-GPU lane-matched plan as the selected bounded q4 schedule",
+                                active_devices);
                     std::vector<StateflowPlan> optimal88_only;
                     optimal88_only.emplace_back(std::move(optimal88_plan));
                     return optimal88_only;
@@ -8776,11 +8778,13 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMu
         std::min<int64_t>(buffer_capacity, std::max<int64_t>(0, stateflow_env_int64("GEGE_STATEFLOW_MAX_ADMITS",
                                                                                    "STATEFLOW_MAX_ADMITS", 3))));
     std::vector<std::vector<int>> buffer_states;
+    bool using_optimal88_states = false;
     if ((active_devices == 2 || active_devices == 4) && bounded_q4_optimal88_enabled()) {
         buffer_states = build_weighted_optimal88_q4_states(num_partitions, buffer_capacity,
                                                            std::max(max_admits, 3), edge_bucket_sizes,
                                                            false);
         if (!buffer_states.empty()) {
+            using_optimal88_states = true;
             SPDLOG_INFO("Using Optimal88 p32/q4 state cover as bounded multi-GPU input states={}", buffer_states.size());
         }
     }
@@ -8792,8 +8796,9 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMu
     }
 
     vector<vector<std::pair<int, int>>> edge_buckets_per_buffer;
-    if (active_devices == 2) {
-        SPDLOG_INFO("Using first-cover edge-bucket assignment for 2-GPU bounded q4 schedule");
+    if ((active_devices == 2 || active_devices == 4) && using_optimal88_states) {
+        SPDLOG_INFO("Using first-cover edge-bucket assignment for Optimal88 {}-GPU bounded q4 schedule",
+                    active_devices);
         edge_buckets_per_buffer = greedyAssignEdgeBucketsToBuffers(buffer_states, num_partitions);
     } else {
         edge_buckets_per_buffer =

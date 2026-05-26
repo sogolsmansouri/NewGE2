@@ -1350,13 +1350,19 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     // }
     // memset_wrapper(buff_mem_, 0, capacity_ * partition_size_ * embedding_size_ * dtype_size_);
 
+    const bool pinned_host_env_set = std::getenv("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST") != nullptr;
     use_pinned_host_buffer_ = mem_partition_buffer_pinned_host_enabled();
-    if (!use_pinned_host_buffer_ && buffer_sizes_ > 1 && device_.is_cuda()) {
+    if (!use_pinned_host_buffer_ && buffer_sizes_ > 1 && device_.is_cuda() && !pinned_host_env_set) {
         static std::once_flag warned_once;
         std::call_once(warned_once, []() {
             SPDLOG_WARN("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=0 is unsupported for multi-GPU MEM_PARTITION_BUFFER; forcing pinned host buffers");
         });
         use_pinned_host_buffer_ = true;
+    } else if (!use_pinned_host_buffer_ && buffer_sizes_ > 1 && device_.is_cuda()) {
+        static std::once_flag warned_pageable_once;
+        std::call_once(warned_pageable_once, []() {
+            SPDLOG_WARN("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=0 explicitly requested for multi-GPU MEM_PARTITION_BUFFER; using pageable host frame buffers");
+        });
     }
 
     hidden_frame_capacity_ =

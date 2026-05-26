@@ -1350,19 +1350,13 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
     // }
     // memset_wrapper(buff_mem_, 0, capacity_ * partition_size_ * embedding_size_ * dtype_size_);
 
-    const bool pinned_host_env_set = std::getenv("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST") != nullptr;
     use_pinned_host_buffer_ = mem_partition_buffer_pinned_host_enabled();
-    if (!use_pinned_host_buffer_ && buffer_sizes_ > 1 && device_.is_cuda() && !pinned_host_env_set) {
+    if (!use_pinned_host_buffer_ && buffer_sizes_ > 1 && device_.is_cuda()) {
         static std::once_flag warned_once;
         std::call_once(warned_once, []() {
             SPDLOG_WARN("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=0 is unsupported for multi-GPU MEM_PARTITION_BUFFER; forcing pinned host buffers");
         });
         use_pinned_host_buffer_ = true;
-    } else if (!use_pinned_host_buffer_ && buffer_sizes_ > 1 && device_.is_cuda()) {
-        static std::once_flag warned_pageable_once;
-        std::call_once(warned_pageable_once, []() {
-            SPDLOG_WARN("GEGE_MEM_PARTITION_BUFFER_PINNED_HOST=0 explicitly requested for multi-GPU MEM_PARTITION_BUFFER; using pageable host frame buffers");
-        });
     }
 
     hidden_frame_capacity_ =
@@ -1408,7 +1402,7 @@ bool MemPartitionBuffer::frameCacheEnabled_() const { return hidden_frame_capaci
 
 int64_t MemPartitionBuffer::frameCacheMaxStaleBacklog_() const {
     const int64_t default_manual_backlog =
-        buffer_sizes_ > 1 ? 1 : static_cast<int64_t>(hidden_frame_capacity_);
+        buffer_sizes_ > 1 ? 2 : static_cast<int64_t>(hidden_frame_capacity_);
     int64_t default_backlog =
         frame_cache_auto_max_stale_backlog_ >= 0
             ? frame_cache_auto_max_stale_backlog_

@@ -1371,21 +1371,16 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         }
 
-        std::unordered_map<int, MemPartitionBuffer::HiddenFramePublish> peer_hidden_publishes_by_partition;
         std::unordered_set<int64_t> hidden_publish_slots;
-        hidden_publish_slots.reserve(buffer->pending_hidden_publishes_.size() + admit_ids.size());
+        hidden_publish_slots.reserve(buffer->pending_hidden_publishes_.size());
         for (const auto &hidden_publish : buffer->pending_hidden_publishes_) {
             hidden_publish_slots.insert(hidden_publish.logical_slot);
         }
-        if (frame_cache_mapping && stateflow_runtime_controlling && multi_gpu_async_admit_preload_enabled()) {
-            int64_t remaining_hidden_preload_frames =
-                std::max<int64_t>(buffer->frameCacheReservedPreloadFrames_() -
-                                      static_cast<int64_t>(buffer->pending_hidden_publishes_.size()),
-                                  0);
+
+        std::vector<int64_t> direct_peer_slots;
+        std::unordered_map<int64_t, int64_t> direct_visible_frame_by_slot;
+        if (frame_cache_mapping && stateflow_runtime_controlling) {
             for (int partition_id : admit_ids) {
-                if (remaining_hidden_preload_frames <= 0) {
-                    break;
-                }
                 if (preloaded_host_admit_ids.find(partition_id) != preloaded_host_admit_ids.end()) {
                     continue;
                 }
@@ -1402,41 +1397,41 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                         : -1;
                 if (target_slot < 0) {
                     throw GegeRuntimeException(
-                        fmt::format("Stateflow peer relay could not determine peer hidden-publish target slot for partition {} on device {}",
+                        fmt::format("Stateflow peer relay could not determine direct peer target slot for partition {} on device {}",
                                     partition_id, buffer->device_.index()));
                 }
                 if (hidden_publish_slots.find(target_slot) != hidden_publish_slots.end()) {
                     continue;
                 }
-
-                int64_t hidden_frame = -1;
-                {
-                    std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
-                    if (!buffer->free_physical_frames_.empty()) {
-                        hidden_frame = buffer->free_physical_frames_.back();
-                        buffer->free_physical_frames_.pop_back();
-                    }
-                }
-                if (hidden_frame < 0) {
-                    break;
-                }
-
-                MemPartitionBuffer::HiddenFramePublish hidden_publish{partition_id, target_slot, hidden_frame};
-                buffer->pending_hidden_publishes_.push_back(hidden_publish);
-                peer_hidden_publishes_by_partition.emplace(partition_id, hidden_publish);
-                hidden_publish_slots.insert(target_slot);
-                hidden_publish_parts += 1;
-                hidden_publish_rows += buffer->partition_table_[partition_id]->partition_size_;
-                remaining_hidden_preload_frames -= 1;
+                direct_peer_slots.push_back(target_slot);
             }
         }
+        std::sort(direct_peer_slots.begin(), direct_peer_slots.end());
+        direct_peer_slots.erase(std::unique(direct_peer_slots.begin(), direct_peer_slots.end()), direct_peer_slots.end());
+
         if (frame_cache_mapping) {
             std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+            for (int64_t slot : direct_peer_slots) {
+                if (buffer->free_physical_frames_.empty()) {
+                    break;
+                }
+                int64_t frame = buffer->free_physical_frames_.back();
+                buffer->free_physical_frames_.pop_back();
+                direct_visible_frame_by_slot.emplace(slot, frame);
+            }
             free_frames_before_swap = static_cast<int64_t>(buffer->free_physical_frames_.size());
         }
+
+        std::unordered_set<int64_t> incoming_visible_slots = hidden_publish_slots;
+        for (const auto &[slot, frame] : direct_visible_frame_by_slot) {
+            (void)frame;
+            incoming_visible_slots.insert(slot);
+        }
+        const int64_t reserved_incoming_frames = static_cast<int64_t>(incoming_visible_slots.size());
+
         if (frame_cache_mapping) {
             stale_backlog_frames_before_swap =
-                buffer->frameCacheStaleBacklogFromFreeFrames_(free_frames_before_swap, static_cast<int64_t>(hidden_publish_slots.size()));
+                buffer->frameCacheStaleBacklogFromFreeFrames_(free_frames_before_swap, reserved_incoming_frames);
         }
 
         const bool delayed_stale_enabled =
@@ -1475,16 +1470,16 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 delayed_stale_row_offsets.push_back(delayed_stale_rows);
             }
         };
-        if (delayed_stale_enabled && !hidden_publish_slots.empty()) {
+        if (delayed_stale_enabled && !incoming_visible_slots.empty()) {
             const int64_t max_stale_backlog = buffer->frameCacheMaxStaleBacklog_();
             const int64_t stale_backlog_before_delay =
                 frame_cache_mapping ? buffer->frameCacheStaleBacklogFromFreeFrames_(
-                                          free_frames_before_swap, static_cast<int64_t>(hidden_publish_slots.size()))
+                                          free_frames_before_swap, reserved_incoming_frames)
                                     : 0;
             int64_t remaining_delayed_stale_slots =
                 std::max<int64_t>(max_stale_backlog - stale_backlog_before_delay, 0);
             remaining_delayed_stale_slots =
-                std::min<int64_t>(remaining_delayed_stale_slots, static_cast<int64_t>(hidden_publish_slots.size()));
+                std::min<int64_t>(remaining_delayed_stale_slots, reserved_incoming_frames);
             for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                 int evict_id = evict_ids[idx];
                 int64_t evict_slot = evict_slots[idx];
@@ -1643,12 +1638,35 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                             delayed_stale_entries[delayed_stale_frame_cursor++].release_frame;
                         continue;
                     }
+                    auto direct_frame_it = direct_visible_frame_by_slot.find(slot);
+                    if (direct_frame_it != direct_visible_frame_by_slot.end()) {
+                        buffer->logical_to_physical_frames_[static_cast<std::size_t>(slot)] = direct_frame_it->second;
+                        continue;
+                    }
                     // Retained partitions may move logical slots. Therefore an admitted logical
                     // slot cannot safely inherit the frame that used to live at the same slot: that
                     // frame may now be owned by a retained partition. Assign each admitted slot a
                     // frame from an actually evicted partition; hidden publishes will replace and
                     // release this frame later, while visible host/peer admits copy into it.
                     buffer->logical_to_physical_frames_[static_cast<std::size_t>(slot)] = take_reusable_frame();
+                }
+            }
+            if (reusable_frame_cursor < reusable_evicted_frames.size()) {
+                std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+                for (std::size_t idx = reusable_frame_cursor; idx < reusable_evicted_frames.size(); idx++) {
+                    int64_t frame = reusable_evicted_frames[idx];
+                    bool frame_is_visible = false;
+                    for (int64_t mapped_frame : buffer->logical_to_physical_frames_) {
+                        if (mapped_frame == frame) {
+                            frame_is_visible = true;
+                            break;
+                        }
+                    }
+                    if (!frame_is_visible &&
+                        std::find(buffer->free_physical_frames_.begin(), buffer->free_physical_frames_.end(), frame) ==
+                            buffer->free_physical_frames_.end()) {
+                        buffer->free_physical_frames_.push_back(frame);
+                    }
                 }
             }
         } else {
@@ -1788,10 +1806,6 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
             int64_t dst_slot = slot;
             int64_t dst_offset = buffer->logicalSlotRowOffset_(dst_slot);
-            auto peer_hidden_publish_it = peer_hidden_publishes_by_partition.find(partition_id);
-            bool peer_hidden_publish = peer_hidden_publish_it != peer_hidden_publishes_by_partition.end();
-            int64_t copy_dst_offset =
-                peer_hidden_publish ? peer_hidden_publish_it->second.frame * buffer->partition_size_ : dst_offset;
             int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
 
             const PeerHandoffDescriptor *scheduled_handoff = nullptr;
@@ -1880,7 +1894,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     } else {
                         void *dst_ptr =
                             static_cast<char *>(buffer->buffer_tensor_gpu_view_.data_ptr()) +
-                            (copy_dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
+                            (dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
                         void *src_ptr = src_scratch.data_ptr();
                         if (!peer_stream_armed) {
                             AT_CUDA_CHECK(cudaStreamWaitEvent(peer_stream.stream(), layout_ready_event.handle, 0));
@@ -1914,21 +1928,19 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                         peer_copy_count += 1;
                         if (eval_finite_debug_enabled()) {
                             relay_debug_slots.push_back(
-                                {partition_id, static_cast<int>(scheduled_handoff->src_lane_id), dst_slot, copy_dst_offset});
+                                {partition_id, static_cast<int>(scheduled_handoff->src_lane_id), dst_slot, dst_offset});
                         }
                     }
                 }
             }
 
             if (!used_peer_copy) {
-                torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, copy_dst_offset, copy_dst_offset + rows);
+                torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
                 load_partition_from_host(dst_partition, cpu_view);
-                torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, copy_dst_offset, copy_dst_offset + rows);
+                torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, dst_offset, dst_offset + rows);
                 gpu_view.copy_(cpu_view, true);
-                if (!peer_hidden_publish) {
-                    fallback_visible_admit_parts += 1;
-                    fallback_visible_admit_rows += rows;
-                }
+                fallback_visible_admit_parts += 1;
+                fallback_visible_admit_rows += rows;
                 if (scheduled_handoff != nullptr) {
                     host_fallback_bytes += bytes;
                     host_fallback_count += 1;
@@ -1999,7 +2011,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             buffer->frame_cache_perf_stats_.async_admit_valid_before_swap_count +=
                 preloaded_host_admit_ids.empty() ? 0 : 1;
             buffer->frame_cache_perf_stats_.reserved_preload_frames_sum +=
-                std::max<int64_t>(static_cast<int64_t>(hidden_publish_slots.size()), 0);
+                std::max<int64_t>(reserved_incoming_frames, 0);
             buffer->frame_cache_perf_stats_.free_frames_before_swap_sum += std::max<int64_t>(free_frames_before_swap, 0);
             buffer->frame_cache_perf_stats_.free_frames_after_publish_sum += std::max<int64_t>(free_frames_after_publish, 0);
             buffer->frame_cache_perf_stats_.stale_backlog_before_swap_max =

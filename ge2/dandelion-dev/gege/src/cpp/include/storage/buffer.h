@@ -279,7 +279,9 @@ class MemPartitionBuffer : public PartitionBuffer {
     void autoConfigureFrameCacheFromOrdering_();
     bool asyncAdmitPreloadEnabled_() const;
     bool frameCacheEnabled_() const;
+    int64_t frameCacheReservedPreloadFrames_() const;
     int64_t frameCacheMaxStaleBacklog_() const;
+    int64_t frameCacheStaleBacklogFromFreeFrames_(int64_t free_frames, int64_t preload_reserved_frames) const;
     int64_t logicalSlotToPhysicalFrame_(int64_t logical_slot) const;
     int64_t logicalSlotRowOffset_(int64_t logical_slot) const;
     int64_t partitionRowOffset_(const Partition *partition) const;

@@ -1159,6 +1159,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         int partition_id;
         int src_dev;
         int64_t dst_slot;
+        int64_t dst_offset;
     };
 
     auto &published_source_scratch = peer_relay_source_scratch_tensors_[device_idx];
@@ -1370,10 +1371,72 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
         }
 
+        std::unordered_map<int, MemPartitionBuffer::HiddenFramePublish> peer_hidden_publishes_by_partition;
         std::unordered_set<int64_t> hidden_publish_slots;
-        hidden_publish_slots.reserve(buffer->pending_hidden_publishes_.size());
+        hidden_publish_slots.reserve(buffer->pending_hidden_publishes_.size() + admit_ids.size());
         for (const auto &hidden_publish : buffer->pending_hidden_publishes_) {
             hidden_publish_slots.insert(hidden_publish.logical_slot);
+        }
+        if (frame_cache_mapping && stateflow_runtime_controlling && multi_gpu_async_admit_preload_enabled()) {
+            int64_t remaining_hidden_preload_frames =
+                std::max<int64_t>(buffer->frameCacheReservedPreloadFrames_() -
+                                      static_cast<int64_t>(buffer->pending_hidden_publishes_.size()),
+                                  0);
+            for (int partition_id : admit_ids) {
+                if (remaining_hidden_preload_frames <= 0) {
+                    break;
+                }
+                if (preloaded_host_admit_ids.find(partition_id) != preloaded_host_admit_ids.end()) {
+                    continue;
+                }
+
+                int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
+                auto handoff_it = stateflow_peer_handoff_index_per_device_[device_idx].find(handoff_key);
+                if (handoff_it == stateflow_peer_handoff_index_per_device_[device_idx].end()) {
+                    continue;
+                }
+
+                int64_t target_slot =
+                    (partition_id >= 0 && partition_id < static_cast<int>(next_slot_by_partition.size()))
+                        ? next_slot_by_partition[static_cast<std::size_t>(partition_id)]
+                        : -1;
+                if (target_slot < 0) {
+                    throw GegeRuntimeException(
+                        fmt::format("Stateflow peer relay could not determine peer hidden-publish target slot for partition {} on device {}",
+                                    partition_id, buffer->device_.index()));
+                }
+                if (hidden_publish_slots.find(target_slot) != hidden_publish_slots.end()) {
+                    continue;
+                }
+
+                int64_t hidden_frame = -1;
+                {
+                    std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+                    if (!buffer->free_physical_frames_.empty()) {
+                        hidden_frame = buffer->free_physical_frames_.back();
+                        buffer->free_physical_frames_.pop_back();
+                    }
+                }
+                if (hidden_frame < 0) {
+                    break;
+                }
+
+                MemPartitionBuffer::HiddenFramePublish hidden_publish{partition_id, target_slot, hidden_frame};
+                buffer->pending_hidden_publishes_.push_back(hidden_publish);
+                peer_hidden_publishes_by_partition.emplace(partition_id, hidden_publish);
+                hidden_publish_slots.insert(target_slot);
+                hidden_publish_parts += 1;
+                hidden_publish_rows += buffer->partition_table_[partition_id]->partition_size_;
+                remaining_hidden_preload_frames -= 1;
+            }
+        }
+        if (frame_cache_mapping) {
+            std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+            free_frames_before_swap = static_cast<int64_t>(buffer->free_physical_frames_.size());
+        }
+        if (frame_cache_mapping) {
+            stale_backlog_frames_before_swap =
+                buffer->frameCacheStaleBacklogFromFreeFrames_(free_frames_before_swap, static_cast<int64_t>(hidden_publish_slots.size()));
         }
 
         const bool delayed_stale_enabled =
@@ -1415,8 +1478,8 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         if (delayed_stale_enabled && !hidden_publish_slots.empty()) {
             const int64_t max_stale_backlog = buffer->frameCacheMaxStaleBacklog_();
             const int64_t stale_backlog_before_delay =
-                frame_cache_mapping ? std::max<int64_t>(
-                                          static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap, 0)
+                frame_cache_mapping ? buffer->frameCacheStaleBacklogFromFreeFrames_(
+                                          free_frames_before_swap, static_cast<int64_t>(hidden_publish_slots.size()))
                                     : 0;
             int64_t remaining_delayed_stale_slots =
                 std::max<int64_t>(max_stale_backlog - stale_backlog_before_delay, 0);
@@ -1725,6 +1788,10 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             int64_t bytes = rows * dim1_size_ * get_dtype_size_wrapper(dtype_);
             int64_t dst_slot = slot;
             int64_t dst_offset = buffer->logicalSlotRowOffset_(dst_slot);
+            auto peer_hidden_publish_it = peer_hidden_publishes_by_partition.find(partition_id);
+            bool peer_hidden_publish = peer_hidden_publish_it != peer_hidden_publishes_by_partition.end();
+            int64_t copy_dst_offset =
+                peer_hidden_publish ? peer_hidden_publish_it->second.frame * buffer->partition_size_ : dst_offset;
             int64_t handoff_key = transition_round_idx >= 0 ? peer_handoff_lookup_key(transition_round_idx, partition_id) : -1;
 
             const PeerHandoffDescriptor *scheduled_handoff = nullptr;
@@ -1813,7 +1880,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     } else {
                         void *dst_ptr =
                             static_cast<char *>(buffer->buffer_tensor_gpu_view_.data_ptr()) +
-                            (dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
+                            (copy_dst_offset * dim1_size_ * get_dtype_size_wrapper(dtype_));
                         void *src_ptr = src_scratch.data_ptr();
                         if (!peer_stream_armed) {
                             AT_CUDA_CHECK(cudaStreamWaitEvent(peer_stream.stream(), layout_ready_event.handle, 0));
@@ -1846,19 +1913,22 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                         peer_bytes_executed += bytes;
                         peer_copy_count += 1;
                         if (eval_finite_debug_enabled()) {
-                            relay_debug_slots.push_back({partition_id, static_cast<int>(scheduled_handoff->src_lane_id), dst_slot});
+                            relay_debug_slots.push_back(
+                                {partition_id, static_cast<int>(scheduled_handoff->src_lane_id), dst_slot, copy_dst_offset});
                         }
                     }
                 }
             }
 
             if (!used_peer_copy) {
-                torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, dst_offset, dst_offset + rows);
+                torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, copy_dst_offset, copy_dst_offset + rows);
                 load_partition_from_host(dst_partition, cpu_view);
-                torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, dst_offset, dst_offset + rows);
+                torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, copy_dst_offset, copy_dst_offset + rows);
                 gpu_view.copy_(cpu_view, true);
-                fallback_visible_admit_parts += 1;
-                fallback_visible_admit_rows += rows;
+                if (!peer_hidden_publish) {
+                    fallback_visible_admit_parts += 1;
+                    fallback_visible_admit_rows += rows;
+                }
                 if (scheduled_handoff != nullptr) {
                     host_fallback_bytes += bytes;
                     host_fallback_count += 1;
@@ -1929,7 +1999,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             buffer->frame_cache_perf_stats_.async_admit_valid_before_swap_count +=
                 preloaded_host_admit_ids.empty() ? 0 : 1;
             buffer->frame_cache_perf_stats_.reserved_preload_frames_sum +=
-                std::max<int64_t>(static_cast<int64_t>(buffer->hidden_frame_capacity_), 0);
+                std::max<int64_t>(static_cast<int64_t>(hidden_publish_slots.size()), 0);
             buffer->frame_cache_perf_stats_.free_frames_before_swap_sum += std::max<int64_t>(free_frames_before_swap, 0);
             buffer->frame_cache_perf_stats_.free_frames_after_publish_sum += std::max<int64_t>(free_frames_after_publish, 0);
             buffer->frame_cache_perf_stats_.stale_backlog_before_swap_max =
@@ -1956,7 +2026,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 }
                 Partition *dst_partition = buffer->partition_table_[debug_slot.partition_id];
                 int64_t rows = dst_partition->partition_size_;
-                int64_t dst_offset = buffer->logicalSlotRowOffset_(debug_slot.dst_slot);
+                int64_t dst_offset = debug_slot.dst_offset;
                 torch::Tensor dst_view = buffer->buffer_tensor_gpu_view_.slice(0, dst_offset, dst_offset + rows);
                 log_non_finite_rows_if_any("src_scratch", debug_slot.partition_id, buffers_[debug_slot.src_dev]->device_.index(),
                                            buffer->device_.index(), scratch_it->second);

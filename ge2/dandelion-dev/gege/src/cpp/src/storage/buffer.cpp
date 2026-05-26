@@ -1400,10 +1400,41 @@ MemPartitionBuffer::~MemPartitionBuffer() {
 
 bool MemPartitionBuffer::frameCacheEnabled_() const { return hidden_frame_capacity_ > 0; }
 
+int64_t MemPartitionBuffer::frameCacheReservedPreloadFrames_() const {
+    if (hidden_frame_capacity_ <= 0) {
+        return 0;
+    }
+
+    int64_t default_reserved = frame_cache_auto_max_transition_admits_ > 0 ? frame_cache_auto_max_transition_admits_ : -1;
+    if (default_reserved < 0) {
+        default_reserved = parse_env_int("GEGE_STATEFLOW_MAX_ADMITS", parse_env_int("STATEFLOW_MAX_ADMITS", -1));
+    }
+    if (default_reserved < 0) {
+        default_reserved = capacity_ > 0 ? static_cast<int64_t>(capacity_ - 1)
+                                         : (static_cast<int64_t>(hidden_frame_capacity_) + 1) / 2;
+    }
+
+    int64_t requested = parse_env_int("GEGE_FRAME_CACHE_RESERVED_PRELOAD_FRAMES", default_reserved);
+    return std::min<int64_t>(std::max<int64_t>(requested, 0), static_cast<int64_t>(hidden_frame_capacity_));
+}
+
 int64_t MemPartitionBuffer::frameCacheMaxStaleBacklog_() const {
+    const int64_t max_without_preload_reserve =
+        std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) - frameCacheReservedPreloadFrames_(), 0);
     int64_t default_backlog =
-        frame_cache_auto_max_stale_backlog_ >= 0 ? frame_cache_auto_max_stale_backlog_ : static_cast<int64_t>(hidden_frame_capacity_);
-    return std::max<int64_t>(parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG", default_backlog), 0);
+        frame_cache_auto_max_stale_backlog_ >= 0 ? frame_cache_auto_max_stale_backlog_ : max_without_preload_reserve;
+    default_backlog = std::min<int64_t>(std::max<int64_t>(default_backlog, 0), max_without_preload_reserve);
+    int64_t requested = parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG", default_backlog);
+    return std::min<int64_t>(std::max<int64_t>(requested, 0), max_without_preload_reserve);
+}
+
+int64_t MemPartitionBuffer::frameCacheStaleBacklogFromFreeFrames_(int64_t free_frames, int64_t preload_reserved_frames) const {
+    if (hidden_frame_capacity_ <= 0) {
+        return 0;
+    }
+    const int64_t used_hidden_frames =
+        std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) - std::max<int64_t>(free_frames, 0), 0);
+    return std::max<int64_t>(used_hidden_frames - std::max<int64_t>(preload_reserved_frames, 0), 0);
 }
 
 bool MemPartitionBuffer::asyncAdmitPreloadEnabled_() const {
@@ -2569,8 +2600,11 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
             std::vector<int> stage_admit_ids = admit_ids;
             std::vector<int64_t> stage_evict_slots = evict_slots;
             if (frameCacheEnabled_() && !admit_ids.empty()) {
+                const int64_t reserved_preload_frames = std::max<int64_t>(reserved_hidden_frames, 0);
+                const int64_t preload_frame_limit =
+                    std::max<int64_t>(frameCacheReservedPreloadFrames_() - reserved_preload_frames, 0);
                 const std::size_t target_hidden_count =
-                    std::min<std::size_t>(static_cast<std::size_t>(hidden_frame_capacity_), admit_ids.size());
+                    std::min<std::size_t>(static_cast<std::size_t>(preload_frame_limit), admit_ids.size());
                 if (target_hidden_count > 0 && frame_cache_hidden_only_preload_enabled() &&
                     frame_cache_delayed_stale_writeback_enabled() && !single_gpu_async_evict_writeback_enabled()) {
                     std::size_t free_count = 0;
@@ -2585,8 +2619,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                 }
                 {
                     std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
-                    const std::size_t reserved_count =
-                        static_cast<std::size_t>(std::max<int64_t>(reserved_hidden_frames, 0));
+                    const std::size_t reserved_count = static_cast<std::size_t>(reserved_preload_frames);
                     const std::size_t available_count =
                         free_physical_frames_.size() > reserved_count ? free_physical_frames_.size() - reserved_count : 0;
                     const std::size_t hidden_count = std::min<std::size_t>(available_count, target_hidden_count);
@@ -3725,10 +3758,9 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 int64_t stale_backlog_before_delay = 0;
                 if (frameCacheEnabled_()) {
                     std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
-                    stale_backlog_before_delay =
-                        std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) -
-                                              static_cast<int64_t>(free_physical_frames_.size()),
-                                          0);
+                    stale_backlog_before_delay = frameCacheStaleBacklogFromFreeFrames_(
+                        static_cast<int64_t>(free_physical_frames_.size()),
+                        static_cast<int64_t>(async_admit_preload_hidden_publishes_.size()));
                 }
                 int64_t remaining_delayed_stale_slots =
                     std::max<int64_t>(frameCacheMaxStaleBacklog_() - stale_backlog_before_delay, 0);
@@ -3792,13 +3824,16 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         if (frameCacheEnabled_()) {
             std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
             free_frames_before_swap = static_cast<int64_t>(free_physical_frames_.size());
-            stale_backlog_frames_before_swap = static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_swap;
         }
         {
             std::lock_guard<std::mutex> preload_lock(async_admit_preload_lock_);
             async_admit_preload_in_flight_before_swap = async_admit_preload_in_flight_;
             async_admit_preload_valid_before_swap = async_admit_preload_valid_;
             reserved_preload_frames_before_swap = static_cast<int64_t>(async_admit_preload_hidden_publishes_.size());
+        }
+        if (frameCacheEnabled_()) {
+            stale_backlog_frames_before_swap =
+                frameCacheStaleBacklogFromFreeFrames_(free_frames_before_swap, reserved_preload_frames_before_swap);
         }
         {
             std::lock_guard<std::mutex> evict_lock(async_evict_writeback_lock_);
@@ -4036,7 +4071,8 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         if (frameCacheEnabled_()) {
             std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
             free_frames_before_publish = static_cast<int64_t>(free_physical_frames_.size());
-            stale_backlog_frames_before_publish = static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_publish;
+            stale_backlog_frames_before_publish =
+                frameCacheStaleBacklogFromFreeFrames_(free_frames_before_publish, static_cast<int64_t>(pending_hidden_publishes_.size()));
         }
         std::vector<int> fallback_admit_ids = admit_ids;
         std::vector<int64_t> fallback_evict_slots = evict_slots;

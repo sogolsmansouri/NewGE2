@@ -1875,6 +1875,7 @@ struct TwoGpuPathCost {
     int64_t same_overlap = 0;
     int64_t max_lane_admits = 0;
     int64_t bad_lane_transitions = 0;
+    int64_t first_transition_peer_partitions = 0;
     int64_t lane_edge_imbalance = 0;
     long double score = 0.0L;
 };
@@ -1950,6 +1951,9 @@ bool two_gpu_path_cost_less(const TwoGpuPathCost &lhs, const TwoGpuPathCost &rhs
     if (lhs.bad_lane_transitions != rhs.bad_lane_transitions) {
         return lhs.bad_lane_transitions < rhs.bad_lane_transitions;
     }
+    if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
+        return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
+    }
     if (lhs.host_partitions != rhs.host_partitions) {
         return lhs.host_partitions < rhs.host_partitions;
     }
@@ -1995,6 +1999,9 @@ TwoGpuPathCost evaluate_two_gpu_oriented_path(const std::vector<TwoGpuRoundPair>
         path_cost.peer_bytes += step.peer_bytes;
         path_cost.host_partitions += step.host_partitions;
         path_cost.peer_partitions += step.peer_partitions;
+        if (idx == 1) {
+            path_cost.first_transition_peer_partitions += step.peer_partitions;
+        }
         path_cost.lane_admits += step.lane_admits;
         path_cost.same_overlap += step.same_overlap;
         path_cost.max_lane_admits = std::max(path_cost.max_lane_admits, step.max_lane_admits);
@@ -2345,10 +2352,11 @@ std::vector<int64_t> getOptimal88TwoGpuLaneMatchedPermutation(const vector<torch
     }
 
     SPDLOG_INFO(
-        "Optimal88 2-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
+        "Optimal88 2-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} first_transition_peer_handoffs={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
         best_path.oriented_rounds.size(), buffer_states.size(), best_path.cost.host_partitions,
         best_path.cost.peer_partitions, best_path.cost.lane_admits, best_path.cost.same_overlap,
         best_path.cost.max_lane_admits, best_path.cost.bad_lane_transitions,
+        best_path.cost.first_transition_peer_partitions,
         best_path.cost.host_bytes, best_path.cost.peer_bytes, best_path.cost.lane_edge_imbalance);
 
     return permutation;
@@ -2562,6 +2570,7 @@ struct MultiGpuPathCost {
     int64_t same_overlap = 0;
     int64_t max_lane_admits = 0;
     int64_t bad_lane_transitions = 0;
+    int64_t first_transition_peer_partitions = 0;
     int64_t lane_edge_imbalance = 0;
     long double score = 0.0L;
 };
@@ -2575,6 +2584,9 @@ struct MultiGpuOrientedPath {
 bool multi_gpu_path_cost_less(const MultiGpuPathCost &lhs, const MultiGpuPathCost &rhs) {
     if (lhs.bad_lane_transitions != rhs.bad_lane_transitions) {
         return lhs.bad_lane_transitions < rhs.bad_lane_transitions;
+    }
+    if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
+        return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
     }
     if (lhs.host_partitions != rhs.host_partitions) {
         return lhs.host_partitions < rhs.host_partitions;
@@ -2742,6 +2754,9 @@ MultiGpuPathCost evaluate_multi_gpu_oriented_path(const std::vector<MultiGpuRoun
         path_cost.peer_bytes += step.peer_bytes;
         path_cost.host_partitions += step.host_partitions;
         path_cost.peer_partitions += step.peer_partitions;
+        if (idx == 1) {
+            path_cost.first_transition_peer_partitions += step.peer_partitions;
+        }
         path_cost.lane_admits += step.lane_admits;
         path_cost.same_overlap += step.same_overlap;
         path_cost.max_lane_admits = std::max(path_cost.max_lane_admits, step.max_lane_admits);
@@ -3180,10 +3195,11 @@ std::vector<int64_t> getOptimal88MultiGpuLaneMatchedPermutation(const vector<tor
     }
 
     SPDLOG_INFO(
-        "Optimal88 {}-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
+        "Optimal88 {}-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} first_transition_peer_handoffs={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
         active_devices, best_path.oriented_rounds.size(), buffer_states.size(), best_path.cost.host_partitions,
         best_path.cost.peer_partitions, best_path.cost.lane_admits, best_path.cost.same_overlap,
         best_path.cost.max_lane_admits, best_path.cost.bad_lane_transitions,
+        best_path.cost.first_transition_peer_partitions,
         best_path.cost.host_bytes, best_path.cost.peer_bytes, best_path.cost.lane_edge_imbalance);
 
     return permutation;

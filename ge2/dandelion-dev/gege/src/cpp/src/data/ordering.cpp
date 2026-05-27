@@ -2834,9 +2834,6 @@ bool multi_gpu_path_cost_less(const MultiGpuPathCost &lhs, const MultiGpuPathCos
     if (lhs.bad_lane_transitions != rhs.bad_lane_transitions) {
         return lhs.bad_lane_transitions < rhs.bad_lane_transitions;
     }
-    if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
-        return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
-    }
     if (lhs.peer_partitions_over_budget != rhs.peer_partitions_over_budget) {
         return lhs.peer_partitions_over_budget < rhs.peer_partitions_over_budget;
     }
@@ -2851,6 +2848,9 @@ bool multi_gpu_path_cost_less(const MultiGpuPathCost &lhs, const MultiGpuPathCos
     }
     if (lhs.same_overlap != rhs.same_overlap) {
         return lhs.same_overlap > rhs.same_overlap;
+    }
+    if (lhs.first_transition_peer_partitions != rhs.first_transition_peer_partitions) {
+        return lhs.first_transition_peer_partitions < rhs.first_transition_peer_partitions;
     }
     if (lhs.host_bytes != rhs.host_bytes) {
         return lhs.host_bytes < rhs.host_bytes;
@@ -3459,6 +3459,118 @@ std::vector<int64_t> getOptimal88MultiGpuLaneMatchedPermutation(const vector<tor
         best_path.cost.max_lane_admits, best_path.cost.bad_lane_transitions,
         best_path.cost.first_transition_peer_partitions,
         best_path.cost.host_bytes, best_path.cost.peer_bytes, best_path.cost.lane_edge_imbalance);
+
+    return permutation;
+}
+
+std::vector<int64_t> getTw16TwentyStateFourGpuLaneMatchedPermutation(const vector<torch::Tensor>& buffer_states,
+                                                                     const vector<torch::Tensor>& edge_buckets_per_buffer,
+                                                                     const vector<int64_t> &edge_bucket_sizes,
+                                                                     const std::vector<int64_t> &partition_row_counts,
+                                                                     const PlanEmbeddingLayout &layout) {
+    if (buffer_states.size() != 20 || edge_buckets_per_buffer.size() != buffer_states.size()) {
+        return {};
+    }
+
+    auto summaries = build_state_access_summaries(buffer_states, edge_buckets_per_buffer, edge_bucket_sizes);
+    for (const auto &summary : summaries) {
+        if (summary.partitions.size() != 4) {
+            return {};
+        }
+        for (auto partition : summary.partitions) {
+            if (partition < 0 || partition >= 16) {
+                return {};
+            }
+        }
+    }
+
+    LaneMatchCostConfig cfg = lane_match_cost_config_from_env();
+    cfg.allow_peer_relay = stateflow_env_bool("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "STATEFLOW_ALLOW_PEER_RELAY",
+                                              stateflow_allow_peer_relay_default());
+    if (cfg.max_admits_per_transition < 0) {
+        cfg.max_admits_per_transition = 3;
+    }
+    const int64_t bytes_per_row = plan_embedding_bytes_per_row(layout);
+
+    auto find_state_with_partitions = [&](std::vector<int64_t> partitions,
+                                          const std::vector<uint8_t> &seen) -> int64_t {
+        std::sort(partitions.begin(), partitions.end());
+        for (std::size_t idx = 0; idx < summaries.size(); idx++) {
+            if (seen[idx] != 0) {
+                continue;
+            }
+            if (summaries[idx].partitions == partitions) {
+                return static_cast<int64_t>(idx);
+            }
+        }
+        return -1;
+    };
+
+    using PartitionRound = std::vector<std::vector<int64_t>>;
+    const std::vector<PartitionRound> partition_rounds = {
+        {{0, 4, 8, 12}, {1, 5, 9, 13}, {2, 6, 10, 14}, {3, 7, 11, 15}},
+        {{0, 1, 2, 3}, {4, 5, 6, 7}, {8, 9, 10, 11}, {12, 13, 14, 15}},
+        {{0, 5, 10, 15}, {1, 4, 11, 14}, {2, 7, 8, 13}, {3, 6, 9, 12}},
+        {{0, 7, 9, 14}, {1, 6, 8, 15}, {2, 5, 11, 12}, {3, 4, 10, 13}},
+        {{0, 6, 11, 13}, {1, 7, 10, 12}, {2, 4, 9, 15}, {3, 5, 8, 14}},
+    };
+
+    std::vector<uint8_t> seen(buffer_states.size(), 0);
+    std::vector<MultiGpuRoundGroup> groups;
+    groups.reserve(partition_rounds.size());
+    for (const auto &round : partition_rounds) {
+        if (round.size() != 4) {
+            return {};
+        }
+        MultiGpuRoundGroup group;
+        group.states.reserve(round.size());
+        for (const auto &partitions : round) {
+            int64_t state_idx = find_state_with_partitions(partitions, seen);
+            if (state_idx < 0) {
+                return {};
+            }
+            seen[static_cast<std::size_t>(state_idx)] = 1;
+            group.states.emplace_back(state_idx);
+        }
+        if (!multi_gpu_round_group_valid(group, summaries, 4)) {
+            return {};
+        }
+        groups.emplace_back(std::move(group));
+    }
+
+    if (groups.size() * 4 != buffer_states.size()) {
+        return {};
+    }
+    for (auto value : seen) {
+        if (value == 0) {
+            return {};
+        }
+    }
+
+    auto path = orient_multi_gpu_group_order_dp(groups, summaries, partition_row_counts, cfg, bytes_per_row);
+    if (path.oriented_rounds.size() * 4 != buffer_states.size()) {
+        return {};
+    }
+
+    std::vector<int64_t> permutation;
+    permutation.reserve(buffer_states.size());
+    for (const auto &round : path.oriented_rounds) {
+        if (!multi_gpu_round_group_valid(round, summaries, 4)) {
+            return {};
+        }
+        for (auto state_idx : round.states) {
+            permutation.emplace_back(state_idx);
+        }
+    }
+
+    SPDLOG_INFO(
+        "TW16 p16/q4 4-GPU lane schedule selected rounds={} microstates={} transition_host_admits={} peer_handoffs={} peer_handoffs_over_budget={} lane_transition_admits={} same_lane_overlap={} max_lane_admits={} bad_lane_transitions={} first_transition_peer_handoffs={} host_bytes={} peer_bytes={} lane_edge_imbalance={}",
+        path.oriented_rounds.size(), buffer_states.size(), path.cost.host_partitions,
+        path.cost.peer_partitions, path.cost.peer_partitions_over_budget,
+        path.cost.lane_admits, path.cost.same_overlap,
+        path.cost.max_lane_admits, path.cost.bad_lane_transitions,
+        path.cost.first_transition_peer_partitions,
+        path.cost.host_bytes, path.cost.peer_bytes, path.cost.lane_edge_imbalance);
 
     return permutation;
 }
@@ -7773,6 +7885,28 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                 validateStateflowPlanExactSemantics(tw16_plan)) {
                 score_stateflow_plan(tw16_plan, edge_bucket_sizes, layout);
                 SPDLOG_INFO("Using TW16 p16/q4 2-GPU lane-matched plan as the selected bounded q4 schedule");
+                std::vector<StateflowPlan> tw16_only;
+                tw16_only.emplace_back(std::move(tw16_plan));
+                return tw16_only;
+            }
+        }
+    }
+
+    if (active_devices == 4 && buffer_states.size() == 20) {
+        auto tw16_permutation =
+            getTw16TwentyStateFourGpuLaneMatchedPermutation(buffer_states, edge_buckets_per_buffer,
+                                                            edge_bucket_sizes, partition_row_counts, layout);
+        if (!tw16_permutation.empty()) {
+            StateflowPlan tw16_plan =
+                build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer,
+                                                                tw16_permutation, active_devices,
+                                                                PlanVariant::MULTI_GPU_LANE_MATCHED,
+                                                                edge_bucket_sizes, partition_row_counts, layout);
+            if (stateflow_plan_valid(tw16_plan) &&
+                stateflow_plan_respects_max_admits(tw16_plan, lane_match_cfg.max_admits_per_transition) &&
+                validateStateflowPlanExactSemantics(tw16_plan)) {
+                score_stateflow_plan(tw16_plan, edge_bucket_sizes, layout);
+                SPDLOG_INFO("Using TW16 p16/q4 4-GPU lane-matched plan as the selected bounded q4 schedule");
                 std::vector<StateflowPlan> tw16_only;
                 tw16_only.emplace_back(std::move(tw16_plan));
                 return tw16_only;

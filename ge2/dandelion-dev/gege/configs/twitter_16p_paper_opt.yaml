@@ -55,7 +55,7 @@ storage:
       num_cache_partitions: 0
       edge_bucket_ordering: CUSTOM
       randomly_assign_edge_buckets: false
-  prefetch: false
+  prefetch: true
   shuffle_input: true
   full_graph_evaluation: false
   model_dir: /dev/shm/smansou2_ge2/paper_single_gpu/twitter_16p_opt

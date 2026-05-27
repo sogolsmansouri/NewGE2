@@ -1379,7 +1379,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
 
         if (frame_cache_mapping) {
             stale_backlog_frames_before_swap =
-                std::max<int64_t>(static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap, 0);
+                std::max<int64_t>(static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap -
+                                      static_cast<int64_t>(hidden_publish_slots.size()),
+                                  0);
         }
 
         const bool delayed_stale_enabled =
@@ -1420,9 +1422,12 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         };
         if (delayed_stale_enabled && !hidden_publish_slots.empty()) {
             const int64_t max_stale_backlog = buffer->frameCacheMaxStaleBacklog_();
+            const int64_t reserved_preload_frames = static_cast<int64_t>(hidden_publish_slots.size());
             const int64_t stale_backlog_before_delay =
                 frame_cache_mapping ? std::max<int64_t>(
-                                          static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap, 0)
+                                          static_cast<int64_t>(buffer->hidden_frame_capacity_) - free_frames_before_swap -
+                                              reserved_preload_frames,
+                                          0)
                                     : 0;
             int64_t remaining_delayed_stale_slots =
                 std::max<int64_t>(max_stale_backlog - stale_backlog_before_delay, 0);

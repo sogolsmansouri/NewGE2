@@ -3728,11 +3728,17 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             if (async_admit_preload_valid_ && !async_admit_preload_hidden_publishes_.empty() && async_admit_preload_admit_ids_.empty() &&
                 async_admit_preload_evict_slots_.empty()) {
                 int64_t stale_backlog_before_delay = 0;
+                const int64_t reserved_preload_frames =
+                    static_cast<int64_t>(async_admit_preload_hidden_publishes_.size());
                 if (frameCacheEnabled_()) {
                     std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
+                    // Hidden preload frames are reserved for the next visible install, but
+                    // they are not stale-writeback backlog. Keep the stale budget available
+                    // for old visible frames that can be written back after the slot remap.
                     stale_backlog_before_delay =
                         std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) -
-                                              static_cast<int64_t>(free_physical_frames_.size()),
+                                              static_cast<int64_t>(free_physical_frames_.size()) -
+                                              reserved_preload_frames,
                                           0);
                 }
                 int64_t remaining_delayed_stale_slots =
@@ -3806,7 +3812,9 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         }
         if (frameCacheEnabled_()) {
             stale_backlog_frames_before_swap =
-                std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_swap, 0);
+                std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_swap -
+                                      reserved_preload_frames_before_swap,
+                                  0);
         }
         {
             std::lock_guard<std::mutex> evict_lock(async_evict_writeback_lock_);
@@ -4045,7 +4053,9 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
             free_frames_before_publish = static_cast<int64_t>(free_physical_frames_.size());
             stale_backlog_frames_before_publish =
-                std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_publish, 0);
+                std::max<int64_t>(static_cast<int64_t>(hidden_frame_capacity_) - free_frames_before_publish -
+                                      hidden_publish_parts,
+                                  0);
         }
         std::vector<int> fallback_admit_ids = admit_ids;
         std::vector<int64_t> fallback_evict_slots = evict_slots;

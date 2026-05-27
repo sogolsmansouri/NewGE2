@@ -23,6 +23,7 @@
 #include <cuco/probing_scheme.cuh>
 
 #include <thrust/distance.h>
+#include <thrust/pair.h>
 #include <thrust/tuple.h>
 
 #include <cuda/atomic>

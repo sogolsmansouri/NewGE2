@@ -18,6 +18,7 @@
 
 #include <cuco/operator.hpp>
 
+#include <thrust/pair.h>
 #include <thrust/tuple.h>
 
 #include <cuda/atomic>

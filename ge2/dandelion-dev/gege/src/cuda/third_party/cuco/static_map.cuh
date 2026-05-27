@@ -29,6 +29,7 @@
 #include <cuco/utility/traits.hpp>
 
 #include <thrust/functional.h>
+#include <thrust/pair.h>
 
 #include <cuda/std/atomic>
 

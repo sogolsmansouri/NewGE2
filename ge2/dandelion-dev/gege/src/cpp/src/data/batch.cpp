@@ -10,11 +10,27 @@
 #ifdef GEGE_CUDA
 #include "common/unique_map_cuda.h"
 #include "pytorch_scatter/segment_sum.h"
+#include <cuda_runtime_api.h>
 #endif
 
 using std::get;
 
 namespace {
+
+torch::Tensor allocate_pinned_cpu_float_stage_or_pageable(c10::IntArrayRef sizes, const char *context) {
+    auto pinned_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
+    try {
+        return torch::empty(sizes, pinned_options);
+    } catch (const std::exception &) {
+#ifdef GEGE_CUDA
+        cudaGetLastError();
+#endif
+        SPDLOG_WARN("{} pinned host gradient allocation failed; retrying with pageable host memory", context);
+    }
+
+    auto pageable_options = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU);
+    return torch::empty(sizes, pageable_options);
+}
 
 bool parse_env_flag(const char *name, bool default_value) {
     const char *raw = std::getenv(name);
@@ -627,21 +643,19 @@ void Batch::accumulateGradientsG(float learning_rate) {
 
 void Batch::embeddingsToHost() {
     if (node_gradients_.defined() && node_gradients_.device().is_cuda()) {
-        auto grad_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
-        Gradients temp_grads = torch::empty(node_gradients_.sizes(), grad_opts);
-        temp_grads.copy_(node_gradients_, true);
-        Gradients temp_grads2 = torch::empty(node_state_update_.sizes(), grad_opts);
-        temp_grads2.copy_(node_state_update_, true);
+        Gradients temp_grads = allocate_pinned_cpu_float_stage_or_pageable(node_gradients_.sizes(), "node_gradients");
+        temp_grads.copy_(node_gradients_, temp_grads.is_pinned());
+        Gradients temp_grads2 = allocate_pinned_cpu_float_stage_or_pageable(node_state_update_.sizes(), "node_state_update");
+        temp_grads2.copy_(node_state_update_, temp_grads2.is_pinned());
         node_gradients_ = temp_grads;
         node_state_update_ = temp_grads2;
     }
 
     if (qual_gradients_.defined() && qual_gradients_.device().is_cuda()) {
-        auto grad_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
-        Gradients temp_qgrads = torch::empty(qual_gradients_.sizes(), grad_opts);
-        temp_qgrads.copy_(qual_gradients_, true);
-        Gradients temp_qgrads2 = torch::empty(qual_state_update_.sizes(), grad_opts);
-        temp_qgrads2.copy_(qual_state_update_, true);
+        Gradients temp_qgrads = allocate_pinned_cpu_float_stage_or_pageable(qual_gradients_.sizes(), "qual_gradients");
+        temp_qgrads.copy_(qual_gradients_, temp_qgrads.is_pinned());
+        Gradients temp_qgrads2 = allocate_pinned_cpu_float_stage_or_pageable(qual_state_update_.sizes(), "qual_state_update");
+        temp_qgrads2.copy_(qual_state_update_, temp_qgrads2.is_pinned());
         qual_gradients_ = temp_qgrads;
         qual_state_update_ = temp_qgrads2;
         qual_indices_ = qual_indices_.to(torch::kCPU);
@@ -661,11 +675,10 @@ void Batch::embeddingsToHost() {
 
 void Batch::embeddingsToHostG() {
     if (node_gradients_g_.defined() && node_gradients_g_.device().is_cuda()) {
-        auto grad_opts = torch::TensorOptions().dtype(torch::kFloat32).device(torch::kCPU).pinned_memory(true);
-        Gradients temp_grads = torch::empty(node_gradients_g_.sizes(), grad_opts);
-        temp_grads.copy_(node_gradients_g_, true);
-        Gradients temp_grads2 = torch::empty(node_state_update_g_.sizes(), grad_opts);
-        temp_grads2.copy_(node_state_update_g_, true);
+        Gradients temp_grads = allocate_pinned_cpu_float_stage_or_pageable(node_gradients_g_.sizes(), "node_gradients_g");
+        temp_grads.copy_(node_gradients_g_, temp_grads.is_pinned());
+        Gradients temp_grads2 = allocate_pinned_cpu_float_stage_or_pageable(node_state_update_g_.sizes(), "node_state_update_g");
+        temp_grads2.copy_(node_state_update_g_, temp_grads2.is_pinned());
         node_gradients_g_ = temp_grads;
         node_state_update_g_ = temp_grads2;
     }

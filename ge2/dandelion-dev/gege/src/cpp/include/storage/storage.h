@@ -10,6 +10,7 @@
 #include <memory>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "common/datatypes.h"
 #include "data/batch.h"
@@ -257,6 +258,12 @@ class MemPartitionBufferStorage : public Storage {
     std::vector<std::shared_ptr<std::mutex>> peer_relay_source_publish_mutexes_;
     std::vector<std::shared_ptr<std::condition_variable>> peer_relay_source_publish_cvs_;
     std::vector<int64_t> peer_relay_source_published_rounds_;
+    std::vector<std::unordered_set<int64_t>> peer_relay_source_host_ready_handoff_keys_;
+    std::vector<std::shared_ptr<std::mutex>> peer_relay_source_host_ready_mutexes_;
+    std::vector<std::shared_ptr<std::condition_variable>> peer_relay_source_host_ready_cvs_;
+    std::vector<std::unordered_set<int64_t>> peer_relay_source_pending_handoff_keys_;
+    std::vector<std::shared_ptr<std::mutex>> peer_relay_source_pending_mutexes_;
+    std::vector<std::shared_ptr<std::condition_variable>> peer_relay_source_pending_cvs_;
     bool stateflow_peer_schedule_active_ = false;
     std::vector<std::unordered_map<int64_t, PeerHandoffDescriptor>> stateflow_peer_handoff_index_per_device_;
     std::vector<int64_t> stateflow_transition_counts_;
@@ -271,6 +278,10 @@ class MemPartitionBufferStorage : public Storage {
     void ensureHostLoaded_();
     void initializePeerRelay_();
     bool peerRelayEnabled_();
+    void waitForPeerRelaySourcePendingHandoffs_(std::size_t source_idx);
+    void markPeerRelaySourceHandoffConsumed_(std::size_t source_idx, int64_t pending_key);
+    void markPeerRelaySourceHostHandoffReady_(std::size_t source_idx, int64_t pending_key);
+    void waitForPeerRelaySourceHostHandoffReady_(std::size_t source_idx, int64_t pending_key);
 
 };
 

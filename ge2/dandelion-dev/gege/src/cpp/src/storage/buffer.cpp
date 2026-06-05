@@ -418,6 +418,29 @@ int64_t partition_rows_for_ids(const std::vector<int> &partition_ids, const std:
 
 double bytes_to_mib(int64_t bytes) { return static_cast<double>(bytes) / (1024.0 * 1024.0); }
 
+torch::Tensor allocate_cpu_stage_with_optional_pinning(int64_t rows, int embedding_size, torch::Dtype dtype, bool prefer_pinned,
+                                                       const char *context, const torch::Device &device) {
+    torch::TensorOptions host_options = torch::TensorOptions().dtype(dtype).device(torch::kCPU);
+    if (rows <= 0) {
+        return torch::Tensor();
+    }
+
+    if (prefer_pinned) {
+        try {
+            return torch::empty({rows, embedding_size}, host_options.pinned_memory(true));
+        } catch (const std::exception &) {
+#ifdef GEGE_CUDA
+            cudaGetLastError();
+#endif
+            SPDLOG_WARN(
+                "{} pinned host stage allocation failed on {} for rows={} dim={}; retrying with pageable host memory",
+                context, device.str(), rows, embedding_size);
+        }
+    }
+
+    return torch::empty({rows, embedding_size}, host_options);
+}
+
 #ifdef GEGE_CUDA
 bool parse_storage_cuda_env_flag(const char *name, bool default_value) {
     const char *raw = std::getenv(name);
@@ -2227,12 +2250,68 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                 return;
             }
 
-            torch::TensorOptions host_options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
-            if (use_pinned_host_buffer_) {
-                host_options = host_options.pinned_memory(true);
+            if (!source_frame_offsets.empty() && !expected_host_stage.defined() && !sparse_dirty_source_writeback &&
+                source_frame_offsets.size() == evict_ids.size() && row_offsets.size() == evict_ids.size() + 1) {
+#ifdef GEGE_CUDA
+                c10::cuda::CUDAGuard device_guard(device_);
+                auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
+                c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                if (owned_source_ready_event != 0) {
+                    auto ready_event = reinterpret_cast<cudaEvent_t>(owned_source_ready_event);
+                    AT_CUDA_CHECK(cudaStreamWaitEvent(copy_stream.stream(), ready_event, 0));
+                }
+#endif
+                for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
+                    int64_t source_start = source_frame_offsets[idx];
+                    int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
+                    if (source_rows <= 0) {
+                        mark_partition_writeback_complete(idx);
+                        continue;
+                    }
+
+                    auto alloc_start = std::chrono::high_resolution_clock::now();
+                    torch::Tensor host_view = allocate_cpu_stage_with_optional_pinning(
+                        source_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-evict-writeback-partition", device_);
+                    host_alloc_ms += elapsed_ms(alloc_start, std::chrono::high_resolution_clock::now());
+
+                    torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
+                    auto copy_start = std::chrono::high_resolution_clock::now();
+#ifdef GEGE_CUDA
+                    bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(host_view);
+                    if (non_blocking_host_copy) {
+                        host_view.copy_(gpu_view, true);
+                    } else {
+                        host_view.copy_(gpu_view);
+                    }
+                    AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
+#else
+                    host_view.copy_(gpu_view);
+#endif
+                    gpu_to_host_stage_ms += elapsed_ms(copy_start, std::chrono::high_resolution_clock::now());
+
+                    Partition *partition = partition_table_[evict_ids[idx]];
+                    auto write_start = std::chrono::high_resolution_clock::now();
+                    copyPartitionFromPinnedToHost_(partition, host_view);
+                    host_storage_write_ms += elapsed_ms(write_start, std::chrono::high_resolution_clock::now());
+                    mark_partition_writeback_complete(idx);
+                }
+                destroy_owned_source_event();
+                finish_writeback_task(nullptr);
+                if (partition_buffer_swap_timing_enabled()) {
+                    SPDLOG_INFO(
+                        "[partition-buffer-async-evict-writeback] storage={} this={} device={} evict_ids={} rows={} release_frames={} dirty_rows={} "
+                        "dirty_count_ms={:.3f} skipped_clean_source_writeback=false sparse_dirty_source_writeback=false streaming_source_writeback=true "
+                        "host_alloc_ms={:.3f} gpu_to_host_stage_ms={:.3f} host_storage_write_ms={:.3f} total_ms={:.3f}",
+                        basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(evict_ids), total_rows,
+                        vector_prefix_string(release_frames), dirty_rows, dirty_count_ms, host_alloc_ms, gpu_to_host_stage_ms,
+                        host_storage_write_ms, elapsed_ms(total_start, std::chrono::high_resolution_clock::now()));
+                }
+                return;
             }
+
             int64_t host_stage_rows = sparse_dirty_source_writeback ? dirty_rows : total_rows;
-            torch::Tensor host_stage = torch::empty({host_stage_rows, embedding_size_}, host_options);
+            torch::Tensor host_stage = allocate_cpu_stage_with_optional_pinning(
+                host_stage_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-evict-writeback", device_);
             auto after_host_alloc = std::chrono::high_resolution_clock::now();
             host_alloc_ms = elapsed_ms(phase_start, after_host_alloc);
             phase_start = after_host_alloc;
@@ -2624,11 +2703,8 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
 
             torch::Tensor host_stage;
             if (stage_rows > 0) {
-                torch::TensorOptions host_options = torch::TensorOptions().dtype(dtype_).device(torch::kCPU);
-                if (use_pinned_host_buffer_) {
-                    host_options = host_options.pinned_memory(true);
-                }
-                host_stage = torch::empty({stage_rows, embedding_size_}, host_options);
+                host_stage = allocate_cpu_stage_with_optional_pinning(
+                    stage_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-admit-preload", device_);
                 for (std::size_t idx = 0; idx < stage_admit_ids.size(); idx++) {
                     Partition *partition = partition_table_[stage_admit_ids[idx]];
                     torch::Tensor stage_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);

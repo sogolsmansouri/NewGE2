@@ -62,7 +62,7 @@ bool eval_finite_debug_enabled() {
 }
 
 bool eval_chunked_ranks_enabled() {
-    static bool enabled = parse_env_flag("GEGE_EVAL_CHUNKED_RANKS", false);
+    static bool enabled = parse_env_flag("GEGE_EVAL_CHUNKED_RANKS", true);
     return enabled;
 }
 
@@ -81,6 +81,11 @@ bool fixed_buffer_manual_distmult_rns_enabled() {
     return enabled;
 }
 
+bool fixed_buffer_manual_complex_rns_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS", false);
+    return enabled;
+}
+
 bool fixed_buffer_manual_dot_rns_sanity_enabled() {
     static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MANUAL_DOT_RNS_SANITY", false);
     return enabled;
@@ -93,6 +98,11 @@ bool fixed_buffer_manual_dot_rns_torch_adagrad_enabled() {
 
 bool fixed_buffer_manual_dot_rns_verify_enabled() {
     static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MANUAL_DOT_RNS_VERIFY", false);
+    return enabled;
+}
+
+bool fixed_buffer_manual_complex_rns_verify_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS_VERIFY", false);
     return enabled;
 }
 
@@ -131,6 +141,11 @@ int64_t fixed_buffer_manual_dot_rns_verify_max() {
     return max_batches;
 }
 
+int64_t fixed_buffer_manual_complex_rns_verify_max() {
+    static int64_t max_batches = std::max<int64_t>(parse_env_int("GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS_VERIFY_MAX", 8), 0);
+    return max_batches;
+}
+
 int64_t fixed_buffer_padded_forward_verify_max() {
     static int64_t max_batches = std::max<int64_t>(parse_env_int("GEGE_FIXED_BUFFER_PADDED_FORWARD_VERIFY_MAX", 8), 0);
     return max_batches;
@@ -146,7 +161,17 @@ std::atomic<int64_t> &fixed_buffer_manual_dot_rns_verify_counter() {
     return counter;
 }
 
+std::atomic<int64_t> &fixed_buffer_manual_complex_rns_verify_counter() {
+    static std::atomic<int64_t> counter{0};
+    return counter;
+}
+
 std::atomic<bool> &fixed_buffer_manual_distmult_rns_log_once() {
+    static std::atomic<bool> logged{false};
+    return logged;
+}
+
+std::atomic<bool> &fixed_buffer_manual_complex_rns_log_once() {
     static std::atomic<bool> logged{false};
     return logged;
 }
@@ -453,7 +478,8 @@ void accumulate_dot_softmax_side(torch::Tensor grad_unique,
                                  torch::Tensor anchor_ids,
                                  torch::Tensor other_ids,
                                  torch::Tensor neg_ids,
-                                 torch::Tensor neg_filter) {
+                                 torch::Tensor neg_filter,
+                                 double negative_mass_scale) {
     if (!neg_ids.defined() || neg_ids.numel() == 0) {
         return;
     }
@@ -490,9 +516,9 @@ void accumulate_dot_softmax_side(torch::Tensor grad_unique,
     torch::Tensor max_logits = torch::maximum(pos_scores, max_neg);
     torch::Tensor exp_pos = (pos_scores - max_logits).exp();
     torch::Tensor exp_neg = (neg_scores - max_logits).exp();
-    torch::Tensor denom = exp_pos + exp_neg.sum(1, true);
-    torch::Tensor grad_pos = exp_pos / denom - 1.0;
-    torch::Tensor grad_neg = exp_neg / denom;
+    torch::Tensor denom = exp_pos + exp_neg.sum(1, true).mul(negative_mass_scale);
+    torch::Tensor grad_pos = exp_pos.div(denom).sub_(1.0);
+    torch::Tensor grad_neg = exp_neg.mul_(negative_mass_scale).div_(denom);
 
     torch::Tensor grad_neg_padded = pad_rows(grad_neg, padded_batch_size);
     torch::Tensor grad_neg_chunks = grad_neg_padded.reshape({num_chunks, per_chunk, num_negatives});
@@ -621,6 +647,116 @@ void accumulate_distmult_softmax_side(torch::Tensor grad_unique,
     grad_relations.index_add_(0, rel_ids, grad_rel);
 }
 
+torch::Tensor complex_mul_2d(torch::Tensor lhs, torch::Tensor rhs) {
+    int64_t half = lhs.size(1) / 2;
+    torch::Tensor lhs_r = lhs.narrow(1, 0, half);
+    torch::Tensor lhs_i = lhs.narrow(1, half, half);
+    torch::Tensor rhs_r = rhs.narrow(1, 0, half);
+    torch::Tensor rhs_i = rhs.narrow(1, half, half);
+    return torch::cat({lhs_r * rhs_r - lhs_i * rhs_i,
+                       lhs_r * rhs_i + lhs_i * rhs_r},
+                      1);
+}
+
+torch::Tensor complex_anchor_grad_2d(torch::Tensor relation, torch::Tensor other) {
+    int64_t half = relation.size(1) / 2;
+    torch::Tensor rel_r = relation.narrow(1, 0, half);
+    torch::Tensor rel_i = relation.narrow(1, half, half);
+    torch::Tensor other_r = other.narrow(1, 0, half);
+    torch::Tensor other_i = other.narrow(1, half, half);
+    return torch::cat({rel_r * other_r + rel_i * other_i,
+                       -rel_i * other_r + rel_r * other_i},
+                      1);
+}
+
+torch::Tensor complex_relation_grad_2d(torch::Tensor anchor, torch::Tensor other) {
+    int64_t half = anchor.size(1) / 2;
+    torch::Tensor anchor_r = anchor.narrow(1, 0, half);
+    torch::Tensor anchor_i = anchor.narrow(1, half, half);
+    torch::Tensor other_r = other.narrow(1, 0, half);
+    torch::Tensor other_i = other.narrow(1, half, half);
+    return torch::cat({anchor_r * other_r + anchor_i * other_i,
+                       -anchor_i * other_r + anchor_r * other_i},
+                      1);
+}
+
+void accumulate_complex_softmax_side(torch::Tensor grad_unique,
+                                     torch::Tensor grad_relations,
+                                     torch::Tensor node_embeddings,
+                                     torch::Tensor relation_embeddings,
+                                     torch::Tensor rel_ids,
+                                     torch::Tensor anchor_ids,
+                                     torch::Tensor other_ids,
+                                     torch::Tensor neg_ids,
+                                     torch::Tensor neg_filter,
+                                     double negative_mass_scale) {
+    if (!neg_ids.defined() || neg_ids.numel() == 0) {
+        return;
+    }
+
+    rel_ids = rel_ids.to(torch::kInt64);
+    anchor_ids = anchor_ids.to(torch::kInt64);
+    other_ids = other_ids.to(torch::kInt64);
+    neg_ids = neg_ids.to(torch::kInt64);
+
+    int64_t batch_size = anchor_ids.numel();
+    int64_t num_chunks = neg_ids.size(0);
+    int64_t num_negatives = neg_ids.size(1);
+    if (batch_size == 0 || num_chunks == 0 || num_negatives == 0) {
+        return;
+    }
+
+    int64_t dim = node_embeddings.size(1);
+    if (dim % 2 != 0) {
+        throw GegeRuntimeException("Manual ComplEx/RNS update requires an even embedding dimension");
+    }
+
+    int64_t per_chunk = (batch_size + num_chunks - 1) / num_chunks;
+    int64_t padded_batch_size = per_chunk * num_chunks;
+
+    torch::Tensor anchor = node_embeddings.index_select(0, anchor_ids);
+    torch::Tensor other = node_embeddings.index_select(0, other_ids);
+    torch::Tensor rel = relation_embeddings.index_select(0, rel_ids);
+    torch::Tensor adjusted_anchor = complex_mul_2d(anchor, rel);
+
+    torch::Tensor neg_flat = neg_ids.flatten(0, 1);
+    torch::Tensor neg_embeddings = node_embeddings.index_select(0, neg_flat).reshape({num_chunks, num_negatives, dim});
+
+    torch::Tensor adjusted_padded = pad_rows(adjusted_anchor, padded_batch_size);
+    torch::Tensor adjusted_chunks = adjusted_padded.reshape({num_chunks, per_chunk, dim});
+    torch::Tensor neg_scores = torch::bmm(adjusted_chunks, neg_embeddings.transpose(1, 2))
+                                   .reshape({padded_batch_size, num_negatives})
+                                   .narrow(0, 0, batch_size);
+    neg_scores = apply_score_filter(neg_scores, neg_filter);
+
+    torch::Tensor pos_scores = (adjusted_anchor * other).sum(1, true);
+    torch::Tensor max_neg = std::get<0>(neg_scores.max(1, true));
+    torch::Tensor max_logits = torch::maximum(pos_scores, max_neg);
+    torch::Tensor exp_pos = (pos_scores - max_logits).exp();
+    torch::Tensor exp_neg = (neg_scores - max_logits).exp();
+    torch::Tensor denom = exp_pos + exp_neg.sum(1, true).mul(negative_mass_scale);
+    torch::Tensor grad_pos = exp_pos.div(denom).sub_(1.0);
+    torch::Tensor grad_neg = exp_neg.mul_(negative_mass_scale).div_(denom);
+
+    torch::Tensor grad_neg_padded = pad_rows(grad_neg, padded_batch_size);
+    torch::Tensor grad_neg_chunks = grad_neg_padded.reshape({num_chunks, per_chunk, num_negatives});
+    torch::Tensor weighted_neg = torch::bmm(grad_neg_chunks, neg_embeddings)
+                                     .reshape({padded_batch_size, dim})
+                                     .narrow(0, 0, batch_size);
+
+    torch::Tensor weighted_other = grad_pos * other + weighted_neg;
+    torch::Tensor grad_anchor = complex_anchor_grad_2d(rel, weighted_other);
+    torch::Tensor grad_rel = complex_relation_grad_2d(anchor, weighted_other);
+    torch::Tensor grad_other = grad_pos * adjusted_anchor;
+    torch::Tensor grad_neg_embeddings = torch::bmm(grad_neg_chunks.transpose(1, 2), adjusted_chunks)
+                                            .reshape({num_chunks * num_negatives, dim});
+
+    grad_unique.index_add_(0, anchor_ids, grad_anchor);
+    grad_unique.index_add_(0, other_ids, grad_other);
+    grad_unique.index_add_(0, neg_flat, grad_neg_embeddings);
+    grad_relations.index_add_(0, rel_ids, grad_rel);
+}
+
 void manual_distmult_rns_update(Model *model, shared_ptr<Batch> batch, shared_ptr<EdgeDecoder> edge_decoder, bool call_step) {
 #ifdef GEGE_CUDA
     torch::NoGradGuard no_grad;
@@ -674,6 +810,64 @@ void manual_distmult_rns_update(Model *model, shared_ptr<Batch> batch, shared_pt
     (void)batch;
     (void)edge_decoder;
     (void)call_step;
+#endif
+}
+
+void manual_complex_rns_update(Model *model, shared_ptr<Batch> batch, shared_ptr<EdgeDecoder> edge_decoder, bool call_step,
+                               torch::Tensor *raw_gradient_out = nullptr) {
+#ifdef GEGE_CUDA
+    torch::NoGradGuard no_grad;
+    bool expected = false;
+    if (fixed_buffer_manual_complex_rns_log_once().compare_exchange_strong(expected, true)) {
+        SPDLOG_INFO("[manual_complex_rns] enabled=1 decoder=COMPLEX negative_sampling=RNS relation_grad=1 negative_mass_scale={}",
+                    softmax_negative_mass_scale_for_manual_update());
+    }
+
+    torch::Tensor node_embeddings = batch->node_embeddings_.detach();
+    torch::Tensor grad_unique = torch::zeros_like(node_embeddings);
+    torch::Tensor grad_rel = torch::zeros_like(edge_decoder->relations_);
+    torch::Tensor grad_inv_rel = torch::zeros_like(edge_decoder->inverse_relations_);
+
+    torch::Tensor src_ids = batch->edges_.select(1, 0).to(torch::kInt64);
+    torch::Tensor rel_ids = batch->edges_.select(1, 1).to(torch::kInt64);
+    torch::Tensor dst_ids = batch->edges_.select(1, 2).to(torch::kInt64);
+    double negative_mass_scale = softmax_negative_mass_scale_for_manual_update();
+
+    accumulate_complex_softmax_side(grad_unique, grad_rel, node_embeddings, edge_decoder->relations_.detach(),
+                                    rel_ids, src_ids, dst_ids, batch->dst_neg_indices_mapping_, batch->dst_neg_filter_,
+                                    negative_mass_scale);
+    accumulate_complex_softmax_side(grad_unique, grad_inv_rel, node_embeddings, edge_decoder->inverse_relations_.detach(),
+                                    rel_ids, dst_ids, src_ids, batch->src_neg_indices_mapping_, batch->src_neg_filter_,
+                                    negative_mass_scale);
+
+    if (fixed_buffer_manual_dot_rns_sanity_enabled()) {
+        if (!torch::isfinite(grad_rel).all().item<bool>() || !torch::isfinite(grad_inv_rel).all().item<bool>()) {
+            throw GegeRuntimeException("Manual ComplEx/RNS update produced non-finite relation gradients");
+        }
+    }
+
+    if (edge_decoder->relations_.mutable_grad().defined()) {
+        edge_decoder->relations_.mutable_grad().add_(grad_rel);
+    } else {
+        edge_decoder->relations_.mutable_grad() = grad_rel;
+    }
+    if (edge_decoder->inverse_relations_.mutable_grad().defined()) {
+        edge_decoder->inverse_relations_.mutable_grad().add_(grad_inv_rel);
+    } else {
+        edge_decoder->inverse_relations_.mutable_grad() = grad_inv_rel;
+    }
+
+    if (call_step) {
+        model->step();
+    }
+
+    apply_manual_node_adagrad_update(batch, model->sparse_lr_, grad_unique, raw_gradient_out);
+#else
+    (void)model;
+    (void)batch;
+    (void)edge_decoder;
+    (void)call_step;
+    (void)raw_gradient_out;
 #endif
 }
 
@@ -766,6 +960,60 @@ bool can_use_manual_distmult_rns_update(const shared_ptr<EdgeDecoder> &edge_deco
     }
     if (batch->node_embeddings_.scalar_type() != torch::kFloat32 || batch->node_embeddings_state_.scalar_type() != torch::kFloat32 ||
         edge_decoder->relations_.scalar_type() != torch::kFloat32 || edge_decoder->inverse_relations_.scalar_type() != torch::kFloat32) {
+        return false;
+    }
+    if (batch->unique_node_active_mask_.defined() &&
+        (batch->unique_node_active_mask_.scalar_type() != torch::kUInt8 || !batch->unique_node_active_mask_.device().is_cuda() ||
+         batch->unique_node_active_mask_.numel() != batch->node_embeddings_.size(0))) {
+        return false;
+    }
+    return true;
+#endif
+}
+
+bool can_use_manual_complex_rns_update(const shared_ptr<EdgeDecoder> &edge_decoder, const shared_ptr<Batch> &batch,
+                                       const shared_ptr<LossFunction> &loss_function,
+                                       NegativeSamplingMethod negative_sampling_method, LearningTask learning_task) {
+#ifndef GEGE_CUDA
+    return false;
+#else
+    if (!fixed_buffer_manual_complex_rns_enabled()) {
+        return false;
+    }
+    if (learning_task != LearningTask::LINK_PREDICTION || negative_sampling_method != NegativeSamplingMethod::RNS) {
+        return false;
+    }
+    if (std::dynamic_pointer_cast<SoftmaxCrossEntropy>(loss_function) == nullptr) {
+        return false;
+    }
+    if (edge_decoder == nullptr || std::dynamic_pointer_cast<ComplEx>(edge_decoder) == nullptr ||
+        edge_decoder->decoder_method_ != EdgeDecoderMethod::CORRUPT_NODE ||
+        !edge_decoder->relations_.defined() || !edge_decoder->inverse_relations_.defined() ||
+        !edge_decoder->use_inverse_relations_) {
+        return false;
+    }
+    if (batch == nullptr || batch->resident_local_lp_direct_ || batch->qual_embeddings_.defined()) {
+        return false;
+    }
+    if (!batch->edges_.defined() || batch->edges_.dim() != 2 || batch->edges_.size(1) != 3) {
+        return false;
+    }
+    if (!batch->node_embeddings_.defined() || !batch->node_embeddings_state_.defined() ||
+        !batch->unique_node_indices_.defined() || !batch->dst_neg_indices_mapping_.defined() ||
+        !batch->src_neg_indices_mapping_.defined()) {
+        return false;
+    }
+    if (!batch->node_embeddings_.device().is_cuda() || !batch->node_embeddings_state_.device().is_cuda() ||
+        !edge_decoder->relations_.device().is_cuda() || !edge_decoder->inverse_relations_.device().is_cuda() ||
+        !batch->dst_neg_indices_mapping_.device().is_cuda() || !batch->src_neg_indices_mapping_.device().is_cuda()) {
+        return false;
+    }
+    if (batch->node_embeddings_.scalar_type() != torch::kFloat32 || batch->node_embeddings_state_.scalar_type() != torch::kFloat32 ||
+        edge_decoder->relations_.scalar_type() != torch::kFloat32 || edge_decoder->inverse_relations_.scalar_type() != torch::kFloat32) {
+        return false;
+    }
+    if (batch->node_embeddings_.size(1) % 2 != 0 || edge_decoder->relations_.size(1) != batch->node_embeddings_.size(1) ||
+        edge_decoder->inverse_relations_.size(1) != batch->node_embeddings_.size(1)) {
         return false;
     }
     if (batch->unique_node_active_mask_.defined() &&
@@ -1088,13 +1336,16 @@ void manual_dot_rns_update(shared_ptr<Batch> batch, float learning_rate, bool in
 
     torch::Tensor src_ids = batch->edges_.select(1, 0).to(torch::kInt64);
     torch::Tensor dst_ids = batch->edges_.select(1, -1).to(torch::kInt64);
+    double negative_mass_scale = softmax_negative_mass_scale_for_manual_update();
 
     accumulate_dot_softmax_side(grad_unique, node_embeddings, src_ids, dst_ids,
-                                batch->dst_neg_indices_mapping_, batch->dst_neg_filter_);
+                                batch->dst_neg_indices_mapping_, batch->dst_neg_filter_,
+                                negative_mass_scale);
 
     if (include_src_negatives && batch->src_neg_indices_mapping_.defined() && batch->src_neg_indices_mapping_.numel() > 0) {
         accumulate_dot_softmax_side(grad_unique, node_embeddings, dst_ids, src_ids,
-                                    batch->src_neg_indices_mapping_, batch->src_neg_filter_);
+                                    batch->src_neg_indices_mapping_, batch->src_neg_filter_,
+                                    negative_mass_scale);
     }
 
     apply_manual_node_adagrad_update(batch, learning_rate, grad_unique, raw_gradient_out);
@@ -1167,6 +1418,46 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> reference_dot_rns_autogr
     return std::make_tuple(raw_gradients, adjusted_gradients, state_update);
 }
 
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+reference_complex_rns_autograd_update(Model *model, const shared_ptr<Batch> &batch, const shared_ptr<EdgeDecoder> &edge_decoder) {
+    model->clear_grad();
+    auto shadow = clone_manual_dot_rns_verify_batch(batch);
+    shadow->node_embeddings_.requires_grad_();
+
+    auto all_scores = model->forward_lp(shadow, true);
+    torch::Tensor pos_scores = std::get<0>(all_scores);
+    torch::Tensor neg_scores = std::get<1>(all_scores);
+    torch::Tensor inv_pos_scores = std::get<2>(all_scores);
+    torch::Tensor inv_neg_scores = std::get<3>(all_scores);
+
+    torch::Tensor rhs_loss = model->loss_function_->operator()(pos_scores, neg_scores, true);
+    torch::Tensor lhs_loss = model->loss_function_->operator()(inv_pos_scores, inv_neg_scores, true);
+    torch::Tensor loss = lhs_loss + rhs_loss;
+    loss.backward();
+
+    torch::NoGradGuard no_grad;
+    torch::Tensor raw_gradients = shadow->node_embeddings_.grad().detach().clone();
+    torch::Tensor gradients = raw_gradients;
+    if (shadow->unique_node_active_mask_.defined() && shadow->unique_node_active_mask_.numel() == gradients.size(0)) {
+        torch::Tensor active_mask = shadow->unique_node_active_mask_.to(gradients.device()).to(gradients.dtype()).reshape({-1, 1});
+        gradients = gradients * active_mask;
+        raw_gradients = raw_gradients * active_mask;
+    }
+
+    torch::Tensor optimizer_state = shadow->node_embeddings_state_.detach().clone();
+    torch::Tensor state_update = gradients.pow(2);
+    optimizer_state.add_(state_update);
+    torch::Tensor adjusted_gradients = -model->sparse_lr_ * (gradients / (optimizer_state.sqrt().add_(1e-10)));
+    torch::Tensor rel_grad = edge_decoder->relations_.grad().defined()
+                                 ? edge_decoder->relations_.grad().detach().clone()
+                                 : torch::zeros_like(edge_decoder->relations_);
+    torch::Tensor inv_rel_grad = edge_decoder->inverse_relations_.grad().defined()
+                                     ? edge_decoder->inverse_relations_.grad().detach().clone()
+                                     : torch::zeros_like(edge_decoder->inverse_relations_);
+    model->clear_grad();
+    return std::make_tuple(raw_gradients, adjusted_gradients, state_update, rel_grad, inv_rel_grad);
+}
+
 void verify_manual_dot_rns_update(Model *model, const shared_ptr<Batch> &batch, bool include_src_negatives) {
 #ifdef GEGE_CUDA
     if (!fixed_buffer_manual_dot_rns_verify_enabled()) {
@@ -1229,6 +1520,67 @@ void verify_manual_dot_rns_update(Model *model, const shared_ptr<Batch> &batch, 
     (void)model;
     (void)batch;
     (void)include_src_negatives;
+#endif
+}
+
+void verify_manual_complex_rns_update(Model *model, const shared_ptr<Batch> &batch, const shared_ptr<EdgeDecoder> &edge_decoder) {
+#ifdef GEGE_CUDA
+    if (!fixed_buffer_manual_complex_rns_verify_enabled()) {
+        return;
+    }
+    int64_t verify_id = fixed_buffer_manual_complex_rns_verify_counter().fetch_add(1);
+    if (verify_id >= fixed_buffer_manual_complex_rns_verify_max()) {
+        return;
+    }
+
+    auto manual_shadow = clone_manual_dot_rns_verify_batch(batch);
+    torch::Tensor ref_raw_gradients;
+    torch::Tensor ref_gradients;
+    torch::Tensor ref_state_update;
+    torch::Tensor ref_rel_grad;
+    torch::Tensor ref_inv_rel_grad;
+    std::tie(ref_raw_gradients, ref_gradients, ref_state_update, ref_rel_grad, ref_inv_rel_grad) =
+        reference_complex_rns_autograd_update(model, batch, edge_decoder);
+
+    torch::Tensor manual_raw_gradients;
+    manual_complex_rns_update(model, manual_shadow, edge_decoder, false, &manual_raw_gradients);
+    torch::Tensor manual_rel_grad = edge_decoder->relations_.grad().defined()
+                                        ? edge_decoder->relations_.grad().detach().clone()
+                                        : torch::zeros_like(edge_decoder->relations_);
+    torch::Tensor manual_inv_rel_grad = edge_decoder->inverse_relations_.grad().defined()
+                                            ? edge_decoder->inverse_relations_.grad().detach().clone()
+                                            : torch::zeros_like(edge_decoder->inverse_relations_);
+    model->clear_grad();
+
+    if (manual_shadow->unique_node_active_mask_.defined() && manual_shadow->unique_node_active_mask_.numel() == manual_raw_gradients.size(0)) {
+        torch::Tensor active_mask = manual_shadow->unique_node_active_mask_.to(manual_raw_gradients.device()).to(manual_raw_gradients.dtype()).reshape({-1, 1});
+        manual_raw_gradients = manual_raw_gradients * active_mask;
+    }
+
+    bool raw_gradients_match = torch::allclose(manual_raw_gradients, ref_raw_gradients, 1e-4, 1e-7);
+    bool gradients_match = torch::allclose(manual_shadow->node_gradients_, ref_gradients, 1e-4, 1e-5);
+    bool state_update_match = torch::allclose(manual_shadow->node_state_update_, ref_state_update, 1e-4, 1e-5);
+    bool rel_grad_match = torch::allclose(manual_rel_grad, ref_rel_grad, 1e-4, 1e-5);
+    bool inv_rel_grad_match = torch::allclose(manual_inv_rel_grad, ref_inv_rel_grad, 1e-4, 1e-5);
+
+    if (!raw_gradients_match || !gradients_match || !state_update_match || !rel_grad_match || !inv_rel_grad_match) {
+        double raw_grad_max_abs = max_abs_diff_or_zero(manual_raw_gradients, ref_raw_gradients);
+        double grad_max_abs = max_abs_diff_or_zero(manual_shadow->node_gradients_, ref_gradients);
+        double state_max_abs = max_abs_diff_or_zero(manual_shadow->node_state_update_, ref_state_update);
+        double rel_max_abs = max_abs_diff_or_zero(manual_rel_grad, ref_rel_grad);
+        double inv_rel_max_abs = max_abs_diff_or_zero(manual_inv_rel_grad, ref_inv_rel_grad);
+        SPDLOG_ERROR("GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS_VERIFY failed check={} batch={} raw_match={} gradients_match={} state_update_match={} rel_match={} inv_rel_match={} raw_grad_max_abs={} grad_max_abs={} state_max_abs={} rel_max_abs={} inv_rel_max_abs={}",
+                     verify_id, batch->batch_id_, raw_gradients_match, gradients_match, state_update_match, rel_grad_match, inv_rel_grad_match,
+                     raw_grad_max_abs, grad_max_abs, state_max_abs, rel_max_abs, inv_rel_max_abs);
+        throw GegeRuntimeException("Manual ComplEx/RNS verifier failed");
+    }
+
+    SPDLOG_INFO("GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS_VERIFY check={} batch={} passed rows={} relations={} inverse_relations={}",
+                verify_id, batch->batch_id_, ref_gradients.size(0), ref_rel_grad.size(0), ref_inv_rel_grad.size(0));
+#else
+    (void)model;
+    (void)batch;
+    (void)edge_decoder;
 #endif
 }
 
@@ -1713,6 +2065,18 @@ void Model::train_batch_with_callback(shared_ptr<Batch> batch, bool call_step, s
             post_forward_callback();
         }
         manual_distmult_rns_update(this, batch, manual_edge_decoder, call_step);
+        return;
+    }
+
+    if (can_use_manual_complex_rns_update(manual_edge_decoder, batch, loss_function_, negative_sampling_method_, learning_task_)) {
+        verify_manual_complex_rns_update(this, batch, manual_edge_decoder);
+        if (post_decoder_gather_callback) {
+            post_decoder_gather_callback();
+        }
+        if (post_forward_callback) {
+            post_forward_callback();
+        }
+        manual_complex_rns_update(this, batch, manual_edge_decoder, call_step);
         return;
     }
 

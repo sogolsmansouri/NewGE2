@@ -12,8 +12,10 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <map>
 #include <numeric>
 #include <random>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -1264,6 +1266,19 @@ bool states_disjoint(const std::vector<int64_t> &lhs, const std::vector<int64_t>
     return true;
 }
 
+int64_t state_overlap_count64(const std::vector<int64_t> &lhs, const std::vector<int64_t> &rhs) {
+    int64_t overlap = 0;
+    for (auto left_part : lhs) {
+        for (auto right_part : rhs) {
+            if (left_part == right_part) {
+                overlap++;
+                break;
+            }
+        }
+    }
+    return overlap;
+}
+
 bool search_disjoint_groups(const std::vector<std::vector<bool>> &compatible, const std::vector<int64_t> &remaining, int active_devices,
                             std::vector<std::vector<int64_t>> &groups);
 
@@ -2300,6 +2315,107 @@ std::vector<TwoGpuRoundPair> build_farthest_two_gpu_matching(const std::vector<S
                                                  : TwoGpuRoundPair{best_partner, state_idx});
     }
     return pairs;
+}
+
+bool validate_unital28_multi_gpu_permutation(const vector<torch::Tensor>& buffer_states,
+                                             const std::vector<int64_t> &permutation,
+                                             int active_devices,
+                                             int min_lane_overlap) {
+    if (active_devices <= 1 || buffer_states.size() != 63 || permutation.size() != buffer_states.size()) {
+        return false;
+    }
+
+    std::vector<uint8_t> seen(buffer_states.size(), 0);
+    std::vector<std::vector<int64_t>> partitions;
+    partitions.reserve(buffer_states.size());
+    for (const auto &state : buffer_states) {
+        auto parts = tensor_to_partitions(state);
+        std::sort(parts.begin(), parts.end());
+        if (parts.size() != 4) {
+            return false;
+        }
+        for (auto partition : parts) {
+            if (partition < 0 || partition >= 28) {
+                return false;
+            }
+        }
+        partitions.emplace_back(std::move(parts));
+    }
+
+    for (std::size_t pos = 0; pos < permutation.size(); pos++) {
+        int64_t state_idx = permutation[pos];
+        if (state_idx < 0 || state_idx >= static_cast<int64_t>(buffer_states.size())) {
+            return false;
+        }
+        if (seen[static_cast<std::size_t>(state_idx)] != 0) {
+            return false;
+        }
+        seen[static_cast<std::size_t>(state_idx)] = 1;
+    }
+
+    for (std::size_t round_begin = 0; round_begin < permutation.size();
+         round_begin += static_cast<std::size_t>(active_devices)) {
+        std::size_t round_end =
+            std::min<std::size_t>(permutation.size(), round_begin + static_cast<std::size_t>(active_devices));
+        for (std::size_t lhs = round_begin; lhs < round_end; lhs++) {
+            for (std::size_t rhs = lhs + 1; rhs < round_end; rhs++) {
+                if (!states_disjoint(partitions[static_cast<std::size_t>(permutation[lhs])],
+                                     partitions[static_cast<std::size_t>(permutation[rhs])])) {
+                    return false;
+                }
+            }
+        }
+    }
+
+    for (int lane = 0; lane < active_devices; lane++) {
+        int64_t previous = -1;
+        for (std::size_t pos = static_cast<std::size_t>(lane); pos < permutation.size();
+             pos += static_cast<std::size_t>(active_devices)) {
+            int64_t current = permutation[pos];
+            if (previous >= 0 &&
+                state_overlap_count64(partitions[static_cast<std::size_t>(previous)],
+                                      partitions[static_cast<std::size_t>(current)]) < min_lane_overlap) {
+                return false;
+            }
+            previous = current;
+        }
+    }
+
+    return true;
+}
+
+std::vector<int64_t> getUnital28MultiGpuLaneMatchedPermutation(const vector<torch::Tensor>& buffer_states,
+                                                               int active_devices) {
+    if (buffer_states.size() != 63 || (active_devices != 2 && active_devices != 4)) {
+        return {};
+    }
+
+    static const std::array<int64_t, 63> kTwoGpuPermutation = {{
+        50, 4, 51, 28, 13, 18, 38, 14, 43, 47, 20, 45, 19, 46, 30, 49,
+        26, 37, 25, 22, 15, 55, 1, 35, 44, 61, 9, 27, 8, 23, 21, 10,
+        57, 31, 3, 58, 12, 7, 40, 34, 32, 17, 54, 6, 53, 39, 41, 33,
+        5, 62, 11, 52, 59, 16, 48, 0, 29, 56, 60, 24, 42, 36, 2,
+    }};
+    static const std::array<int64_t, 63> kFourGpuPermutation = {{
+        45, 21, 14, 41, 26, 58, 43, 5, 60, 54, 0, 15, 47, 31, 56, 16,
+        12, 48, 7, 52, 17, 28, 39, 23, 11, 37, 2, 20, 55, 13, 1, 36,
+        4, 61, 46, 9, 51, 10, 44, 8, 25, 40, 22, 50, 53, 42, 19, 33,
+        27, 49, 38, 30, 34, 59, 6, 24, 18, 62, 32, 3, 29, 35, 57,
+    }};
+
+    const auto &selected = active_devices == 2 ? kTwoGpuPermutation : kFourGpuPermutation;
+    std::vector<int64_t> permutation(selected.begin(), selected.end());
+    if (!validate_unital28_multi_gpu_permutation(buffer_states, permutation, active_devices, 1)) {
+        SPDLOG_WARN("Static unital p28/q4 {}-GPU permutation failed validation against loaded state order",
+                    active_devices);
+        return {};
+    }
+
+    const int64_t rounds =
+        (static_cast<int64_t>(permutation.size()) + active_devices - 1) / static_cast<int64_t>(active_devices);
+    SPDLOG_INFO("Using static unital p28/q4 {}-GPU lane-matched permutation rounds={} microstates={}",
+                active_devices, rounds, permutation.size());
+    return permutation;
 }
 
 std::vector<int64_t> getTw16TwentyStateTwoGpuLaneMatchedPermutation(const vector<torch::Tensor>& buffer_states,
@@ -4022,12 +4138,21 @@ vector<vector<std::pair<int, int>>> greedyAssignEdgeBucketsToBuffers(vector<vect
     vector<vector<std::pair<int, int>>> edge_buckets_per_buffer(buffer_states.size());
     torch::Tensor interacted = torch::zeros({num_partitions, num_partitions}, torch::kInt32);
     auto interacted_accessor = interacted.accessor<int32_t, 2>();
+    bool warned_invalid_partition = false;
 
     for (int i = 0; i < buffer_states.size(); i++) {
         for (int j = 0; j < buffer_states[i].size(); j++) {
             for (int k = 0; k < buffer_states[i].size(); k++) {
                 int32_t src_part = buffer_states[i][j];
                 int32_t dst_part = buffer_states[i][k];
+                if (src_part < 0 || src_part >= num_partitions || dst_part < 0 || dst_part >= num_partitions) {
+                    if (!warned_invalid_partition) {
+                        SPDLOG_WARN("Skipping out-of-range edge bucket in greedy assignment: state={} src={} dst={} num_partitions={}",
+                                    i, src_part, dst_part, num_partitions);
+                        warned_invalid_partition = true;
+                    }
+                    continue;
+                }
                 if (interacted_accessor[src_part][dst_part] == 1) {
                     continue;
                 }
@@ -4125,24 +4250,44 @@ std::vector<std::vector<int>> load_bounded_state_order_file(const char *path,
     int line_number = 0;
     while (std::getline(input, line)) {
         line_number++;
-        std::size_t begin = line.find("state=[");
+        std::size_t comment = line.find('#');
+        std::string parse_text = comment == std::string::npos ? line : line.substr(0, comment);
+        std::size_t begin = parse_text.find("state=[");
         if (begin == std::string::npos) {
-            begin = line.find('[');
+            begin = parse_text.find('[');
         } else {
             begin += std::string("state=").size();
         }
-        if (begin == std::string::npos) {
-            continue;
-        }
-        std::size_t end = line.find(']', begin);
-        if (end == std::string::npos) {
-            continue;
+        if (begin != std::string::npos) {
+            std::size_t end = parse_text.find(']', begin);
+            if (end == std::string::npos) {
+                continue;
+            }
+            parse_text = parse_text.substr(begin + 1, end - begin - 1);
+        } else {
+            bool numeric_line = true;
+            bool saw_digit = false;
+            for (char ch : parse_text) {
+                unsigned char uch = static_cast<unsigned char>(ch);
+                if (std::isdigit(uch)) {
+                    saw_digit = true;
+                    continue;
+                }
+                if (std::isspace(uch) || ch == ',' || ch == '-' || ch == '+') {
+                    continue;
+                }
+                numeric_line = false;
+                break;
+            }
+            if (!numeric_line || !saw_digit) {
+                continue;
+            }
         }
 
         std::vector<int> state;
         std::string token;
-        for (std::size_t idx = begin + 1; idx < end; idx++) {
-            char ch = line[idx];
+        for (std::size_t idx = 0; idx < parse_text.size(); idx++) {
+            char ch = parse_text[idx];
             if ((ch >= '0' && ch <= '9') || ch == '-') {
                 token.push_back(ch);
             } else if (!token.empty()) {
@@ -7588,6 +7733,11 @@ StateflowPlan compileCustomStateflowPlan(int num_partitions,
                                          const std::vector<int64_t> &edge_bucket_sizes,
                                          const std::vector<int64_t> &partition_row_counts) {
     if (!randomly_assign_edge_buckets) {
+        if (buffer_capacity == 4 && !is_positive_power_of_two(num_partitions)) {
+            SPDLOG_WARN("Skipping CUSTOM canonical q4 bit-template for non-power-of-two num_partitions={}",
+                        num_partitions);
+            return StateflowPlan{};
+        }
         auto buffer_states = build_custom_template_buffer_states(num_partitions, buffer_capacity);
         auto edge_buckets = greedyAssignEdgeBucketsToBuffers(buffer_states, num_partitions);
         auto ordering = convertEdgeBucketOrderToTensors(std::move(buffer_states), std::move(edge_buckets));
@@ -7721,6 +7871,13 @@ std::vector<StateflowPlan> enumerateSingleGpuStateflowPlans(int num_partitions,
     const bool custom_valid = stateflow_plan_valid(custom_plan);
 
     std::vector<std::function<StateflowPlan()>> factories;
+    if (bounded_greedy_cover_q4_enabled() && buffer_capacity == 4) {
+        factories.emplace_back([num_partitions, buffer_capacity, &edge_bucket_sizes, &partition_row_counts]() {
+            auto ordering = getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, edge_bucket_sizes);
+            return tensor_ordering_to_stateflow_plan(ordering, PlanFamily::CUSTOM, num_partitions, buffer_capacity,
+                                                     PlanVariant::DEFAULT, edge_bucket_sizes, partition_row_counts);
+        });
+    }
     if (custom_valid) {
         factories.emplace_back([&custom_plan]() { return custom_plan; });
         factories.emplace_back([&custom_plan, num_partitions, &edge_bucket_sizes, &partition_row_counts]() {
@@ -7910,6 +8067,27 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                 std::vector<StateflowPlan> tw16_only;
                 tw16_only.emplace_back(std::move(tw16_plan));
                 return tw16_only;
+            }
+        }
+    }
+
+    if ((active_devices == 2 || active_devices == 4) && buffer_states.size() == 63) {
+        auto unital28_permutation = getUnital28MultiGpuLaneMatchedPermutation(buffer_states, active_devices);
+        if (!unital28_permutation.empty()) {
+            StateflowPlan unital28_plan =
+                build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer,
+                                                                unital28_permutation, active_devices,
+                                                                PlanVariant::MULTI_GPU_LANE_MATCHED,
+                                                                edge_bucket_sizes, partition_row_counts, layout);
+            if (stateflow_plan_valid(unital28_plan) &&
+                stateflow_plan_respects_max_admits(unital28_plan, lane_match_cfg.max_admits_per_transition) &&
+                validateStateflowPlanExactSemantics(unital28_plan)) {
+                score_stateflow_plan(unital28_plan, edge_bucket_sizes, layout);
+                SPDLOG_INFO("Using unital p28/q4 {}-GPU lane-matched plan as the selected bounded q4 schedule",
+                            active_devices);
+                std::vector<StateflowPlan> unital28_only;
+                unital28_only.emplace_back(std::move(unital28_plan));
+                return unital28_only;
             }
         }
     }
@@ -8632,6 +8810,407 @@ std::vector<std::array<int, 3>> build_gf2_partial_spread_direction_cover(int num
     return dfs();
 }
 
+int gf9_add(int lhs, int rhs) {
+    int real = (lhs % 3 + rhs % 3) % 3;
+    int imag = (lhs / 3 + rhs / 3) % 3;
+    return real + 3 * imag;
+}
+
+int gf9_mul(int lhs, int rhs) {
+    int a = lhs % 3;
+    int b = lhs / 3;
+    int c = rhs % 3;
+    int d = rhs / 3;
+    int real = (a * c + 2 * b * d) % 3;  // alpha^2 = -1 = 2 in F_3.
+    int imag = (a * d + b * c) % 3;
+    return real + 3 * imag;
+}
+
+int gf9_pow(int value, int exponent) {
+    int result = 1;
+    int base = value;
+    while (exponent > 0) {
+        if ((exponent & 1) != 0) {
+            result = gf9_mul(result, base);
+        }
+        base = gf9_mul(base, base);
+        exponent >>= 1;
+    }
+    return result;
+}
+
+int gf9_inv(int value) {
+    if (value == 0) {
+        return 0;
+    }
+    for (int candidate = 1; candidate < 9; candidate++) {
+        if (gf9_mul(value, candidate) == 1) {
+            return candidate;
+        }
+    }
+    return 0;
+}
+
+std::array<int, 3> gf9_normalize_projective_point(std::array<int, 3> point) {
+    for (auto coord : point) {
+        if (coord == 0) {
+            continue;
+        }
+        int inv = gf9_inv(coord);
+        for (auto &value : point) {
+            value = gf9_mul(value, inv);
+        }
+        return point;
+    }
+    return point;
+}
+
+std::vector<std::vector<int>> build_static_unital28_q4_cover_states(int num_partitions,
+                                                                    int buffer_capacity) {
+    if (buffer_capacity != 4 || num_partitions != 28) {
+        return {};
+    }
+
+    static const std::array<std::array<int, 4>, 63> kUnital28Q4OverlapPath = {{
+        {{22, 23, 24, 25}},
+        {{10, 15, 17, 22}},
+        {{4, 14, 22, 27}},
+        {{7, 15, 23, 27}},
+        {{0, 8, 17, 27}},
+        {{1, 10, 19, 27}},
+        {{0, 4, 19, 23}},
+        {{5, 10, 23, 26}},
+        {{10, 14, 18, 24}},
+        {{11, 14, 16, 23}},
+        {{9, 13, 17, 23}},
+        {{8, 9, 10, 11}},
+        {{2, 11, 18, 27}},
+        {{3, 9, 16, 27}},
+        {{5, 13, 24, 27}},
+        {{3, 6, 10, 13}},
+        {{1, 6, 18, 23}},
+        {{2, 8, 21, 23}},
+        {{8, 13, 18, 25}},
+        {{6, 12, 25, 27}},
+        {{3, 12, 20, 23}},
+        {{4, 10, 16, 20}},
+        {{8, 12, 16, 22}},
+        {{0, 13, 20, 22}},
+        {{20, 21, 26, 27}},
+        {{0, 10, 21, 25}},
+        {{0, 6, 9, 14}},
+        {{5, 9, 18, 20}},
+        {{16, 17, 18, 19}},
+        {{4, 12, 18, 21}},
+        {{6, 15, 16, 21}},
+        {{12, 13, 14, 15}},
+        {{0, 5, 11, 12}},
+        {{5, 14, 17, 21}},
+        {{3, 5, 8, 15}},
+        {{6, 8, 19, 20}},
+        {{2, 14, 20, 25}},
+        {{1, 5, 16, 25}},
+        {{3, 4, 17, 25}},
+        {{4, 5, 6, 7}},
+        {{7, 11, 17, 20}},
+        {{11, 15, 19, 25}},
+        {{1, 4, 11, 13}},
+        {{3, 11, 21, 24}},
+        {{6, 11, 22, 26}},
+        {{1, 9, 21, 22}},
+        {{3, 7, 18, 22}},
+        {{2, 5, 19, 22}},
+        {{7, 13, 19, 21}},
+        {{1, 7, 8, 14}},
+        {{3, 14, 19, 26}},
+        {{0, 1, 2, 3}},
+        {{1, 15, 20, 24}},
+        {{0, 15, 18, 26}},
+        {{1, 12, 17, 26}},
+        {{4, 8, 24, 26}},
+        {{7, 9, 25, 26}},
+        {{0, 7, 16, 24}},
+        {{2, 13, 16, 26}},
+        {{2, 7, 10, 12}},
+        {{2, 4, 9, 15}},
+        {{9, 12, 19, 24}},
+        {{2, 6, 17, 24}},
+    }};
+
+    std::vector<std::vector<int>> states;
+    states.reserve(kUnital28Q4OverlapPath.size());
+    for (const auto &state : kUnital28Q4OverlapPath) {
+        states.emplace_back(state.begin(), state.end());
+    }
+
+    if (!bounded_q4_cover_is_valid(states, num_partitions, buffer_capacity)) {
+        SPDLOG_WARN("Static unital p28/q4 cover failed validation");
+        return {};
+    }
+
+    int64_t transition_overlap = 0;
+    for (std::size_t idx = 1; idx < states.size(); idx++) {
+        transition_overlap += state_overlap_count(states[idx - 1], states[idx]);
+    }
+    const int64_t transition_admits =
+        static_cast<int64_t>(states.size() - 1) * static_cast<int64_t>(buffer_capacity) - transition_overlap;
+    SPDLOG_INFO("Using static unital p28/q4 cover states={} transition_overlap={} transition_admits={}",
+                states.size(), transition_overlap, transition_admits);
+    return states;
+}
+
+std::vector<std::vector<int>> build_static_cyclic30_q4_cover_states(int num_partitions,
+                                                                    int buffer_capacity) {
+    if (buffer_capacity != 4 || num_partitions != 30) {
+        return {};
+    }
+
+    static const std::array<std::array<int, 4>, 75> kCyclic30Q4Overlap2Path = {{
+        {{5, 10, 22, 24}},
+        {{3, 8, 20, 22}},
+        {{1, 21, 22, 25}},
+        {{3, 5, 16, 21}},
+        {{0, 20, 21, 24}},
+        {{8, 10, 21, 26}},
+        {{10, 11, 14, 20}},
+        {{11, 12, 15, 21}},
+        {{12, 13, 16, 22}},
+        {{6, 7, 10, 16}},
+        {{16, 17, 20, 26}},
+        {{1, 6, 18, 20}},
+        {{7, 9, 20, 25}},
+        {{7, 12, 24, 26}},
+        {{2, 7, 19, 21}},
+        {{7, 8, 11, 17}},
+        {{6, 8, 19, 24}},
+        {{4, 6, 17, 22}},
+        {{2, 3, 6, 12}},
+        {{3, 4, 7, 13}},
+        {{2, 4, 15, 20}},
+        {{2, 22, 23, 26}},
+        {{6, 11, 23, 25}},
+        {{5, 7, 18, 23}},
+        {{4, 9, 21, 23}},
+        {{5, 6, 9, 15}},
+        {{1, 2, 5, 11}},
+        {{4, 5, 8, 14}},
+        {{8, 9, 12, 18}},
+        {{9, 11, 22, 27}},
+        {{4, 12, 19, 27}},
+        {{5, 12, 20, 27}},
+        {{5, 13, 20, 28}},
+        {{6, 13, 21, 28}},
+        {{6, 14, 21, 29}},
+        {{7, 14, 22, 29}},
+        {{0, 7, 15, 22}},
+        {{0, 8, 15, 23}},
+        {{1, 8, 16, 23}},
+        {{1, 9, 16, 24}},
+        {{2, 9, 17, 24}},
+        {{2, 10, 17, 25}},
+        {{3, 10, 18, 25}},
+        {{3, 11, 18, 26}},
+        {{4, 11, 19, 26}},
+        {{5, 25, 26, 29}},
+        {{19, 20, 23, 29}},
+        {{4, 16, 18, 29}},
+        {{15, 16, 19, 25}},
+        {{18, 19, 22, 28}},
+        {{9, 10, 13, 19}},
+        {{0, 5, 17, 19}},
+        {{17, 18, 21, 27}},
+        {{0, 6, 26, 27}},
+        {{0, 2, 13, 18}},
+        {{0, 1, 4, 10}},
+        {{0, 11, 16, 28}},
+        {{0, 3, 9, 29}},
+        {{0, 12, 14, 25}},
+        {{1, 12, 17, 29}},
+        {{10, 12, 23, 28}},
+        {{2, 8, 28, 29}},
+        {{4, 24, 25, 28}},
+        {{11, 13, 24, 29}},
+        {{8, 13, 25, 27}},
+        {{10, 15, 27, 29}},
+        {{3, 23, 24, 27}},
+        {{2, 14, 16, 27}},
+        {{1, 7, 27, 28}},
+        {{3, 15, 17, 28}},
+        {{13, 14, 17, 23}},
+        {{9, 14, 26, 28}},
+        {{14, 15, 18, 24}},
+        {{1, 13, 15, 26}},
+        {{1, 3, 14, 19}},
+    }};
+
+    std::vector<std::vector<int>> states;
+    states.reserve(kCyclic30Q4Overlap2Path.size());
+    for (const auto &state : kCyclic30Q4Overlap2Path) {
+        states.emplace_back(state.begin(), state.end());
+    }
+
+    if (!bounded_q4_cover_is_valid(states, num_partitions, buffer_capacity)) {
+        SPDLOG_WARN("Static cyclic p30/q4 cover failed validation");
+        return {};
+    }
+
+    std::vector<uint8_t> directed_covered(static_cast<std::size_t>(num_partitions) *
+                                              static_cast<std::size_t>(num_partitions),
+                                          0);
+    int64_t directed_count = 0;
+    std::vector<int64_t> rep_counts(static_cast<std::size_t>(num_partitions), 0);
+    auto pair_counts = bounded_pair_counts_for_states(states, num_partitions);
+    std::map<int, int64_t> pair_hist;
+    for (const auto &state : states) {
+        directed_count += mark_state_buckets_covered(state, directed_covered, num_partitions);
+        for (auto partition : state) {
+            rep_counts[static_cast<std::size_t>(partition)]++;
+        }
+    }
+    for (int lhs = 0; lhs < num_partitions; lhs++) {
+        for (int rhs = lhs + 1; rhs < num_partitions; rhs++) {
+            pair_hist[pair_counts[bounded_pair_index(lhs, rhs, num_partitions)]]++;
+        }
+    }
+
+    std::map<int64_t, int64_t> rep_hist;
+    for (auto count : rep_counts) {
+        rep_hist[count]++;
+    }
+
+    std::map<int, int64_t> overlap_hist;
+    int64_t transition_overlap = 0;
+    for (std::size_t idx = 1; idx < states.size(); idx++) {
+        const int overlap = state_overlap_count(states[idx - 1], states[idx]);
+        overlap_hist[overlap]++;
+        transition_overlap += overlap;
+    }
+    const int64_t transition_admits =
+        static_cast<int64_t>(states.size() - 1) * static_cast<int64_t>(buffer_capacity) - transition_overlap;
+
+    const bool expected =
+        states.size() == 75 &&
+        directed_count == static_cast<int64_t>(num_partitions) * static_cast<int64_t>(num_partitions) &&
+        pair_hist[1] == 420 && pair_hist[2] == 15 && rep_hist[10] == 30 &&
+        overlap_hist[1] == 60 && overlap_hist[2] == 14 && transition_admits == 208;
+    if (!expected) {
+        SPDLOG_WARN(
+            "Static cyclic p30/q4 cover failed expected stats: states={} directed_buckets={} pair_hist[1]={} pair_hist[2]={} rep_hist[10]={} overlap_hist[1]={} overlap_hist[2]={} transition_admits={}",
+            states.size(), directed_count, pair_hist[1], pair_hist[2], rep_hist[10], overlap_hist[1],
+            overlap_hist[2], transition_admits);
+        return {};
+    }
+
+    SPDLOG_INFO(
+        "Using static cyclic p30/q4 cover states=75 directed_buckets_covered=900 rep_hist={{10: 30}} overlap_hist={{1: 60, 2: 14}} transition_admits=208");
+    return states;
+}
+
+std::vector<std::vector<int>> build_gf9_unital28_q4_cover_states(int num_partitions,
+                                                                 int buffer_capacity) {
+    if (buffer_capacity != 4 || num_partitions != 28) {
+        return {};
+    }
+
+    auto static_states = build_static_unital28_q4_cover_states(num_partitions, buffer_capacity);
+    if (!static_states.empty()) {
+        return static_states;
+    }
+
+    std::vector<std::array<int, 3>> points;
+    std::set<std::array<int, 3>> point_set;
+    for (int x = 0; x < 9; x++) {
+        for (int y = 0; y < 9; y++) {
+            for (int z = 0; z < 9; z++) {
+                if (x == 0 && y == 0 && z == 0) {
+                    continue;
+                }
+                auto point = gf9_normalize_projective_point({x, y, z});
+                int hermitian_sum = gf9_add(gf9_add(gf9_pow(point[0], 4), gf9_pow(point[1], 4)),
+                                            gf9_pow(point[2], 4));
+                if (hermitian_sum != 0) {
+                    continue;
+                }
+                if (point_set.insert(point).second) {
+                    points.emplace_back(point);
+                }
+            }
+        }
+    }
+    std::sort(points.begin(), points.end());
+    if (points.size() != 28) {
+        SPDLOG_WARN("Generated GF(9) unital q4 cover expected 28 points, got {}", points.size());
+        return {};
+    }
+
+    std::map<std::array<int, 3>, int> point_to_partition;
+    for (int idx = 0; idx < static_cast<int>(points.size()); idx++) {
+        point_to_partition[points[idx]] = idx;
+    }
+
+    std::set<std::array<int, 3>> line_set;
+    std::set<std::vector<int>> block_set;
+    for (int a = 0; a < 9; a++) {
+        for (int b = 0; b < 9; b++) {
+            for (int c = 0; c < 9; c++) {
+                if (a == 0 && b == 0 && c == 0) {
+                    continue;
+                }
+                auto line = gf9_normalize_projective_point({a, b, c});
+                if (!line_set.insert(line).second) {
+                    continue;
+                }
+
+                std::vector<int> block;
+                for (const auto &point : points) {
+                    int dot = gf9_add(gf9_add(gf9_mul(line[0], point[0]), gf9_mul(line[1], point[1])),
+                                      gf9_mul(line[2], point[2]));
+                    if (dot == 0) {
+                        block.emplace_back(point_to_partition[point]);
+                    }
+                }
+                if (static_cast<int>(block.size()) == buffer_capacity) {
+                    std::sort(block.begin(), block.end());
+                    block_set.insert(std::move(block));
+                }
+            }
+        }
+    }
+
+    std::vector<std::vector<int>> states(block_set.begin(), block_set.end());
+    if (states.size() != 63 || !bounded_q4_cover_is_valid(states, num_partitions, buffer_capacity)) {
+        SPDLOG_WARN("Generated GF(9) unital p28/q4 cover failed validation states={}", states.size());
+        return {};
+    }
+
+    const int path_restarts = static_cast<int>(
+        std::max<int64_t>(1, stateflow_env_int64("GEGE_BOUNDED_Q4_UNITAL28_PATH_RESTARTS", nullptr, 256)));
+    const int path_2opt_passes = static_cast<int>(
+        std::max<int64_t>(0, stateflow_env_int64("GEGE_BOUNDED_Q4_UNITAL28_PATH_2OPT_PASSES", nullptr, 80)));
+    const int64_t seed = stateflow_env_int64("GEGE_BOUNDED_Q4_UNITAL28_SEED", nullptr, 47);
+    std::mt19937_64 rng(static_cast<uint64_t>(seed));
+    auto path = best_bounded_q4_path_for_states(states, buffer_capacity, 3, rng, path_restarts, path_2opt_passes);
+    if (!path.order.empty()) {
+        std::vector<std::vector<int>> ordered;
+        ordered.reserve(path.order.size());
+        for (auto state_idx : path.order) {
+            if (state_idx < 0 || state_idx >= static_cast<int>(states.size())) {
+                ordered.clear();
+                break;
+            }
+            ordered.emplace_back(states[state_idx]);
+        }
+        if (bounded_q4_cover_is_valid(ordered, num_partitions, buffer_capacity)) {
+            SPDLOG_INFO("Generated GF(9) unital p28/q4 cover states={} transition_overlap={}",
+                        ordered.size(), path.transition_overlap);
+            return ordered;
+        }
+    }
+
+    SPDLOG_WARN("Generated GF(9) unital p28/q4 cover could not find overlap-ordered path; using construction order");
+    return states;
+}
+
 std::vector<std::vector<int>> build_gf2_affine_q4_cover_states(int num_partitions, int buffer_capacity) {
     if (buffer_capacity != 4 || num_partitions != 32) {
         return {};
@@ -9145,6 +9724,14 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
             load_bounded_state_order_file(std::getenv("GEGE_BOUNDED_STATE_ORDER_FILE"), num_partitions, buffer_capacity);
         loaded_state_order = !buffer_states.empty();
     }
+    if (buffer_states.empty()) {
+        buffer_states = build_static_cyclic30_q4_cover_states(num_partitions, buffer_capacity);
+        loaded_state_order = !buffer_states.empty();
+    }
+    if (buffer_states.empty()) {
+        buffer_states = build_gf9_unital28_q4_cover_states(num_partitions, buffer_capacity);
+        loaded_state_order = !buffer_states.empty();
+    }
     if (!loaded_state_order) {
         buffer_states = build_greedy_cover_state_set(num_partitions, buffer_capacity);
     }
@@ -9226,6 +9813,18 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMu
         }
     }
     if (buffer_states.empty()) {
+        buffer_states = build_static_cyclic30_q4_cover_states(num_partitions, buffer_capacity);
+        if (!buffer_states.empty()) {
+            SPDLOG_INFO("Using static cyclic p30/q4 state cover as bounded multi-GPU input states={}", buffer_states.size());
+        }
+    }
+    if (buffer_states.empty()) {
+        buffer_states = build_gf9_unital28_q4_cover_states(num_partitions, buffer_capacity);
+        if (!buffer_states.empty()) {
+            SPDLOG_INFO("Using GF(9) unital p28/q4 state cover as bounded multi-GPU input states={}", buffer_states.size());
+        }
+    }
+    if (buffer_states.empty()) {
         buffer_states = build_bounded_multi_gpu_round_states(num_partitions, buffer_capacity, active_devices, max_admits);
     }
     if (buffer_states.empty()) {
@@ -9260,6 +9859,7 @@ vector<vector<std::pair<int, int>>> randomlyAssignEdgeBucketsToBuffers(vector<ve
 
     torch::Tensor choices = torch::zeros({num_buckets, num_buffers}, torch::kInt32);
     int32_t *choices_mem = choices.data_ptr<int32_t>();
+    std::atomic<bool> saw_invalid_partition{false};
 
 #pragma omp parallel for
     for (int i = 0; i < num_buffers; i++) {
@@ -9267,10 +9867,17 @@ vector<vector<std::pair<int, int>>> randomlyAssignEdgeBucketsToBuffers(vector<ve
             for (int k = j; k < buffer_size; k++) {
                 int src_part = buffer_states[i][j];
                 int dst_part = buffer_states[i][k];
+                if (src_part < 0 || src_part >= num_partitions || dst_part < 0 || dst_part >= num_partitions) {
+                    saw_invalid_partition.store(true, std::memory_order_relaxed);
+                    continue;
+                }
                 *(choices_mem + (src_part * num_partitions + dst_part) * num_buffers + i) = 1;
                 *(choices_mem + (dst_part * num_partitions + src_part) * num_buffers + i) = 1;
             }
         }
+    }
+    if (saw_invalid_partition.load(std::memory_order_relaxed)) {
+        SPDLOG_WARN("Skipped out-of-range edge buckets in random assignment for num_partitions={}", num_partitions);
     }
 
     torch::Tensor pick = torch::zeros({num_buckets}, torch::kInt32);
@@ -9699,6 +10306,12 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getCustomEdgeBucketOrde
 
     while(pow(2, log2l) < num_partitions) {
         log2l += 1;
+    }
+
+    if (pow(2, log2l) != num_partitions) {
+        SPDLOG_WARN("CUSTOM q4 bit-template ordering requires power-of-two num_partitions; got {}. Falling back to GREEDY_COVER.",
+                    num_partitions);
+        return getGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
     }
 
     assert(pow(2, log2l) == num_partitions);

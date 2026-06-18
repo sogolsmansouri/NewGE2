@@ -1661,6 +1661,15 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
     // // batch_cv_->wait(batch_lock, [this] { return !waiting_for_batches_; });
 
     auto get_next_batch_start = std::chrono::high_resolution_clock::now();
+    auto active_swap_participants = [&]() {
+        int32_t participants = 0;
+        for (bool read_done : all_reads_) {
+            if (!read_done) {
+                participants++;
+            }
+        }
+        return std::max<int32_t>(participants, 1);
+    };
     shared_ptr<Batch> batch;
     if (batch_iterators_[device_idx] != all_batches_[device_idx].end()) {
         batch = *batch_iterators_[device_idx];
@@ -1669,7 +1678,12 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
         if (batch_iterators_[device_idx] == all_batches_[device_idx].end()) {
             if (graph_storage_->useInMemorySubGraph()) {
                 if (!graph_storage_->hasSwap(device_idx)) {
-                    all_reads_[device_idx] = true;
+                    // Multi-GPU schedules can have uneven lane lengths, e.g. p28 has
+                    // 63 states. Defer terminal completion until the next getNextBatch()
+                    // call so this lane can release peers waiting at the swap barrier.
+                    if (all_batches_.size() <= 1) {
+                        all_reads_[device_idx] = true;
+                    }
                 }
             } else {
                 all_reads_[device_idx] = true;
@@ -1684,7 +1698,8 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 auto swap_path_start = std::chrono::high_resolution_clock::now();
                 // wait for all batches to finish before swapping
                 auto swap_barrier_start = std::chrono::high_resolution_clock::now();
-                waitForSwapReadBarrier(static_cast<int32_t>(all_batches_.size()));
+                int32_t swap_participants = active_swap_participants();
+                waitForSwapReadBarrier(swap_participants);
                 int64_t swap_barrier_elapsed = elapsed_ns(swap_barrier_start, std::chrono::high_resolution_clock::now());
                 swap_barrier_wait_ns_.fetch_add(swap_barrier_elapsed);
                 if (device_idx < device_swap_barrier_wait_ns_.size()) {
@@ -1748,7 +1763,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 }
 
                 auto swap_sync_start = std::chrono::high_resolution_clock::now();
-                waitForSwapRebuildBarrier(static_cast<int32_t>(all_batches_.size()));
+                waitForSwapRebuildBarrier(swap_participants);
                 int64_t swap_sync_elapsed = elapsed_ns(swap_sync_start, std::chrono::high_resolution_clock::now());
                 swap_sync_wait_ns_.fetch_add(swap_sync_elapsed);
                 if (device_idx < device_swap_sync_wait_ns_.size()) {
@@ -1774,7 +1789,11 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 if (batch_iterators_[device_idx] == all_batches_[device_idx].end()) {
                     if (graph_storage_->useInMemorySubGraph()) {
                         if (!graph_storage_->hasSwap(device_idx)) {
-                            all_reads_[device_idx] = true;
+                            // See the direct-batch path above: terminal multi-GPU lanes
+                            // must participate in one final barrier before exiting.
+                            if (all_batches_.size() <= 1) {
+                                all_reads_[device_idx] = true;
+                            }
                         }
                     } else {
                         all_reads_[device_idx] = true;
@@ -1786,6 +1805,12 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 add_perf_stat(get_next_batch_swap_path_ns_, device_get_next_batch_swap_path_ns_, device_idx, swap_path_elapsed);
                 add_perf_stat(get_next_batch_swap_overhead_ns_, device_get_next_batch_swap_overhead_ns_, device_idx, swap_overhead_elapsed);
             } else {
+                int32_t swap_participants = active_swap_participants();
+                if (swap_participants > 1) {
+                    waitForSwapReadBarrier(swap_participants);
+                    graph_storage_->publishStateflowPeerSourcesForNextRound(device_idx);
+                    waitForSwapRebuildBarrier(swap_participants);
+                }
                 all_reads_[device_idx] = true;
             }
         } else {

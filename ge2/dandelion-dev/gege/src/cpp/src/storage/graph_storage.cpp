@@ -136,6 +136,46 @@ bool remap_validate_slots_enabled() {
     return enabled;
 }
 
+bool partition_buffer_remap_breakdown_timing_enabled() {
+    static bool enabled = parse_graph_storage_env_flag("GEGE_PARTITION_BUFFER_REMAP_BREAKDOWN_TIMING", false);
+    return enabled;
+}
+
+bool partition_buffer_pin_mapped_edge_buckets_enabled() {
+    static bool enabled = parse_graph_storage_env_flag("GEGE_PARTITION_BUFFER_PIN_MAPPED_EDGE_BUCKETS", false);
+    return enabled;
+}
+
+struct PartitionSlotRemapTiming {
+    double input_to_map_ms = 0.0;
+    double arithmetic_ms = 0.0;
+    double stack_ms = 0.0;
+    double pin_memory_ms = 0.0;
+    double output_to_device_ms = 0.0;
+    int64_t calls = 0;
+    int64_t edges = 0;
+};
+
+thread_local PartitionSlotRemapTiming *active_partition_slot_remap_timing = nullptr;
+thread_local bool active_partition_slot_pin_mapped_edge_buckets = false;
+
+struct PartitionSlotRemapTimingScope {
+    explicit PartitionSlotRemapTimingScope(PartitionSlotRemapTiming *timing, bool allow_pinned_mapped_edge_buckets)
+        : previous(active_partition_slot_remap_timing),
+          previous_pin_mapped_edge_buckets(active_partition_slot_pin_mapped_edge_buckets) {
+        active_partition_slot_remap_timing = timing;
+        active_partition_slot_pin_mapped_edge_buckets = allow_pinned_mapped_edge_buckets;
+    }
+
+    ~PartitionSlotRemapTimingScope() {
+        active_partition_slot_remap_timing = previous;
+        active_partition_slot_pin_mapped_edge_buckets = previous_pin_mapped_edge_buckets;
+    }
+
+    PartitionSlotRemapTiming *previous;
+    bool previous_pin_mapped_edge_buckets;
+};
+
 template <typename T>
 std::string vector_prefix_string(const std::vector<T> &values, std::size_t limit = 8) {
     std::ostringstream oss;
@@ -176,15 +216,16 @@ EdgeList merge_sorted_edges_with_additional(const EdgeList &base_sorted_edges, c
         return base_sorted_edges;
     }
 
-    torch::Tensor additional_i64 = additional_edges.to(torch::kInt64);
+    torch::Device output_device = base_sorted_edges.defined() ? base_sorted_edges.device() : additional_edges.device();
+    torch::Tensor additional_i64 = additional_edges.to(torch::kCPU).to(torch::kInt64);
     torch::Tensor additional_sorted =
         additional_i64.index_select(0, torch::argsort(additional_i64.select(1, sort_dim), 0, false));
 
     if (!base_sorted_edges.defined() || base_sorted_edges.numel() == 0) {
-        return additional_sorted;
+        return additional_sorted.to(output_device);
     }
 
-    torch::Tensor base_i64 = base_sorted_edges.to(torch::kInt64);
+    torch::Tensor base_i64 = base_sorted_edges.to(torch::kCPU).to(torch::kInt64);
     torch::Tensor insertion_points =
         torch::searchsorted(base_i64.select(1, sort_dim).contiguous(), additional_sorted.select(1, sort_dim).contiguous()).to(torch::kInt64);
 
@@ -213,7 +254,7 @@ EdgeList merge_sorted_edges_with_additional(const EdgeList &base_sorted_edges, c
         merged.narrow(0, out_offset, tail_count).copy_(base_i64.narrow(0, prev_base, tail_count));
     }
 
-    return merged;
+    return merged.to(output_device);
 }
 
 int64_t partition_buffer_pipeline_timing_max() {
@@ -485,7 +526,27 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
     }
 
     torch::Device map_device = partition_to_buffer_slot.device();
+    PartitionSlotRemapTiming *timing = active_partition_slot_remap_timing;
+    std::chrono::high_resolution_clock::time_point phase_start;
+    if (timing != nullptr) {
+        phase_start = std::chrono::high_resolution_clock::now();
+    }
     torch::Tensor edges_for_map = edges.to(map_device);
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->input_to_map_ms += elapsed_graph_storage_ms(phase_start, now);
+        phase_start = now;
+    }
+
+    int64_t edge_dim = storage_ptrs_.edges->dim1_size_;
+#ifdef GEGE_CUDA
+    bool pin_mapped_edges =
+        device.is_cuda() && map_device.type() == torch::kCPU && active_partition_slot_pin_mapped_edge_buckets &&
+        partition_buffer_pin_mapped_edge_buckets_enabled();
+#else
+    bool pin_mapped_edges = false;
+#endif
+
     torch::Tensor src = edges_for_map.select(1, 0);
     // For arity-3/4 [src, rel, dst, ...], dst is col 2, not the last column
     torch::Tensor dst = (storage_ptrs_.edges->dim1_size_ >= 4) ? edges_for_map.select(1, 2) : edges_for_map.select(1, -1);
@@ -504,6 +565,11 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
         src_slots * partition_size + (src - src_partitions * partition_size);
     torch::Tensor dst_local =
         dst_slots * partition_size + (dst - dst_partitions * partition_size);
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->arithmetic_ms += elapsed_graph_storage_ms(phase_start, now);
+        phase_start = now;
+    }
 
     torch::Tensor mapped_edges;
     if (storage_ptrs_.edges->dim1_size_ == 3) {
@@ -522,8 +588,35 @@ torch::Tensor GraphModelStorage::mapEdgesWithPartitionSlots_(torch::Tensor edges
         SPDLOG_ERROR("Unexpected number of edge columns");
         throw GegeRuntimeException("Unexpected number of edge columns");
     }
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->stack_ms += elapsed_graph_storage_ms(phase_start, now);
+        phase_start = now;
+    }
 
-    return mapped_edges.to(device);
+    torch::Tensor result;
+#ifdef GEGE_CUDA
+    if (device.is_cuda() && map_device.type() == torch::kCPU && active_partition_slot_pin_mapped_edge_buckets &&
+        partition_buffer_pin_mapped_edge_buckets_enabled()) {
+        mapped_edges = mapped_edges.pin_memory();
+        if (timing != nullptr) {
+            auto now = std::chrono::high_resolution_clock::now();
+            timing->pin_memory_ms += elapsed_graph_storage_ms(phase_start, now);
+            phase_start = now;
+        }
+        result = mapped_edges.to(device, true);
+    } else
+#endif
+    {
+        result = mapped_edges.to(device);
+    }
+    if (timing != nullptr) {
+        auto now = std::chrono::high_resolution_clock::now();
+        timing->output_to_device_ms += elapsed_graph_storage_ms(phase_start, now);
+        timing->calls += 1;
+        timing->edges += edges.size(0);
+    }
+    return result;
 }
 
 namespace {
@@ -1515,12 +1608,19 @@ shared_ptr<InMemorySubgraphState> GraphModelStorage::getPrefetchedNextSubgraphSt
 void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState> subgraph, std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx) {
     int64_t timing_id = -1;
     bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
+    bool log_remap_breakdown = log_timing && partition_buffer_remap_breakdown_timing_enabled();
     auto total_start = std::chrono::high_resolution_clock::now();
     auto phase_start = total_start;
     double state_prepare_ms = 0.0;
     double edge_materialize_ms = 0.0;
     double remap_ms = 0.0;
     double graph_build_ms = 0.0;
+    double retained_bucket_copy_ms = 0.0;
+    double new_bucket_map_call_ms = 0.0;
+    double new_bucket_final_copy_ms = 0.0;
+    int64_t retained_bucket_copy_edges = 0;
+    int64_t new_bucket_map_edges = 0;
+    PartitionSlotRemapTiming remap_breakdown;
 
     std::vector<int> evict_partition_ids = std::get<0>(swap_ids);
     std::vector<int> admit_partition_ids = std::get<1>(swap_ids);
@@ -1802,26 +1902,54 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
         mapped_edges = torch::empty({total_size, storage_ptrs_.edges->dim1_size_},
                                     torch::TensorOptions().dtype(torch::kInt64).device(devices_[device_idx]));
 
-        for (int i = 0; i < num_edge_buckets_in_mem; i++) {
-            int64_t edge_bucket_size = in_mem_edge_bucket_sizes_accessor[i];
-            if (edge_bucket_size == 0) {
-                continue;
+        {
+            PartitionSlotRemapTimingScope remap_timing_scope(log_remap_breakdown ? &remap_breakdown : nullptr, true);
+            for (int i = 0; i < num_edge_buckets_in_mem; i++) {
+                int64_t edge_bucket_size = in_mem_edge_bucket_sizes_accessor[i];
+                if (edge_bucket_size == 0) {
+                    continue;
+                }
+
+                int64_t edge_bucket_start = local_or_global_edge_bucket_starts_accessor[i];
+                bool in_mem = in_mem_mask_accessor[i];
+                int64_t local_offset = in_mem_edge_bucket_starts_accessor[i];
+
+                if (in_mem && can_reuse_mapped_buckets) {
+                    std::chrono::high_resolution_clock::time_point copy_start;
+                    if (log_remap_breakdown) {
+                        copy_start = std::chrono::high_resolution_clock::now();
+                    }
+                    mapped_edges.narrow(0, local_offset, edge_bucket_size)
+                        .copy_(previous_state->all_in_memory_mapped_edges_.narrow(0, edge_bucket_start, edge_bucket_size));
+                    if (log_remap_breakdown) {
+                        auto now = std::chrono::high_resolution_clock::now();
+                        retained_bucket_copy_ms += elapsed_graph_storage_ms(copy_start, now);
+                        retained_bucket_copy_edges += edge_bucket_size;
+                    }
+                    continue;
+                }
+
+                std::chrono::high_resolution_clock::time_point map_start;
+                if (log_remap_breakdown) {
+                    map_start = std::chrono::high_resolution_clock::now();
+                }
+                torch::Tensor mapped_bucket =
+                    mapEdgesWithPartitionSlots_(subgraph->all_in_memory_edges_.narrow(0, local_offset, edge_bucket_size), partition_to_buffer_slot,
+                                                partition_size, devices_[device_idx]);
+                std::chrono::high_resolution_clock::time_point copy_start;
+                if (log_remap_breakdown) {
+                    copy_start = std::chrono::high_resolution_clock::now();
+                }
+                if (log_remap_breakdown) {
+                    new_bucket_map_call_ms += elapsed_graph_storage_ms(map_start, copy_start);
+                    new_bucket_map_edges += edge_bucket_size;
+                }
+                mapped_edges.narrow(0, local_offset, edge_bucket_size).copy_(mapped_bucket);
+                if (log_remap_breakdown) {
+                    auto now = std::chrono::high_resolution_clock::now();
+                    new_bucket_final_copy_ms += elapsed_graph_storage_ms(copy_start, now);
+                }
             }
-
-            int64_t edge_bucket_start = local_or_global_edge_bucket_starts_accessor[i];
-            bool in_mem = in_mem_mask_accessor[i];
-            int64_t local_offset = in_mem_edge_bucket_starts_accessor[i];
-
-            if (in_mem && can_reuse_mapped_buckets) {
-                mapped_edges.narrow(0, local_offset, edge_bucket_size)
-                    .copy_(previous_state->all_in_memory_mapped_edges_.narrow(0, edge_bucket_start, edge_bucket_size));
-                continue;
-            }
-
-            torch::Tensor mapped_bucket =
-                mapEdgesWithPartitionSlots_(subgraph->all_in_memory_edges_.narrow(0, local_offset, edge_bucket_size), partition_to_buffer_slot,
-                                            partition_size, devices_[device_idx]);
-            mapped_edges.narrow(0, local_offset, edge_bucket_size).copy_(mapped_bucket);
         }
         if (log_timing) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -1943,6 +2071,17 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             vector_prefix_string(evict_partition_ids), vector_prefix_string(admit_partition_ids), kept_bucket_count, fetched_bucket_count, reused_edge_count,
             fetched_edge_count, num_edge_buckets_in_mem, total_size, state_prepare_ms, edge_materialize_ms, remap_ms, graph_build_ms,
             elapsed_graph_storage_ms(total_start, total_end));
+        if (log_remap_breakdown) {
+            double measured_ms = retained_bucket_copy_ms + new_bucket_map_call_ms + new_bucket_final_copy_ms;
+            SPDLOG_INFO(
+                "[partition-buffer-pipeline][remap-breakdown {}] device={} retained_copy_edges={} new_map_edges={} map_calls={} "
+                "input_to_map_ms={:.3f} arithmetic_ms={:.3f} stack_ms={:.3f} pin_memory_ms={:.3f} output_to_device_ms={:.3f} "
+                "new_bucket_map_call_ms={:.3f} retained_copy_ms={:.3f} final_copy_ms={:.3f} measured_ms={:.3f} unaccounted_ms={:.3f}",
+                timing_id, device_idx, retained_bucket_copy_edges, new_bucket_map_edges, remap_breakdown.calls,
+                remap_breakdown.input_to_map_ms, remap_breakdown.arithmetic_ms, remap_breakdown.stack_ms,
+                remap_breakdown.pin_memory_ms, remap_breakdown.output_to_device_ms, new_bucket_map_call_ms, retained_bucket_copy_ms,
+                new_bucket_final_copy_ms, measured_ms, remap_ms - measured_ms);
+        }
     }
 
     if (prefetch_) {

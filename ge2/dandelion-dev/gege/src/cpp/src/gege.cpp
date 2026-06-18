@@ -232,11 +232,15 @@ void gege_eval(shared_ptr<GegeConfig> gege_config) {
     auto graph_model_storage = std::get<1>(tup);
     auto dataloader = std::get<2>(tup);
 
-    shared_ptr<Evaluator> evaluator;
-    if (gege_config->evaluation->epochs_per_eval > 0) {
-        evaluator = std::make_shared<SynchronousEvaluator>(dataloader, model);
-        evaluator->evaluate(false);
+    bool use_validation_split = false;
+    if (gege_config->storage != nullptr && gege_config->storage->dataset != nullptr &&
+        gege_config->storage->dataset->num_test < 0 && gege_config->storage->dataset->num_valid > 0) {
+        use_validation_split = true;
+        SPDLOG_WARN("Evaluation dataset has no test split (num_test={}); using validation split with {} edges",
+                    gege_config->storage->dataset->num_test, gege_config->storage->dataset->num_valid);
     }
+    auto evaluator = std::make_shared<SynchronousEvaluator>(dataloader, model);
+    evaluator->evaluate(use_validation_split);
 
     if (gege_config->storage->export_encoded_nodes) {
         encode_and_export(dataloader, model, gege_config);

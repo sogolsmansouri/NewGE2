@@ -1307,6 +1307,190 @@ void MemPartitionBufferStorage::unload(bool perform_write, int32_t device_idx) {
     buffers_[device_idx]->unload(false);
 }
 
+void MemPartitionBufferStorage::publishStateflowPeerSourcesForNextRound(int32_t device_idx, std::uintptr_t swap_ready_event) {
+    if (!peerRelayEnabled_()) {
+        return;
+    }
+
+#if !defined(GEGE_CUDA)
+    (void)device_idx;
+    (void)swap_ready_event;
+    return;
+#else
+    if (device_idx < 0 || device_idx >= static_cast<int32_t>(buffers_.size())) {
+        throw GegeRuntimeException("MemPartitionBufferStorage::publishStateflowPeerSourcesForNextRound received an invalid device index");
+    }
+
+    auto *buffer = buffers_[device_idx];
+    if (!buffer->buffer_state_.defined() || !stateflow_peer_schedule_active_) {
+        return;
+    }
+
+    bool stateflow_runtime_controlling =
+        static_cast<std::size_t>(device_idx) < stateflow_peer_handoff_index_per_device_.size();
+    if (!stateflow_runtime_controlling || static_cast<std::size_t>(device_idx) >= stateflow_transition_counts_.size()) {
+        return;
+    }
+
+    if (stateflow_sync_before_swap_enabled()) {
+        synchronize_cuda_device_for_stateflow_swap(buffer->device_);
+    }
+
+    int64_t transition_round_idx = stateflow_transition_counts_[device_idx] + 1;
+    std::vector<PeerHandoffDescriptor> outgoing_handoffs;
+    for (const auto &handoff_index : stateflow_peer_handoff_index_per_device_) {
+        for (const auto &[handoff_key, handoff] : handoff_index) {
+            (void)handoff_key;
+            if (handoff.round_idx == transition_round_idx && handoff.src_lane_id == device_idx) {
+                outgoing_handoffs.emplace_back(handoff);
+            }
+        }
+    }
+    std::sort(outgoing_handoffs.begin(), outgoing_handoffs.end(),
+              [](const PeerHandoffDescriptor &lhs, const PeerHandoffDescriptor &rhs) {
+                  if (lhs.partition_id != rhs.partition_id) {
+                      return lhs.partition_id < rhs.partition_id;
+                  }
+                  if (lhs.dst_lane_id != rhs.dst_lane_id) {
+                      return lhs.dst_lane_id < rhs.dst_lane_id;
+                  }
+                  return lhs.dst_slot_id < rhs.dst_slot_id;
+              });
+
+    auto previous_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous();
+    bool frame_cache_mapping = buffer->frameCacheEnabled_();
+    auto &published_source_scratch = peer_relay_source_scratch_tensors_[device_idx];
+    auto &published_source_scratch_frames = peer_relay_source_scratch_frames_[device_idx];
+
+    {
+        c10::cuda::CUDAGuard device_guard(buffer->device_);
+        auto comm_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
+        c10::cuda::CUDAStreamGuard stream_guard(comm_stream);
+        if (swap_ready_event != 0) {
+            auto ready_event = reinterpret_cast<cudaEvent_t>(swap_ready_event);
+            AT_CUDA_CHECK(cudaStreamWaitEvent(comm_stream.stream(), ready_event, 0));
+        }
+
+        auto &source_scratch_pool = peer_relay_source_scratch_pool_tensors_[device_idx];
+        auto publish_mutex = peer_relay_source_publish_mutexes_[device_idx];
+        auto publish_cv = peer_relay_source_publish_cvs_[device_idx];
+        {
+            std::lock_guard<std::mutex> publish_lock(*publish_mutex);
+            published_source_scratch.clear();
+            source_scratch_pool.clear();
+            if (frame_cache_mapping && !published_source_scratch_frames.empty()) {
+                std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+                for (const auto &[partition_id, frame] : published_source_scratch_frames) {
+                    (void)partition_id;
+                    if (frame < buffer->capacity_ || frame >= buffer->physical_frame_capacity_) {
+                        continue;
+                    }
+                    bool frame_is_visible = false;
+                    for (int64_t mapped_frame : buffer->logical_to_physical_frames_) {
+                        if (mapped_frame == frame) {
+                            frame_is_visible = true;
+                            break;
+                        }
+                    }
+                    if (!frame_is_visible &&
+                        std::find(buffer->free_physical_frames_.begin(), buffer->free_physical_frames_.end(), frame) ==
+                            buffer->free_physical_frames_.end()) {
+                        buffer->free_physical_frames_.push_back(frame);
+                    }
+                }
+                published_source_scratch_frames.clear();
+            }
+
+            auto &slot_snapshot = peer_relay_source_slot_snapshots_[device_idx];
+            std::fill(slot_snapshot.begin(), slot_snapshot.end(), -1);
+            auto *previous_state_ptr = previous_state.data_ptr<int64_t>();
+            for (int64_t slot = 0; slot < previous_state.numel(); slot++) {
+                int64_t partition_id = previous_state_ptr[slot];
+                if (partition_id >= 0 && partition_id < static_cast<int64_t>(slot_snapshot.size())) {
+                    slot_snapshot[static_cast<std::size_t>(partition_id)] = slot;
+                }
+            }
+
+            auto &scratch_rounds = peer_relay_source_scratch_rounds_[device_idx];
+            for (const auto &handoff : outgoing_handoffs) {
+                if (handoff.partition_id >= 0 && handoff.partition_id < static_cast<int>(scratch_rounds.size())) {
+                    scratch_rounds[static_cast<std::size_t>(handoff.partition_id)] = -1;
+                }
+            }
+
+            for (const auto &handoff : outgoing_handoffs) {
+                if (handoff.partition_id < 0 || handoff.partition_id >= static_cast<int>(buffer->partition_table_.size())) {
+                    throw GegeRuntimeException(fmt::format(
+                        "Stateflow peer handoff references invalid partition {} on terminal source lane {}",
+                        handoff.partition_id, device_idx));
+                }
+                if (handoff.partition_id < static_cast<int>(scratch_rounds.size()) &&
+                    scratch_rounds[static_cast<std::size_t>(handoff.partition_id)] == transition_round_idx) {
+                    continue;
+                }
+
+                Partition *src_partition = buffer->partition_table_[handoff.partition_id];
+                if (!src_partition->present_ || src_partition->buffer_idx_ < 0) {
+                    continue;
+                }
+                if (src_partition->buffer_idx_ != handoff.src_slot_id) {
+                    continue;
+                }
+
+                int64_t rows = src_partition->partition_size_;
+                int64_t src_offset = buffer->logicalSlotRowOffset_(src_partition->buffer_idx_);
+                torch::Tensor src_view = buffer->buffer_tensor_gpu_view_.slice(0, src_offset, src_offset + rows);
+                try {
+                    torch::Tensor source_scratch;
+                    if (frame_cache_mapping && !stateflow_peer_relay_independent_scratch_enabled()) {
+                        int64_t scratch_frame = -1;
+                        {
+                            std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
+                            if (!buffer->free_physical_frames_.empty()) {
+                                scratch_frame = buffer->free_physical_frames_.back();
+                                buffer->free_physical_frames_.pop_back();
+                            }
+                        }
+                        if (scratch_frame < 0) {
+                            continue;
+                        }
+                        int64_t scratch_offset = scratch_frame * buffer->partition_size_;
+                        source_scratch = buffer->buffer_tensor_gpu_view_.slice(0, scratch_offset, scratch_offset + rows);
+                        published_source_scratch_frames[handoff.partition_id] = scratch_frame;
+                    } else {
+                        auto pool_it = source_scratch_pool.find(handoff.partition_id);
+                        if (pool_it != source_scratch_pool.end() && pool_it->second.defined() && pool_it->second.size(0) == rows &&
+                            pool_it->second.size(1) == dim1_size_ && pool_it->second.scalar_type() == src_view.scalar_type()) {
+                            source_scratch = pool_it->second;
+                        } else {
+                            source_scratch = torch::empty({rows, dim1_size_}, src_view.options());
+                            source_scratch_pool[handoff.partition_id] = source_scratch;
+                        }
+                    }
+                    source_scratch.copy_(src_view, true);
+                    published_source_scratch[handoff.partition_id] = source_scratch;
+                    scratch_rounds[static_cast<std::size_t>(handoff.partition_id)] = transition_round_idx;
+                } catch (const c10::Error &e) {
+                    cudaGetLastError();
+                    throw GegeRuntimeException(fmt::format(
+                        "Stateflow peer relay unable to publish terminal source scratch for partition {} on device {} ({})",
+                        handoff.partition_id, buffer->device_.index(), e.what()));
+                }
+            }
+
+            if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < peer_relay_source_ready_events_.size() &&
+                peer_relay_source_ready_events_[device_idx] != 0) {
+                auto ready_event = reinterpret_cast<cudaEvent_t>(peer_relay_source_ready_events_[device_idx]);
+                AT_CUDA_CHECK(cudaEventRecord(ready_event, comm_stream.stream()));
+            }
+            AT_CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+            peer_relay_source_published_rounds_[device_idx] = transition_round_idx;
+        }
+        publish_cv->notify_all();
+    }
+#endif
+}
+
 void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr_t swap_ready_event) {
     if (!peerRelayEnabled_()) {
         buffers_[device_idx]->performNextSwap(swap_ready_event);

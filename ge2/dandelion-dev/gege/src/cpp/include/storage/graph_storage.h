@@ -516,6 +516,77 @@ class GraphModelStorage {
         }
     }
 
+    void publishStateflowPeerSourcesForNextRound(int32_t device_idx = 0) {
+        if (storage_ptrs_.node_embeddings == nullptr ||
+            !instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings)) {
+            return;
+        }
+
+        std::uintptr_t swap_ready_event_handle = 0;
+        auto read_env_flag = [](const char *name, bool default_value) {
+            const char *raw = std::getenv(name);
+            if (raw == nullptr) {
+                return default_value;
+            }
+            std::string value(raw);
+            if (value == "0" || value == "false" || value == "False" || value == "FALSE") {
+                return false;
+            }
+            if (value == "1" || value == "true" || value == "True" || value == "TRUE") {
+                return true;
+            }
+            return default_value;
+        };
+#ifdef GEGE_CUDA
+        cudaEvent_t swap_ready_event = nullptr;
+        bool swap_event_sync = read_env_flag("GEGE_MEM_SWAP_EVENT_SYNC", true);
+        bool global_swap_sync = read_env_flag("GEGE_SYNC_BEFORE_SWAP", true);
+        if (swap_event_sync && !global_swap_sync && device_idx >= 0 &&
+            static_cast<std::size_t>(device_idx) < devices_.size() && devices_[device_idx].is_cuda()) {
+            c10::cuda::CUDAGuard guard(devices_[device_idx]);
+            AT_CUDA_CHECK(cudaEventCreateWithFlags(&swap_ready_event, cudaEventDisableTiming));
+            AT_CUDA_CHECK(cudaEventRecord(swap_ready_event, c10::cuda::getCurrentCUDAStream(devices_[device_idx].index()).stream()));
+            swap_ready_event_handle = reinterpret_cast<std::uintptr_t>(swap_ready_event);
+        }
+#endif
+
+        try {
+            auto embedding_storage = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings);
+            embedding_storage->publishStateflowPeerSourcesForNextRound(device_idx, swap_ready_event_handle);
+            if (storage_ptrs_.node_optimizer_state != nullptr && train_) {
+                auto optimizer_storage = std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state);
+                if (optimizer_storage != nullptr) {
+                    optimizer_storage->publishStateflowPeerSourcesForNextRound(device_idx, swap_ready_event_handle);
+                }
+            }
+            if (storage_ptrs_.node_embeddings_g != nullptr &&
+                instance_of<Storage, MemPartitionBufferStorage>(storage_ptrs_.node_embeddings_g)) {
+                std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_embeddings_g)
+                    ->publishStateflowPeerSourcesForNextRound(device_idx, swap_ready_event_handle);
+                if (storage_ptrs_.node_optimizer_state_g != nullptr && train_) {
+                    auto optimizer_storage_g =
+                        std::dynamic_pointer_cast<MemPartitionBufferStorage>(storage_ptrs_.node_optimizer_state_g);
+                    if (optimizer_storage_g != nullptr) {
+                        optimizer_storage_g->publishStateflowPeerSourcesForNextRound(device_idx, swap_ready_event_handle);
+                    }
+                }
+            }
+        } catch (...) {
+#ifdef GEGE_CUDA
+            if (swap_ready_event != nullptr) {
+                static_cast<void>(cudaEventDestroy(swap_ready_event));
+            }
+#endif
+            throw;
+        }
+
+#ifdef GEGE_CUDA
+        if (swap_ready_event != nullptr) {
+            AT_CUDA_CHECK(cudaEventDestroy(swap_ready_event));
+        }
+#endif
+    }
+
     void setBufferOrdering(vector<torch::Tensor> buffer_states) {
         if (storage_ptrs_.node_embeddings != nullptr && (instance_of<Storage, PartitionBufferStorage>(storage_ptrs_.node_embeddings))) {
             std::dynamic_pointer_cast<PartitionBufferStorage>(storage_ptrs_.node_embeddings)->setBufferOrdering(buffer_states);

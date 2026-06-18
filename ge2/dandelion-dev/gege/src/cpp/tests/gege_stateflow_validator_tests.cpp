@@ -227,6 +227,78 @@ void expect_exact_diagonal_bucket_coverage(const std::vector<torch::Tensor> &edg
     }
 }
 
+void expect_static_p30_q4_schedule_stats(const std::vector<torch::Tensor> &buffer_states) {
+    constexpr int kNumPartitions = 30;
+    constexpr int kBufferCapacity = 4;
+
+    expect_true(buffer_states.size() == 75, "p30/q4 static schedule should have 75 states");
+
+    std::vector<int64_t> rep_counts(kNumPartitions, 0);
+    std::vector<int64_t> overlap_hist(kBufferCapacity + 1, 0);
+    int64_t transition_overlap = 0;
+    std::vector<int64_t> previous;
+
+    for (const auto &state_tensor : buffer_states) {
+        auto partitions = tensor_to_vector(state_tensor);
+        expect_true(partitions.size() == kBufferCapacity, "p30/q4 state should have four partitions");
+        std::sort(partitions.begin(), partitions.end());
+        expect_true(std::adjacent_find(partitions.begin(), partitions.end()) == partitions.end(),
+                    "p30/q4 state should not repeat partitions");
+        for (auto partition : partitions) {
+            expect_true(partition >= 0 && partition < kNumPartitions, "p30/q4 partition id out of range");
+            rep_counts[static_cast<std::size_t>(partition)]++;
+        }
+
+        if (!previous.empty()) {
+            int64_t overlap = 0;
+            for (auto lhs : previous) {
+                for (auto rhs : partitions) {
+                    if (lhs == rhs) {
+                        overlap++;
+                        break;
+                    }
+                }
+            }
+            expect_true(overlap >= 0 && overlap <= kBufferCapacity, "p30/q4 transition overlap out of range");
+            overlap_hist[static_cast<std::size_t>(overlap)]++;
+            transition_overlap += overlap;
+        }
+        previous = std::move(partitions);
+    }
+
+    int64_t rep10 = 0;
+    for (auto count : rep_counts) {
+        if (count == 10) {
+            rep10++;
+        }
+    }
+    const int64_t transition_admits =
+        static_cast<int64_t>(buffer_states.size() - 1) * kBufferCapacity - transition_overlap;
+
+    expect_true(rep10 == 30, "p30/q4 static schedule should have rep_hist={10: 30}");
+    expect_true(overlap_hist[1] == 60, "p30/q4 static schedule should have 60 one-overlap transitions");
+    expect_true(overlap_hist[2] == 14, "p30/q4 static schedule should have 14 two-overlap transitions");
+    expect_true(transition_admits == 208, "p30/q4 static schedule should have transition_admits=208");
+}
+
+void test_bounded_q4_static_p30_schedule_stats() {
+    constexpr int kNumPartitions = 30;
+    constexpr int kBufferCapacity = 4;
+
+    ScopedEnvVar order_file_env("GEGE_BOUNDED_STATE_ORDER_FILE", nullptr);
+    ScopedEnvVar optimal88_env("GEGE_BOUNDED_Q4_OPTIMAL88", "0");
+    ScopedEnvVar max_admits_env("GEGE_STATEFLOW_MAX_ADMITS", "3");
+    ScopedEnvVar minmax_env("GEGE_MINMAX_BUCKET_ASSIGNMENT", "1");
+
+    std::vector<int64_t> edge_bucket_sizes(static_cast<std::size_t>(kNumPartitions * kNumPartitions), 1);
+    auto [buffer_states, edge_buckets] =
+        getBoundedGreedyCoverEdgeBucketOrdering(kNumPartitions, kBufferCapacity, edge_bucket_sizes);
+
+    expect_true(buffer_states.size() == edge_buckets.size(), "p30/q4 state and edge-bucket schedule sizes should match");
+    expect_static_p30_q4_schedule_stats(buffer_states);
+    expect_exact_diagonal_bucket_coverage(edge_buckets, kNumPartitions);
+}
+
 void test_bounded_q4_scheduler_trains_diagonal_buckets_once() {
     constexpr int kNumPartitions = 32;
     constexpr int kBufferCapacity = 4;
@@ -320,6 +392,7 @@ int main() {
         {"reject_bucket_coverage_gap", test_reject_bucket_coverage_gap},
         {"four_gpu_lane_matched_candidate_validates", test_four_gpu_lane_matched_candidate_validates},
         {"peer_aware_lane_matching_reduces_lane_matched_cost", test_peer_aware_lane_matching_reduces_lane_matched_cost},
+        {"bounded_q4_static_p30_schedule_stats", test_bounded_q4_static_p30_schedule_stats},
         {"bounded_q4_scheduler_trains_diagonal_buckets_once", test_bounded_q4_scheduler_trains_diagonal_buckets_once},
         {"bounded_q4_scheduler_is_parameterized", test_bounded_q4_scheduler_is_parameterized},
         {"bounded_q4_lane_matched_respects_three_admit_cap", test_bounded_q4_lane_matched_respects_three_admit_cap},

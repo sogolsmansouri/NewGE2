@@ -2,10 +2,12 @@
 """Allocation-bounded ARC TW study using the validated fixed/shared-frame runner."""
 import argparse
 import csv
+import fcntl
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -16,7 +18,53 @@ import numpy as np
 import yaml
 
 from run_local_tw_fixed_frames import (NODES, TRAIN, cases, digest, environment, execute,
-    gpu_processes, schedule_info, validate_prepared_data, write_json)
+    gpu_processes, schedule_info, summarize, validate_prepared_data, write_json)
+
+
+class AllocationInterrupted(SystemExit):
+    def __init__(self, signum):
+        self.signum = signum
+        super().__init__(128 + signum)
+
+
+def interrupt_allocation(signum, frame):
+    raise AllocationInterrupted(signum)
+
+
+def reusable_results(previous, rows, commit, binary_hashes):
+    """Reuse whole validated cases, never partially trained model state."""
+    plan = json.loads((previous / 'plan.json').read_text())
+    build = json.loads((previous / 'build.json').read_text())
+    if (plan['commit'] != commit or build['commit'] != commit or
+            plan['batch_size'] != 50000 or plan['epochs'] != 5 or
+            build['hashes'] != binary_hashes):
+        raise RuntimeError('Previous study has incompatible build or training controls')
+    expected = {row['case']: row for row in rows}
+    reused = []
+    for entry in json.loads((previous / 'results.json').read_text()):
+        if entry['status'] != 'valid_timing' or entry['case'] not in expected:
+            continue
+        row = expected[entry['case']]
+        if any(entry.get(key) != value for key, value in row.items()):
+            raise RuntimeError('Previous case configuration differs: ' + row['case'])
+        directory = Path(entry['run_dir'])
+        result = json.loads((directory / 'result.json').read_text())
+        provenance = json.loads((directory / 'provenance.json').read_text())
+        artifacts = directory.parent / 'artifacts'
+        if any(digest(artifacts / name) != sha for name, sha in binary_hashes.items()):
+            raise RuntimeError('Previous case binary changed: ' + row['case'])
+        if digest(directory / 'effective_config.yaml') != provenance['config_sha256']:
+            raise RuntimeError('Previous case config changed: ' + row['case'])
+        log = (directory / 'train.log').read_text()
+        verified = summarize(log, entry, 5, result['exit_code'], result['foreign_gpu_pids'])
+        edges = [int(a) for a, b in re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\]', log) if a == b]
+        if (result['status'] != 'valid_timing' or verified['status'] != 'valid_timing' or
+                verified['epoch_times_s'] != result['epoch_times_s'] or
+                edges != [TRAIN] * 5):
+            raise RuntimeError('Previous case does not pass log revalidation: ' + row['case'])
+        reused.append(dict(entry, average_epoch_s=verified['average_epoch_s'],
+            steady_epoch_s=verified['steady_epoch_s'], reused_from=str(previous)))
+    return reused
 
 
 def study_rows():
@@ -82,13 +130,19 @@ def main():
     parser.add_argument('--job', required=True)
     parser.add_argument('--commit', required=True)
     parser.add_argument('--end-epoch', type=float, required=True)
+    parser.add_argument('--resume-from', type=Path, action='append', default=[],
+                        help='Reuse validated cases from a previous study in a fresh results directory')
     args = parser.parse_args()
     work, results = args.work.resolve(), args.results.resolve()
     results.mkdir(parents=True, exist_ok=True)
+    if any((results / name).exists() for name in ('plan.json', 'status.json', 'results.json')):
+        raise RuntimeError('Use a fresh results directory; prior attempts must remain intact')
     if os.environ.get('SLURM_JOB_ID') != args.job:
         raise RuntimeError('This supervisor must run inside the authorized allocation')
     if 'TW_PHYSICAL_GPU' not in os.environ or 'TW_RUNTIME_ENV' not in os.environ:
         raise RuntimeError('Select the allocated physical GPU and node-local runtime explicitly')
+    lock = (work / 'supervisor.lock').open('a')
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     deadline = args.end_epoch - 300
     os.environ['TW_DEADLINE_EPOCH'] = str(deadline)
     rows = study_rows()
@@ -97,11 +151,16 @@ def main():
     write_json(results / 'plan.json', dict(commit=args.commit, job=args.job,
         batch_size=50000, epochs=5, eval=False, cases=rows,
         physical_gpu=os.environ['TW_PHYSICAL_GPU'], allocation_end=args.end_epoch,
+        resume_from=[str(p.resolve()) for p in args.resume_from],
+        supervisor_sha256=digest(Path(__file__)),
         note='Shared-node timing; foreign GPUs may use CPU memory/storage. No uncontended-node claim.'))
     completed = []
 
     def status(state, **extra):
         write_json(results / 'status.json', dict(status=state, pid=os.getpid(), updated=time.time(), **extra))
+
+    signal.signal(signal.SIGTERM, interrupt_allocation)
+    signal.signal(signal.SIGINT, interrupt_allocation)
 
     def collect(row, state, **extra):
         completed.append(dict(row, status=state, **extra))
@@ -122,8 +181,9 @@ def main():
         for src, dst in [('reference.yaml', 'reference.yaml'), ('reference_flags.sh', 'reference_flags.sh'),
                          ('source_files.json', 'source_files.json')]:
             shutil.copy2(work / 'input' / src, artifacts / dst)
-        for name in ('run_local_tw_fixed_frames.py', 'prepare_ge2_partitioned_view.py', 'run_arc_tw_memory_study.py'):
+        for name in ('run_local_tw_fixed_frames.py', 'prepare_ge2_partitioned_view.py'):
             shutil.copy2(work / 'input' / name, artifacts / name)
+        shutil.copy2(Path(__file__), artifacts / 'run_arc_tw_memory_study.py')
         source = work / 'input/schedules' / f"q{row['q']}" / f"p{row['p']}"
         row.update(schedule_info(source / 'states.txt', source / 'cover.json', row['q']))
         for name, suffix in (('states.txt', 'txt'), ('cover.json', 'json')):
@@ -166,6 +226,11 @@ def main():
         frozen_hashes = {name: digest(build / name) for name in ('gege_train', 'libge2.so', 'gege_fixed_frame_buffer_test')}
         write_json(results / 'build.json', dict(commit=args.commit, hashes=frozen_hashes,
             environment=os.environ['TW_RUNTIME_ENV'], pythonpath=os.environ.get('TW_RUNTIME_PYTHONPATH')))
+        for previous in args.resume_from:
+            for entry in reusable_results(previous.resolve(), rows, args.commit, frozen_hashes):
+                if entry['case'] not in {item['case'] for item in completed}:
+                    collect(entry, entry['status'])
+                    print('reused', entry['case'], entry['run_dir'], flush=True)
         fixture = work / 'fixture'
         (fixture / 'edges').mkdir(parents=True, exist_ok=True)
         rng = np.random.default_rng(1987)
@@ -178,6 +243,8 @@ def main():
             'import torch; print(torch.cuda.get_device_properties(0).total_memory)'],env=memory_env,text=True))
         write_json(results / 'all_resident_p2_preflight.json', all_resident_payload(NODES,TRAIN,capacity))
         for row in rows:
+            if row['case'] in {item['case'] for item in completed}:
+                continue
             if time.time() + 1800 > deadline:
                 status('needs_next_allocation', remaining=[r['case'] for r in rows if r['case'] not in {c['case'] for c in completed}])
                 return
@@ -207,7 +274,8 @@ def main():
                 collect(row,'value_gate_failed',run_dir=str(run))
                 continue
             gate_row = dict(row,case='gate')
-            gate = execute(work,run,gate_row,tiny_data,work / 'models' / (row['case']+'_gate'),5,tiny=True)
+            model_root = work / 'models' / results.name
+            gate = execute(work,run,gate_row,tiny_data,model_root / (row['case']+'_gate'),5,tiny=True)
             if gate['status'] != 'valid_timing':
                 collect(row,'training_gate_failed',run_dir=str(run))
                 continue
@@ -227,11 +295,16 @@ def main():
                 return
             subprocess.run(['nvidia-smi','-q'],stdout=(run / 'node_gpu_before.log').open('w'),check=True)
             status('training',case=row['case'],detail=str(run / 'status.json'))
-            result = execute(work,run,dict(row,case='full'),data,work / 'models' / row['case'],5)
+            result = execute(work,run,dict(row,case='full'),data,model_root / row['case'],5)
             subprocess.run(['nvidia-smi','-q'],stdout=(run / 'node_gpu_after.log').open('w'),check=True)
             collect(row,result['status'],average_epoch_s=result.get('average_epoch_s'),
                     steady_epoch_s=result.get('steady_epoch_s'),run_dir=str(run / 'full'))
         status('finished',total=len(completed),valid=sum(r['status']=='valid_timing' for r in completed))
+    except AllocationInterrupted as error:
+        status('interrupted', signal=error.signum, job=args.job,
+            remaining=[r['case'] for r in rows if r['case'] not in {c['case'] for c in completed}],
+            note='Allocation-bound step; resume unfinished cases in a new allocation/results directory')
+        raise
     except BaseException as error:
         status('stopped',error=str(error))
         raise

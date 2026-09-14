@@ -29,6 +29,7 @@
 #endif
 
 #include "configuration/constants.h"
+#include "common/pipeline_nvtx.h"
 #include "reporting/logger.h"
 
 #if defined(GEGE_CUDA)
@@ -187,9 +188,26 @@ int64_t frame_cache_hidden_frames() {
     return hidden_frames;
 }
 
+// A nonnegative value opts into a fixed physical-frame budget. Unstaged
+// admissions stay on the boundary; they must not allocate a CUDA staging tensor.
+int64_t frame_cache_fixed_preload_frames() {
+    static int64_t frames = parse_env_int("GEGE_FRAME_CACHE_FIXED_PRELOAD_FRAMES", -1);
+    return frames;
+}
+
 bool frame_cache_auto_pipeline_frames_enabled() {
     static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES", false);
     return enabled;
+}
+
+int64_t frame_cache_auto_max_admits() {
+    static int64_t max_admits = parse_env_int("GEGE_FRAME_CACHE_AUTO_MAX_ADMITS", -1);
+    return max_admits;
+}
+
+int64_t frame_cache_auto_max_evicts() {
+    static int64_t max_evicts = parse_env_int("GEGE_FRAME_CACHE_AUTO_MAX_EVICTS", -1);
+    return max_evicts;
 }
 
 bool frame_cache_hidden_only_preload_enabled() {
@@ -1388,6 +1406,18 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
             ? static_cast<int>(frame_cache_hidden_frames())
             : 0;
     physical_frame_capacity_ = capacity_ + hidden_frame_capacity_;
+    if (frame_cache_fixed_preload_frames() >= 0) {
+        const int64_t stale = parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG", -1);
+        if (buffer_sizes_ != 1 || !device_.is_cuda() || prefetching ||
+            frame_cache_auto_pipeline_frames_enabled() || single_gpu_async_evict_writeback_enabled() ||
+            (hidden_frame_capacity_ == 0 && single_gpu_async_admit_preload_enabled()) ||
+            stale < 0 || frame_cache_fixed_preload_frames() + stale != hidden_frame_capacity_) {
+            throw GegeRuntimeException("Fixed frames require one CUDA buffer, explicit preload+stale=hidden, no auto growth or extra staging");
+        }
+        SPDLOG_INFO("[fixed-frame-budget] storage={} visible={} preload={} stale={} physical={} partition_rows={} width={} bytes={}",
+                    basename_string(filename_), capacity_, frame_cache_fixed_preload_frames(), stale, physical_frame_capacity_,
+                    partition_size_, embedding_size_, physical_frame_capacity_ * partition_size_ * embedding_size_ * dtype_size_);
+    }
     resetFrameCacheState_();
 
     buff_mem_ = nullptr;
@@ -1424,6 +1454,9 @@ MemPartitionBuffer::~MemPartitionBuffer() {
 bool MemPartitionBuffer::frameCacheEnabled_() const { return hidden_frame_capacity_ > 0; }
 
 int64_t MemPartitionBuffer::frameCacheMaxStaleBacklog_() const {
+    if (frame_cache_auto_pipeline_frames_enabled() && frame_cache_auto_max_stale_backlog_ >= 0) {
+        return frame_cache_auto_max_stale_backlog_;
+    }
     const int64_t default_manual_backlog =
         buffer_sizes_ > 1 ? 2 : static_cast<int64_t>(hidden_frame_capacity_);
     int64_t default_backlog =
@@ -1491,11 +1524,6 @@ void MemPartitionBuffer::autoConfigureFrameCacheFromOrdering_() {
         SPDLOG_WARN("[frame_cache_auto] requested but async admit preload is disabled for device={} buffer_sizes={}", device_.str(), buffer_sizes_);
         return;
     }
-    if (buffer_tensor_view_.defined() || buffer_tensor_gpu_view_.defined()) {
-        throw GegeRuntimeException(
-            "GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES requires frame-cache sizing before MemPartitionBuffer backing tensors are allocated");
-    }
-
     int device_index = device_.index();
     if (device_index < 0) {
         throw GegeRuntimeException("GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES requires a concrete CUDA device index");
@@ -1523,6 +1551,7 @@ void MemPartitionBuffer::autoConfigureFrameCacheFromOrdering_() {
     };
 
     int64_t max_transition_admits = 0;
+    int64_t max_transition_evicts = 0;
     int64_t transition_count = 0;
     int64_t max_visible_slots = 0;
     for (; idx < buffer_states_.size(); idx += stride) {
@@ -1535,21 +1564,55 @@ void MemPartitionBuffer::autoConfigureFrameCacheFromOrdering_() {
         max_visible_slots = std::max<int64_t>(max_visible_slots, static_cast<int64_t>(next_ids.size()));
 
         std::unordered_set<int64_t> current_set(current_ids.begin(), current_ids.end());
+        std::unordered_set<int64_t> next_set(next_ids.begin(), next_ids.end());
         int64_t admits = 0;
         for (int64_t partition_id : next_ids) {
             if (current_set.find(partition_id) == current_set.end()) {
                 admits += 1;
             }
         }
+        int64_t evicts = 0;
+        for (int64_t partition_id : current_ids) {
+            if (next_set.find(partition_id) == next_set.end()) {
+                evicts += 1;
+            }
+        }
         max_transition_admits = std::max(max_transition_admits, admits);
+        max_transition_evicts = std::max(max_transition_evicts, evicts);
         transition_count += 1;
     }
 
     const int64_t preload_frames = max_transition_admits;
-    const int64_t stale_frames = max_transition_admits;
+    const int64_t stale_frames = max_transition_evicts;
     const int64_t extra_frames = preload_frames + stale_frames;
+    const int64_t configured_max_admits = frame_cache_auto_max_admits();
+    const int64_t configured_max_evicts = frame_cache_auto_max_evicts();
+    if (configured_max_admits >= 0 && max_transition_admits > configured_max_admits) {
+        throw GegeRuntimeException(fmt::format(
+            "Schedule requires {} transition admissions, exceeding GEGE_FRAME_CACHE_AUTO_MAX_ADMITS={}",
+            max_transition_admits, configured_max_admits));
+    }
+    if (configured_max_evicts >= 0 && max_transition_evicts > configured_max_evicts) {
+        throw GegeRuntimeException(fmt::format(
+            "Schedule requires {} transition evictions, exceeding GEGE_FRAME_CACHE_AUTO_MAX_EVICTS={}",
+            max_transition_evicts, configured_max_evicts));
+    }
     frame_cache_auto_max_transition_admits_ = max_transition_admits;
     frame_cache_auto_max_stale_backlog_ = stale_frames;
+
+    if (buffer_tensor_view_.defined() || buffer_tensor_gpu_view_.defined()) {
+        const int expected_physical_frames = capacity_ + static_cast<int>(extra_frames);
+        if (hidden_frame_capacity_ != extra_frames || physical_frame_capacity_ != expected_physical_frames) {
+            throw GegeRuntimeException(fmt::format(
+                "Schedule-derived frame capacity changed after backing allocation: existing hidden={} physical={}, required hidden={} physical={}",
+                hidden_frame_capacity_, physical_frame_capacity_, extra_frames, expected_physical_frames));
+        }
+        SPDLOG_INFO(
+            "[frame_cache_auto] reusing allocated frame capacity device={} preload_frames={} stale_frames={} extra_frames={} physical_frames={}",
+            device_.str(), preload_frames, stale_frames, extra_frames, physical_frame_capacity_);
+        return;
+    }
+
     hidden_frame_capacity_ = static_cast<int>(extra_frames);
     physical_frame_capacity_ = capacity_ + hidden_frame_capacity_;
     resetFrameCacheState_();
@@ -1561,9 +1624,9 @@ void MemPartitionBuffer::autoConfigureFrameCacheFromOrdering_() {
     }
     double frame_mib = static_cast<double>(partition_size_) * static_cast<double>(embedding_size_) *
                        static_cast<double>(dtype_size_) / (1024.0 * 1024.0);
-    SPDLOG_INFO("[frame_cache_auto] device={} visible_capacity={} max_visible_slots={} transitions={} max_transition_admits={} "
+    SPDLOG_INFO("[frame_cache_auto] device={} visible_capacity={} max_visible_slots={} transitions={} max_transition_admits={} max_transition_evicts={} "
                 "preload_frames={} stale_frames={} extra_frames={} physical_frames={} frame_mib={:.3f}",
-                device_.str(), capacity_, max_visible_slots, transition_count, max_transition_admits, preload_frames, stale_frames,
+                device_.str(), capacity_, max_visible_slots, transition_count, max_transition_admits, max_transition_evicts, preload_frames, stale_frames,
                 extra_frames, physical_frame_capacity_, frame_mib);
 }
 
@@ -2094,6 +2157,7 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                          expected_host_stage, release_frames = std::move(writeback_release_frames),
                          source_frame_offsets = std::move(writeback_source_frame_offsets), source_ready_event, destroy_source_ready_event,
                          prioritized_source_writeback]() {
+        gege::profiling::ScopedRange writeback_scope("buffer.writeback.worker");
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double host_alloc_ms = 0.0;
@@ -2270,28 +2334,38 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                     }
 
                     auto alloc_start = std::chrono::high_resolution_clock::now();
-                    torch::Tensor host_view = allocate_cpu_stage_with_optional_pinning(
-                        source_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-evict-writeback-partition", device_);
+                    torch::Tensor host_view;
+                    {
+                        gege::profiling::ScopedRange host_alloc_scope("buffer.writeback.host_alloc");
+                        host_view = allocate_cpu_stage_with_optional_pinning(
+                            source_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-evict-writeback-partition", device_);
+                    }
                     host_alloc_ms += elapsed_ms(alloc_start, std::chrono::high_resolution_clock::now());
 
                     torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
                     auto copy_start = std::chrono::high_resolution_clock::now();
+                    {
+                        gege::profiling::ScopedRange d2h_scope("buffer.writeback.d2h");
 #ifdef GEGE_CUDA
-                    bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(host_view);
-                    if (non_blocking_host_copy) {
-                        host_view.copy_(gpu_view, true);
-                    } else {
-                        host_view.copy_(gpu_view);
-                    }
-                    AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
+                        bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(host_view);
+                        if (non_blocking_host_copy) {
+                            host_view.copy_(gpu_view, true);
+                        } else {
+                            host_view.copy_(gpu_view);
+                        }
+                        AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
 #else
-                    host_view.copy_(gpu_view);
+                        host_view.copy_(gpu_view);
 #endif
+                    }
                     gpu_to_host_stage_ms += elapsed_ms(copy_start, std::chrono::high_resolution_clock::now());
 
                     Partition *partition = partition_table_[evict_ids[idx]];
                     auto write_start = std::chrono::high_resolution_clock::now();
-                    copyPartitionFromPinnedToHost_(partition, host_view);
+                    {
+                        gege::profiling::ScopedRange host_store_scope("buffer.writeback.host_store");
+                        copyPartitionFromPinnedToHost_(partition, host_view);
+                    }
                     host_storage_write_ms += elapsed_ms(write_start, std::chrono::high_resolution_clock::now());
                     mark_partition_writeback_complete(idx);
                 }
@@ -2310,8 +2384,12 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
             }
 
             int64_t host_stage_rows = sparse_dirty_source_writeback ? dirty_rows : total_rows;
-            torch::Tensor host_stage = allocate_cpu_stage_with_optional_pinning(
-                host_stage_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-evict-writeback", device_);
+            torch::Tensor host_stage;
+            {
+                gege::profiling::ScopedRange host_alloc_scope("buffer.writeback.host_alloc");
+                host_stage = allocate_cpu_stage_with_optional_pinning(
+                    host_stage_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-evict-writeback", device_);
+            }
             auto after_host_alloc = std::chrono::high_resolution_clock::now();
             host_alloc_ms = elapsed_ms(phase_start, after_host_alloc);
             phase_start = after_host_alloc;
@@ -2342,13 +2420,16 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                         int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
                         torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
                         auto copy_start = std::chrono::high_resolution_clock::now();
-                        torch::Tensor dirty_gpu_view = gpu_view.index_select(0, dirty_local);
-                        if (non_blocking_host_copy) {
-                            host_view.copy_(dirty_gpu_view, true);
-                        } else {
-                            host_view.copy_(dirty_gpu_view);
+                        {
+                            gege::profiling::ScopedRange d2h_scope("buffer.writeback.d2h");
+                            torch::Tensor dirty_gpu_view = gpu_view.index_select(0, dirty_local);
+                            if (non_blocking_host_copy) {
+                                host_view.copy_(dirty_gpu_view, true);
+                            } else {
+                                host_view.copy_(dirty_gpu_view);
+                            }
+                            cudaStreamSynchronize(copy_stream.stream());
                         }
-                        cudaStreamSynchronize(copy_stream.stream());
                         sparse_gpu_to_host_ms += elapsed_ms(copy_start, std::chrono::high_resolution_clock::now());
                     }
                     gpu_to_host_stage_ms = sparse_gpu_to_host_ms;
@@ -2362,18 +2443,24 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                         int64_t source_rows = row_offsets[idx + 1] - row_offsets[idx];
                         torch::Tensor gpu_view = buffer_tensor_gpu_view_.slice(0, source_start, source_start + source_rows);
                         auto copy_start = std::chrono::high_resolution_clock::now();
-                        if (non_blocking_host_copy) {
-                            host_view.copy_(gpu_view, true);
-                        } else {
-                            host_view.copy_(gpu_view);
+                        {
+                            gege::profiling::ScopedRange d2h_scope("buffer.writeback.d2h");
+                            if (non_blocking_host_copy) {
+                                host_view.copy_(gpu_view, true);
+                            } else {
+                                host_view.copy_(gpu_view);
+                            }
+                            cudaStreamSynchronize(copy_stream.stream());
                         }
-                        cudaStreamSynchronize(copy_stream.stream());
                         auto after_copy = std::chrono::high_resolution_clock::now();
                         inline_gpu_to_host_ms += elapsed_ms(copy_start, after_copy);
 
                         Partition *partition = partition_table_[evict_ids[idx]];
                         auto write_start = after_copy;
-                        copyPartitionFromPinnedToHost_(partition, host_view);
+                        {
+                            gege::profiling::ScopedRange host_store_scope("buffer.writeback.host_store");
+                            copyPartitionFromPinnedToHost_(partition, host_view);
+                        }
                         auto after_write = std::chrono::high_resolution_clock::now();
                         inline_host_storage_ms += elapsed_ms(write_start, after_write);
                         mark_partition_writeback_complete(idx);
@@ -2381,6 +2468,7 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                     gpu_to_host_stage_ms = inline_gpu_to_host_ms;
                     host_storage_write_ms = inline_host_storage_ms;
                 } else {
+                    gege::profiling::ScopedRange d2h_scope("buffer.writeback.d2h");
                     for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                         torch::Tensor host_view = host_stage.slice(0, row_offsets[idx], row_offsets[idx + 1]);
                         int64_t source_start = source_frame_offsets[idx];
@@ -2395,6 +2483,7 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                     AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
                 }
             } else if (gpu_stage.device().is_cuda()) {
+                gege::profiling::ScopedRange d2h_scope("buffer.writeback.d2h");
                 c10::cuda::CUDAGuard device_guard(device_);
                 bool non_blocking_host_copy = tensor_supports_non_blocking_host_copy(host_stage);
                 if (non_blocking_host_copy) {
@@ -2406,10 +2495,12 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
                     host_stage.copy_(gpu_stage);
                 }
             } else {
+                gege::profiling::ScopedRange d2h_scope("buffer.writeback.d2h");
                 host_stage.copy_(gpu_stage);
             }
 #else
             if (gpu_stage.defined()) {
+                gege::profiling::ScopedRange d2h_scope("buffer.writeback.d2h");
                 host_stage.copy_(gpu_stage);
             }
 #endif
@@ -2436,6 +2527,10 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
             verify_host_copy_ms = elapsed_ms(phase_start, after_host_copy_verify);
             phase_start = after_host_copy_verify;
 
+            gege::profiling::ManualRange host_store_range;
+            if (!host_storage_written_inline) {
+                host_store_range.start("buffer.writeback.host_store");
+            }
             if (sparse_dirty_source_writeback) {
                 for (std::size_t idx = 0; idx < evict_ids.size(); idx++) {
                     int64_t dirty_start = dirty_row_offsets[idx];
@@ -2481,6 +2576,7 @@ void MemPartitionBuffer::startAsyncEvictWriteback_(const std::vector<int> &evict
             if (!host_storage_written_inline) {
                 host_storage_write_ms = elapsed_ms(phase_start, after_host_storage_write);
             }
+            host_store_range.stop();
             phase_start = after_host_storage_write;
 
             if (expected_host_stage.defined()) {
@@ -2589,7 +2685,7 @@ void MemPartitionBuffer::releaseReservedHiddenFrames_(const std::vector<HiddenFr
     }
     std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
     for (const HiddenFramePublish &publish : publishes) {
-        if (publish.frame < capacity_ || publish.frame >= physical_frame_capacity_) {
+        if (publish.frame < 0 || publish.frame >= physical_frame_capacity_) {
             continue;
         }
         bool frame_is_visible = false;
@@ -2641,6 +2737,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
         async_admit_preload_total_ms_ = 0.0;
     }
     async_admit_preload_thread_ = std::thread([this, admit_ids, evict_slots, reserved_hidden_frames]() {
+        gege::profiling::ScopedRange preload_scope("buffer.preload.worker");
         auto total_start = std::chrono::high_resolution_clock::now();
         auto phase_start = total_start;
         double host_load_ms = 0.0;
@@ -2648,13 +2745,18 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
         std::vector<HiddenFramePublish> hidden_publishes;
 
         try {
-            joinAsyncEvictWritebackForPartitions_(admit_ids);
+            {
+                gege::profiling::ScopedRange wait_scope("buffer.preload.wait_matching_writeback");
+                joinAsyncEvictWritebackForPartitions_(admit_ids);
+            }
 
             std::vector<int> stage_admit_ids = admit_ids;
             std::vector<int64_t> stage_evict_slots = evict_slots;
             if (frameCacheEnabled_() && !admit_ids.empty()) {
                 const std::size_t target_hidden_count =
-                    std::min<std::size_t>(static_cast<std::size_t>(hidden_frame_capacity_), admit_ids.size());
+                    std::min<std::size_t>(static_cast<std::size_t>(frame_cache_fixed_preload_frames() >= 0
+                                                                     ? frame_cache_fixed_preload_frames()
+                                                                     : hidden_frame_capacity_), admit_ids.size());
                 if (target_hidden_count > 0 && frame_cache_hidden_only_preload_enabled() &&
                     frame_cache_delayed_stale_writeback_enabled() && !single_gpu_async_evict_writeback_enabled()) {
                     std::size_t free_count = 0;
@@ -2692,7 +2794,8 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                                             stage_evict_slots.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
                 }
             }
-            int64_t stage_rows = partition_rows_for_ids(stage_admit_ids, partition_table_);
+            int64_t stage_rows = frame_cache_fixed_preload_frames() >= 0
+                                     ? 0 : partition_rows_for_ids(stage_admit_ids, partition_table_);
 
             std::vector<int64_t> row_offsets;
             row_offsets.reserve(stage_admit_ids.size() + 1);
@@ -2703,6 +2806,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
 
             torch::Tensor host_stage;
             if (stage_rows > 0) {
+                gege::profiling::ScopedRange host_gather_scope("buffer.preload.host_gather");
                 host_stage = allocate_cpu_stage_with_optional_pinning(
                     stage_rows, embedding_size_, dtype_, use_pinned_host_buffer_, "async-admit-preload", device_);
                 for (std::size_t idx = 0; idx < stage_admit_ids.size(); idx++) {
@@ -2724,13 +2828,17 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                 int64_t hidden_offset = hidden_publish.frame * partition_size_;
                 torch::Tensor hidden_host_view = buffer_tensor_view_.slice(0, hidden_offset, hidden_offset + hidden_partition->partition_size_);
                 auto hidden_host_start = std::chrono::high_resolution_clock::now();
-                copyPartitionFromHostToPinned_(hidden_partition, hidden_host_view);
+                {
+                    gege::profiling::ScopedRange host_gather_scope("buffer.preload.host_gather");
+                    copyPartitionFromHostToPinned_(hidden_partition, hidden_host_view);
+                }
                 auto hidden_host_end = std::chrono::high_resolution_clock::now();
                 if (interleaved_hidden_h2d) {
                     interleaved_hidden_host_load_ms += elapsed_ms(hidden_host_start, hidden_host_end);
                 }
 #ifdef GEGE_CUDA
                 if (interleaved_hidden_h2d) {
+                    gege::profiling::ScopedRange h2d_scope("buffer.preload.h2d");
                     auto hidden_h2d_start = std::chrono::high_resolution_clock::now();
                     std::unique_lock<std::mutex> admit_h2d_lock(frame_cache_admit_h2d_mutex());
                     c10::cuda::CUDAGuard device_guard(device_);
@@ -2756,6 +2864,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
             torch::Tensor gpu_stage;
 #ifdef GEGE_CUDA
             {
+                gege::profiling::ScopedRange h2d_scope("buffer.preload.h2d");
                 c10::cuda::CUDAGuard device_guard(device_);
                 int64_t stage_free_bytes = -1;
                 int64_t stage_required_bytes = -1;
@@ -2842,7 +2951,10 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                 }
             }
 #else
-            gpu_stage = host_stage.to(device_);
+            {
+                gege::profiling::ScopedRange h2d_scope("buffer.preload.h2d");
+                gpu_stage = host_stage.to(device_);
+            }
 #endif
             auto after_gpu = std::chrono::high_resolution_clock::now();
             cpu_to_gpu_ms = interleaved_hidden_cpu_to_gpu_ms + elapsed_ms(phase_start, after_gpu);
@@ -2872,9 +2984,67 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
     });
 }
 
+void MemPartitionBuffer::prepareFixedFrameBoundaryAdmissions_(const std::vector<int> &admit_ids,
+                                                            const std::vector<int64_t> &evict_slots) {
+    if (frame_cache_fixed_preload_frames() < 0 || !frameCacheEnabled_()) {
+        return;
+    }
+    gege::profiling::ScopedRange boundary_scope("buffer.fixed_frames.boundary_admit");
+    joinAsyncAdmitPreload_();
+    const std::size_t target = std::min<std::size_t>(frameCacheMaxStaleBacklog_(), admit_ids.size());
+    const std::size_t prepared = async_admit_preload_hidden_publishes_.size();
+    if (!async_admit_preload_valid_ || target <= prepared) {
+        return;
+    }
+    // When stale capacity exceeds preload capacity, load a replacement at the
+    // boundary into a free physical frame. The old visible allocation can then
+    // become stale. This is exposed H2D, not extra background preload capacity.
+    flushPendingDelayedStaleWriteback_();
+    joinAsyncEvictWriteback_();
+    joinAsyncEvictWritebackForPartitions_(admit_ids);
+    std::vector<HiddenFramePublish> extra;
+    {
+        std::lock_guard<std::mutex> lock(free_physical_frames_lock_);
+        while (prepared + extra.size() < target && !free_physical_frames_.empty()) {
+            const std::size_t idx = prepared + extra.size();
+            const int64_t frame = free_physical_frames_.back();
+            free_physical_frames_.pop_back();
+            extra.push_back(HiddenFramePublish{admit_ids[idx], evict_slots[idx], frame});
+        }
+    }
+    try {
+#ifdef GEGE_CUDA
+        c10::cuda::CUDAGuard device_guard(device_);
+        auto stream = c10::cuda::getStreamFromPool(false, device_.index());
+        c10::cuda::CUDAStreamGuard stream_guard(stream);
+        for (const auto &publish : extra) {
+            Partition *partition = partition_table_[publish.partition_id];
+            const int64_t offset = publish.frame * partition_size_;
+            auto host = buffer_tensor_view_.slice(0, offset, offset + partition->partition_size_);
+            auto gpu = buffer_tensor_gpu_view_.slice(0, offset, offset + partition->partition_size_);
+            copyPartitionFromHostToPinned_(partition, host);
+            gpu.copy_(host, tensor_supports_non_blocking_host_copy(host));
+        }
+        AT_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+#endif
+    } catch (...) {
+        // The process aborts on a transfer failure; do not recycle referenced frames.
+        throw;
+    }
+    async_admit_preload_hidden_publishes_.insert(async_admit_preload_hidden_publishes_.end(), extra.begin(), extra.end());
+    const auto count = async_admit_preload_hidden_publishes_.size();
+    async_admit_preload_admit_ids_.assign(admit_ids.begin() + count, admit_ids.end());
+    async_admit_preload_evict_slots_.assign(evict_slots.begin() + count, evict_slots.end());
+    if (partition_buffer_swap_timing_enabled()) {
+        SPDLOG_INFO("[fixed-frame-boundary-admit] storage={} background_frames={} boundary_frames={}",
+                    basename_string(filename_), prepared, extra.size());
+    }
+}
+
 bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
                                                    int64_t *visible_install_rows, int64_t *hidden_publish_rows,
                                                    int64_t *visible_install_parts, int64_t *hidden_publish_parts) {
+    gege::profiling::ScopedRange consume_scope("buffer.preload.consume");
     if (visible_install_rows != nullptr) {
         *visible_install_rows = 0;
     }
@@ -2888,7 +3058,10 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
         *hidden_publish_parts = 0;
     }
     auto wait_start = std::chrono::high_resolution_clock::now();
-    joinAsyncAdmitPreload_();
+    {
+        gege::profiling::ScopedRange wait_scope("buffer.preload.consume_wait");
+        joinAsyncAdmitPreload_();
+    }
     if (wait_ms != nullptr) {
         *wait_ms = elapsed_ms(wait_start, std::chrono::high_resolution_clock::now());
     }
@@ -2962,7 +3135,7 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
         *hidden_publish_rows = hidden_rows;
     }
     if (visible_install_parts != nullptr) {
-        *visible_install_parts = static_cast<int64_t>(stage_admit_ids.size());
+        *visible_install_parts = gpu_stage.defined() ? static_cast<int64_t>(stage_admit_ids.size()) : 0;
     }
     if (hidden_publish_parts != nullptr) {
         *hidden_publish_parts = static_cast<int64_t>(hidden_publishes.size());
@@ -2970,6 +3143,7 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
 
     auto install_start = std::chrono::high_resolution_clock::now();
     if (gpu_stage.defined() && !row_offsets.empty()) {
+        gege::profiling::ScopedRange install_scope("buffer.preload.visible_install");
 #ifdef GEGE_CUDA
         c10::cuda::CUDAGuard device_guard(device_);
         auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
@@ -3699,6 +3873,7 @@ void MemPartitionBuffer::performNextSwapLegacy_(std::uintptr_t swap_ready_event)
 
 
 void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
+    gege::profiling::ScopedRange swap_scope("buffer.state_transition");
     if (!buffer_state_.defined() || buffer_state_iterator_ == buffer_states_.end()) {
         return;
     }
@@ -3789,6 +3964,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             evict_slots.emplace_back(partition->buffer_idx_);
         }
 
+        prepareFixedFrameBoundaryAdmissions_(admit_ids, evict_slots);
         bool delayed_stale_writeback = false;
         std::vector<int> delayed_stale_partition_ids;
         std::vector<int64_t> delayed_stale_logical_slots;
@@ -3801,8 +3977,9 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             asyncAdmitPreloadEnabled_() && !admit_ids.empty() && !evict_slots.empty()) {
             joinAsyncAdmitPreload_();
             std::lock_guard<std::mutex> preload_lock(async_admit_preload_lock_);
-            if (async_admit_preload_valid_ && !async_admit_preload_hidden_publishes_.empty() && async_admit_preload_admit_ids_.empty() &&
-                async_admit_preload_evict_slots_.empty()) {
+            if (async_admit_preload_valid_ && !async_admit_preload_hidden_publishes_.empty() &&
+                (frame_cache_fixed_preload_frames() >= 0 ||
+                 (async_admit_preload_admit_ids_.empty() && async_admit_preload_evict_slots_.empty()))) {
                 int64_t stale_backlog_before_delay = 0;
                 const int64_t reserved_preload_frames =
                     static_cast<int64_t>(async_admit_preload_hidden_publishes_.size());
@@ -3819,10 +3996,14 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 }
                 int64_t remaining_delayed_stale_slots =
                     std::max<int64_t>(frameCacheMaxStaleBacklog_() - stale_backlog_before_delay, 0);
-                if (remaining_delayed_stale_slots >= static_cast<int64_t>(async_admit_preload_hidden_publishes_.size())) {
+                if (remaining_delayed_stale_slots >= static_cast<int64_t>(async_admit_preload_hidden_publishes_.size()) ||
+                    (frame_cache_fixed_preload_frames() >= 0 && remaining_delayed_stale_slots > 0)) {
                     delayed_stale_row_offsets.emplace_back(0);
                     delayed_stale_writeback = true;
                     for (const HiddenFramePublish &hidden_publish : async_admit_preload_hidden_publishes_) {
+                        if (static_cast<int64_t>(delayed_stale_partition_ids.size()) >= remaining_delayed_stale_slots) {
+                            break;
+                        }
                         auto slot_it = std::find(evict_slots.begin(), evict_slots.end(), hidden_publish.logical_slot);
                         if (slot_it == evict_slots.end()) {
                             delayed_stale_writeback = false;
@@ -4271,6 +4452,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         std::vector<int64_t> logged_hidden_publish_logical_slots;
         std::vector<int64_t> logged_hidden_publish_frames;
         if (!pending_hidden_publishes_.empty()) {
+            gege::profiling::ScopedRange publish_scope("buffer.publish_ready_frames");
             {
                 std::lock_guard<std::mutex> frame_lock(free_physical_frames_lock_);
                 for (const HiddenFramePublish &hidden_publish : pending_hidden_publishes_) {
@@ -4325,6 +4507,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
         }
 
         if (delayed_stale_writeback && !delayed_stale_partition_ids.empty()) {
+            gege::profiling::ScopedRange schedule_writeback_scope("buffer.schedule_stale_writeback");
             std::uintptr_t delayed_stale_ready_event_handle = 0;
             bool destroy_delayed_stale_ready_event = false;
 #ifdef GEGE_CUDA

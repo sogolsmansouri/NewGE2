@@ -294,6 +294,7 @@ class MemPartitionBuffer : public PartitionBuffer {
     void startAsyncAdmitPreloadForPlan_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots,
                                         int64_t reserved_hidden_frames = 0);
     void releaseReservedHiddenFrames_(const std::vector<HiddenFramePublish> &publishes);
+    void prepareFixedFrameBoundaryAdmissions_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots);
     void joinAsyncAdmitPreload_();
     bool consumeAsyncAdmitPreload_(const std::vector<int> &admit_ids, const std::vector<int64_t> &evict_slots, double *wait_ms,
                                    int64_t *visible_install_rows = nullptr, int64_t *hidden_publish_rows = nullptr,

@@ -1,5 +1,7 @@
 #include "storage/graph_storage.h"
 
+#include "common/pipeline_nvtx.h"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1406,6 +1408,8 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
 }
 
 void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
+    gege::profiling::ScopedRange boundary_scope("graph.boundary");
+    gege::profiling::ManualRange boundary_phase;
     ensureSubgraphStateVectors_(device_idx);
     int64_t outer_timing_id = -1;
     bool log_outer_timing = should_log_partition_buffer_pipeline_timing(outer_timing_id);
@@ -1422,6 +1426,7 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
     if (prefetch_) {
         shared_ptr<InMemorySubgraphState> prefetched_subgraph_state = nullptr;
         // wait until the prefetching has been completed
+        boundary_phase.start("graph.boundary.prefetch_wait");
         {
             std::unique_lock lock(*subgraph_lock_);
             subgraph_cv_->wait(lock, [this, device_idx] {
@@ -1429,17 +1434,21 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
             });
             prefetched_subgraph_state = next_subgraph_states_[device_idx];
         }
+        boundary_phase.stop();
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             prefetch_wait_ms = elapsed_graph_storage_ms(outer_phase_start, now);
             outer_phase_start = now;
         }
         // need to wait for the subgraph to be prefetched to perform the swap, otherwise the prefetched buffer_index_map may be incorrect
+        boundary_phase.start("graph.boundary.frame_swap");
         auto t1 = std::chrono::high_resolution_clock::now();
         performSwap(device_idx);
         auto t2 = std::chrono::high_resolution_clock::now();
+        boundary_phase.stop();
         perform_swap_ms = elapsed_graph_storage_ms(t1, t2);
         outer_phase_start = t2;
+        boundary_phase.start("graph.boundary.publish_graph");
         {
             std::lock_guard lock(*subgraph_lock_);
             auto previous_subgraph_state = current_subgraph_states_[device_idx];
@@ -1457,6 +1466,7 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
             prefetch_complete_ = std::any_of(prefetch_complete_by_device_.begin(), prefetch_complete_by_device_.end(),
                                              [](uint8_t complete) { return complete != 0; });
         }
+        boundary_phase.stop();
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             state_publish_ms = elapsed_graph_storage_ms(outer_phase_start, now);
@@ -1465,7 +1475,9 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
 
         if (hasSwap(device_idx)) {
             // update next_subgraph_state_ in background
+            boundary_phase.start("graph.boundary.launch_graph_prefetch");
             getNextSubGraph(device_idx);
+            boundary_phase.stop();
         }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -1473,7 +1485,9 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
             outer_phase_start = now;
         }
         if (hasSwap(device_idx)) {
+            boundary_phase.start("graph.boundary.launch_parameter_preload");
             startAsyncAdmitPreload(device_idx);
+            boundary_phase.stop();
         }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -1486,17 +1500,21 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
                 state_publish_ms, next_prefetch_start_ms, admit_preload_start_ms, elapsed_graph_storage_ms(outer_total_start, now));
         }
     } else {
+        boundary_phase.start("graph.boundary.swap_plan");
         auto get_swap_ids_start = std::chrono::high_resolution_clock::now();
         std::pair<std::vector<int>, std::vector<int>> current_swap_ids = getNextSwapIds(device_idx);
+        boundary_phase.stop();
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
             get_swap_ids_ms = elapsed_graph_storage_ms(get_swap_ids_start, now);
             outer_phase_start = now;
         }
         // SPDLOG_INFO("performSwap");
+        boundary_phase.start("graph.boundary.frame_swap");
         auto t1 = std::chrono::high_resolution_clock::now();
         performSwap(device_idx);
         auto t2 = std::chrono::high_resolution_clock::now();
+        boundary_phase.stop();
         perform_swap_ms = elapsed_graph_storage_ms(t1, t2);
         outer_phase_start = t2;
         // SPDLOG_INFO("performSwap time {}", std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count());
@@ -1504,13 +1522,17 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         empty_cache_for_graph_storage_device(devices_[device_idx]);
 #endif
         // SPDLOG_INFO("updateInMemorySubGraph_");
+        boundary_phase.start("graph.boundary.synchronous_graph_prepare");
         t1 = std::chrono::high_resolution_clock::now();
         updateInMemorySubGraph_(current_subgraph_states_[device_idx], current_swap_ids, device_idx);
         t2 = std::chrono::high_resolution_clock::now();
+        boundary_phase.stop();
         subgraph_update_ms = elapsed_graph_storage_ms(t1, t2);
         outer_phase_start = t2;
         if (hasSwap(device_idx) && !start_admit_preload_after_active_edges_enabled()) {
+            boundary_phase.start("graph.boundary.launch_parameter_preload");
             startAsyncAdmitPreload(device_idx);
+            boundary_phase.stop();
         }
         if (log_outer_timing) {
             auto now = std::chrono::high_resolution_clock::now();
@@ -1606,6 +1628,8 @@ shared_ptr<InMemorySubgraphState> GraphModelStorage::getPrefetchedNextSubgraphSt
 }
 
 void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState> subgraph, std::pair<std::vector<int>, std::vector<int>> swap_ids, int32_t device_idx) {
+    gege::profiling::ScopedRange worker_scope("graph.prepare_worker");
+    gege::profiling::ManualRange worker_phase("graph.prepare.state_plan");
     int64_t timing_id = -1;
     bool log_timing = should_log_partition_buffer_pipeline_timing(timing_id);
     bool log_remap_breakdown = log_timing && partition_buffer_remap_breakdown_timing_enabled();
@@ -1863,6 +1887,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
         state_prepare_ms = elapsed_graph_storage_ms(phase_start, now);
         phase_start = now;
     }
+    worker_phase.start("graph.prepare.edge_materialize");
 
     torch::Tensor new_all_in_memory_edges = torch::empty({total_size, storage_ptrs_.edges->dim1_size_}, torch::kInt64);
 
@@ -1889,6 +1914,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
         edge_materialize_ms = elapsed_graph_storage_ms(phase_start, now);
         phase_start = now;
     }
+    worker_phase.start("graph.prepare.remap_and_h2d");
 
     torch::Tensor mapped_edges;
     torch::Tensor bucket_layout_mapped_edges;
@@ -1956,6 +1982,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             remap_ms = elapsed_graph_storage_ms(phase_start, now);
             phase_start = now;
         }
+        worker_phase.start("graph.prepare.build");
         int64_t validation_id = -1;
         if (should_validate_partition_buffer_lp_fast_path(validation_id)) {
             torch::Tensor dense_map = getGlobalToLocalMapForValidation_(!prefetch_, device_idx);
@@ -1977,6 +2004,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             auto now = std::chrono::high_resolution_clock::now();
             graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
         }
+        worker_phase.stop();
     } else {
         subgraph->in_memory_subgraph_ = nullptr;
         if (storage_ptrs_.node_embeddings != nullptr) {
@@ -2029,6 +2057,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             remap_ms = elapsed_graph_storage_ms(phase_start, now);
             phase_start = now;
         }
+        worker_phase.start("graph.prepare.build");
 #ifdef GEGE_CUDA
         empty_cache_for_graph_storage_device(devices_[device_idx]);
 #endif
@@ -2053,6 +2082,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
             auto now = std::chrono::high_resolution_clock::now();
             graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
         }
+        worker_phase.stop();
     }
     subgraph->all_in_memory_mapped_edges_ = bucket_layout_mapped_edges;
 

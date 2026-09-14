@@ -511,6 +511,14 @@ shared_ptr<GraphModelStorage> initializeStorageLinkPrediction(shared_ptr<Model> 
     GraphModelStoragePtrs storage_ptrs = {};
 
     storage_ptrs.train_edges = std::get<0>(edge_storages);
+    storage_ptrs.edges = storage_ptrs.train_edges;
+    if (storage_ptrs.edges != nullptr && storage_ptrs.edges->getEdgeBucketSizes().empty()) {
+        string train_edges_partitions =
+            storage_config->dataset->dataset_dir + PathConstants::edges_directory + PathConstants::training + PathConstants::edge_partition_offsets_file;
+        storage_ptrs.edges->readPartitionSizes(train_edges_partitions);
+        SPDLOG_INFO("[edge-bucket-sizes] link-prediction train bucket_sizes={} path={}",
+                    storage_ptrs.edges->getEdgeBucketSizes().size(), train_edges_partitions);
+    }
     storage_ptrs.validation_edges = std::get<1>(edge_storages);
     storage_ptrs.test_edges = std::get<2>(edge_storages);
 

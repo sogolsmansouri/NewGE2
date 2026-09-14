@@ -1,5 +1,6 @@
 #include "data/dataloader.h"
 
+#include "common/pipeline_nvtx.h"
 #include "common/util.h"
 #include "data/ordering.h"
 #include <algorithm>
@@ -1332,7 +1333,9 @@ void DataLoader::setBufferOrdering() {
             graph_storage_->clearStateflowPeerHandoffs();
             bool access_aware_state_generation = false;
             bool optimized_custom_schedule = parse_env_flag("GEGE_OPTIMIZED_CUSTOM_SCHEDULE", false);
-            bool bounded_greedy_cover_q4_requested = parse_env_flag("GEGE_BOUNDED_GREEDY_COVER_Q4", false);
+            bool bounded_greedy_cover_q4_requested =
+                parse_env_flag("GEGE_BOUNDED_GREEDY_COVER", false) ||
+                parse_env_flag("GEGE_BOUNDED_GREEDY_COVER_Q4", false);
             bool hybrid_cover_schedule_requested = parse_env_flag("GEGE_HYBRID_COVER", false);
             bool stateflow_lane_matching_requested = parse_env_flag(
                 "GEGE_STATEFLOW_LANE_MATCHING",
@@ -1347,7 +1350,7 @@ void DataLoader::setBufferOrdering() {
                 bounded_greedy_cover_q4_requested &&
                 options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM &&
                 !options->randomly_assign_edge_buckets &&
-                options->buffer_capacity == 4;
+                options->buffer_capacity >= 2 && options->buffer_capacity <= options->num_partitions;
             const char *access_aware_state_generation_env = std::getenv("GEGE_ACCESS_AWARE_STATE_GENERATION");
             if (access_aware_state_generation_env != nullptr && access_aware_state_generation_env[0] != '\0' &&
                 std::string(access_aware_state_generation_env) != "0") {
@@ -1363,8 +1366,8 @@ void DataLoader::setBufferOrdering() {
             bool stateflow_single_gpu_planner_requested = parse_env_flag("GEGE_STATEFLOW_PLANNER", false);
             if (bounded_greedy_cover_q4_requested && !bounded_greedy_cover_q4_supported) {
                 SPDLOG_WARN(
-                    "Ignoring GEGE_BOUNDED_GREEDY_COVER_Q4 because it currently requires CUSTOM ordering, "
-                    "buffer_capacity=4, and no random bucket assignment");
+                    "Ignoring bounded GREEDY_COVER because it requires CUSTOM ordering, a valid buffer capacity, "
+                    "and no random bucket assignment");
             }
             if (hybrid_cover_schedule_requested && !hybrid_cover_schedule_supported) {
                 SPDLOG_WARN(
@@ -1412,8 +1415,8 @@ void DataLoader::setBufferOrdering() {
                     tup = getBoundedGreedyCoverEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, edge_bucket_sizes);
                 }
                 used_bounded_greedy_cover_q4 = true;
-                SPDLOG_INFO("Using bounded GREEDY_COVER q4 ordering for CUSTOM schedule with {} active device(s)",
-                            requested_active_devices);
+                SPDLOG_INFO("Using bounded GREEDY_COVER q={} ordering for CUSTOM schedule with {} active device(s)",
+                            options->buffer_capacity, requested_active_devices);
             } else if (access_aware_state_generation && options->edge_bucket_ordering == EdgeBucketOrdering::CUSTOM) {
                 tup = getAccessAwareCustomEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, requested_active_devices);
                 SPDLOG_INFO("Using access-aware state generation for CUSTOM ordering with {} logical device(s)", requested_active_devices);
@@ -1695,8 +1698,10 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
         batch = nullptr;
         if (graph_storage_->useInMemorySubGraph()) {
             if (graph_storage_->hasSwap(device_idx)) {
+                gege::profiling::ScopedRange boundary_scope("dataloader.state_boundary");
                 auto swap_path_start = std::chrono::high_resolution_clock::now();
                 // wait for all batches to finish before swapping
+                gege::profiling::ManualRange boundary_phase("dataloader.swap_barrier");
                 auto swap_barrier_start = std::chrono::high_resolution_clock::now();
                 int32_t swap_participants = active_swap_participants();
                 waitForSwapReadBarrier(swap_participants);
@@ -1705,6 +1710,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 if (device_idx < device_swap_barrier_wait_ns_.size()) {
                     device_swap_barrier_wait_ns_[device_idx] += swap_barrier_elapsed;
                 }
+                boundary_phase.stop();
 
                 if (negative_sampler_ != nullptr) {
                     negative_sampler_->resetPlanCache();
@@ -1714,6 +1720,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
 #endif
                 // SPDLOG_INFO("Swapping subgraph for device {}", device_idx);
                 // auto t1 = std::chrono::high_resolution_clock::now();
+                boundary_phase.start("dataloader.graph_and_frame_transition");
                 auto update_start = std::chrono::high_resolution_clock::now();
                 graph_storage_->updateInMemorySubGraph(device_idx);
                 int64_t swap_update_elapsed = elapsed_ns(update_start, std::chrono::high_resolution_clock::now());
@@ -1721,12 +1728,14 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 if (device_idx < device_swap_update_ns_.size()) {
                     device_swap_update_ns_[device_idx] += swap_update_elapsed;
                 }
+                boundary_phase.stop();
                 // SPDLOG_INFO("graph_storage_->updateInMemorySubGraph");
 #ifdef GEGE_CUDA
                 empty_cache_for_swap_device(devices_[device_idx]);
 #endif
                 // auto t11 = std::chrono::high_resolution_clock::now();
                 // SPDLOG_INFO("Time to updateInMemorySubGraph for device {}: {} ms", device_idx, std::chrono::duration_cast<std::chrono::milliseconds>(t11 - t1).count());
+                boundary_phase.start("dataloader.batch_rebuild");
                 auto rebuild_start = std::chrono::high_resolution_clock::now();
                 initializeBatches(false, device_idx);
                 int64_t swap_rebuild_elapsed = elapsed_ns(rebuild_start, std::chrono::high_resolution_clock::now());
@@ -1735,6 +1744,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                     device_swap_rebuild_ns_[device_idx] += swap_rebuild_elapsed;
                 }
                 add_perf_sample(device_swap_rebuild_samples_ns_, device_idx, swap_rebuild_elapsed);
+                boundary_phase.stop();
                 if (start_admit_preload_after_active_edges_enabled() && graph_storage_->hasSwap(device_idx)) {
                     graph_storage_->startAsyncAdmitPreload(device_idx);
                 }

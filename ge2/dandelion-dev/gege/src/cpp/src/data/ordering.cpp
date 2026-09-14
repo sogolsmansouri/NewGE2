@@ -74,8 +74,12 @@ bool contrastive_greedy_cover_ordering_enabled() {
     return !(value == "0" || value == "false" || value == "False" || value == "FALSE");
 }
 
-bool bounded_greedy_cover_q4_enabled() {
-    const char *raw = std::getenv("GEGE_BOUNDED_GREEDY_COVER_Q4");
+bool bounded_greedy_cover_enabled() {
+    const char *raw = std::getenv("GEGE_BOUNDED_GREEDY_COVER");
+    if (raw == nullptr) {
+        // Backward-compatible alias used by the frozen q=4 experiments.
+        raw = std::getenv("GEGE_BOUNDED_GREEDY_COVER_Q4");
+    }
     if (raw == nullptr) {
         return false;
     }
@@ -194,7 +198,7 @@ LaneMatchCostConfig lane_match_cost_config_from_env() {
     cfg.host_bandwidth_bps =
         std::max<int64_t>(1, stateflow_env_int64("GEGE_STATEFLOW_HOST_BANDWIDTH_BPS", "STATEFLOW_HOST_BANDWIDTH_BPS", 16000000000LL));
     cfg.max_admits_per_transition =
-        stateflow_env_int64("GEGE_STATEFLOW_MAX_ADMITS", "STATEFLOW_MAX_ADMITS", bounded_greedy_cover_q4_enabled() ? 3 : -1);
+        stateflow_env_int64("GEGE_STATEFLOW_MAX_ADMITS", "STATEFLOW_MAX_ADMITS", bounded_greedy_cover_enabled() ? 3 : -1);
     if (bounded_q4_optimal88_enabled() && cfg.max_admits_per_transition >= 0 && cfg.max_admits_per_transition < 3) {
         static std::atomic<bool> warned_opt88_max_admits_clamp{false};
         bool expected = false;
@@ -4028,7 +4032,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEdgeBucketOrdering(E
             if (hybrid_cover_ordering_enabled()) {
                 return getHybridCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
             }
-            if (bounded_greedy_cover_q4_enabled()) {
+            if (bounded_greedy_cover_enabled()) {
                 return getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, {});
             }
             if (contrastive_greedy_cover_ordering_enabled()) {
@@ -7871,7 +7875,7 @@ std::vector<StateflowPlan> enumerateSingleGpuStateflowPlans(int num_partitions,
     const bool custom_valid = stateflow_plan_valid(custom_plan);
 
     std::vector<std::function<StateflowPlan()>> factories;
-    if (bounded_greedy_cover_q4_enabled() && buffer_capacity == 4) {
+    if (bounded_greedy_cover_enabled() && buffer_capacity == 4) {
         factories.emplace_back([num_partitions, buffer_capacity, &edge_bucket_sizes, &partition_row_counts]() {
             auto ordering = getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, edge_bucket_sizes);
             return tensor_ordering_to_stateflow_plan(ordering, PlanFamily::CUSTOM, num_partitions, buffer_capacity,
@@ -9701,8 +9705,8 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
     int num_partitions,
     int buffer_capacity,
     const vector<int64_t> &edge_bucket_sizes) {
-    if (buffer_capacity != 4 || num_partitions <= 0 || buffer_capacity > num_partitions) {
-        SPDLOG_WARN("Bounded GREEDY_COVER q4 requires buffer_capacity=4 and valid num_partitions; got num_partitions={} buffer_capacity={}",
+    if (buffer_capacity < 2 || num_partitions <= 0 || buffer_capacity > num_partitions) {
+        SPDLOG_WARN("Bounded GREEDY_COVER requires 2<=buffer_capacity<=num_partitions; got num_partitions={} buffer_capacity={}",
                     num_partitions, buffer_capacity);
         return getGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity);
     }
@@ -9713,7 +9717,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
                                                                     "STATEFLOW_MAX_ADMITS", 3))));
     std::vector<std::vector<int>> buffer_states;
     bool loaded_state_order = false;
-    if (bounded_q4_optimal88_enabled()) {
+    if (buffer_capacity == 4 && bounded_q4_optimal88_enabled()) {
         buffer_states = build_weighted_optimal88_q4_states(num_partitions, buffer_capacity,
                                                            requested_max_admits, edge_bucket_sizes,
                                                            false);
@@ -9724,18 +9728,21 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
             load_bounded_state_order_file(std::getenv("GEGE_BOUNDED_STATE_ORDER_FILE"), num_partitions, buffer_capacity);
         loaded_state_order = !buffer_states.empty();
     }
-    if (buffer_states.empty()) {
+    if (buffer_capacity == 4 && buffer_states.empty()) {
         buffer_states = build_static_cyclic30_q4_cover_states(num_partitions, buffer_capacity);
         loaded_state_order = !buffer_states.empty();
     }
-    if (buffer_states.empty()) {
+    if (buffer_capacity == 4 && buffer_states.empty()) {
         buffer_states = build_gf9_unital28_q4_cover_states(num_partitions, buffer_capacity);
         loaded_state_order = !buffer_states.empty();
     }
-    if (!loaded_state_order) {
+    if (!loaded_state_order && buffer_capacity != 4 && requested_max_admits < buffer_capacity) {
+        buffer_states = build_bounded_single_gpu_cover_states(num_partitions, buffer_capacity, requested_max_admits);
+    }
+    if (buffer_states.empty() && !loaded_state_order) {
         buffer_states = build_greedy_cover_state_set(num_partitions, buffer_capacity);
     }
-    if (requested_max_admits < 3) {
+    if (!loaded_state_order && requested_max_admits < 3) {
         auto constrained_states =
             build_bounded_single_gpu_cover_states(num_partitions, buffer_capacity, requested_max_admits);
         if (!constrained_states.empty()) {
@@ -9760,7 +9767,7 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
     }
     if (bounded_greedy_cover_reverse_enabled()) {
         std::reverse(buffer_states.begin(), buffer_states.end());
-        SPDLOG_INFO("Reversed BOUNDED_GREEDY_COVER_Q4 state order");
+        SPDLOG_INFO("Reversed bounded GREEDY_COVER state order");
     }
 
     int64_t retained_total = 0;
@@ -9772,10 +9779,10 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
                               : 0.0;
 
     auto edge_buckets_per_buffer = balancedAssignEdgeBucketsToBuffers(buffer_states, num_partitions, edge_bucket_sizes);
-    log_cover_ordering_summary("Generating BOUNDED_GREEDY_COVER_Q4 Ordering", buffer_states, edge_buckets_per_buffer,
+    log_cover_ordering_summary("Generating bounded GREEDY_COVER ordering", buffer_states, edge_buckets_per_buffer,
                                num_partitions, edge_bucket_sizes);
-    SPDLOG_INFO("BOUNDED_GREEDY_COVER_Q4 retained_avg={:.3f} pre_reorder_retained_avg={:.3f}",
-                retained_avg, pre_reorder_retained_avg);
+    SPDLOG_INFO("Bounded GREEDY_COVER q={} retained_avg={:.3f} pre_reorder_retained_avg={:.3f}",
+                buffer_capacity, retained_avg, pre_reorder_retained_avg);
     return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
 }
 

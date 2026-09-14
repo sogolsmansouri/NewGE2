@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "configuration/options.h"
+#include "common/pipeline_nvtx.h"
 #include "reporting/logger.h"
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDAGuard.h>
@@ -39,6 +40,19 @@ bool env_flag_enabled(const char *name) {
         return static_cast<char>(std::tolower(ch));
     });
     return normalized != "0" && normalized != "false" && normalized != "off" && normalized != "no";
+}
+
+int64_t env_int64(const char *name, int64_t default_value) {
+    const char *raw = std::getenv(name);
+    if (raw == nullptr || raw[0] == '\0') {
+        return default_value;
+    }
+    char *end = nullptr;
+    long long parsed = std::strtoll(raw, &end, 10);
+    if (end == raw || *end != '\0') {
+        return default_value;
+    }
+    return static_cast<int64_t>(parsed);
 }
 
 int64_t elapsed_ns(std::chrono::high_resolution_clock::time_point start, std::chrono::high_resolution_clock::time_point end) {
@@ -397,6 +411,15 @@ void SynchronousTrainer::train(int num_epochs) {
 #endif
 
     Timer timer = Timer(false);
+    const int64_t nsys_capture_epoch = env_int64("GEGE_NSYS_CAPTURE_EPOCH", 1);
+    const int64_t nsys_capture_state_position = env_int64("GEGE_NSYS_CAPTURE_STATE_POSITION", -1);
+    const bool nsys_capture_requested =
+        gege::profiling::pipelineNvtxEnabled() && nsys_capture_epoch > 0 && nsys_capture_state_position >= 0;
+    bool nsys_capture_completed = false;
+    if (nsys_capture_requested) {
+        SPDLOG_INFO("[nsys-capture] epoch={} state_position={} range=pipege.capture", nsys_capture_epoch,
+                    nsys_capture_state_position);
+    }
     for (int epoch = 0; epoch < num_epochs; epoch++) {
         auto epoch_start_wall = std::chrono::high_resolution_clock::now();
         if (has_last_epoch_end_) {
@@ -411,6 +434,7 @@ void SynchronousTrainer::train(int num_epochs) {
         int64_t prepared_batch_direct_fetches = 0;
         int64_t prepared_batch_boundary_blocks = 0;
         int64_t prepared_batch_wait_ns = 0;
+        gege::profiling::ManualRange nsys_capture_range(true);
         auto launch_prepared_batch = [&](bool wait_for_current_cuda_stream = false) {
             if (!prepared_batch_pipeline_enabled || prepared_batch_future.valid()) {
                 return;
@@ -477,10 +501,34 @@ void SynchronousTrainer::train(int num_epochs) {
             return dataloader_->getBatch();
         };
         SPDLOG_INFO("################ Starting training epoch {} ################", dataloader_->getEpochsProcessed() + 1);
+        if (nsys_capture_requested && !nsys_capture_completed && epoch + 1 == nsys_capture_epoch &&
+            nsys_capture_state_position == 0) {
+            nsys_capture_range.start("pipege.capture");
+        }
         while (prepared_batch_future.valid() || dataloader_->hasNextBatch()) {
+            int64_t current_state_position = -1;
+            if (!dataloader_->device_current_state_index_.empty()) {
+                current_state_position = dataloader_->device_current_state_index_[0];
+            }
+            const bool at_state_boundary = !dataloader_->canPrepareNextBatchInCurrentState();
+            if (nsys_capture_requested && !nsys_capture_completed && epoch + 1 == nsys_capture_epoch &&
+                !nsys_capture_range.active() && nsys_capture_state_position > 0 && at_state_boundary &&
+                current_state_position == nsys_capture_state_position - 1) {
+                nsys_capture_range.start("pipege.capture");
+            } else if (nsys_capture_range.active() && at_state_boundary &&
+                       current_state_position == nsys_capture_state_position) {
+                nsys_capture_range.stop();
+                nsys_capture_completed = true;
+                SPDLOG_INFO("[nsys-capture] completed epoch={} state_position={}", epoch + 1,
+                            nsys_capture_state_position);
+            }
+
+            gege::profiling::ScopedRange batch_scope("trainer.batch");
+            gege::profiling::ManualRange batch_phase("trainer.batch.fetch");
             auto batch_fetch_start = std::chrono::high_resolution_clock::now();
             shared_ptr<Batch> batch = fetch_batch();
             auto batch_fetch_end = std::chrono::high_resolution_clock::now();
+            batch_phase.stop();
             if (batch == nullptr) {
                 break;
             }
@@ -501,6 +549,7 @@ void SynchronousTrainer::train(int num_epochs) {
                 launch_prepared_batch();
             }
 
+            batch_phase.start("trainer.batch.parameter_load");
             auto gpu_load_start = std::chrono::high_resolution_clock::now();
             if (dataloader_->graph_storage_->embeddingsOffDevice()) {
                 batch->to(model_->device_);
@@ -508,6 +557,7 @@ void SynchronousTrainer::train(int num_epochs) {
                 dataloader_->loadGPUParameters(batch);
             }
             auto gpu_load_end = std::chrono::high_resolution_clock::now();
+            batch_phase.stop();
             state_timing.gpu_load_region_ns += elapsed_ns(gpu_load_start, gpu_load_end);
 #ifdef GEGE_CUDA
             if (prepared_batch_pipeline_enabled) {
@@ -522,11 +572,14 @@ void SynchronousTrainer::train(int num_epochs) {
                 batch->node_embeddings_.requires_grad_();
             }
 
+            batch_phase.start("trainer.batch.map");
             auto map_start = std::chrono::high_resolution_clock::now();
             batch->dense_graph_.performMap();
             auto map_end = std::chrono::high_resolution_clock::now();
+            batch_phase.stop();
             state_timing.map_region_ns += elapsed_ns(map_start, map_end);
 
+            batch_phase.start("trainer.batch.forward_backward");
             auto compute_start = std::chrono::high_resolution_clock::now();
             std::function<void()> post_forward_callback;
             std::function<void()> post_decoder_gather_callback;
@@ -542,12 +595,14 @@ void SynchronousTrainer::train(int num_epochs) {
                 model_->train_batch(batch);
             }
             auto compute_end = std::chrono::high_resolution_clock::now();
+            batch_phase.stop();
             state_timing.compute_region_ns += elapsed_ns(compute_start, compute_end);
             if (prepared_batch_launch_stage == "after_compute") {
                 launch_prepared_batch();
             }
 
             if (batch->node_gradients_.defined()) {
+                batch_phase.start("trainer.batch.embedding_update");
                 auto embedding_update_start = std::chrono::high_resolution_clock::now();
                 if (dataloader_->graph_storage_->embeddingsOffDevice()) {
                     batch->embeddingsToHost();
@@ -556,10 +611,12 @@ void SynchronousTrainer::train(int num_epochs) {
                 }
                 dataloader_->updateEmbeddings(batch, false);
                 auto embedding_update_end = std::chrono::high_resolution_clock::now();
+                batch_phase.stop();
                 state_timing.embedding_update_region_ns += elapsed_ns(embedding_update_start, embedding_update_end);
             }
 
             if (batch->node_embeddings_g_.defined()) {
+                batch_phase.start("trainer.batch.embedding_update_g");
                 auto embedding_update_g_start = std::chrono::high_resolution_clock::now();
                 if (dataloader_->graph_storage_->embeddingsOffDeviceG()) {
                     batch->embeddingsToHostG();
@@ -568,9 +625,11 @@ void SynchronousTrainer::train(int num_epochs) {
                 }
                 dataloader_->updateEmbeddingsG(batch, false);
                 auto embedding_update_g_end = std::chrono::high_resolution_clock::now();
+                batch_phase.stop();
                 state_timing.embedding_update_g_region_ns += elapsed_ns(embedding_update_g_start, embedding_update_g_end);
             }
 
+            batch_phase.start("trainer.batch.finalize");
             auto finalize_start = std::chrono::high_resolution_clock::now();
 #ifdef GEGE_CUDA
             if (prepared_batch_pipeline_enabled) {
@@ -580,8 +639,15 @@ void SynchronousTrainer::train(int num_epochs) {
             batch->clear();
             dataloader_->finishedBatch();
             auto finalize_end = std::chrono::high_resolution_clock::now();
+            batch_phase.stop();
             state_timing.finalize_region_ns += elapsed_ns(finalize_start, finalize_end);
             progress_reporter_->addResult(batch->batch_size_);
+        }
+        if (nsys_capture_range.active()) {
+            nsys_capture_range.stop();
+            nsys_capture_completed = true;
+            SPDLOG_INFO("[nsys-capture] completed at epoch end epoch={} state_position={}", epoch + 1,
+                        nsys_capture_state_position);
         }
 
         SPDLOG_INFO("################ Finished training epoch {} ################", dataloader_->getEpochsProcessed() + 1);

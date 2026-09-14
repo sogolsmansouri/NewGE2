@@ -195,6 +195,11 @@ int64_t frame_cache_fixed_preload_frames() {
     return frames;
 }
 
+bool frame_cache_strict_budget_enabled() {
+    static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET", false);
+    return enabled || frame_cache_fixed_preload_frames() >= 0;
+}
+
 bool frame_cache_auto_pipeline_frames_enabled() {
     static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_AUTO_PIPELINE_FRAMES", false);
     return enabled;
@@ -1406,6 +1411,11 @@ MemPartitionBuffer::MemPartitionBuffer(int capacity, int num_partitions, int fin
             ? static_cast<int>(frame_cache_hidden_frames())
             : 0;
     physical_frame_capacity_ = capacity_ + hidden_frame_capacity_;
+    if (frame_cache_strict_budget_enabled() &&
+        (buffer_sizes_ != 1 || !device_.is_cuda() || prefetching ||
+         frame_cache_auto_pipeline_frames_enabled() || single_gpu_async_evict_writeback_enabled())) {
+        throw GegeRuntimeException("Strict frame budget requires one CUDA buffer, no legacy prefetch, auto growth or extra evict staging");
+    }
     if (frame_cache_fixed_preload_frames() >= 0) {
         const int64_t stale = parse_env_int("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG", -1);
         if (buffer_sizes_ != 1 || !device_.is_cuda() || prefetching ||
@@ -1472,6 +1482,10 @@ bool MemPartitionBuffer::asyncAdmitPreloadEnabled_() const {
         return false;
     }
     if (buffer_sizes_ == 1) {
+        // An explicit off switch must not be overridden by reserved capacity.
+        if (std::getenv("GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD") != nullptr) {
+            return single_gpu_async_admit_preload_enabled();
+        }
         return single_gpu_async_admit_preload_enabled() || hidden_frame_capacity_ > 0;
     }
     return multi_gpu_async_admit_preload_enabled();
@@ -2794,7 +2808,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                                             stage_evict_slots.begin() + static_cast<std::ptrdiff_t>(hidden_publishes.size()));
                 }
             }
-            int64_t stage_rows = frame_cache_fixed_preload_frames() >= 0
+            int64_t stage_rows = frame_cache_strict_budget_enabled()
                                      ? 0 : partition_rows_for_ids(stage_admit_ids, partition_table_);
 
             std::vector<int64_t> row_offsets;
@@ -2986,7 +3000,7 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
 
 void MemPartitionBuffer::prepareFixedFrameBoundaryAdmissions_(const std::vector<int> &admit_ids,
                                                             const std::vector<int64_t> &evict_slots) {
-    if (frame_cache_fixed_preload_frames() < 0 || !frameCacheEnabled_()) {
+    if (frame_cache_fixed_preload_frames() < 0 || !frameCacheEnabled_() || !asyncAdmitPreloadEnabled_()) {
         return;
     }
     gege::profiling::ScopedRange boundary_scope("buffer.fixed_frames.boundary_admit");
@@ -3182,7 +3196,7 @@ bool MemPartitionBuffer::consumeAsyncAdmitPreload_(const std::vector<int> &admit
         }
         SPDLOG_INFO("[partition-buffer-preload-consume] storage={} this={} device={} admit_ids={} rows={} visible_install_parts={} visible_install_rows={} hidden_publish_parts={} hidden_publish_rows={} hidden_publish_partitions={} hidden_publish_slots={} hidden_publish_frames={} preload_host_load_ms={:.3f} preload_cpu_to_gpu_ms={:.3f} preload_total_ms={:.3f} preload_install_ms={:.3f}",
                     basename_string(filename_), fmt::ptr(this), device_.str(), vector_prefix_string(admit_ids), install_rows,
-                    stage_admit_ids.size(), install_rows, hidden_publishes.size(), hidden_rows,
+                    gpu_stage.defined() ? stage_admit_ids.size() : 0, install_rows, hidden_publishes.size(), hidden_rows,
                     vector_prefix_string(hidden_ids), vector_prefix_string(hidden_slots), vector_prefix_string(hidden_frames),
                     preload_host_load_ms, preload_cpu_to_gpu_ms, preload_total_ms, preload_install_ms);
     }
@@ -3978,7 +3992,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
             joinAsyncAdmitPreload_();
             std::lock_guard<std::mutex> preload_lock(async_admit_preload_lock_);
             if (async_admit_preload_valid_ && !async_admit_preload_hidden_publishes_.empty() &&
-                (frame_cache_fixed_preload_frames() >= 0 ||
+                (frame_cache_strict_budget_enabled() ||
                  (async_admit_preload_admit_ids_.empty() && async_admit_preload_evict_slots_.empty()))) {
                 int64_t stale_backlog_before_delay = 0;
                 const int64_t reserved_preload_frames =
@@ -3997,7 +4011,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
                 int64_t remaining_delayed_stale_slots =
                     std::max<int64_t>(frameCacheMaxStaleBacklog_() - stale_backlog_before_delay, 0);
                 if (remaining_delayed_stale_slots >= static_cast<int64_t>(async_admit_preload_hidden_publishes_.size()) ||
-                    (frame_cache_fixed_preload_frames() >= 0 && remaining_delayed_stale_slots > 0)) {
+                    (frame_cache_strict_budget_enabled() && remaining_delayed_stale_slots > 0)) {
                     delayed_stale_row_offsets.emplace_back(0);
                     delayed_stale_writeback = true;
                     for (const HiddenFramePublish &hidden_publish : async_admit_preload_hidden_publishes_) {

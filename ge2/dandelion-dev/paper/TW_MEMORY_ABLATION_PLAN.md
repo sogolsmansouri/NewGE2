@@ -6,6 +6,42 @@ The runtime changes in this checkpoint are based on
 `codex/tw-fixed-memory-ablation-20260913`. This is an experimental checkpoint,
 not a declaration that every runtime mode is validated.
 
+## Local follow-up authorized on September 14
+
+The matched-build q4 shared3 run has now completed five full-edge epochs:
+185.353, 184.364, 184.771, 184.390, 184.239 s. Average 184.6234 s;
+steady 184.441 s. The binary, library and schedule match the earlier fixed
+1+2 / 2+1 runs; only the pool policy and startup allocation logging differ.
+This is a sharing comparison, not a pipeline on/off comparison.
+
+The next checkpoint fixes explicit admission-off with allocated hidden frames
+and adds `GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET=1` for shared pools. Under that
+flag, excess admissions are synchronous boundary work, not an extra GPU
+staging allocation. Partial hidden publication may delay only the matching
+outgoing frames. The physical budget remains q+h, never q+2h.
+
+Local execution order, five full-data epochs per accepted case, batch 50K:
+
+| Group | p | q | Physical k | Hidden policy | Cases |
+|---|---:|---:|---:|---|---:|
+| Parameter/graph 2x2 | 16 | 4 | 7 | 3 shared on; allocated but unused off | 4 |
+| Smaller shared pools | 16 | 4 | 5,6 | shared1, shared2 | 2 |
+| Visible/hidden follow-up | 16 | 3 | 7 | shared4 | 1 |
+| Previously feasible p13 | 13 | 3 | 8 | shared5 | 1 |
+| Previously feasible p16 | 16 | 3 | 10 | shared7 | 1 |
+
+Each group must first pass exact GPU value tests (including the final partial
+partition), five small-data epochs, allocation checks and observed on/off
+controls. No evaluation is requested. Freeze the source commit, built
+executables, harness and data/schedule hashes. Preserve failed attempts.
+Repartition full TW for p13, then remove only the new disposable copy after
+that group. The original q4/20-GiB sweep remains memory-limited locally;
+sharing does not erase its graph/workspace demand. Repeat those rows on ARC
+only after rebuilding for its GLIBC and staging identical full-edge data.
+
+The ARC stages below remain proposals; the local follow-up does not silently
+launch training on ARC or change its allocation policy.
+
 ## Questions and controls
 
 1. With identical code, p, q, schedule, and total frames, does a shared hidden

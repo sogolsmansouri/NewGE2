@@ -37,6 +37,8 @@ int main(int argc, char **argv) {
     MemPartitionBuffer buffer(q, p, 1, rows, 8, nodes, torch::kFloat32, argv[3], false, torch::Device(torch::kCUDA, 0));
     const int k = q + std::stoi(std::getenv("GEGE_FRAME_CACHE_HIDDEN_FRAMES"));
     const int hs = std::stoi(std::getenv("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG"));
+    const char *preload_flag = std::getenv("GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD");
+    const bool preload_off = preload_flag != nullptr && std::string(preload_flag) == "0";
     for (int epoch = 0; epoch < 5; ++epoch) {
         buffer.setBufferOrdering(states);
         buffer.load(host);
@@ -54,6 +56,13 @@ int main(int argc, char **argv) {
             TORCH_CHECK(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming) == cudaSuccess);
             TORCH_CHECK(cudaEventRecord(ready, c10::cuda::getCurrentCUDAStream().stream()) == cudaSuccess);
             if (step + 1 < states.size()) buffer.performNextSwap(reinterpret_cast<std::uintptr_t>(ready));
+            TORCH_CHECK(buffer.buffer_tensor_gpu_view_.size(0) == k * rows, "Physical allocation grew during transition");
+            if (preload_off) {
+                TORCH_CHECK(buffer.getFrameCachePerfStats().hidden_publish_parts == 0,
+                            "Explicitly disabled preload published hidden frames");
+                TORCH_CHECK(buffer.getFrameCachePerfStats().stale_backlog_after_publish_max == 0,
+                            "Pipeline-off control deferred a stale writeback");
+            }
             TORCH_CHECK(cudaEventSynchronize(ready) == cudaSuccess);
             TORCH_CHECK(cudaEventDestroy(ready) == cudaSuccess);
         }

@@ -2,15 +2,29 @@ import sys
 import json
 import tempfile
 import unittest
+import subprocess
 from unittest.mock import patch
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from run_local_tw_fixed_frames import cases, pipeline_cases, environment, summarize, graph_memory_preflight, gpu_processes
+from run_local_tw_fixed_frames import cases, pipeline_cases, environment, summarize, graph_memory_preflight, gpu_processes, gpu_monitor_timeout
 from queue_local_tw_pipeline_study import predecessor_finished, study_rows
 
 
 class FixedFramesTest(unittest.TestCase):
+    def test_monitor_timeout_is_explicit_and_failures_are_not_hidden(self):
+        with patch.dict('os.environ', {'TW_PHYSICAL_GPU': 'GPU-mine', 'TW_GPU_MONITOR_TIMEOUT': '120'}):
+            with patch('run_local_tw_fixed_frames.subprocess.check_output', side_effect=['GPU-mine\n', '']) as query:
+                self.assertEqual(gpu_processes(), [])
+                self.assertTrue(all(call.kwargs['timeout'] == 120 for call in query.call_args_list))
+            with patch('run_local_tw_fixed_frames.subprocess.check_output', side_effect=subprocess.TimeoutExpired('nvidia-smi', 120)):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    gpu_processes()
+        for value in ('0', '-1', '301', 'nan'):
+            with patch.dict('os.environ', {'TW_GPU_MONITOR_TIMEOUT': value}):
+                with self.assertRaises(ValueError):
+                    gpu_monitor_timeout()
+
     def test_selected_gpu_monitor_does_not_claim_other_users_gpu(self):
         with patch.dict('os.environ', {'TW_PHYSICAL_GPU': 'GPU-mine'}):
             with patch('run_local_tw_fixed_frames.subprocess.check_output', side_effect=[

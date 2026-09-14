@@ -144,17 +144,24 @@ def environment(root, run, row, nodes):
     return env
 
 
+def gpu_monitor_timeout():
+    seconds = float(os.environ.get("TW_GPU_MONITOR_TIMEOUT", "20"))
+    if not 0 < seconds <= 300:
+        raise ValueError("TW_GPU_MONITOR_TIMEOUT must be in (0, 300] seconds")
+    return seconds
+
+
 def gpu_processes():
     selected = os.environ.get("TW_PHYSICAL_GPU")
     if selected is not None:
         uuid = subprocess.check_output(["nvidia-smi", "--id=" + selected, "--query-gpu=uuid", "--format=csv,noheader"],
-                                       text=True, timeout=20).strip()
+                                       text=True, timeout=gpu_monitor_timeout()).strip()
         if not uuid.startswith("GPU-") or "\n" in uuid:
             raise RuntimeError("A single physical GPU must be selected")
         out = subprocess.check_output(["nvidia-smi", "--query-compute-apps=gpu_uuid,pid", "--format=csv,noheader"],
-                                      text=True, timeout=20)
+                                      text=True, timeout=gpu_monitor_timeout())
         return [int(row[1].strip()) for row in csv.reader(out.splitlines()) if len(row) == 2 and row[0].strip() == uuid]
-    out = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True, timeout=20)
+    out = subprocess.check_output(["nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader"], text=True, timeout=gpu_monitor_timeout())
     return [int(line) for line in out.splitlines() if line.strip().isdigit()]
 
 
@@ -284,6 +291,7 @@ def execute(root, run, row, data, model, epochs, tiny=False):
             print(row["case"], "infeasible_payload", memory["minimum_peak_payload_bytes"], flush=True)
             return result
     foreign = set()
+    monitor_errors = []
     start = time.monotonic()
     model.mkdir(parents=True, exist_ok=False)
     command = [str(run / "artifacts/gege_train"), str(config)]
@@ -294,7 +302,7 @@ def execute(root, run, row, data, model, epochs, tiny=False):
         while process.poll() is None:
             try:
                 selected = ["--id=" + os.environ["TW_PHYSICAL_GPU"]] if "TW_PHYSICAL_GPU" in os.environ else []
-                samples.write(subprocess.check_output(["nvidia-smi", *selected, "--query-gpu=timestamp,memory.used,utilization.gpu,power.draw", "--format=csv,noheader,nounits"], text=True, timeout=20))
+                samples.write(subprocess.check_output(["nvidia-smi", *selected, "--query-gpu=timestamp,memory.used,utilization.gpu,power.draw", "--format=csv,noheader,nounits"], text=True, timeout=gpu_monitor_timeout()))
                 samples.flush()
                 foreign.update(pid for pid in gpu_processes() if pid != process.pid)
                 if foreign or time.monotonic() - start > 7200 or time.time() >= float(os.environ.get("TW_DEADLINE_EPOCH", "inf")):
@@ -304,7 +312,13 @@ def execute(root, run, row, data, model, epochs, tiny=False):
                     except subprocess.TimeoutExpired:
                         process.kill()
                     break
-            except (subprocess.SubprocessError, OSError):
+            except (subprocess.SubprocessError, OSError) as error:
+                monitor_errors.append(dict(timestamp=time.time(), exception=type(error).__name__,
+                    message=str(error), command=getattr(error, "cmd", None),
+                    output=str(getattr(error, "output", None)),
+                    timeout_s=gpu_monitor_timeout()))
+                write_json(directory / "monitor_errors.json", monitor_errors)
+                print("GPU monitor failed:", repr(error), flush=True)
                 foreign.add(-1)  # Missing isolation evidence is not a clean timing.
                 process.terminate()
             time.sleep(1 if tiny else 5)
@@ -315,7 +329,8 @@ def execute(root, run, row, data, model, epochs, tiny=False):
     result["completed_epoch_edge_counts"] = completed_edge_counts
     if completed_edge_counts != [ds["num_train"]] * epochs:
         result["status"] = "failed_or_invalid"
-    result.update(wall_s=time.monotonic() - start, case=row["case"], tiny=tiny)
+    result.update(wall_s=time.monotonic() - start, case=row["case"], tiny=tiny,
+                  monitor_errors=monitor_errors)
     if tiny:
         files = list(model.rglob("embeddings.bin"))
         if files:

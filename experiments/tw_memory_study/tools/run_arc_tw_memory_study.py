@@ -153,6 +153,7 @@ def main():
         physical_gpu=os.environ['TW_PHYSICAL_GPU'], allocation_end=args.end_epoch,
         resume_from=[str(p.resolve()) for p in args.resume_from],
         supervisor_sha256=digest(Path(__file__)),
+        gpu_monitor_timeout_s=os.environ.get('TW_GPU_MONITOR_TIMEOUT', '20'),
         note='Shared-node timing; foreign GPUs may use CPU memory/storage. No uncontended-node claim.'))
     completed = []
 
@@ -181,8 +182,10 @@ def main():
         for src, dst in [('reference.yaml', 'reference.yaml'), ('reference_flags.sh', 'reference_flags.sh'),
                          ('source_files.json', 'source_files.json')]:
             shutil.copy2(work / 'input' / src, artifacts / dst)
-        for name in ('run_local_tw_fixed_frames.py', 'prepare_ge2_partitioned_view.py'):
-            shutil.copy2(work / 'input' / name, artifacts / name)
+        shutil.copy2(Path(__file__).with_name('run_local_tw_fixed_frames.py'),
+                     artifacts / 'run_local_tw_fixed_frames.py')
+        shutil.copy2(work / 'input/prepare_ge2_partitioned_view.py',
+                     artifacts / 'prepare_ge2_partitioned_view.py')
         shutil.copy2(Path(__file__), artifacts / 'run_arc_tw_memory_study.py')
         source = work / 'input/schedules' / f"q{row['q']}" / f"p{row['p']}"
         row.update(schedule_info(source / 'states.txt', source / 'cover.json', row['q']))

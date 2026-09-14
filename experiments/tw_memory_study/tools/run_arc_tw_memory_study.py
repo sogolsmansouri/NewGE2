@@ -54,6 +54,27 @@ def all_resident_payload(nodes, edges, cuda_bytes, fraction=0.9):
         graph_policy='whole_state_gpu_graph')
 
 
+def relocate_dataset_metadata(data):
+    """Relocate copied dataset metadata without touching edges or node IDs."""
+    path = data / 'dataset.yaml'
+    metadata = yaml.safe_load(path.read_text())
+    target = str(data.resolve()) + '/'
+    if metadata.get('dataset_dir') == target:
+        return
+    original_sha = digest(path)
+    backup = data / ('dataset.before_relocation.' + original_sha + '.yaml')
+    if not backup.exists():
+        shutil.copy2(path, backup)
+    previous = metadata.get('dataset_dir')
+    metadata['dataset_dir'] = target
+    temp = data / 'dataset.yaml.relocating'
+    temp.write_text(yaml.safe_dump(metadata, sort_keys=False))
+    temp.replace(path)
+    write_json(data / 'metadata_relocation.json', dict(previous_dataset_dir=previous,
+        dataset_dir=target, previous_sha256=original_sha, sha256=digest(path),
+        backup=str(backup), edge_payload_changed=False))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--work', type=Path, required=True)
@@ -141,6 +162,7 @@ def main():
             raise RuntimeError('Extracted source differs from committed source')
         status('verifying_full_source')
         validate_prepared_data(work / 'data/p16', 16)
+        relocate_dataset_metadata(work / 'data/p16')
         frozen_hashes = {name: digest(build / name) for name in ('gege_train', 'libge2.so', 'gege_fixed_frame_buffer_test')}
         write_json(results / 'build.json', dict(commit=args.commit, hashes=frozen_hashes,
             environment=os.environ['TW_RUNTIME_ENV'], pythonpath=os.environ.get('TW_RUNTIME_PYTHONPATH')))
@@ -199,6 +221,7 @@ def main():
                     collect(row,'data_prepare_failed',run_dir=str(run))
                     continue
             validate_prepared_data(data,row['p'])
+            relocate_dataset_metadata(data)
             if time.time()+1800 > deadline:
                 status('needs_next_allocation', remaining=[r['case'] for r in rows if r['case'] not in {c['case'] for c in completed}])
                 return

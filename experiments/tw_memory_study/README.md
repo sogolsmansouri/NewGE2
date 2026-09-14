@@ -43,7 +43,9 @@ the unchanged whole-state GPU graph policy; it is not launched.
 
 Duplicates are removed: 21 candidate cases, each five epochs, batch 50,000,
 evaluation disabled. The full dataset is physically repartitioned for each p
-and hash-verified. Each candidate first passes a tiny full-training gate and
+and hash-verified. Copied dataset metadata is relocated to the node-local path,
+with the original YAML and hashes preserved; edge payloads do not change.
+Each candidate first passes a tiny full-training gate and
 a GPU value/freshness test, using the same pulled build. Minimum-state and
 maximum-overlap certificates are checked before execution. No claim is made
 that every candidate will finish within one allocation.

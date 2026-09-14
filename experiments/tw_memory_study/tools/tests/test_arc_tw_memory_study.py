@@ -1,13 +1,29 @@
 import sys
 import unittest
+import tempfile
+import yaml
 from pathlib import Path
 
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
-from run_arc_tw_memory_study import study_rows, all_resident_payload
+from run_arc_tw_memory_study import study_rows, all_resident_payload, relocate_dataset_metadata
 from run_local_tw_fixed_frames import NODES, TRAIN
 
 
 class ArcMemoryStudyTest(unittest.TestCase):
+    def test_relocation_preserves_counts_and_original_metadata(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data=Path(directory)
+            original='dataset_dir: /old/machine/\nnum_train: 42\nnum_nodes: 16\n'
+            (data/'dataset.yaml').write_text(original)
+            relocate_dataset_metadata(data)
+            new=yaml.safe_load((data/'dataset.yaml').read_text())
+            self.assertEqual(new,dict(dataset_dir=str(data.resolve())+'/',num_train=42,num_nodes=16))
+            backup=list(data.glob('dataset.before_relocation.*.yaml'))
+            self.assertEqual(len(backup),1)
+            self.assertEqual(backup[0].read_text(),original)
+            relocate_dataset_metadata(data)
+            self.assertEqual(len(list(data.glob('dataset.before_relocation.*.yaml'))),1)
+
     def test_every_k_and_original_quota_split_remain_in_plan(self):
         rows = study_rows()
         self.assertEqual(len(rows),21)

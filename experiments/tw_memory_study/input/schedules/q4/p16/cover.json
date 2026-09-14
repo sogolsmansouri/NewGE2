@@ -1,0 +1,61 @@
+{
+  "admission_histogram": {
+    "3": 19
+  },
+  "capacity": 4,
+  "covered_pairs": 120,
+  "covering_lower_bound": 20,
+  "max_admits": 3,
+  "max_evicts": 3,
+  "optimality": {
+    "candidate_count": 1820,
+    "covering_lower_bound": 20,
+    "elapsed_s": 0.06028872006572783,
+    "feasible_upper_bound": 20,
+    "maximum_overlap": 19,
+    "method": "feasible_cover_matches_lower_bound",
+    "minimum_state_count": 20,
+    "overlap": {
+      "achieved_overlap": 19,
+      "analytic_upper_bound": 19,
+      "cyclic_wrap_included": false,
+      "duplicate_pair_budget": 0,
+      "elapsed_s": 7.933820597827435e-05,
+      "fixed_state_count": 20,
+      "maximum_overlap": 19,
+      "method": "feasible_cover_matches_duplicate_pair_bound",
+      "overlap_optimal": true,
+      "peak_admissions_lower_bound": 3,
+      "peak_admissions_optimal": true,
+      "schedule_sha256": "23262dcd79c78722e8db42b15e2b0ccbbde601c4fb03cd085ad5573eda7fef34",
+      "scope": "all_distinct_full_pair_covers_of_fixed_size_and_all_path_orders",
+      "seed": 0,
+      "time_limit_s": 600.0,
+      "upper_bound": 19,
+      "workers": 8
+    },
+    "overlap_optimality": "proven",
+    "overlap_scope": "all_minimum_covers_and_path_orders",
+    "requested_solver": "optimal",
+    "schedule_sha256": "23262dcd79c78722e8db42b15e2b0ccbbde601c4fb03cd085ad5573eda7fef34",
+    "scope": "full_pair_cover_without_transition_constraints",
+    "state_count_optimal": true,
+    "time_limit_s": 600.0
+  },
+  "overlap_histogram": {
+    "1": 19
+  },
+  "partitions": 16,
+  "required_pairs": 120,
+  "schedule_path": "/home/smansou2/ge2_patch_work/tacc_baselines/runs/maximum_overlap_validation_20260913/p16/states.txt",
+  "schedule_sha256": "23262dcd79c78722e8db42b15e2b0ccbbde601c4fb03cd085ad5573eda7fef34",
+  "source": "minimum_states_maximum_overlap",
+  "state_count": 20,
+  "state_gap": 0,
+  "state_gap_ratio": 1.0,
+  "status": "valid",
+  "total_admissions": 57,
+  "total_overlap": 19,
+  "transition_count": 19,
+  "unique_state_count": 20
+}

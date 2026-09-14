@@ -1,0 +1,77 @@
+{
+  "admission_histogram": {
+    "2": 8
+  },
+  "capacity": 4,
+  "covered_pairs": 45,
+  "covering_lower_bound": 8,
+  "max_admits": 2,
+  "max_evicts": 2,
+  "optimality": {
+    "candidate_count": 210,
+    "covering_lower_bound": 8,
+    "elapsed_s": 0.7788296809885651,
+    "feasible_upper_bound": 9,
+    "maximum_overlap": 16,
+    "method": "scipy_highs_binary_set_cover",
+    "minimum_state_count": 9,
+    "mip_dual_bound": 8.999999999999915,
+    "mip_gap": 0.0,
+    "overlap": {
+      "achieved_overlap": 16,
+      "analytic_upper_bound": 16,
+      "attempts": [
+        {
+          "elapsed_s": 0.6893181420000001,
+          "status": "OPTIMAL",
+          "target_only": true
+        }
+      ],
+      "cyclic_wrap_included": false,
+      "duplicate_pair_budget": 9,
+      "elapsed_s": 0.961470359005034,
+      "estimated_variables": 1040,
+      "fixed_state_count": 9,
+      "max_variables": 250000,
+      "maximum_overlap": 16,
+      "method": "feasible_cover_matches_duplicate_pair_bound",
+      "overlap_optimal": true,
+      "peak_admissions_lower_bound": 2,
+      "peak_admissions_optimal": true,
+      "schedule_sha256": "fde8aaa8d8926b0ab99538005ab71dc71968fc184a0afdc73186e35b4ae35b23",
+      "scope": "all_distinct_full_pair_covers_of_fixed_size_and_all_path_orders",
+      "seed": 0,
+      "solver": "OR-Tools CP-SAT",
+      "solver_version": "9.15.6755",
+      "time_limit_s": 600.0,
+      "upper_bound": 16,
+      "workers": 8
+    },
+    "overlap_optimality": "proven",
+    "overlap_scope": "all_minimum_covers_and_path_orders",
+    "requested_solver": "optimal",
+    "schedule_sha256": "fde8aaa8d8926b0ab99538005ab71dc71968fc184a0afdc73186e35b4ae35b23",
+    "scipy_version": "1.16.3",
+    "scope": "full_pair_cover_without_transition_constraints",
+    "solver_message": "Optimization terminated successfully. (HiGHS Status 7: Optimal)",
+    "solver_status": 0,
+    "state_count_optimal": true,
+    "time_limit_s": 600.0
+  },
+  "overlap_histogram": {
+    "2": 8
+  },
+  "partitions": 10,
+  "required_pairs": 45,
+  "schedule_path": "/home/smansou2/ge2_patch_work/tacc_baselines/runs/maximum_overlap_validation_20260913/p10/states.txt",
+  "schedule_sha256": "fde8aaa8d8926b0ab99538005ab71dc71968fc184a0afdc73186e35b4ae35b23",
+  "source": "minimum_states_maximum_overlap",
+  "state_count": 9,
+  "state_gap": 1,
+  "state_gap_ratio": 1.125,
+  "status": "valid",
+  "total_admissions": 16,
+  "total_overlap": 16,
+  "transition_count": 8,
+  "unique_state_count": 9
+}

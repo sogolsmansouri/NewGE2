@@ -1,0 +1,61 @@
+{
+  "admission_histogram": {
+    "2": 17
+  },
+  "capacity": 4,
+  "covered_pairs": 91,
+  "covering_lower_bound": 18,
+  "max_admits": 2,
+  "max_evicts": 2,
+  "optimality": {
+    "candidate_count": 1001,
+    "covering_lower_bound": 18,
+    "elapsed_s": 0.04153000097721815,
+    "feasible_upper_bound": 18,
+    "maximum_overlap": 34,
+    "method": "feasible_cover_matches_lower_bound",
+    "minimum_state_count": 18,
+    "overlap": {
+      "achieved_overlap": 34,
+      "analytic_upper_bound": 34,
+      "cyclic_wrap_included": false,
+      "duplicate_pair_budget": 17,
+      "elapsed_s": 6.507290527224541e-05,
+      "fixed_state_count": 18,
+      "maximum_overlap": 34,
+      "method": "feasible_cover_matches_duplicate_pair_bound",
+      "overlap_optimal": true,
+      "peak_admissions_lower_bound": 2,
+      "peak_admissions_optimal": true,
+      "schedule_sha256": "349b9d64ed040368b5fe2a004eba3d5490b6c8479097ac0cf329da8bbafd4f0f",
+      "scope": "all_distinct_full_pair_covers_of_fixed_size_and_all_path_orders",
+      "seed": 0,
+      "time_limit_s": 600.0,
+      "upper_bound": 34,
+      "workers": 8
+    },
+    "overlap_optimality": "proven",
+    "overlap_scope": "all_minimum_covers_and_path_orders",
+    "requested_solver": "optimal",
+    "schedule_sha256": "349b9d64ed040368b5fe2a004eba3d5490b6c8479097ac0cf329da8bbafd4f0f",
+    "scope": "full_pair_cover_without_transition_constraints",
+    "state_count_optimal": true,
+    "time_limit_s": 600.0
+  },
+  "overlap_histogram": {
+    "2": 17
+  },
+  "partitions": 14,
+  "required_pairs": 91,
+  "schedule_path": "/home/smansou2/ge2_patch_work/tacc_baselines/runs/maximum_overlap_validation_20260913/p14/states.txt",
+  "schedule_sha256": "349b9d64ed040368b5fe2a004eba3d5490b6c8479097ac0cf329da8bbafd4f0f",
+  "source": "provided",
+  "state_count": 18,
+  "state_gap": 0,
+  "state_gap_ratio": 1.0,
+  "status": "valid",
+  "total_admissions": 34,
+  "total_overlap": 34,
+  "transition_count": 17,
+  "unique_state_count": 18
+}

@@ -2090,7 +2090,9 @@ void DataLoader::edgeSample(shared_ptr<Batch> batch, int32_t device_idx) {
         auto map_lookup_start = std::chrono::high_resolution_clock::now();
         torch::Tensor active_unique_mask;
         int64_t map_value_domain_size = -1;
-        if (batch->streamed_edge_size_ > 0 && graph_storage_ != nullptr && graph_storage_->useInMemorySubGraph() &&
+        // Both batch paths use resident-local IDs. The final partition may be
+        // padded, so the bitmap domain must match the sampler's resident domain.
+        if (graph_storage_ != nullptr && graph_storage_->useInMemorySubGraph() &&
             device_idx >= 0 && static_cast<std::size_t>(device_idx) < graph_storage_->current_subgraph_states_.size() &&
             graph_storage_->current_subgraph_states_[device_idx] != nullptr &&
             graph_storage_->current_subgraph_states_[device_idx]->all_in_memory_mapped_edges_.defined()) {

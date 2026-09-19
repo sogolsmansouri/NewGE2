@@ -1,4 +1,5 @@
 #include "data/samplers/negative.h"
+#include "common/training_contract.h"
 #ifdef GEGE_CUDA
 #include "data/samplers/negative_cuda.h"
 #endif
@@ -281,7 +282,7 @@ ChunkNegativePlan build_chunk_negative_plan(shared_ptr<GegeGraph> graph,
             plan.uniform_ids = planned_uniform_ids;
         } else {
             auto uniform_start = std::chrono::high_resolution_clock::now();
-            plan.uniform_ids = torch::randint(num_nodes, {num_chunks, num_uniform}, ind_opts);
+            plan.uniform_ids = at::randint(num_nodes, {num_chunks, num_uniform}, training_contract::negative_generator, ind_opts);
             plan.uniform_randint_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                                           std::chrono::high_resolution_clock::now() - uniform_start)
                                           .count();
@@ -291,6 +292,8 @@ ChunkNegativePlan build_chunk_negative_plan(shared_ptr<GegeGraph> graph,
     if (num_degree > 0) {
         auto degree_start = std::chrono::high_resolution_clock::now();
         bool global_degree_sampling = negative_global_degree_sampling_enabled();
+        TORCH_CHECK(!training_contract::negative_generator || (!global_degree_sampling && !exclude_current_chunk_degree_samples),
+                    "Training replay requires local degree sampling without chunk exclusion");
         if (!global_degree_sampling) {
             bool can_exclude_current_chunk =
                 exclude_current_chunk_degree_samples && num_chunks > 1 && batch_size > 1 &&
@@ -314,7 +317,7 @@ ChunkNegativePlan build_chunk_negative_plan(shared_ptr<GegeGraph> graph,
                 plan.sample_edge_ids = random_positions + shift_mask * chunk_lengths_2d;
                 plan.chunk_exclusion_active = true;
             } else {
-                plan.sample_edge_ids = torch::randint(0, batch_size, {num_chunks, num_degree}, ind_opts);
+                plan.sample_edge_ids = at::randint(batch_size, {num_chunks, num_degree}, training_contract::negative_generator, ind_opts);
             }
             plan.sample_ids_are_edge_ids = true;
         } else {
@@ -1217,6 +1220,11 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
 
 NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges,
                                                                                  bool need_src_negatives, int32_t device_idx) {
+    if (training_contract::baseline_semantics()) {
+        TORCH_CHECK(superbatch_negative_plan_batches_ <= 1 && state_negative_pool_refresh_batches_ <= 1,
+                    "Baseline-compatible sampling does not reuse negative plans");
+        return NegativeSampler::getNodeCorruptNegatives(graph, edges, need_src_negatives, device_idx);
+    }
     auto get_negatives_start = std::chrono::high_resolution_clock::now();
     bool used_state_pool = false;
     bool used_planned_uniform = false;

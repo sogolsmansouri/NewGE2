@@ -1,6 +1,7 @@
 #include "data/dataloader.h"
 
 #include "common/pipeline_nvtx.h"
+#include "common/training_contract.h"
 #include "common/util.h"
 #include "data/ordering.h"
 #include <algorithm>
@@ -1070,7 +1071,8 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
             auto opts = torch::TensorOptions()
                             .dtype(torch::kInt64)
                             .device(device_shuffle ? active_edges.device() : torch::Device(torch::kCPU));
-            auto perm = torch::randperm(active_edges.size(0), opts);
+            auto gen = training_contract::generator(opts.device(), 1, epochs_processed_, selection.state_idx, 0, device_idx);
+            auto perm = at::randperm(active_edges.size(0), gen, opts);
             if (perm.device() != active_edges.device()) {
                 perm = perm.to(active_edges.device());
             }
@@ -1084,7 +1086,7 @@ void DataLoader::setActiveEdges(int32_t device_idx) {
         } catch (const c10::Error &err) {
             std::string message = err.what();
             bool cuda_oom = !active_edges.device().is_cpu() && message.find("out of memory") != std::string::npos;
-            if (!cuda_oom) {
+            if (!cuda_oom || training_contract::replay_seed()) {
                 throw;
             }
 
@@ -2283,6 +2285,10 @@ void DataLoader::nodeSample(shared_ptr<Batch> batch, int32_t device_idx) {
 }
 
 void DataLoader::negativeSample(shared_ptr<Batch> batch, int32_t device_idx) {
+    int64_t state = device_idx >= 0 && static_cast<size_t>(device_idx) < device_current_state_index_.size()
+                        ? device_current_state_index_[device_idx] : -1;
+    auto gen = training_contract::generator(batch->edges_.device(), 2, epochs_processed_, state, batch->batch_id_, device_idx);
+    training_contract::NegativeScope negative_scope(gen);
     // For arity-4, inverse relations (src corruption) are not supported in this implementation.
     bool need_src_negatives = (batch->edges_.size(1) == 3) && use_inverse_relations_;
     std::tie(batch->src_neg_indices_, batch->src_neg_filter_, batch->dst_neg_indices_, batch->dst_neg_filter_) =

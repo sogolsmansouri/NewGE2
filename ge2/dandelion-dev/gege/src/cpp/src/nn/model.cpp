@@ -1,4 +1,5 @@
 #include "nn/model.h"
+#include "common/training_contract.h"
 
 #include <atomic>
 #include <cmath>
@@ -328,6 +329,10 @@ shared_ptr<InitConfig> default_relation_init_config(const shared_ptr<ModelConfig
 }
 
 void maybe_apply_distmult_relation_init(const shared_ptr<Decoder> &decoder, const shared_ptr<InitConfig> &init_config) {
+    if (training_contract::baseline_semantics()) {
+        SPDLOG_INFO("[relation-init] baseline_semantics=1 retaining decoder initialization");
+        return;
+    }
     auto distmult = std::dynamic_pointer_cast<DistMult>(decoder);
     auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder);
     if (distmult == nullptr || edge_decoder == nullptr || !edge_decoder->relations_.defined()) {

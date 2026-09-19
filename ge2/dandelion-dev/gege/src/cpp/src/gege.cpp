@@ -71,6 +71,12 @@ std::tuple<shared_ptr<Model>, shared_ptr<GraphModelStorage>, shared_ptr<DataLoad
     spdlog::set_default_logger(gege_logger.main_logger_);
     gege_logger.setConsoleLogLevel(gege_config->storage->log_level);
 
+    const char *deterministic_gate = std::getenv("GEGE_TRAINING_DETERMINISTIC_GATE");
+    if (deterministic_gate && std::string(deterministic_gate) == "1") {
+        at::globalContext().setDeterministicAlgorithms(true, false);
+        SPDLOG_INFO("[training-contract] deterministic_algorithms=1 diagnostic_only=1");
+    }
+
     torch::manual_seed(gege_config->model->random_seed);
     srand(gege_config->model->random_seed);
 

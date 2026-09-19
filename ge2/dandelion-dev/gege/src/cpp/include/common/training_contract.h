@@ -54,6 +54,15 @@ inline c10::optional<at::Generator> generator(torch::Device device, uint64_t dom
 
 inline thread_local c10::optional<at::Generator> negative_generator;
 
+inline uint64_t tensor_fingerprint(const torch::Tensor &tensor) {
+    if (!tensor.defined()) return 0;
+    auto cpu = tensor.detach().to(torch::kCPU).contiguous();
+    const auto *bytes = static_cast<const unsigned char *>(cpu.data_ptr());
+    uint64_t hash = 14695981039346656037ULL;
+    for (size_t i = 0; i < cpu.nbytes(); ++i) hash = (hash ^ bytes[i]) * 1099511628211ULL;
+    return hash;
+}
+
 class NegativeScope {
     c10::optional<at::Generator> previous_;
 public:

@@ -2294,6 +2294,13 @@ void DataLoader::negativeSample(shared_ptr<Batch> batch, int32_t device_idx) {
     std::tie(batch->src_neg_indices_, batch->src_neg_filter_, batch->dst_neg_indices_, batch->dst_neg_filter_) =
         negative_sampler_->getNodeCorruptNegatives(graph_storage_->current_subgraph_states_[device_idx]->in_memory_subgraph_, batch->edges_,
                                                    need_src_negatives, device_idx);
+    const char *audit = std::getenv("GEGE_TRAINING_INPUT_AUDIT");
+    if (audit && std::string(audit) == "1") {
+        SPDLOG_INFO("[training-input] epoch={} state={} batch={} edges={} src={} dst={} src_filter={} dst_filter={}",
+                    epochs_processed_, state, batch->batch_id_, training_contract::tensor_fingerprint(batch->edges_),
+                    training_contract::tensor_fingerprint(batch->src_neg_indices_), training_contract::tensor_fingerprint(batch->dst_neg_indices_),
+                    training_contract::tensor_fingerprint(batch->src_neg_filter_), training_contract::tensor_fingerprint(batch->dst_neg_filter_));
+    }
 }
 
 void DataLoader::loadCPUParameters(shared_ptr<Batch> batch) {

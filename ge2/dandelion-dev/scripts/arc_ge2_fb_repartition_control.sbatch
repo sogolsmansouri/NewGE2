@@ -8,7 +8,7 @@
 #SBATCH --output=ge2_fb_repartition_%j.out
 #SBATCH --error=ge2_fb_repartition_%j.err
 set -euo pipefail
-BASE="$SLURM_SUBMIT_DIR"
+BASE="${1:-$PWD}"
 ENV=/mnt/local/smansou2/ge2-a6000-cuda121
 WORK="/mnt/local/smansou2/ge2_fb_repartition_${SLURM_JOB_ID}"
 RESULT="$HOME/arc_results/runs/ge2_fb_repartition_${SLURM_JOB_ID}"

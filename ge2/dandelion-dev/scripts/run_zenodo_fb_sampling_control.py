@@ -63,6 +63,14 @@ def training_times(log):
     return times
 
 
+def conditions(study):
+    if study == 'sampling':
+        return [('degree_00', 0., None), ('degree_05', .5, None)]
+    if study == 'repartition':
+        return [('fixed', .5, 'fixed'), ('repartition', .5, 'repartition')]
+    raise ValueError('Unknown study: ' + study)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('work', 'results', 'env', 'tools', 'reference', 'data'):
@@ -70,11 +78,13 @@ def main():
     parser.add_argument('--job', required=True)
     parser.add_argument('--gpu', type=int, required=True)
     parser.add_argument('--model', choices=('distmult', 'complex'), required=True)
+    parser.add_argument('--study', choices=('sampling', 'repartition'), default='sampling')
+    parser.add_argument('--binary', type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.tools))
     from prepare_ge2_partitioned_view import sha256_file
     from run_arc_ge2_allocated_queue import run_logged, write_json
-    from run_arc_ge2_kge_final import inspect_data, checkpoint_names, SPECS
+    from run_arc_ge2_kge_final import inspect_data, checkpoint_names, SPECS, query_membership
     from run_arc_ge2_fb_reproduction import LIB_SHA
 
     args.results.mkdir(parents=True, exist_ok=False)
@@ -82,8 +92,10 @@ def main():
     lock = (args.work.parent / f'ge2_accuracy_gpu_{args.gpu}.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     state = dict(status='preflight', job=args.job, host=os.uname().nodename.split('.')[0],
-                 gpu=args.gpu, pid=os.getpid(), model=args.model, factors=[0., .5], cases=[],
-                 purpose=__doc__, paper_timing_eligible=False,
+                 gpu=args.gpu, pid=os.getpid(), model=args.model,
+                 factors=[c[1] for c in conditions(args.study)], cases=[],
+                 purpose=__doc__ if args.study == 'sampling' else 'Disabled epoch repartitioning sensitivity',
+                 study=args.study, paper_timing_eligible=False,
                  checkpoint_durable=False, checkpoint_storage='node_local_retained',
                  prediction_direction='both', test_set_tuning=False,
                  interpretation='Prespecified LJ-derived hypothesis; not an authors FB86M recipe')
@@ -113,6 +125,8 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     update()
     try:
+        if args.study == 'repartition' and (args.binary is None or not args.binary.is_file()):
+            raise ValueError('Repartition study requires the separately tested native driver')
         allocation = guard()
         (args.results / 'allocation.txt').write_text(allocation)
         deadline = datetime.datetime.fromisoformat(re.search(r'\bEndTime=(\S+)', allocation)[1]).timestamp() - 180
@@ -137,6 +151,7 @@ def main():
         shutil.copyfile(args.reference / 'result.json', args.results / 'previous_result.json')
         write_json(args.results / 'frozen_inputs.json', dict(library_sha256=LIB_SHA,
                    reference_config_sha256=frozen['config_sha256'], driver_sha256=sha256_file(Path(__file__)),
+                   native_driver_sha256=sha256_file(args.binary) if args.binary else None,
                    helpers={name: sha256_file(args.tools / name) for name in helper_names}))
         update(stage='source_data_audit')
         write_json(args.results / 'source_data_audit.json', inspect_data(args.data, 'FB', True))
@@ -148,29 +163,54 @@ def main():
                    LD_LIBRARY_PATH=':'.join(str(args.env / x) for x in (
                        'lib/python3.9/site-packages/gege', 'lib/python3.9/site-packages/torch/lib', 'lib')))
         python, spec = args.env / 'bin/python', SPECS['FB']
+        query_path, query_hash = None, spec['eval_sha']
+        if args.study == 'repartition':
+            import numpy as np
+            from deterministic_eval_subset import stable_sample_indices
+            seed = 'ge2-fb-optimizer-control-validation-20260920:v1'
+            source = args.data / 'edges/validation_edges.bin'
+            rows = np.memmap(source, '<i4', mode='r').reshape(-1, 3)
+            indices = stable_sample_indices(len(rows), 10000, seed)
+            queries = np.asarray(rows[indices.astype(np.int64)])
+            membership = query_membership(args.data, queries, spec['nodes'])
+            if membership != dict(train=0, validation=10000, test=0):
+                raise RuntimeError('Validation membership/leakage mismatch')
+            query_path = args.results / 'validation_queries.bin'
+            queries.tofile(query_path)
+            query_hash = sha256_file(query_path)
+            if query_hash != '1ace54b772ccd59818befff780fd138f19a2f79d2b4a34f2237e6eb8dfd114cd':
+                raise RuntimeError('Predeclared validation query panel changed')
+            indices.astype('<u8').tofile(args.results / 'validation_row_indices.bin')
+            write_json(args.results / 'validation_manifest.json', dict(seed=seed, rows=10000,
+                       queries_sha256=query_hash, source_sha256=sha256_file(source), membership=membership,
+                       selector_sha256=sha256_file(args.tools / 'deterministic_eval_subset.py')))
+            update(evaluation_scope='validation_only', interpretation='Paper-described repartition path; not unchanged release',
+                   conditions=[c[0] for c in conditions(args.study)])
 
         def run(command, name, case):
             guard()
             if deadline - time.time() < 60:
                 raise RuntimeError('Allocation deadline reached')
             update(status='running', stage=case.name + ':' + name)
-            rc = run_logged(list(map(str, command)), env, case / (name + '.log'), deadline - time.time(),
+            child_env = dict(env)
+            if args.binary and Path(command[0]) == args.binary:
+                child_env['GEGE_NO_BINDINGS'] = '1'
+            rc = run_logged(list(map(str, command)), child_env, case / (name + '.log'), deadline - time.time(),
                             case / (name + '.hardware.jsonl') if name in ('train', 'evaluate') else None)
             if rc:
                 raise RuntimeError(f'{case.name}/{name} failed: {rc}')
 
-        for fraction in state['factors']:
+        for label, fraction, native_mode in conditions(args.study):
             guard()
             if deadline - time.time() < 4500:
-                update(status='deferred', stage='insufficient_allocation_time', next_fraction=fraction)
+                update(status='deferred', stage='insufficient_allocation_time', next_condition=label)
                 return
             gpu_idle()
-            label = 'degree_' + str(fraction).replace('.', '')
             work, case = args.work / label, args.results / label
             work.mkdir()
             case.mkdir()
             data, model = work / 'data', work / 'model'
-            row = dict(degree_fraction=fraction, status='preparing', checkpoint=str(model), run_dir=str(case))
+            row = dict(degree_fraction=fraction, condition=label, status='preparing', checkpoint=str(model), run_dir=str(case))
             state['cases'].append(row)
             update(stage=label + ':private_data_copy')
             shutil.copytree(args.data, data)
@@ -185,7 +225,18 @@ def main():
             run([python, '-c', 'import gege,torch; assert torch.cuda.is_available(); '
                  'print(gege.__file__); print(torch.__version__); print(torch.cuda.get_device_name(0))'], 'runtime_gate', case)
             gpu_idle()
-            run([args.env / 'bin/gege_train', config_path], 'train', case)
+            command = ([args.binary, config_path, native_mode] if native_mode
+                       else [args.env / 'bin/gege_train', config_path])
+            run(command, 'train', case)
+            if native_mode:
+                text = (case / 'train.log').read_text()
+                if 'CONTROL_COMPLETE mode=' + native_mode + ' epochs=10' not in text:
+                    raise RuntimeError('Missing native control completion')
+                costs = [float(x) for x in re.findall(r'REPARTITION before_epoch=\d+ seconds=([0-9.e+-]+)', text)]
+                if len(costs) != (9 if native_mode == 'repartition' else 0):
+                    raise RuntimeError('Wrong number of epoch repartitions')
+                row['repartition_times_s'] = costs
+                row['repartition_total_s'] = sum(costs)
             times = training_times((case / 'train.log').read_text())
             row.update(status='checkpoint_hashing', epoch_times_s=times, average_epoch_s=statistics.mean(times),
                        steady_epoch_s=statistics.mean(times[1:]), paper_timing_eligible=False)
@@ -201,7 +252,7 @@ def main():
             write_json(case / 'checkpoint_manifest.json', dict(status='ready', source=str(model),
                        host=state['host'], files=files, checkpoint_durable=False))
             shutil.copyfile(model / 'full_config.yaml', case / 'full_config.yaml')
-            queries = data / 'exact10000_uniform_v1/edges/test_edges.bin'
+            queries = query_path or data / 'exact10000_uniform_v1/edges/test_edges.bin'
             row['status'] = 'evaluating'
             run([python, args.tools / 'verify_ge2_native_checkpoint_scores.py', '--run', model,
                  '--eval-edges', queries, '--score', args.model, '--nodes', spec['nodes'],
@@ -213,16 +264,16 @@ def main():
                  '--expected-dim', spec['dim'], '--report', case / 'relation_extract.json'], 'relations', case)
             run([python, args.tools / 'eval_marius_kge_exact10k.py', '--entity-bin', model / 'embeddings.bin',
                  '--src-relation-bin', src, '--dst-relation-bin', dst, '--ge2-data-dir', data,
-                 '--eval-edges', queries, '--expected-eval-sha256', spec['eval_sha'], '--score', args.model,
+                 '--eval-edges', queries, '--expected-eval-sha256', query_hash, '--score', args.model,
                  '--filtered', '--tie-policy', 'pessimistic', '--num-test', '10000',
                  '--num-nodes', spec['nodes'], '--num-relations', spec['relations'], '--embedding-dim', spec['dim'],
                  '--batch-size', '32', '--candidate-chunk', '500000', '--filter-chunk', '5000000',
-                 '--device', 'cuda:0', '--evaluator-contract', 'ge2_fb_sampling_control_20260920',
+                 '--device', 'cuda:0', '--evaluator-contract', 'ge2_fb_' + args.study + '_control_20260920',
                  '--score-contract', 'ge2_forward_inverse_relation_embeddings', '--out', case / 'exact_eval.json'],
                 'evaluate', case)
             quality = json.loads((case / 'exact_eval.json').read_text())
             if (quality['num_ranks'] != 20000 or not quality['filtered']
-                    or quality['eval_edges_sha256'] != spec['eval_sha']
+                    or quality['eval_edges_sha256'] != query_hash
                     or quality['entity_bin_sha256'] != files[0]['sha256']
                     or quality['tie_policy'] != 'pessimistic'
                     or quality['evaluator_sha256'] != frozen['tools']['eval_marius_kge_exact10k.py']
@@ -235,8 +286,10 @@ def main():
             for direction in ('', 'head_', 'tail_'):
                 for metric in ('mrr', 'hits_at_10'):
                     row[direction + metric] = quality[direction + metric]
-            row['difference_from_paper'] = {metric: quality[metric] - value
-                                            for metric, value in state['paper_reference'].items()}
+            row['evaluation_scope'] = 'validation' if args.study == 'repartition' else 'test'
+            if args.study == 'sampling':
+                row['difference_from_paper'] = {metric: quality[metric] - value
+                                                for metric, value in state['paper_reference'].items()}
             write_json(case / 'result.json', row)
             update()
         update(status='done', stage='complete')

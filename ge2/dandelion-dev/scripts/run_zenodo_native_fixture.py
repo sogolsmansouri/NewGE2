@@ -21,14 +21,25 @@ def main():
     for name in ("binary", "template", "work", "results", "env"):
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--gpu", required=True)
-    parser.add_argument("--job", required=True)
+    location = parser.add_mutually_exclusive_group(required=True)
+    location.add_argument("--job")
+    location.add_argument("--local", action="store_true")
+    parser.add_argument("--epochs", type=int, default=2)
+    parser.add_argument("--repartition", action="store_true")
     parser.add_argument("--observe-padding", action="store_true")
     args = parser.parse_args()
-    allocation = subprocess.check_output(["scontrol", "show", "job", args.job, "-o"], text=True)
-    if "JobState=RUNNING " not in allocation or f"UserId={os.environ['USER']}(" not in allocation:
-        raise RuntimeError("A running owned allocation is required")
-    if f"NodeList={os.uname().nodename.split('.')[0]} " not in allocation:
-        raise RuntimeError("Allocation is on another node")
+    if args.epochs < 2:
+        raise ValueError("At least two epochs are required for the transition audit")
+    if args.local:
+        if os.uname().nodename.split('.')[0].startswith(('c30', 'c31', 'login')):
+            raise RuntimeError("Compute nodes require an allocation, not --local")
+        allocation = "local workstation: " + os.uname().nodename
+    else:
+        allocation = subprocess.check_output(["scontrol", "show", "job", args.job, "-o"], text=True)
+        if "JobState=RUNNING " not in allocation or f"UserId={os.environ['USER']}(" not in allocation:
+            raise RuntimeError("A running owned allocation is required")
+        if f"NodeList={os.uname().nodename.split('.')[0]} " not in allocation:
+            raise RuntimeError("Allocation is on another node")
     apps = subprocess.check_output(["nvidia-smi", "-i", args.gpu, "--query-compute-apps=pid",
                                     "--format=csv,noheader"], text=True).strip()
     if apps:
@@ -76,7 +87,7 @@ def main():
             config["storage"]["model_dir"] = str(args.work / case / "model") + "/"
             config["storage"]["checkpoint_dir"] = config["storage"]["model_dir"]
             config["storage"]["save_model"] = False
-            config["training"].update(num_epochs=2, batch_size=13, save_model=False)
+            config["training"].update(num_epochs=args.epochs, batch_size=13, save_model=False)
             config["training"]["negative_sampling"].update(num_chunks=3, negatives_per_positive=12)
             path, result = args.results / f"{case}.yaml", args.results / f"{case}.json"
             path.write_text(yaml.safe_dump(config))
@@ -84,6 +95,8 @@ def main():
                 command = [str(args.binary), str(path), str(result)]
                 if args.observe_padding:
                     command.append("--observe-padding")
+                if args.repartition:
+                    command.append("--repartition")
                 process = subprocess.run(command, env=env,
                                          stdout=log, stderr=subprocess.STDOUT, timeout=120)
             entry = dict(case=case, exit_code=process.returncode, config_sha256=sha(path))

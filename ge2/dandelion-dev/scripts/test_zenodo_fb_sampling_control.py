@@ -2,7 +2,7 @@ import copy
 from pathlib import Path
 import unittest
 
-from run_zenodo_fb_sampling_control import case_config, check_reference, training_times
+from run_zenodo_fb_sampling_control import case_config, check_reference, training_times, conditions
 
 
 def reference():
@@ -21,6 +21,14 @@ def reference():
 
 
 class SamplingControlTests(unittest.TestCase):
+    def test_repartition_preserves_learning_config(self):
+        self.assertEqual(conditions('repartition'), [('fixed', .5, 'fixed'), ('repartition', .5, 'repartition')])
+        a, b = [case_config(reference(), Path('/data'), Path('/model'), fraction)
+                for _, fraction, _ in conditions('repartition')]
+        self.assertEqual(a, b)
+        with self.assertRaises(ValueError):
+            conditions('best_test_score')
+
     def test_reference(self):
         check_reference(reference(), 'distmult')
 

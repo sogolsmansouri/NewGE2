@@ -34,9 +34,14 @@ torch::Tensor keys(torch::Tensor edges, int64_t nodes, int64_t relations) {
 
 int main(int argc, char** argv) {
     try {
-        TORCH_CHECK(argc == 3 || (argc == 4 && std::string(argv[3]) == "--observe-padding"),
-                    "Usage: audit CONFIG OUTPUT_JSON [--observe-padding]");
-        bool observe_padding = argc == 4;
+        TORCH_CHECK(argc >= 3, "Usage: audit CONFIG OUTPUT_JSON [--observe-padding] [--repartition]");
+        bool observe_padding = false, repartition = false;
+        for (int i = 3; i < argc; ++i) {
+            std::string option(argv[i]);
+            if (option == "--observe-padding") observe_padding = true;
+            else if (option == "--repartition") repartition = true;
+            else TORCH_CHECK(false, "Unknown option: ", option);
+        }
         auto cfg = loadConfig(argv[1], false);
         TORCH_CHECK(cfg->training->negative_sampling_method == NegativeSamplingMethod::RNS, "RNS required");
         TORCH_CHECK(cfg->model->dense_optimizer->type == OptimizerType::ADAGRAD, "Adagrad required");
@@ -54,14 +59,22 @@ int main(int argc, char** argv) {
         torch::Tensor expected_embeddings, expected_state;
         auto dense_state = torch::zeros_like(decoder->relations_);
         auto inv_dense_state = torch::zeros_like(decoder->inverse_relations_);
-        for (int epoch = 0; epoch < 2; ++epoch) {
+        storage->storage_ptrs_.train_edges->load();
+        auto wanted_edges = keys(storage->storage_ptrs_.train_edges->data_, mem->dim0_size_, decoder->num_relations_);
+        for (int epoch = 0; epoch < cfg->training->num_epochs; ++epoch) {
+            if (epoch && repartition) {
+                // nextEpoch has flushed device updates before changing the ID-to-slot map.
+                storage->rePartition();
+                equal("repartition preserves canonical edge multiset",
+                      keys(storage->storage_ptrs_.train_edges->data_, mem->dim0_size_, decoder->num_relations_),
+                      wanted_edges, 0, 0);
+            }
             loader->setTrainSet();
             loader->initializeBatches(false);
             if (epoch == 0) {
                 expected_embeddings = mem->data_.clone();
                 expected_state = state->data_.clone();
             }
-            auto wanted_edges = keys(storage->storage_ptrs_.train_edges->data_, mem->dim0_size_, decoder->num_relations_);
             std::vector<torch::Tensor> seen_edges;
             torch::Tensor previous_map;
             while (loader->hasNextBatch()) {
@@ -154,6 +167,7 @@ int main(int argc, char** argv) {
             << ",\"math_storage_passed\":true,\"padding_candidate_draws\":" << padding_draws
             << ",\"candidate_draws\":" << candidate_draws << ",\"checks\":" << checks << ",\"batches\":" << batches
             << ",\"edges\":" << edge_count << ",\"states_observed\":" << transitions
+            << ",\"epochs\":" << cfg->training->num_epochs << ",\"repartition\":" << (repartition ? "true" : "false")
             << ",\"max_absolute_difference\":" << worst << "}\n";
         std::cout << "PASS math, valid-entity storage, and edge coverage: " << checks
                   << " checks; invalid padding candidates: " << padding_draws << "\n";

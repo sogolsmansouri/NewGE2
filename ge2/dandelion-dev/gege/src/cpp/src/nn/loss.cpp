@@ -102,6 +102,28 @@ torch::Tensor SoftmaxCrossEntropy::operator()(torch::Tensor y_pred, torch::Tenso
     return torch::nn::functional::cross_entropy(y_pred, labels, options);
 }
 
+std::tuple<torch::Tensor, torch::Tensor> SoftmaxCrossEntropy::score_gradients(
+    torch::Tensor pos_scores, torch::Tensor neg_scores) const {
+    torch::NoGradGuard no_grad;
+    check_score_shapes(pos_scores, neg_scores);
+    auto negative_log_mass = neg_scores.logsumexp(1, true);
+    auto biased_mass = negative_log_mass;
+    double bias = softmax_negative_log_mass_bias();
+    if (bias != 0.0) biased_mass = biased_mass + bias;
+    auto logits = torch::cat({pos_scores.unsqueeze(1), biased_mass}, 1);
+    auto log_probs = logits.log_softmax(1);
+    auto targets = torch::zeros({pos_scores.size(0)}, pos_scores.options().dtype(torch::kInt64));
+    int64_t reduction = reduction_type_ == LossReduction::MEAN ? at::Reduction::Mean : at::Reduction::Sum;
+    // Use the same native reverse kernels and reduction scaling as forward loss,
+    // without constructing an autograd graph. Algebraic softmax reassociation
+    // changes near-zero gradients enough to alter first-step Adagrad updates.
+    auto grad_log_probs = at::nll_loss_backward(torch::ones({}, pos_scores.options()), log_probs, targets,
+        c10::nullopt, reduction, -100, torch::full({}, pos_scores.size(0), pos_scores.options()));
+    auto grad_logits = at::_log_softmax_backward_data(grad_log_probs, log_probs, 1, logits.scalar_type());
+    auto grad_neg = grad_logits.narrow(1, 1, 1) * (neg_scores - negative_log_mass).exp();
+    return {grad_logits.narrow(1, 0, 1), grad_neg};
+}
+
 torch::Tensor RankingLoss::operator()(torch::Tensor pos_scores, torch::Tensor neg_scores, bool scores) {
     // does this loss make sense?
 

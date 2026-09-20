@@ -32,6 +32,10 @@ class SoftmaxCrossEntropy : public LossFunction {
    public:
     SoftmaxCrossEntropy(shared_ptr<LossOptions> options) { reduction_type_ = options->loss_reduction; };
 
+    LossReduction reduction() const { return reduction_type_; }
+
+    std::tuple<torch::Tensor, torch::Tensor> score_gradients(torch::Tensor pos_scores, torch::Tensor neg_scores) const;
+
     torch::Tensor operator()(torch::Tensor y_pred, torch::Tensor targets, bool scores) override;
 };
 

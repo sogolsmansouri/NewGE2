@@ -87,6 +87,26 @@ bool fixed_buffer_manual_complex_rns_enabled() {
     return enabled;
 }
 
+bool manual_rns_execution_allowed(const Model *model, const shared_ptr<Batch> &batch) {
+    if (!fixed_buffer_manual_dot_rns_enabled() && !fixed_buffer_manual_distmult_rns_enabled() &&
+        !fixed_buffer_manual_complex_rns_enabled()) {
+        return false;
+    }
+
+    auto loss = std::dynamic_pointer_cast<SoftmaxCrossEntropy>(model->loss_function_);
+    auto encoder = model->encoder_;
+    if (!loss || !encoder || encoder->layers_.size() != 1 ||
+        encoder->layers_[0].size() != 1 || !batch || batch->resident_local_lp_direct_ ||
+        batch->qual_embeddings_.defined() || !batch->node_embeddings_.defined()) {
+        return false;
+    }
+    auto embedding = std::dynamic_pointer_cast<EmbeddingLayer>(encoder->layers_[0][0]);
+    // Manual derivatives bypass the encoder and only implement an identity map.
+    return embedding && embedding->config_ && embedding->offset_ == 0 && !embedding->config_->bias &&
+           embedding->config_->activation == ActivationFunction::NONE &&
+           embedding->config_->output_dim == batch->node_embeddings_.size(1);
+}
+
 bool fixed_buffer_manual_dot_rns_sanity_enabled() {
     static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MANUAL_DOT_RNS_SANITY", false);
     return enabled;
@@ -478,15 +498,18 @@ torch::Tensor pad_rows(torch::Tensor input, int64_t rows) {
     return torch::cat({input, pad}, 0);
 }
 
-void accumulate_dot_softmax_side(torch::Tensor grad_unique,
-                                 torch::Tensor node_embeddings,
+struct ManualRnsSideGradients {
+    torch::Tensor anchor, other, negative;
+};
+
+ManualRnsSideGradients dot_softmax_side_gradients(torch::Tensor node_embeddings,
                                  torch::Tensor anchor_ids,
                                  torch::Tensor other_ids,
                                  torch::Tensor neg_ids,
                                  torch::Tensor neg_filter,
-                                 double negative_mass_scale) {
+                                 const SoftmaxCrossEntropy &loss) {
     if (!neg_ids.defined() || neg_ids.numel() == 0) {
-        return;
+        return {};
     }
 
     anchor_ids = anchor_ids.to(torch::kInt64);
@@ -497,7 +520,7 @@ void accumulate_dot_softmax_side(torch::Tensor grad_unique,
     int64_t num_chunks = neg_ids.size(0);
     int64_t num_negatives = neg_ids.size(1);
     if (batch_size == 0 || num_chunks == 0 || num_negatives == 0) {
-        return;
+        return {};
     }
 
     int64_t dim = node_embeddings.size(1);
@@ -517,13 +540,8 @@ void accumulate_dot_softmax_side(torch::Tensor grad_unique,
     neg_scores = apply_score_filter(neg_scores, neg_filter);
 
     torch::Tensor pos_scores = (anchor * other).sum(1, true);
-    torch::Tensor max_neg = std::get<0>(neg_scores.max(1, true));
-    torch::Tensor max_logits = torch::maximum(pos_scores, max_neg);
-    torch::Tensor exp_pos = (pos_scores - max_logits).exp();
-    torch::Tensor exp_neg = (neg_scores - max_logits).exp();
-    torch::Tensor denom = exp_pos + exp_neg.sum(1, true).mul(negative_mass_scale);
-    torch::Tensor grad_pos = exp_pos.div(denom).sub_(1.0);
-    torch::Tensor grad_neg = exp_neg.mul_(negative_mass_scale).div_(denom);
+    torch::Tensor grad_pos, grad_neg;
+    std::tie(grad_pos, grad_neg) = loss.score_gradients(pos_scores.squeeze(1), neg_scores);
 
     torch::Tensor grad_neg_padded = pad_rows(grad_neg, padded_batch_size);
     torch::Tensor grad_neg_chunks = grad_neg_padded.reshape({num_chunks, per_chunk, num_negatives});
@@ -535,9 +553,32 @@ void accumulate_dot_softmax_side(torch::Tensor grad_unique,
     torch::Tensor grad_neg_embeddings = torch::bmm(grad_neg_chunks.transpose(1, 2), anchor_chunks)
                                             .reshape({num_chunks * num_negatives, dim});
 
-    grad_unique.index_add_(0, anchor_ids, grad_anchor);
-    grad_unique.index_add_(0, other_ids, grad_other);
-    grad_unique.index_add_(0, neg_flat, grad_neg_embeddings);
+    return {grad_anchor, grad_other, grad_neg_embeddings};
+}
+
+torch::Tensor reduce_manual_node_gradients(const shared_ptr<Batch> &batch,
+    const ManualRnsSideGradients &forward, const ManualRnsSideGradients &inverse = {}) {
+    auto result = torch::zeros_like(batch->node_embeddings_);
+    auto scratch = torch::empty_like(result);
+    bool initialized = false;
+    auto add_gather = [&](torch::Tensor ids, torch::Tensor values) {
+        auto &out = initialized ? scratch : result;
+        if (initialized) out.zero_();
+        out.index_add_(0, ids.reshape({-1}).to(torch::kInt64), values);
+        if (initialized) result.add_(out);
+        initialized = true;
+    };
+    // Match independent index_select backward reductions, then their accumulation
+    // order. Scattering directly into a running total changes FP32 cancellation.
+    if (inverse.negative.defined()) add_gather(batch->src_neg_indices_mapping_, inverse.negative);
+    add_gather(batch->dst_neg_indices_mapping_, forward.negative);
+    auto dst = forward.other;
+    auto src = forward.anchor;
+    if (inverse.anchor.defined()) dst = dst + inverse.anchor;
+    if (inverse.other.defined()) src = src + inverse.other;
+    add_gather(batch->edges_.select(1, -1), dst);
+    add_gather(batch->edges_.select(1, 0), src);
+    return result;
 }
 
 void apply_manual_node_adagrad_update(shared_ptr<Batch> batch, float learning_rate, torch::Tensor grad_unique,
@@ -580,8 +621,7 @@ void apply_manual_node_adagrad_update(shared_ptr<Batch> batch, float learning_ra
 #endif
 }
 
-void accumulate_distmult_softmax_side(torch::Tensor grad_unique,
-                                      torch::Tensor grad_relations,
+ManualRnsSideGradients distmult_softmax_side_gradients(torch::Tensor grad_relations,
                                       torch::Tensor node_embeddings,
                                       torch::Tensor relation_embeddings,
                                       torch::Tensor rel_ids,
@@ -589,9 +629,9 @@ void accumulate_distmult_softmax_side(torch::Tensor grad_unique,
                                       torch::Tensor other_ids,
                                       torch::Tensor neg_ids,
                                       torch::Tensor neg_filter,
-                                      double negative_mass_scale) {
+                                      const SoftmaxCrossEntropy &loss) {
     if (!neg_ids.defined() || neg_ids.numel() == 0) {
-        return;
+        return {};
     }
 
     rel_ids = rel_ids.to(torch::kInt64);
@@ -603,7 +643,7 @@ void accumulate_distmult_softmax_side(torch::Tensor grad_unique,
     int64_t num_chunks = neg_ids.size(0);
     int64_t num_negatives = neg_ids.size(1);
     if (batch_size == 0 || num_chunks == 0 || num_negatives == 0) {
-        return;
+        return {};
     }
 
     int64_t dim = node_embeddings.size(1);
@@ -626,13 +666,8 @@ void accumulate_distmult_softmax_side(torch::Tensor grad_unique,
     neg_scores = apply_score_filter(neg_scores, neg_filter);
 
     torch::Tensor pos_scores = (adjusted_anchor * other).sum(1, true);
-    torch::Tensor max_neg = std::get<0>(neg_scores.max(1, true));
-    torch::Tensor max_logits = torch::maximum(pos_scores, max_neg);
-    torch::Tensor exp_pos = (pos_scores - max_logits).exp();
-    torch::Tensor exp_neg = (neg_scores - max_logits).exp();
-    torch::Tensor denom = exp_pos + exp_neg.sum(1, true).mul(negative_mass_scale);
-    torch::Tensor grad_pos = exp_pos.div(denom).sub_(1.0);
-    torch::Tensor grad_neg = exp_neg.mul_(negative_mass_scale).div_(denom);
+    torch::Tensor grad_pos, grad_neg;
+    std::tie(grad_pos, grad_neg) = loss.score_gradients(pos_scores.squeeze(1), neg_scores);
 
     torch::Tensor grad_neg_padded = pad_rows(grad_neg, padded_batch_size);
     torch::Tensor grad_neg_chunks = grad_neg_padded.reshape({num_chunks, per_chunk, num_negatives});
@@ -640,16 +675,15 @@ void accumulate_distmult_softmax_side(torch::Tensor grad_unique,
                                      .reshape({padded_batch_size, dim})
                                      .narrow(0, 0, batch_size);
 
-    torch::Tensor grad_anchor = grad_pos * (rel * other) + rel * weighted_neg;
-    torch::Tensor grad_other = grad_pos * (anchor * rel);
-    torch::Tensor grad_rel = grad_pos * (anchor * other) + anchor * weighted_neg;
+    torch::Tensor weighted_other = grad_pos * other + weighted_neg;
+    torch::Tensor grad_anchor = weighted_other * rel;
+    torch::Tensor grad_other = grad_pos * adjusted_anchor;
+    torch::Tensor grad_rel = weighted_other * anchor;
     torch::Tensor grad_neg_embeddings = torch::bmm(grad_neg_chunks.transpose(1, 2), adjusted_chunks)
                                             .reshape({num_chunks * num_negatives, dim});
 
-    grad_unique.index_add_(0, anchor_ids, grad_anchor);
-    grad_unique.index_add_(0, other_ids, grad_other);
-    grad_unique.index_add_(0, neg_flat, grad_neg_embeddings);
     grad_relations.index_add_(0, rel_ids, grad_rel);
+    return {grad_anchor, grad_other, grad_neg_embeddings};
 }
 
 torch::Tensor complex_mul_2d(torch::Tensor lhs, torch::Tensor rhs) {
@@ -685,8 +719,7 @@ torch::Tensor complex_relation_grad_2d(torch::Tensor anchor, torch::Tensor other
                       1);
 }
 
-void accumulate_complex_softmax_side(torch::Tensor grad_unique,
-                                     torch::Tensor grad_relations,
+ManualRnsSideGradients complex_softmax_side_gradients(torch::Tensor grad_relations,
                                      torch::Tensor node_embeddings,
                                      torch::Tensor relation_embeddings,
                                      torch::Tensor rel_ids,
@@ -694,9 +727,9 @@ void accumulate_complex_softmax_side(torch::Tensor grad_unique,
                                      torch::Tensor other_ids,
                                      torch::Tensor neg_ids,
                                      torch::Tensor neg_filter,
-                                     double negative_mass_scale) {
+                                     const SoftmaxCrossEntropy &loss) {
     if (!neg_ids.defined() || neg_ids.numel() == 0) {
-        return;
+        return {};
     }
 
     rel_ids = rel_ids.to(torch::kInt64);
@@ -708,7 +741,7 @@ void accumulate_complex_softmax_side(torch::Tensor grad_unique,
     int64_t num_chunks = neg_ids.size(0);
     int64_t num_negatives = neg_ids.size(1);
     if (batch_size == 0 || num_chunks == 0 || num_negatives == 0) {
-        return;
+        return {};
     }
 
     int64_t dim = node_embeddings.size(1);
@@ -735,13 +768,8 @@ void accumulate_complex_softmax_side(torch::Tensor grad_unique,
     neg_scores = apply_score_filter(neg_scores, neg_filter);
 
     torch::Tensor pos_scores = (adjusted_anchor * other).sum(1, true);
-    torch::Tensor max_neg = std::get<0>(neg_scores.max(1, true));
-    torch::Tensor max_logits = torch::maximum(pos_scores, max_neg);
-    torch::Tensor exp_pos = (pos_scores - max_logits).exp();
-    torch::Tensor exp_neg = (neg_scores - max_logits).exp();
-    torch::Tensor denom = exp_pos + exp_neg.sum(1, true).mul(negative_mass_scale);
-    torch::Tensor grad_pos = exp_pos.div(denom).sub_(1.0);
-    torch::Tensor grad_neg = exp_neg.mul_(negative_mass_scale).div_(denom);
+    torch::Tensor grad_pos, grad_neg;
+    std::tie(grad_pos, grad_neg) = loss.score_gradients(pos_scores.squeeze(1), neg_scores);
 
     torch::Tensor grad_neg_padded = pad_rows(grad_neg, padded_batch_size);
     torch::Tensor grad_neg_chunks = grad_neg_padded.reshape({num_chunks, per_chunk, num_negatives});
@@ -756,10 +784,8 @@ void accumulate_complex_softmax_side(torch::Tensor grad_unique,
     torch::Tensor grad_neg_embeddings = torch::bmm(grad_neg_chunks.transpose(1, 2), adjusted_chunks)
                                             .reshape({num_chunks * num_negatives, dim});
 
-    grad_unique.index_add_(0, anchor_ids, grad_anchor);
-    grad_unique.index_add_(0, other_ids, grad_other);
-    grad_unique.index_add_(0, neg_flat, grad_neg_embeddings);
     grad_relations.index_add_(0, rel_ids, grad_rel);
+    return {grad_anchor, grad_other, grad_neg_embeddings};
 }
 
 void manual_distmult_rns_update(Model *model, shared_ptr<Batch> batch, shared_ptr<EdgeDecoder> edge_decoder, bool call_step) {
@@ -772,21 +798,20 @@ void manual_distmult_rns_update(Model *model, shared_ptr<Batch> batch, shared_pt
     }
 
     torch::Tensor node_embeddings = batch->node_embeddings_.detach();
-    torch::Tensor grad_unique = torch::zeros_like(node_embeddings);
     torch::Tensor grad_rel = torch::zeros_like(edge_decoder->relations_);
     torch::Tensor grad_inv_rel = torch::zeros_like(edge_decoder->inverse_relations_);
 
     torch::Tensor src_ids = batch->edges_.select(1, 0).to(torch::kInt64);
     torch::Tensor rel_ids = batch->edges_.select(1, 1).to(torch::kInt64);
     torch::Tensor dst_ids = batch->edges_.select(1, 2).to(torch::kInt64);
-    double negative_mass_scale = softmax_negative_mass_scale_for_manual_update();
-
-    accumulate_distmult_softmax_side(grad_unique, grad_rel, node_embeddings, edge_decoder->relations_.detach(),
+    auto loss = std::static_pointer_cast<SoftmaxCrossEntropy>(model->loss_function_);
+    auto forward = distmult_softmax_side_gradients(grad_rel, node_embeddings, edge_decoder->relations_.detach(),
                                      rel_ids, src_ids, dst_ids, batch->dst_neg_indices_mapping_, batch->dst_neg_filter_,
-                                     negative_mass_scale);
-    accumulate_distmult_softmax_side(grad_unique, grad_inv_rel, node_embeddings, edge_decoder->inverse_relations_.detach(),
+                                     *loss);
+    auto inverse = distmult_softmax_side_gradients(grad_inv_rel, node_embeddings, edge_decoder->inverse_relations_.detach(),
                                      rel_ids, dst_ids, src_ids, batch->src_neg_indices_mapping_, batch->src_neg_filter_,
-                                     negative_mass_scale);
+                                     *loss);
+    auto grad_unique = reduce_manual_node_gradients(batch, forward, inverse);
 
     if (fixed_buffer_manual_dot_rns_sanity_enabled()) {
         if (!torch::isfinite(grad_rel).all().item<bool>() || !torch::isfinite(grad_inv_rel).all().item<bool>()) {
@@ -829,21 +854,20 @@ void manual_complex_rns_update(Model *model, shared_ptr<Batch> batch, shared_ptr
     }
 
     torch::Tensor node_embeddings = batch->node_embeddings_.detach();
-    torch::Tensor grad_unique = torch::zeros_like(node_embeddings);
     torch::Tensor grad_rel = torch::zeros_like(edge_decoder->relations_);
     torch::Tensor grad_inv_rel = torch::zeros_like(edge_decoder->inverse_relations_);
 
     torch::Tensor src_ids = batch->edges_.select(1, 0).to(torch::kInt64);
     torch::Tensor rel_ids = batch->edges_.select(1, 1).to(torch::kInt64);
     torch::Tensor dst_ids = batch->edges_.select(1, 2).to(torch::kInt64);
-    double negative_mass_scale = softmax_negative_mass_scale_for_manual_update();
-
-    accumulate_complex_softmax_side(grad_unique, grad_rel, node_embeddings, edge_decoder->relations_.detach(),
+    auto loss = std::static_pointer_cast<SoftmaxCrossEntropy>(model->loss_function_);
+    auto forward = complex_softmax_side_gradients(grad_rel, node_embeddings, edge_decoder->relations_.detach(),
                                     rel_ids, src_ids, dst_ids, batch->dst_neg_indices_mapping_, batch->dst_neg_filter_,
-                                    negative_mass_scale);
-    accumulate_complex_softmax_side(grad_unique, grad_inv_rel, node_embeddings, edge_decoder->inverse_relations_.detach(),
+                                    *loss);
+    auto inverse = complex_softmax_side_gradients(grad_inv_rel, node_embeddings, edge_decoder->inverse_relations_.detach(),
                                     rel_ids, dst_ids, src_ids, batch->src_neg_indices_mapping_, batch->src_neg_filter_,
-                                    negative_mass_scale);
+                                    *loss);
+    auto grad_unique = reduce_manual_node_gradients(batch, forward, inverse);
 
     if (fixed_buffer_manual_dot_rns_sanity_enabled()) {
         if (!torch::isfinite(grad_rel).all().item<bool>() || !torch::isfinite(grad_inv_rel).all().item<bool>()) {
@@ -890,7 +914,8 @@ bool can_use_manual_dot_rns_update(const shared_ptr<EdgeDecoder> &edge_decoder, 
     if (!emulate_dot_single_relation_enabled()) {
         return false;
     }
-    if (std::dynamic_pointer_cast<DistMult>(edge_decoder) == nullptr) {
+    if (std::dynamic_pointer_cast<DistMult>(edge_decoder) == nullptr ||
+        edge_decoder->decoder_method_ != EdgeDecoderMethod::CORRUPT_NODE) {
         return false;
     }
     if (!batch->edges_.defined() || !(batch->edges_.size(1) == 2 || batch->edges_.size(1) == 3)) {
@@ -1333,26 +1358,26 @@ void verify_padded_backward_equivalence(Model *model, const std::shared_ptr<Batc
     }
 }
 
-void manual_dot_rns_update(shared_ptr<Batch> batch, float learning_rate, bool include_src_negatives, torch::Tensor *raw_gradient_out = nullptr) {
+void manual_dot_rns_update(shared_ptr<Batch> batch, float learning_rate, bool include_src_negatives,
+                           const SoftmaxCrossEntropy &loss, torch::Tensor *raw_gradient_out = nullptr) {
 #ifdef GEGE_CUDA
     torch::NoGradGuard no_grad;
     torch::Tensor node_embeddings = batch->node_embeddings_.detach();
-    torch::Tensor grad_unique = torch::zeros_like(node_embeddings);
 
     torch::Tensor src_ids = batch->edges_.select(1, 0).to(torch::kInt64);
     torch::Tensor dst_ids = batch->edges_.select(1, -1).to(torch::kInt64);
-    double negative_mass_scale = softmax_negative_mass_scale_for_manual_update();
-
-    accumulate_dot_softmax_side(grad_unique, node_embeddings, src_ids, dst_ids,
+    auto forward = dot_softmax_side_gradients(node_embeddings, src_ids, dst_ids,
                                 batch->dst_neg_indices_mapping_, batch->dst_neg_filter_,
-                                negative_mass_scale);
+                                loss);
+    ManualRnsSideGradients inverse;
 
     if (include_src_negatives && batch->src_neg_indices_mapping_.defined() && batch->src_neg_indices_mapping_.numel() > 0) {
-        accumulate_dot_softmax_side(grad_unique, node_embeddings, dst_ids, src_ids,
+        inverse = dot_softmax_side_gradients(node_embeddings, dst_ids, src_ids,
                                     batch->src_neg_indices_mapping_, batch->src_neg_filter_,
-                                    negative_mass_scale);
+                                    loss);
     }
 
+    auto grad_unique = reduce_manual_node_gradients(batch, forward, inverse);
     apply_manual_node_adagrad_update(batch, learning_rate, grad_unique, raw_gradient_out);
 #else
     (void)batch;
@@ -1479,7 +1504,8 @@ void verify_manual_dot_rns_update(Model *model, const shared_ptr<Batch> &batch, 
     torch::Tensor ref_state_update;
     std::tie(ref_raw_gradients, ref_gradients, ref_state_update) = reference_dot_rns_autograd_update(model, batch);
     torch::Tensor manual_raw_gradients;
-    manual_dot_rns_update(manual_shadow, model->sparse_lr_, include_src_negatives, &manual_raw_gradients);
+    manual_dot_rns_update(manual_shadow, model->sparse_lr_, include_src_negatives,
+                         *std::static_pointer_cast<SoftmaxCrossEntropy>(model->loss_function_), &manual_raw_gradients);
 
     bool raw_gradients_match = torch::allclose(manual_raw_gradients, ref_raw_gradients, 1e-4, 1e-7);
     bool gradients_match = torch::allclose(manual_shadow->node_gradients_, ref_gradients, 1e-4, 1e-5);
@@ -2048,7 +2074,8 @@ void Model::train_batch_with_callback(shared_ptr<Batch> batch, bool call_step, s
     }
 
     auto manual_edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
-    if (can_use_manual_dot_rns_update(manual_edge_decoder, batch, negative_sampling_method_, learning_task_)) {
+    bool allow_manual = manual_rns_execution_allowed(this, batch);
+    if (allow_manual && can_use_manual_dot_rns_update(manual_edge_decoder, batch, negative_sampling_method_, learning_task_)) {
         bool has_relations = batch->edges_.size(1) == 3;
         bool include_src_negatives = has_relations && manual_edge_decoder->use_inverse_relations_;
         verify_manual_dot_rns_update(this, batch, include_src_negatives);
@@ -2058,11 +2085,12 @@ void Model::train_batch_with_callback(shared_ptr<Batch> batch, bool call_step, s
         if (post_forward_callback) {
             post_forward_callback();
         }
-        manual_dot_rns_update(batch, sparse_lr_, include_src_negatives);
+        manual_dot_rns_update(batch, sparse_lr_, include_src_negatives,
+                             *std::static_pointer_cast<SoftmaxCrossEntropy>(loss_function_));
         return;
     }
 
-    if (can_use_manual_distmult_rns_update(manual_edge_decoder, batch, loss_function_, negative_sampling_method_, learning_task_)) {
+    if (allow_manual && can_use_manual_distmult_rns_update(manual_edge_decoder, batch, loss_function_, negative_sampling_method_, learning_task_)) {
         if (post_decoder_gather_callback) {
             post_decoder_gather_callback();
         }
@@ -2073,7 +2101,7 @@ void Model::train_batch_with_callback(shared_ptr<Batch> batch, bool call_step, s
         return;
     }
 
-    if (can_use_manual_complex_rns_update(manual_edge_decoder, batch, loss_function_, negative_sampling_method_, learning_task_)) {
+    if (allow_manual && can_use_manual_complex_rns_update(manual_edge_decoder, batch, loss_function_, negative_sampling_method_, learning_task_)) {
         verify_manual_complex_rns_update(this, batch, manual_edge_decoder);
         if (post_decoder_gather_callback) {
             post_decoder_gather_callback();

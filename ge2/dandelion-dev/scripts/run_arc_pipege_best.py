@@ -180,10 +180,10 @@ def main():
         if args.case == 'prepare':
             if shutil.disk_usage(args.work).free < 800*1024**3:
                 raise RuntimeError('Need 800 GiB for gate/final state and partitioned views')
-            if not ENGINE.exists():
-                ENGINE.mkdir(parents=True)
+            if host != 'c31':
+                ENGINE.mkdir(parents=True, exist_ok=True)
                 for item in ('repo', 'build_git', 'build_git_completed_commit.txt'):
-                    run(['rsync', '-aL', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
+                    run(['rsync', '-a', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
                          f'c31:{ENGINE}/{item}', str(ENGINE)+'/'], result_dir/f'engine_copy_{item}.log')
             run(['git', 'clone', '--no-hardlinks', ENGINE/'repo', repo], result_dir/'clone.log')
             run(['git', '-C', repo, 'fetch', args.base/'source.bundle', args.commit], result_dir/'fetch.log')

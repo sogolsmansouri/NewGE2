@@ -28,7 +28,7 @@ def main():
     args.results.mkdir(parents=True, exist_ok=True)
     lock = (args.results/'supervisor.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    attempt = args.results/('attempt_'+job)
+    attempt = args.results/('attempt_'+job+'_'+datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
     attempt.mkdir(exist_ok=False)
     state = dict(job=job, commit=args.commit, status='starting', completed=[], failed=[])
     def update(**changes):

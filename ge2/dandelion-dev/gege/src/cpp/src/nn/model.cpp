@@ -117,6 +117,15 @@ bool fixed_buffer_manual_dot_rns_torch_adagrad_enabled() {
     return enabled;
 }
 
+int64_t manual_adagrad_verify_id() {
+    static const bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY", false);
+    static const int64_t limit = std::max<int64_t>(parse_env_int("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY_MAX", 8), 0);
+    static std::atomic<int64_t> counter{0};
+    if (!enabled) return -1;
+    const int64_t id = counter.fetch_add(1);
+    return id < limit ? id : -1;
+}
+
 bool fixed_buffer_manual_dot_rns_verify_enabled() {
     static bool enabled = parse_env_flag("GEGE_FIXED_BUFFER_MANUAL_DOT_RNS_VERIFY", false);
     return enabled;
@@ -596,6 +605,20 @@ void apply_manual_node_adagrad_update(shared_ptr<Batch> batch, float learning_ra
         *raw_gradient_out = grad_unique.detach().clone();
     }
 
+    // Manual backward bypasses Batch::accumulateGradients and its Adagrad verifier.
+    const int64_t verify_id = manual_adagrad_verify_id();
+    torch::Tensor ref_gradients, ref_state_update, ref_state;
+    if (verify_id >= 0) {
+        torch::Tensor ref_raw = grad_unique.detach().clone();
+        if (batch->unique_node_active_mask_.defined() && batch->unique_node_active_mask_.numel() == ref_raw.size(0)) {
+            ref_raw.mul_(batch->unique_node_active_mask_.to(ref_raw.device()).to(ref_raw.dtype()).reshape({-1, 1}));
+        }
+        ref_state_update = ref_raw.pow(2);
+        ref_state = optimizer_state.detach().clone();
+        ref_state.add_(ref_state_update);
+        ref_gradients = -learning_rate * (ref_raw / (ref_state.sqrt().add_(1e-10)));
+    }
+
     if (fixed_buffer_manual_dot_rns_torch_adagrad_enabled()) {
         if (batch->unique_node_active_mask_.defined() && batch->unique_node_active_mask_.numel() == grad_unique.size(0)) {
             torch::Tensor active_mask = batch->unique_node_active_mask_.to(grad_unique.device()).to(grad_unique.dtype()).reshape({-1, 1});
@@ -611,6 +634,18 @@ void apply_manual_node_adagrad_update(shared_ptr<Batch> batch, float learning_ra
         batch->node_state_update_ = grad_unique.pow(2);
         optimizer_state.add_(batch->node_state_update_);
         batch->node_gradients_ = -learning_rate * (grad_unique / (optimizer_state.sqrt().add_(1e-10)));
+    }
+    if (verify_id >= 0) {
+        const bool gradients_match = torch::allclose(batch->node_gradients_, ref_gradients, 1e-5, 1e-6);
+        const bool state_update_match = torch::allclose(batch->node_state_update_, ref_state_update, 1e-5, 1e-6);
+        const bool state_match = torch::allclose(optimizer_state, ref_state, 1e-5, 1e-6);
+        if (!gradients_match || !state_update_match || !state_match) {
+            SPDLOG_ERROR("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY failed in Adagrad check {} batch={} path=manual gradients_match={} state_update_match={} state_match={}",
+                         verify_id, batch->batch_id_, gradients_match, state_update_match, state_match);
+            throw GegeRuntimeException("Manual Adagrad verifier failed");
+        }
+        SPDLOG_INFO("GEGE_FIXED_BUFFER_MASKED_UPDATE_VERIFY Adagrad check {} batch={} passed rows={} path=manual",
+                    verify_id, batch->batch_id_, ref_gradients.size(0));
     }
     batch->node_embeddings_state_ = torch::Tensor();
 #else

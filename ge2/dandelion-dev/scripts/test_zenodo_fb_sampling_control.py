@@ -8,7 +8,8 @@ from run_zenodo_fb_sampling_control import case_config, check_reference, trainin
 def reference():
     optimizer = dict(type='ADAGRAD', options=dict(learning_rate=.1))
     return dict(model=dict(decoder=dict(type='DISTMULT', options=dict(input_dim=100, inverse_edges=True)),
-                           encoder=dict(layers=[[dict(type='EMBEDDING', output_dim=100)]]),
+                           encoder=dict(layers=[[dict(type='EMBEDDING', output_dim=100,
+                                                     init=dict(type='GLOROT_UNIFORM'))]]),
                            dense_optimizer=copy.deepcopy(optimizer), sparse_optimizer=copy.deepcopy(optimizer),
                            random_seed=741135446461071584,
                            loss=dict(type='SOFTMAX_CE', options=dict(reduction='SUM'))),
@@ -21,6 +22,19 @@ def reference():
 
 
 class SamplingControlTests(unittest.TestCase):
+    def test_initialization_changes_only_one_learning_factor(self):
+        original = reference()
+        untouched = copy.deepcopy(original)
+        config = case_config(original, Path('/old/data'), Path('/old/model'), .5, 'normal_0001')
+        self.assertEqual(original, untouched)
+        init = config['model']['encoder']['layers'][0][0]['init']
+        self.assertEqual(init, dict(type='NORMAL', options=dict(mean=0., std=.001)))
+        config['model']['encoder']['layers'][0][0]['init'] = dict(type='GLOROT_UNIFORM')
+        self.assertEqual(config, original)
+        self.assertEqual(conditions('initialization'), [('normal_0001', .5, None)])
+        with self.assertRaises(ValueError):
+            case_config(original, Path('/data'), Path('/model'), .5, 'choose_by_test_mrr')
+
     def test_repartition_preserves_learning_config(self):
         self.assertEqual(conditions('repartition'), [('fixed', .5, 'fixed'), ('repartition', .5, 'repartition')])
         a, b = [case_config(reference(), Path('/data'), Path('/model'), fraction)

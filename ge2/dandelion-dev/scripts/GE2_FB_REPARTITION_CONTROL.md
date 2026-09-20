@@ -14,12 +14,23 @@ released execution path. A missing feature is not yet a proven cause of the gap.
 | DistMult | repartition | Fresh node partition membership before epochs 2-10 | 10 | Same validation queries |
 | ComplEx | fixed | None | 10 | Same validation queries |
 | ComplEx | repartition | Fresh node partition membership before epochs 2-10 | 10 | Same validation queries |
+| DistMult | normal_0001 | Entity initialization only: Normal(0, 0.001) | 10 | Same validation queries |
+| ComplEx | normal_0001 | Entity initialization only: Normal(0, 0.001) | 10 | Same validation queries |
 
 Constants: FB86M, 304,727,650 training triples, p=16/q=4, real width 100,
 batch 50K, 50 chunks, 1,000 negatives, degree fraction 0.5, SUM softmax loss,
 Adagrad 0.1 for entities and relations, inverse relations, one GPU. Additional
 RNG consumption by repartitioning means subsequent batches and samples need not
 be identical even though both runs start from the same seed.
+
+The initialization follow-up uses the ordinary GE2 CLI and fixed partitions.
+It compares against the fixed-partition Glorot controls, not against the
+repartition cases. Original Marius defaults to Normal(0, 0.001); the released
+GE2 configuration used here has Glorot uniform entity initialization. This is
+one explicitly labeled learning-configuration sensitivity, not evidence of the
+authors' missing FB86M recipe or a reason to change the evaluation protocol.
+The follow-up is submitted after the repartition job, using an immutable script
+snapshot; it cannot modify that job's running code or checkpoints.
 
 Validation seed: `ge2-fb-optimizer-control-validation-20260920:v1`.
 Query SHA256: `1ace54b772ccd59818befff780fd138f19a2f79d2b4a34f2237e6eb8dfd114cd`.
@@ -55,6 +66,7 @@ the allocation expiring or a node failure.
 Uniform negatives already worsened FB accuracy; dense Adam did not consistently
 improve validation accuracy. Native/external full-candidate ranks agreed on
 predeclared 256-query panels. This control tests a remaining structural mismatch,
-not a demonstrated gradient defect. Further stages, if needed, are initialization
-and negative-sampling convention checks, controlled seeds, and the exact data
+not a demonstrated gradient defect. Initialization is the next queued control.
+Further stages, if needed, are negative-sampling convention checks, controlled
+seeds, regularization differences, and the exact data
 permutation/split recipe. They are not silently swept for the best test score.

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prespecified FB uniform/mixed sampling comparison with unchanged exact evaluation."""
+"""Prespecified original-GE2 FB accuracy controls with frozen evaluation panels."""
 
 import argparse
 import copy
@@ -24,6 +24,7 @@ def check_reference(config, model):
     options = s['embeddings']['options']
     checks = [m['decoder']['type'].lower() == model,
               m['encoder']['layers'][0][0]['output_dim'] == 100,
+              m['encoder']['layers'][0][0]['init']['type'] == 'GLOROT_UNIFORM',
               m['decoder']['options']['input_dim'] == 100,
               m['decoder']['options']['inverse_edges'] is True,
               m['random_seed'] == 741135446461071584,
@@ -42,7 +43,7 @@ def check_reference(config, model):
         raise ValueError('Reference no longer matches the declared FB control')
 
 
-def case_config(reference, data, model_dir, fraction):
+def case_config(reference, data, model_dir, fraction, initialization=None):
     if fraction not in (0., .5):
         raise ValueError('Only the two prespecified sampling conditions are allowed')
     config = copy.deepcopy(reference)
@@ -50,6 +51,11 @@ def case_config(reference, data, model_dir, fraction):
     config['storage']['model_dir'] = str(model_dir) + '/'
     config['storage']['checkpoint_dir'] = str(model_dir) + '/'
     config['training']['negative_sampling']['degree_fraction'] = fraction
+    if initialization is not None:
+        if initialization != 'normal_0001':
+            raise ValueError('Only the prespecified Normal(0, 0.001) initializer is allowed')
+        config['model']['encoder']['layers'][0][0]['init'] = dict(
+            type='NORMAL', options=dict(mean=0., std=.001))
     return config
 
 
@@ -68,6 +74,8 @@ def conditions(study):
         return [('degree_00', 0., None), ('degree_05', .5, None)]
     if study == 'repartition':
         return [('fixed', .5, 'fixed'), ('repartition', .5, 'repartition')]
+    if study == 'initialization':
+        return [('normal_0001', .5, None)]
     raise ValueError('Unknown study: ' + study)
 
 
@@ -78,7 +86,7 @@ def main():
     parser.add_argument('--job', required=True)
     parser.add_argument('--gpu', type=int, required=True)
     parser.add_argument('--model', choices=('distmult', 'complex'), required=True)
-    parser.add_argument('--study', choices=('sampling', 'repartition'), default='sampling')
+    parser.add_argument('--study', choices=('sampling', 'repartition', 'initialization'), default='sampling')
     parser.add_argument('--binary', type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.tools))
@@ -94,7 +102,9 @@ def main():
     state = dict(status='preflight', job=args.job, host=os.uname().nodename.split('.')[0],
                  gpu=args.gpu, pid=os.getpid(), model=args.model,
                  factors=[c[1] for c in conditions(args.study)], cases=[],
-                 purpose=__doc__ if args.study == 'sampling' else 'Disabled epoch repartitioning sensitivity',
+                 purpose={'sampling': 'Uniform/mixed negative sampling sensitivity',
+                          'repartition': 'Disabled epoch repartitioning sensitivity',
+                          'initialization': 'Original-Marius entity initialization sensitivity'}[args.study],
                  study=args.study, paper_timing_eligible=False,
                  checkpoint_durable=False, checkpoint_storage='node_local_retained',
                  prediction_direction='both', test_set_tuning=False,
@@ -164,7 +174,7 @@ def main():
                        'lib/python3.9/site-packages/gege', 'lib/python3.9/site-packages/torch/lib', 'lib')))
         python, spec = args.env / 'bin/python', SPECS['FB']
         query_path, query_hash = None, spec['eval_sha']
-        if args.study == 'repartition':
+        if args.study != 'sampling':
             import numpy as np
             from deterministic_eval_subset import stable_sample_indices
             seed = 'ge2-fb-optimizer-control-validation-20260920:v1'
@@ -184,7 +194,9 @@ def main():
             write_json(args.results / 'validation_manifest.json', dict(seed=seed, rows=10000,
                        queries_sha256=query_hash, source_sha256=sha256_file(source), membership=membership,
                        selector_sha256=sha256_file(args.tools / 'deterministic_eval_subset.py')))
-            update(evaluation_scope='validation_only', interpretation='Paper-described repartition path; not unchanged release',
+            interpretation = ('Paper-described repartition path; not unchanged release' if args.study == 'repartition'
+                              else 'Single-factor original-Marius initialization; not an authors GE2 FB86M recipe')
+            update(evaluation_scope='validation_only', interpretation=interpretation,
                    conditions=[c[0] for c in conditions(args.study)])
 
         def run(command, name, case):
@@ -218,7 +230,9 @@ def main():
             meta['dataset_dir'] = str(data) + '/'
             (data / 'dataset.yaml').write_text(yaml.safe_dump(meta, sort_keys=False))
             write_json(case / 'data_audit.json', inspect_data(data, 'FB'))
-            config = case_config(reference, data, model, fraction)
+            initializer = label if args.study == 'initialization' else None
+            config = case_config(reference, data, model, fraction, initializer)
+            row['entity_initialization'] = config['model']['encoder']['layers'][0][0]['init']
             config_path = case / 'config.yaml'
             config_path.write_text(yaml.safe_dump(config, sort_keys=False))
             row.update(status='training', config_sha256=sha256_file(config_path))
@@ -252,6 +266,12 @@ def main():
             write_json(case / 'checkpoint_manifest.json', dict(status='ready', source=str(model),
                        host=state['host'], files=files, checkpoint_durable=False))
             shutil.copyfile(model / 'full_config.yaml', case / 'full_config.yaml')
+            full_config = yaml.safe_load((case / 'full_config.yaml').read_text())
+            observed_init = full_config['model']['encoder']['layers'][0][0]['init']
+            if observed_init['type'] != row['entity_initialization']['type']:
+                raise RuntimeError('Saved entity initialization type differs from requested configuration')
+            if initializer and observed_init['options'] != dict(mean=0., std=.001):
+                raise RuntimeError('Saved normal initializer parameters differ from requested configuration')
             queries = query_path or data / 'exact10000_uniform_v1/edges/test_edges.bin'
             row['status'] = 'evaluating'
             run([python, args.tools / 'verify_ge2_native_checkpoint_scores.py', '--run', model,
@@ -286,7 +306,7 @@ def main():
             for direction in ('', 'head_', 'tail_'):
                 for metric in ('mrr', 'hits_at_10'):
                     row[direction + metric] = quality[direction + metric]
-            row['evaluation_scope'] = 'validation' if args.study == 'repartition' else 'test'
+            row['evaluation_scope'] = 'test' if args.study == 'sampling' else 'validation'
             if args.study == 'sampling':
                 row['difference_from_paper'] = {metric: quality[metric] - value
                                                 for metric, value in state['paper_reference'].items()}

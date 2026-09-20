@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import resource
+import shlex
 import shutil
 import signal
 import subprocess
@@ -238,13 +239,32 @@ def main():
                 source, query = Path(spec['source']), Path(spec['query'])
                 if 'source_origin' in spec:
                     source.mkdir(parents=True, exist_ok=True)
-                    run(['rsync', '-aL', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
-                         f"c31:{spec['source_origin']}/", str(source)+'/'], result_dir/f"{spec['graph']}_copy.log")
                     original_source, original_query = Path(spec['source_origin']), Path(spec['query_origin'])
+                    required = ['dataset.yaml'] + [f'edges/{split}_{suffix}' for split in ('train','validation','test')
+                                                   for suffix in ('edges.bin','partition_offsets.txt')]
+                    optional = ['split_manifest.json','partitioned_view_manifest.json',
+                                'nodes/node_mapping.txt','edges/relation_mapping.txt']
+                    if original_source in original_query.parents:
+                        required.append(str(original_query.relative_to(original_source)))
+                        prefix = original_query.parent.parent.relative_to(original_source)
+                        optional += [str(prefix/x) for x in ('selection_manifest.json','selected_test_row_indices_u64.bin')]
+                    # Copy only the actual split contract, not obsolete raw-data
+                    # and evaluation-view symlinks in the surrounding cache.
+                    inspect = ('import json; from pathlib import Path; '
+                               f'p=Path({str(original_source)!r}); required={required!r}; optional={optional!r}; '
+                               'missing=[x for x in required if not (p/x).is_file()]; '
+                               'assert not missing, missing; '
+                               'print(json.dumps(required+[x for x in optional if (p/x).is_file()]))')
+                    selected = json.loads(subprocess.check_output(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=15',
+                        'c31','python3 -c '+shlex.quote(inspect)], text=True, timeout=30))
+                    file_list = result_dir/f"{spec['graph']}_copy_files.txt"
+                    file_list.write_text('\n'.join(selected)+'\n')
+                    run(['rsync', '-aL', '--files-from='+str(file_list), '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
+                         f"c31:{spec['source_origin']}/", str(source)+'/'], result_dir/f"{spec['graph']}_copy.log")
                     if original_source not in original_query.parents:
-                        query.parent.parent.mkdir(parents=True, exist_ok=True)
+                        query.parent.mkdir(parents=True, exist_ok=True)
                         run(['rsync', '-aL', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
-                             f'c31:{original_query.parent.parent}/', str(query.parent.parent)+'/'],
+                             f'c31:{original_query}', str(query)],
                             result_dir/f"{spec['graph']}_query_copy.log")
                 update(stage=spec['graph']+':data_audit')
                 if spec['graph'] != 'lj':

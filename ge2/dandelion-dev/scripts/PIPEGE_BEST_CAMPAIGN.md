@@ -4,6 +4,10 @@ Six independent single-GPU RTX A6000 runs, serial and node-exclusive. The
 new c30 allocation 284846 can run them while GE2 continues independently on
 c31. c30 is configured at 300 W versus c31 at 200 W; record these hardware
 differences and do not merge their timings into an unlabeled comparison.
+Live inspection found another user's CPU allocation on c30 with no GPU process.
+The interactive run therefore provides quality measurements and provisional
+shared-node timings, not a claim of exclusive-node paper timing. Batch
+continuations request exclusive allocation; all results retain isolation logs.
 Each case first runs a two-epoch masked-update correctness gate, then trains
 from scratch for the final epoch count and saves entity, optimizer, and
 relation checkpoints. Only the final run is timed for the result table.

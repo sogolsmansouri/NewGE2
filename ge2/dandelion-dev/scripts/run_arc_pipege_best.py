@@ -185,11 +185,18 @@ def main():
                 for item in ('repo', 'build_git', 'build_git_completed_commit.txt'):
                     run(['rsync', '-a', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
                          f'c31:{ENGINE}/{item}', str(ENGINE)+'/'], result_dir/f'engine_copy_{item}.log')
-            run(['git', 'clone', '--no-hardlinks', ENGINE/'repo', repo], result_dir/'clone.log')
+            if not repo.exists():
+                run(['git', 'clone', '--no-hardlinks', ENGINE/'repo', repo], result_dir/'clone.log')
+            elif subprocess.check_output(['git', '-C', str(repo), 'diff', 'HEAD']):
+                raise RuntimeError('Refusing to replace modified campaign source')
             run(['git', '-C', repo, 'fetch', args.base/'source.bundle', args.commit], result_dir/'fetch.log')
             run(['git', '-C', repo, 'checkout', '--detach', args.commit], result_dir/'checkout.log')
-            (args.work/'python').mkdir()
-            (args.work/'python/gege').symlink_to(repo/TREE/'src/python', target_is_directory=True)
+            (args.work/'python').mkdir(exist_ok=True)
+            package = args.work/'python/gege'
+            if not package.exists():
+                package.symlink_to(repo/TREE/'src/python', target_is_directory=True)
+            if package.resolve() != (repo/TREE/'src/python').resolve():
+                raise RuntimeError('Wrong Python overlay')
         def git(*cmd):
             return subprocess.check_output(['git', '-C', str(repo), *cmd], text=True).strip()
         if (git('rev-parse', 'HEAD') != args.commit or git('diff', 'HEAD')
@@ -210,9 +217,12 @@ def main():
                    engine_tree=git('rev-parse', args.commit+':'+TREE), build=hashes,
                    manifest_sha256=sha256_file(args.base/'manifest.json'), driver_sha256=sha256_file(Path(__file__))))
         apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True)
-        jobs = subprocess.check_output(['squeue', '-h', '-w', host, '-o', '%A'], text=True).split()
-        if apps.strip() or jobs != [job]:
-            raise RuntimeError('Exclusive idle node required before timing/gates')
+        jobs = subprocess.check_output(['squeue', '-h', '-t', 'RUNNING,COMPLETING', '-w', host, '-o', '%A'], text=True).split()
+        if apps.strip():
+            raise RuntimeError('Idle GPUs required before correctness gates or training')
+        other_jobs_at_start = [x for x in jobs if x != job]
+        update(other_jobs_at_start=other_jobs_at_start,
+               timing_status='shared_node_provisional' if other_jobs_at_start else 'isolation_monitor_required')
 
         if args.case == 'prepare':
             native = build/'gege_manual_training_update_test'
@@ -227,7 +237,7 @@ def main():
                 spec = manifest['cases'][name]
                 source, query = Path(spec['source']), Path(spec['query'])
                 if 'source_origin' in spec:
-                    source.mkdir(parents=True, exist_ok=False)
+                    source.mkdir(parents=True, exist_ok=True)
                     run(['rsync', '-aL', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
                          f"c31:{spec['source_origin']}/", str(source)+'/'], result_dir/f"{spec['graph']}_copy.log")
                     original_source, original_query = Path(spec['source_origin']), Path(spec['query_origin'])
@@ -355,10 +365,10 @@ def main():
                          if r['other_jobs'] or r['other_processes']]
             write_json(case/'result.json', dict(status='done', train_status=0, exact_eval_status=0,
                        **timing, mrr=quality['mrr'], hits_at_10=quality['hits_at_10'],
-                       commit=args.commit, built_engine_commit=CORE, scope=spec['scope'],
+                       commit=args.commit, built_engine_commit=CORE, scope=spec['scope'], host=host,
                        config_notes=spec['notes'], checkpoint_durable=False,
-                       checkpoint=str(model_dir), isolation_violations=isolation,
-                       paper_readiness='pending_protocol_review' if not isolation else 'isolation_failed'))
+                       checkpoint=str(model_dir), isolation_violations=isolation, other_jobs_at_start=other_jobs_at_start,
+                       paper_readiness='pending_protocol_review' if not isolation and not other_jobs_at_start else 'shared_node_timing_provisional'))
         update(status='done', stage='evaluated', final_result=str(case/'result.json'))
     except BaseException as error:
         update(status='failed', error=repr(error))

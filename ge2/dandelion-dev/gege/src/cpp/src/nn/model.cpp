@@ -2076,6 +2076,10 @@ void Model::train_batch_with_callback(shared_ptr<Batch> batch, bool call_step, s
     auto manual_edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
     bool allow_manual = manual_rns_execution_allowed(this, batch);
     if (allow_manual && can_use_manual_dot_rns_update(manual_edge_decoder, batch, negative_sampling_method_, learning_task_)) {
+        static std::atomic<bool> dot_manual_logged{false};
+        if (!dot_manual_logged.exchange(true)) {
+            SPDLOG_INFO("[manual_dot_rns] enabled=1 decoder=DOT negative_sampling=RNS");
+        }
         bool has_relations = batch->edges_.size(1) == 3;
         bool include_src_negatives = has_relations && manual_edge_decoder->use_inverse_relations_;
         verify_manual_dot_rns_update(this, batch, include_src_negatives);

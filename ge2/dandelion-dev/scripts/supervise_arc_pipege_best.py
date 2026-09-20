@@ -19,6 +19,7 @@ def main():
         parser.add_argument('--'+name, type=Path, required=True)
     parser.add_argument('--commit', required=True)
     parser.add_argument('--only')
+    parser.add_argument('--reuse-completed-commit', action='append', default=[])
     args = parser.parse_args()
     sys.path.insert(0, str(args.base/'harness/tools'))
     from run_arc_ge2_allocated_queue import run_logged, write_json
@@ -64,8 +65,14 @@ def main():
             done = False
             for status in args.results.glob('attempt_*/'+case+'/status.json'):
                 value = json.loads(status.read_text())
-                if value.get('status') == 'done' and value.get('commit') == args.commit:
+                if value.get('status') == 'done' and value.get('commit') in [args.commit]+args.reuse_completed_commit:
                     result = Path(value['final_result'])
+                    provenance = json.loads((status.parent/'provenance.json').read_text())
+                    current_tree = subprocess.check_output(['git','-C',str(args.work/'repo'),'rev-parse',
+                        args.commit+':ge2/dandelion-dev/gege'],text=True).strip()
+                    if (provenance['manifest_sha256'] != sha256_file(args.base/'manifest.json')
+                            or provenance['engine_tree'] != current_tree):
+                        raise RuntimeError('Completed result has different inputs or engine')
                     row = json.loads(result.read_text())
                     if row['status'] == 'done' and row['train_status'] == 0 and row['exact_eval_status'] == 0:
                         evaluation_check(json.loads((result.parent/'exact_eval.json').read_text()), manifest['cases'][case])

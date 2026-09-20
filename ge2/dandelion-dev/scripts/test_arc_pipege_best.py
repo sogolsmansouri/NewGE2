@@ -1,11 +1,41 @@
 import copy
 from pathlib import Path
+import tempfile
 import unittest
+import yaml
 
-from run_arc_pipege_best import configure, evaluation_check, schedule_check, training_check
+from run_arc_pipege_best import configure, evaluation_check, normalize_dataset_metadata, schedule_check, training_check
 
 
 class Contracts(unittest.TestCase):
+    def test_relocated_metadata_persisted_and_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            view = Path(temp)
+            (view/'edges').mkdir()
+            path = view/'dataset.yaml'
+            old = dict(dataset_dir='/old/node/data/', num_nodes=17, num_train=50, split_identity='fixed')
+            path.write_text(yaml.safe_dump(old))
+            expected = dict(old, dataset_dir=str(view.resolve())+'/')
+            self.assertEqual(normalize_dataset_metadata(view, expected), expected)
+            self.assertEqual(yaml.safe_load(path.read_text()), expected)
+            first = path.read_bytes()
+            normalize_dataset_metadata(view, expected)
+            self.assertEqual(path.read_bytes(), first)
+            with self.assertRaisesRegex(ValueError, 'beyond its location'):
+                normalize_dataset_metadata(view, dict(expected, num_train=51))
+            self.assertEqual(path.read_bytes(), first)
+
+    def test_relocation_does_not_mutate_symlink_target(self):
+        with tempfile.TemporaryDirectory() as temp:
+            view = Path(temp)/'copy'
+            (view/'edges').mkdir(parents=True)
+            original = Path(temp)/'original.yaml'
+            original.write_text('dataset_dir: /old/\nnum_nodes: 17\n')
+            (view/'dataset.yaml').symlink_to(original)
+            with self.assertRaisesRegex(ValueError, 'shared dataset metadata'):
+                normalize_dataset_metadata(view)
+            self.assertEqual(original.read_text(), 'dataset_dir: /old/\nnum_nodes: 17\n')
+
     def setUp(self):
         self.spec = dict(graph='tw', model='dot', p=16, q=4, hidden=3, nodes=41652230,
                          states=20, edges=1321528663, relations=1, width=100, epochs=10, eval_sha='query')

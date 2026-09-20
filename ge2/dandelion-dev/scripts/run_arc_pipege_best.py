@@ -38,6 +38,47 @@ SPLIT_HASHES = {
 }
 
 
+def normalize_dataset_metadata(view, expected=None):
+    """Relocate a private dataset copy without changing its data contract."""
+    view = Path(view).resolve()
+    path = view/'dataset.yaml'
+    metadata = yaml.safe_load(path.read_text())
+    if not isinstance(metadata, dict):
+        raise ValueError('Dataset metadata must be a mapping')
+    metadata['dataset_dir'] = str(view)+'/'
+    if expected is not None and metadata != expected:
+        raise ValueError('Dataset metadata changed beyond its location')
+    if not (view/'edges').is_dir():
+        raise ValueError('Dataset edge directory is missing')
+    original = yaml.safe_load(path.read_text())
+    if metadata != original:
+        if path.is_symlink() or path.stat().st_nlink != 1:
+            raise ValueError('Refusing to rewrite shared dataset metadata')
+        temporary = path.with_name(path.name+'.relocate.tmp')
+        with temporary.open('x') as output:
+            output.write(yaml.safe_dump(metadata, sort_keys=False))
+        temporary.replace(path)
+    return metadata
+
+
+def resolved_config_check(config_path, dataset_path, spec):
+    # Use the same loader as gege_train: it re-reads dataset.yaml and may
+    # override the path embedded in the generated training configuration.
+    from gege.tools.configuration.gege_config import load_config
+    config = load_config(str(config_path), save=False)
+    actual = config.storage.dataset
+    if (Path(actual.dataset_dir).resolve() != Path(dataset_path).resolve()
+            or (actual.num_nodes, actual.num_relations, actual.num_train) != (
+                spec['nodes'], spec['relations'], spec['edges'])
+            or config.storage.embeddings.options.num_partitions != spec['p']
+            or config.storage.embeddings.options.buffer_capacity != spec['q']
+            or config.training.batch_size != 50000):
+        raise ValueError('Resolved training configuration disagrees with the audited dataset/preset')
+    print(json.dumps(dict(status='pass', dataset_dir=actual.dataset_dir,
+                          nodes=actual.num_nodes, edges=actual.num_train,
+                          partitions=spec['p'], visible=spec['q'])), flush=True)
+
+
 def schedule_check(text, spec):
     states = []
     for line in text.splitlines():
@@ -294,8 +335,7 @@ def main():
                     raise RuntimeError('Wrong physical training partition count')
                 verify_bucket_order(view/'edges/train_edges.bin', spec['columns'],
                                     (spec['nodes']+spec['p']-1)//spec['p'], spec['p'], counts, 1_000_000)
-                md = yaml.safe_load((view/'dataset.yaml').read_text())
-                md['dataset_dir'] = str(view)+'/'
+                md = normalize_dataset_metadata(view)
                 audit.update(view=str(view), metadata=md, query_sha256=sha256_file(query),
                              train_view_sha256=sha256_file(view/'edges/train_edges.bin'),
                              train_offsets_sha256=sha256_file(view/'edges/train_partition_offsets.txt'))
@@ -318,6 +358,7 @@ def main():
         spec = manifest['cases'][args.case]
         audit = prepared['data'][spec['graph']]
         view = Path(audit['view'])
+        normalize_dataset_metadata(view, audit['metadata'])
         if (sha256_file(view/'edges/train_edges.bin') != audit['train_view_sha256']
                 or sha256_file(view/'edges/train_partition_offsets.txt') != audit['train_offsets_sha256']
                 or sha256_file(Path(spec['query'])) != spec['eval_sha']):
@@ -347,6 +388,10 @@ def main():
             write_json(case/'contract.json', dict(spec, commit=args.commit, model_dir=str(model_dir),
                        gradient_mode='repaired_manual', hidden_policy='shared', epochs=epochs,
                        config_sha256=sha256_file(case/'config.yaml'), flags_sha256=sha256_file(case/'flags.json')))
+            run([python, '-c', 'import json,sys; from run_arc_pipege_best import resolved_config_check; '
+                 'resolved_config_check(sys.argv[1],sys.argv[2],json.loads(sys.argv[3]))',
+                 case/'config.yaml', view, json.dumps(spec)], case/'resolved_config_gate.log',
+                dict(effective, PYTHONPATH=str(args.base/'scripts')+':'+env['PYTHONPATH']))
             run([build/'gege_train', case/'config.yaml'], case/'train.log', effective, monitor=True)
             text = (case/'train.log').read_text()
             times = training_check(text, spec, epochs)

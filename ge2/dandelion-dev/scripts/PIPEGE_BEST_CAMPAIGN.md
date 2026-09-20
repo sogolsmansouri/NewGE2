@@ -67,3 +67,16 @@ existing data and the active c31 GE2 campaign are not modified.
 Small evidence files live in ARC home. Large checkpoints are retained on the compute node's
 local disk and are explicitly marked not durably archived. Completed results
 remain paper candidates until protocol, power-limit, and isolation review.
+
+Relocated private dataset copies have their on-disk `dataset.yaml` path
+normalized, not only the path in the generated config. Each training launch
+first passes the actual GEGE config loader with `save=False` and checks the
+resolved dataset, partition count, visible capacity and batch size. Data
+counts and other metadata cannot change during relocation.
+
+For a driver-only repair, `handoff_arc_pipege_best.py` pauses the old serial
+dispatcher but lets its active training/evaluation child finish. It then
+starts a fresh supervisor and preparation workspace. Completed results from
+an explicitly allowed older commit can be reused only when frozen inputs
+and the engine source tree match; their original result provenance is kept.
+The engine, datasets and running checkpoint are not patched in place.

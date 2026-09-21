@@ -9,31 +9,27 @@
 
 namespace {
 
-double softmax_negative_log_mass_bias() {
-    static double bias = []() {
-        const char *bias_raw = std::getenv("GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS");
-        if (bias_raw != nullptr && bias_raw[0] != '\0') {
+void require_unweighted_softmax() {
+    // Reject obsolete tuning flags rather than silently mislabel old recipes.
+    static const bool checked = []() {
+        for (const auto &setting : {std::make_pair("GEGE_SOFTMAX_NEGATIVE_MASS_SCALE", 1.0),
+                                   std::make_pair("GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS", 0.0)}) {
+            const char *raw = std::getenv(setting.first);
+            if (raw == nullptr || raw[0] == '\0') continue;
+            bool valid = false;
             try {
-                double parsed = std::stod(std::string(bias_raw));
-                return std::isfinite(parsed) ? parsed : 0.0;
-            } catch (...) {
-                return 0.0;
+                size_t consumed = 0;
+                std::string text(raw);
+                double parsed = std::stod(text, &consumed);
+                valid = consumed == text.size() && std::isfinite(parsed) && parsed == setting.second;
+            } catch (...) {}
+            if (!valid) {
+                throw GegeRuntimeException(std::string("Weighted negative softmax was removed; unset ") + setting.first);
             }
         }
-
-        const char *scale_raw = std::getenv("GEGE_SOFTMAX_NEGATIVE_MASS_SCALE");
-        if (scale_raw != nullptr && scale_raw[0] != '\0') {
-            try {
-                double parsed = std::stod(std::string(scale_raw));
-                return parsed > 0.0 && std::isfinite(parsed) ? std::log(parsed) : 0.0;
-            } catch (...) {
-                return 0.0;
-            }
-        }
-
-        return 0.0;
+        return true;
     }();
-    return bias;
+    (void)checked;
 }
 
 }  // namespace
@@ -88,11 +84,8 @@ torch::Tensor SoftmaxCrossEntropy::operator()(torch::Tensor y_pred, torch::Tenso
     }
 
     check_score_shapes(y_pred, labels);
+    require_unweighted_softmax();
     torch::Tensor negative_log_mass = labels.logsumexp(1, true);
-    double negative_bias = softmax_negative_log_mass_bias();
-    if (negative_bias != 0.0) {
-        negative_log_mass = negative_log_mass + negative_bias;
-    }
     std::tie(y_pred, labels) = scores_to_labels(y_pred.unsqueeze(1), negative_log_mass, false);
 
     torch::nn::functional::CrossEntropyFuncOptions options;
@@ -109,11 +102,9 @@ std::tuple<torch::Tensor, torch::Tensor> SoftmaxCrossEntropy::score_gradients(
     torch::Tensor pos_scores, torch::Tensor neg_scores) const {
     torch::NoGradGuard no_grad;
     check_score_shapes(pos_scores, neg_scores);
+    require_unweighted_softmax();
     auto negative_log_mass = neg_scores.logsumexp(1, true);
-    auto biased_mass = negative_log_mass;
-    double bias = softmax_negative_log_mass_bias();
-    if (bias != 0.0) biased_mass = biased_mass + bias;
-    auto logits = torch::cat({pos_scores.unsqueeze(1), biased_mass}, 1);
+    auto logits = torch::cat({pos_scores.unsqueeze(1), negative_log_mass}, 1);
     auto log_probs = logits.log_softmax(1);
     auto targets = torch::zeros({pos_scores.size(0)}, pos_scores.options().dtype(torch::kInt64));
     int64_t reduction = reduction_type_ == LossReduction::MEAN ? at::Reduction::Mean : at::Reduction::Sum;

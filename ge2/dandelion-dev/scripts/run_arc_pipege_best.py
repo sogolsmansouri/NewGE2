@@ -173,8 +173,24 @@ def training_check(text, spec, epochs):
     return times
 
 
+def loss_contract(flags):
+    for name, expected in [('GEGE_SOFTMAX_NEGATIVE_MASS_SCALE', 1.0),
+                           ('GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS', 0.0)]:
+        if float(flags.get(name, expected)) != expected:
+            raise ValueError('Only unweighted softmax is allowed: '+name)
+
+
+def report_directions(spec):
+    expected = 'tail' if spec['graph'] == 'tw' else 'both'
+    if spec.get('report_directions', expected) != expected:
+        raise ValueError('Evaluation direction violates the frozen reporting protocol')
+    return expected
+
+
 def evaluation_check(value, spec):
-    if (value.get('num_ranks') != 20000 or value.get('filtered') is not True
+    directions = report_directions(spec)
+    if (value.get('num_ranks') != (10000 if directions == 'tail' else 20000)
+            or value.get('report_directions', 'both') != directions or value.get('filtered') is not True
             or value.get('eval_edges_sha256') != spec['eval_sha']
             or value.get('tie_policy') != 'pessimistic' or value.get('tf32') is not False):
         raise ValueError('Incomplete or mismatched exact evaluation')
@@ -299,12 +315,15 @@ def main():
 
         if args.case == 'prepare':
             native = build/'gege_manual_training_update_test'
-            for width, mass in [(100,1), (100,8), (80,8)]:
+            for width, mass in [(100,1), (80,1)]:
                 log = result_dir/f'native_w{width}_m{mass}.log'
                 run([native, 'manual', '--width', width, '--mass', mass], log)
                 records = [json.loads(s) for s in log.read_text().splitlines() if s.startswith('{"mode":')]
                 if len(records) != 42 or not all(x['pass'] and x['exact'] for x in records):
                     raise RuntimeError('Native gradient parity gate failed')
+            for index, rejected in enumerate((['--mass', '8'], ['--log-mass', '2.0794415416798357'])):
+                run([native, 'manual', '--expect-unweighted-rejection']+rejected,
+                    result_dir/f'rejected_weight_{index}.log')
             if 'engine' in manifest:
                 run([build/'gege_manual_backward_test'], result_dir/'native_backward.log')
                 if not gradient_gate.exists():
@@ -384,6 +403,8 @@ def main():
                     raise RuntimeError('Reused dataset changed since its prior audit: '+spec['graph'])
                 audits[spec['graph']] = audit
             for spec in manifest['cases'].values():
+                loss_contract(json.loads((args.base/spec['flags']).read_text()))
+                report_directions(spec)
                 if 'schedule' in spec:
                     schedule_check((args.base/spec['schedule']).read_text(), spec)
                 configure(yaml.safe_load((args.base/spec['config']).read_text()),
@@ -411,6 +432,7 @@ def main():
             if sha256_file(Path(spec['source'])/'edges'/f'{split}_edges.bin') != entry['sha256']:
                 raise RuntimeError('Source/filter split changed: '+split)
         flags = json.loads((args.base/spec['flags']).read_text())
+        loss_contract(flags)
         if 'schedule' in spec:
             schedule = args.base/spec['schedule']
             schedule_check(schedule.read_text(), spec)
@@ -451,7 +473,7 @@ def main():
                 command = [python, tools/'stream_marius_dot_exact_eval.py', '--run-dir', case,
                            '--embedding-file', model_dir/'embeddings.bin', '--num-nodes', spec['nodes'],
                            '--dim', spec['width'], '--eval-edge-columns', 2, '--filter-edge-columns', 2,
-                           '--expected-num-eval-edges', 10000]
+                           '--expected-num-eval-edges', 10000, '--report-directions', report_directions(spec)]
             else:
                 run([python, tools/'extract_ge2_relation_embeddings.py', '--model', model_dir/'model.pt_0',
                      '--src-out', model_dir/'src_relations.bin', '--dst-out', model_dir/'dst_relations.bin',
@@ -461,7 +483,7 @@ def main():
                            '--src-relation-bin', model_dir/'src_relations.bin', '--dst-relation-bin', model_dir/'dst_relations.bin',
                            '--score', spec['model'], '--num-nodes', spec['nodes'], '--num-relations', spec['relations'],
                            '--embedding-dim', spec['width'], '--num-test', 10000,
-                           '--evaluator-contract', 'pipege_fast_a6000_20260920',
+                           '--evaluator-contract', 'pipege_unweighted_a6000_20260921',
                            '--score-contract', 'ge2_forward_inverse_relation_embeddings']
             command += ['--eval-edges', spec['query'], '--expected-eval-sha256', spec['eval_sha'],
                         '--ge2-data-dir', spec['source'], '--filtered', '--tie-policy', 'pessimistic',
@@ -474,6 +496,7 @@ def main():
                          if r['other_jobs'] or r['other_processes']]
             write_json(case/'result.json', dict(status='done', train_status=0, exact_eval_status=0,
                        **timing, mrr=quality['mrr'], hits_at_10=quality['hits_at_10'],
+                       negative_mass_scale=1, report_directions=report_directions(spec), num_ranks=quality['num_ranks'],
                        commit=args.commit, built_engine_commit=core, scope=spec['scope'], host=host,
                        config_notes=spec['notes'], checkpoint_durable=False,
                        checkpoint=str(model_dir), isolation_violations=isolation, other_jobs_at_start=other_jobs_at_start,

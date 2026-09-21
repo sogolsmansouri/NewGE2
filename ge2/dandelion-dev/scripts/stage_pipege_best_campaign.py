@@ -55,7 +55,8 @@ def stage(base, cache_root=None):
                   GEGE_STATEFLOW_ALLOW_PEER_RELAY='0', GEGE_STATEFLOW_ENABLE_UNVERIFIED_PEER_RELAY_RUNTIME='0',
                   GEGE_PARTITION_BUFFER_PIPELINE_TIMING='0', GEGE_PARTITION_BUFFER_SWAP_TIMING='0',
                   GEGE_PARTITION_BUFFER_REMAP_BREAKDOWN_TIMING='0', GEGE_STARTUP_TIMING='1',
-                  GEGE_FIXED_BUFFER_MANUAL_DOT_RNS_VERIFY='0', GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS_VERIFY='0')
+                  GEGE_FIXED_BUFFER_MANUAL_DOT_RNS_VERIFY='0', GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS_VERIFY='0',
+                  GEGE_SOFTMAX_NEGATIVE_MASS_SCALE='1')
     specs = {
         'lj': dict(p=2,q=2,hidden=0,states=1,nodes=4847571,relations=1,width=100,edges=62094395,epochs=30,columns=2,
                    source=str(BASE/'pipege_lj_281586/data/lj_p2'), query=str(BASE/'ge2-paper-data/LJ/exact10000/edges/test_edges.bin'),
@@ -81,10 +82,11 @@ def stage(base, cache_root=None):
             target = cache_root/graph
             spec['source'] = str(target)
             spec['query'] = str(target/query.relative_to(source)) if source in query.parents else str(target/'exact10000/edges/test_edges.bin')
-    manifest = dict(cases={}, references={}, interpretation='Archived fast policy replay on audited splits; repaired gradients; quality pending')
+    manifest = dict(cases={}, references={}, interpretation='Unweighted softmax; archived runtime policies; TW tail-only evaluation; quality pending')
     for name, path in configs.items():
         graph, model = name.split('_')
         spec = dict(specs[graph], model=model, graph=graph, case=name)
+        spec.update(negative_mass_scale=1, report_directions='tail' if graph == 'tw' else 'both')
         case = refs / name
         case.mkdir(exist_ok=False)
         cfg = yaml.safe_load(path.read_text())
@@ -96,17 +98,18 @@ def stage(base, cache_root=None):
             flags = {k:str(v) for k,v in json.loads((refs/'tw/archived_invocation.json').read_text()).items() if k.startswith('GEGE_')}
             flags['PYTORCH_CUDA_ALLOC_CONF'] = json.loads((refs/'tw/archived_invocation.json').read_text())['PYTORCH_CUDA_ALLOC_CONF']
             flag_source = refs/'tw/archived_invocation.json'
-            spec['notes'] = 'Fast shared-3, 8-batch negative reuse; controlled 90% training split, not full-edge timing workload'
+            spec['notes'] = 'Fast shared-3, 8-batch negative planning with distinct per-batch slices; controlled 90% training split; tail-only evaluation'
         elif graph == 'fb':
             flags = json.loads(fb_flags.read_text())
             flag_source = fb_flags
-            spec['notes'] = 'Historical mass-8, graph-prefetch-off shared-6 profile on audited FB split'
+            spec['notes'] = 'Unweighted softmax; historical graph-prefetch-off shared-6 runtime on audited FB split'
         else:
             flags = shell_flags(wk_driver)
             flag_source = wk_driver
             cfg['model']['decoder']['type'] = 'COMPLEX' if model == 'complex' else 'DISTMULT'
             spec['notes'] = 'Bias-free GE2-style learning recipe plus archived p30 fast runtime; not exact replay of biased Adam-0.01 YAML'
         flags.update(common)
+        flags.pop('GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS', None)
         flags.pop('GEGE_TRAINING_REPLAY_SEED', None)
         flags.pop('GEGE_TRAINING_INPUT_AUDIT', None)
         flags.pop('GEGE_BOUNDED_STATE_ORDER_FILE', None)

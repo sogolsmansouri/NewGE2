@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import yaml
 
-from run_arc_pipege_best import (configure, engine_contract, evaluation_check,
+from run_arc_pipege_best import (configure, engine_contract, evaluation_check, loss_contract,
                                 normalize_dataset_metadata, reused_data_contract,
                                 schedule_check, training_check)
 
@@ -112,14 +112,27 @@ class Contracts(unittest.TestCase):
             with self.assertRaises(ValueError):
                 training_check(changed, self.spec, 2)
 
-    def test_evaluation_requires_both_directions_and_pinned_subset(self):
-        value = dict(num_ranks=20000, filtered=True, eval_edges_sha256='query', tie_policy='pessimistic',
+    def test_unweighted_loss_only(self):
+        loss_contract({})
+        loss_contract(dict(GEGE_SOFTMAX_NEGATIVE_MASS_SCALE='1', GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS='0'))
+        for flags in [dict(GEGE_SOFTMAX_NEGATIVE_MASS_SCALE=x) for x in ('8', 'nan', 'invalid', '0')] + [
+                dict(GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS='2.0794415416798357')]:
+            with self.assertRaises(ValueError):
+                loss_contract(flags)
+
+    def test_tw_evaluation_requires_tail_and_pinned_subset(self):
+        value = dict(num_ranks=10000, report_directions='tail', filtered=True, eval_edges_sha256='query', tie_policy='pessimistic',
                      tf32=False, mrr=.14, hits_at_10=.33)
         evaluation_check(value, self.spec)
-        for key, wrong in [('num_ranks',10000),('tf32',True),('mrr',float('nan')),
+        for key, wrong in [('num_ranks',20000),('report_directions','both'),('tf32',True),('mrr',float('nan')),
                            ('eval_edges_sha256','other'),('filtered',False)]:
             with self.assertRaises(ValueError):
                 evaluation_check(dict(value, **{key:wrong}), self.spec)
+        for graph in ('lj', 'fb', 'wk'):
+            spec = dict(self.spec, graph=graph)
+            evaluation_check(dict(value, report_directions='both', num_ranks=20000), spec)
+            with self.assertRaises(ValueError):
+                evaluation_check(value, spec)
 
 
 if __name__ == '__main__':

@@ -307,30 +307,6 @@ void maybe_empty_cache_before_backward() {
 #endif
 }
 
-double softmax_negative_mass_scale_for_manual_update() {
-    const char *bias_raw = std::getenv("GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS");
-    if (bias_raw != nullptr && bias_raw[0] != '\0') {
-        try {
-            double parsed = std::stod(std::string(bias_raw));
-            return std::isfinite(parsed) ? std::exp(parsed) : 1.0;
-        } catch (...) {
-            return 1.0;
-        }
-    }
-
-    const char *scale_raw = std::getenv("GEGE_SOFTMAX_NEGATIVE_MASS_SCALE");
-    if (scale_raw != nullptr && scale_raw[0] != '\0') {
-        try {
-            double parsed = std::stod(std::string(scale_raw));
-            return parsed > 0.0 && std::isfinite(parsed) ? parsed : 1.0;
-        } catch (...) {
-            return 1.0;
-        }
-    }
-
-    return 1.0;
-}
-
 void verify_padded_backward_equivalence(Model *model, const std::shared_ptr<Batch> &batch);
 
 std::string tensor_shape_string(const torch::Tensor &tensor) {
@@ -852,7 +828,7 @@ void manual_distmult_rns_update(Model *model, shared_ptr<Batch> batch, shared_pt
     bool expected = false;
     if (fixed_buffer_manual_distmult_rns_log_once().compare_exchange_strong(expected, true)) {
         SPDLOG_INFO("[manual_distmult_rns] enabled=1 decoder=DISTMULT negative_sampling=RNS relation_grad=1 negative_mass_scale={}",
-                    softmax_negative_mass_scale_for_manual_update());
+                    1.0);
     }
 
     torch::Tensor node_embeddings = batch->node_embeddings_.detach();
@@ -908,7 +884,7 @@ void manual_complex_rns_update(Model *model, shared_ptr<Batch> batch, shared_ptr
     bool expected = false;
     if (fixed_buffer_manual_complex_rns_log_once().compare_exchange_strong(expected, true)) {
         SPDLOG_INFO("[manual_complex_rns] enabled=1 decoder=COMPLEX negative_sampling=RNS relation_grad=1 negative_mass_scale={}",
-                    softmax_negative_mass_scale_for_manual_update());
+                    1.0);
     }
 
     torch::Tensor node_embeddings = batch->node_embeddings_.detach();

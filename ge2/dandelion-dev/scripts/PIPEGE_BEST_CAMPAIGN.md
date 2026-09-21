@@ -1,5 +1,10 @@
 # ARC fast-policy replay, 2026-09-20
 
+Historical campaign description. New runs follow
+[the 2026-09-21 unweighted protocol](PIPEGE_UNWEIGHTED_PROTOCOL.md): mass 1 for
+every dataset and tail-only TW reporting. Existing mass-8 results below are
+preserved as tuned-objective measurements, not reused as unweighted results.
+
 Six independent single-GPU RTX A6000 runs, serial and node-exclusive. The
 new c30 allocation 284846 can run them while GE2 continues independently on
 c31. c30 is configured at 300 W versus c31 at 200 W; record these hardware

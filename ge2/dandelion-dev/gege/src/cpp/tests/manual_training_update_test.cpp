@@ -18,13 +18,16 @@ int main(int argc, char **argv) {
     const char *enabled = mode == "autograd" ? "0" : "1";
     int64_t seed = 20260919, width = 100;
     std::string mass = "1";
-    bool benchmark = false;
+    std::string log_mass = "0";
+    bool benchmark = false, expect_rejection = false;
     for (int arg = 2; arg < argc; ++arg) {
         const std::string key = argv[arg];
         if (key == "--benchmark") benchmark = true;
         else if (key == "--seed" && arg+1 < argc) seed = std::stoll(argv[++arg]);
         else if (key == "--width" && arg+1 < argc) width = std::stoll(argv[++arg]);
         else if (key == "--mass" && arg+1 < argc) mass = argv[++arg];
+        else if (key == "--log-mass" && arg+1 < argc) log_mass = argv[++arg];
+        else if (key == "--expect-unweighted-rejection") expect_rejection = true;
         else { std::cerr << "Unknown/incomplete argument: " << key << "\n"; return 2; }
     }
     setenv("GEGE_EMULATE_DOT_SINGLE_RELATION", "1", 1);
@@ -35,7 +38,19 @@ int main(int argc, char **argv) {
     setenv("GEGE_CSR_GATHER", "0", 1);
     setenv("GEGE_SCORE_FILTER_CUDA", "1", 1);
     setenv("GEGE_SOFTMAX_NEGATIVE_MASS_SCALE", mass.c_str(), 1);
-    unsetenv("GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS");
+    setenv("GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS", log_mass.c_str(), 1);
+    if (expect_rejection) {
+        auto options = std::make_shared<LossOptions>();
+        options->loss_reduction = LossReduction::SUM;
+        SoftmaxCrossEntropy loss(options);
+        auto pos = torch::zeros({2});
+        auto neg = torch::zeros({2, 3});
+        int rejected = 0;
+        try { loss(pos, neg, true); } catch (const GegeRuntimeException &) { ++rejected; }
+        try { loss.score_gradients(pos, neg); } catch (const GegeRuntimeException &) { ++rejected; }
+        std::cout << "unweighted_guard_rejections=" << rejected << std::endl;
+        return rejected == 2 ? 0 : 1;
+    }
     setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
     at::globalContext().setDeterministicAlgorithms(!benchmark, false);
     at::globalContext().setAllowTF32CuBLAS(false);

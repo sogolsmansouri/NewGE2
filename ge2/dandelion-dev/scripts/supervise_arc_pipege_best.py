@@ -18,7 +18,9 @@ def main():
     for name in ('base','work','results'):
         parser.add_argument('--'+name, type=Path, required=True)
     parser.add_argument('--commit', required=True)
-    parser.add_argument('--only')
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument('--only')
+    selection.add_argument('--cases', nargs='+')
     parser.add_argument('--reuse-completed-commit', action='append', default=[])
     args = parser.parse_args()
     sys.path.insert(0, str(args.base/'harness/tools'))
@@ -61,6 +63,10 @@ def main():
             if args.only not in cases:
                 raise ValueError('Unknown case')
             cases = [args.only]
+        elif args.cases:
+            if len(set(args.cases)) != len(args.cases) or any(case not in cases for case in args.cases):
+                raise ValueError('Unknown or duplicate case')
+            cases = args.cases
         for case in cases:
             done = False
             for status in args.results.glob('attempt_*/'+case+'/status.json'):

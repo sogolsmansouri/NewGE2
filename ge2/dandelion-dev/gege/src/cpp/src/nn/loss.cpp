@@ -1,4 +1,7 @@
 #include "nn/loss.h"
+#ifdef GEGE_CUDA
+#include "nn/manual_backward_cuda.h"
+#endif
 
 #include <cmath>
 #include <cstdlib>
@@ -120,7 +123,15 @@ std::tuple<torch::Tensor, torch::Tensor> SoftmaxCrossEntropy::score_gradients(
     auto grad_log_probs = at::nll_loss_backward(torch::ones({}, pos_scores.options()), log_probs, targets,
         c10::nullopt, reduction, -100, torch::full({}, pos_scores.size(0), pos_scores.options()));
     auto grad_logits = at::_log_softmax_backward_data(grad_log_probs, log_probs, 1, logits.scalar_type());
-    auto grad_neg = grad_logits.narrow(1, 1, 1) * (neg_scores - negative_log_mass).exp();
+    torch::Tensor grad_neg;
+#ifdef GEGE_CUDA
+    if (neg_scores.is_cuda() && neg_scores.scalar_type() == torch::kFloat32) {
+        grad_neg = negative_log_mass_backward_cuda(neg_scores, negative_log_mass, grad_logits.narrow(1, 1, 1));
+    } else
+#endif
+    {
+        grad_neg = grad_logits.narrow(1, 1, 1) * (neg_scores - negative_log_mass).exp();
+    }
     return {grad_logits.narrow(1, 0, 1), grad_neg};
 }
 

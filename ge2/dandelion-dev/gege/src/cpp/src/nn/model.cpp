@@ -1,4 +1,7 @@
 #include "nn/model.h"
+#ifdef GEGE_CUDA
+#include "nn/manual_backward_cuda.h"
+#endif
 #include "common/training_contract.h"
 
 #include <atomic>
@@ -567,6 +570,26 @@ ManualRnsSideGradients dot_softmax_side_gradients(torch::Tensor node_embeddings,
 
 torch::Tensor reduce_manual_node_gradients(const shared_ptr<Batch> &batch,
     const ManualRnsSideGradients &forward, const ManualRnsSideGradients &inverse = {}) {
+#ifdef GEGE_CUDA
+    if (batch->node_embeddings_.is_cuda() && batch->node_embeddings_.scalar_type() == torch::kFloat32) {
+        const int64_t count = inverse.negative.defined() ? 4 : 3;
+        auto components = torch::zeros({count, batch->node_embeddings_.size(0), batch->node_embeddings_.size(1)},
+                                        batch->node_embeddings_.options());
+        int64_t component = 0;
+        auto scatter = [&](torch::Tensor ids, torch::Tensor values) {
+            components.select(0, component++).index_add_(0, ids.reshape({-1}).to(torch::kInt64), values);
+        };
+        if (inverse.negative.defined()) scatter(batch->src_neg_indices_mapping_, inverse.negative);
+        scatter(batch->dst_neg_indices_mapping_, forward.negative);
+        auto dst = forward.other;
+        auto src = forward.anchor;
+        if (inverse.anchor.defined()) dst = dst + inverse.anchor;
+        if (inverse.other.defined()) src = src + inverse.other;
+        scatter(batch->edges_.select(1, -1), dst);
+        scatter(batch->edges_.select(1, 0), src);
+        return ordered_gradient_sum_cuda(components);
+    }
+#endif
     auto result = torch::zeros_like(batch->node_embeddings_);
     auto scratch = torch::empty_like(result);
     bool initialized = false;

@@ -38,6 +38,29 @@ SPLIT_HASHES = {
 }
 
 
+def engine_contract(manifest):
+    contract = manifest.get('engine')
+    if contract is None:
+        return dict(commit=CORE, root=str(ENGINE), hashes=BUILD_HASHES,
+                    gradient_gate='/home/smansou2/arc_results/runs/pipege_manual_verified_284744/paired_gradient_gate/result.json')
+    if (not re.fullmatch(r'[0-9a-f]{40}', contract.get('commit', ''))
+            or not Path(contract.get('root', '')).is_absolute()
+            or set(contract.get('hashes', {})) != {'libge2_so', 'gege_train'}
+            or any(not re.fullmatch(r'[0-9a-f]{64}', x) for x in contract['hashes'].values())
+            or not Path(contract.get('gradient_gate', '')).is_absolute()
+            or not Path(contract.get('gate_template', '')).is_absolute()):
+        raise ValueError('New engine requires a pinned build and paired gradient gate')
+    return contract
+
+
+def reused_data_contract(prepared, reference):
+    if (prepared.get('status') != 'ready' or prepared.get('commit') != reference['commit']
+            or prepared.get('manifest_sha256') != reference['manifest_sha256']
+            or not all(x in prepared.get('data', {}) for x in ('lj', 'tw', 'fb', 'wk'))):
+        raise ValueError('Reused preparation identity mismatch')
+    return prepared['data']
+
+
 def normalize_dataset_metadata(view, expected=None):
     """Relocate a private dataset copy without changing its data contract."""
     view = Path(view).resolve()
@@ -174,6 +197,9 @@ def main():
     from run_arc_pipege_quality import checkpoint_manifest, timing_summary, validate_gradient_gate, validate_update_checks
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     manifest = json.loads((args.base/'manifest.json').read_text())
+    engine_spec = engine_contract(manifest)
+    core, engine, build_hashes = engine_spec['commit'], Path(engine_spec['root']), engine_spec['hashes']
+    gradient_gate = Path(engine_spec['gradient_gate'])
     if args.case != 'prepare' and args.case not in manifest['cases']:
         raise ValueError('Unknown case')
     result_dir = args.results/args.case
@@ -183,7 +209,7 @@ def main():
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     job, host = os.environ['SLURM_JOB_ID'], os.uname().nodename.split('.')[0]
     state = dict(status='preflight', job=job, host=host, case=args.case, commit=args.commit,
-                 built_engine_commit=CORE, pid=os.getpid(), checkpoint_durable=False)
+                 built_engine_commit=core, pid=os.getpid(), checkpoint_durable=False)
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
         write_json(result_dir/'status.json', state)
@@ -192,7 +218,7 @@ def main():
     signal.signal(signal.SIGTERM, interrupted)
     signal.signal(signal.SIGUSR1, interrupted)
     update()
-    repo, build, python = args.work/'repo', ENGINE/'build_git', ENV/'bin/python'
+    repo, build, python = args.work/'repo', engine/'build_git', ENV/'bin/python'
     tools = args.base/'harness/tools'
     env = {k:v for k,v in os.environ.items() if not k.startswith(('GEGE_', 'OURS_', 'PYTHON', 'CONDA'))}
     env.pop('LD_PRELOAD', None)
@@ -220,15 +246,21 @@ def main():
             if sha256_file(args.base/rel) != digest:
                 raise RuntimeError('Frozen file changed: '+rel)
         if args.case == 'prepare':
-            if shutil.disk_usage(args.work).free < 800*1024**3:
-                raise RuntimeError('Need 800 GiB for gate/final state and partitioned views')
+            reused = None
+            if 'reuse_prepared' in manifest:
+                reference = manifest['reuse_prepared']
+                reused = reused_data_contract(json.loads(Path(reference['path']).read_text()), reference)
+            required_space = (max(s['nodes']*s['width']*16 for s in manifest['cases'].values())
+                              + 16*1024**3) if reused else 800*1024**3
+            if shutil.disk_usage(args.work).free < required_space:
+                raise RuntimeError('Insufficient disk for gate/final state and dataset preparation')
             if host != 'c31':
-                ENGINE.mkdir(parents=True, exist_ok=True)
+                engine.mkdir(parents=True, exist_ok=True)
                 for item in ('repo', 'build_git', 'build_git_completed_commit.txt'):
                     run(['rsync', '-a', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
-                         f'c31:{ENGINE}/{item}', str(ENGINE)+'/'], result_dir/f'engine_copy_{item}.log')
+                         f'c31:{engine}/{item}', str(engine)+'/'], result_dir/f'engine_copy_{item}.log')
             if not repo.exists():
-                run(['git', 'clone', '--no-hardlinks', ENGINE/'repo', repo], result_dir/'clone.log')
+                run(['git', 'clone', '--no-hardlinks', engine/'repo', repo], result_dir/'clone.log')
             elif subprocess.check_output(['git', '-C', str(repo), 'diff', 'HEAD']):
                 raise RuntimeError('Refusing to replace modified campaign source')
             run(['git', '-C', repo, 'fetch', args.base/'source.bundle', args.commit], result_dir/'fetch.log')
@@ -242,20 +274,19 @@ def main():
         def git(*cmd):
             return subprocess.check_output(['git', '-C', str(repo), *cmd], text=True).strip()
         if (git('rev-parse', 'HEAD') != args.commit or git('diff', 'HEAD')
-                or git('rev-parse', args.commit+':'+TREE) != git('rev-parse', CORE+':'+TREE)
-                or (ENGINE/'build_git_completed_commit.txt').read_text().strip() != CORE):
+                or git('rev-parse', args.commit+':'+TREE) != git('rev-parse', core+':'+TREE)
+                or (engine/'build_git_completed_commit.txt').read_text().strip() != core):
             raise RuntimeError('Source tree/build attestation mismatch; rebuild required')
         if sha256_file(Path(__file__)) != sha256_file(repo/'ge2/dandelion-dev/scripts'/Path(__file__).name):
             raise RuntimeError('Staged driver differs from committed driver')
         hashes = {n:sha256_file(build/n) for n in ('libge2.so', 'gege_train')}
-        if hashes != {'libge2.so':BUILD_HASHES['libge2_so'], 'gege_train':BUILD_HASHES['gege_train']}:
+        if hashes != {'libge2.so':build_hashes['libge2_so'], 'gege_train':build_hashes['gege_train']}:
             raise RuntimeError('Repaired binary changed')
-        validate_gradient_gate(json.loads(Path('/home/smansou2/arc_results/runs/pipege_manual_verified_284744/paired_gradient_gate/result.json').read_text()), hashes)
         links = subprocess.check_output(['ldd', str(build/'gege_train')], env=env, text=True)
         if 'not found' in links or f'libge2.so => {build}/libge2.so' not in links:
             raise RuntimeError('Runtime libraries do not resolve to the verified engine')
         (result_dir/'ldd.txt').write_text(links)
-        write_json(result_dir/'provenance.json', dict(commit=args.commit, built_engine_commit=CORE,
+        write_json(result_dir/'provenance.json', dict(commit=args.commit, built_engine_commit=core,
                    engine_tree=git('rev-parse', args.commit+':'+TREE), build=hashes,
                    manifest_sha256=sha256_file(args.base/'manifest.json'), driver_sha256=sha256_file(Path(__file__))))
         apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True)
@@ -274,11 +305,19 @@ def main():
                 records = [json.loads(s) for s in log.read_text().splitlines() if s.startswith('{"mode":')]
                 if len(records) != 42 or not all(x['pass'] and x['exact'] for x in records):
                     raise RuntimeError('Native gradient parity gate failed')
+            if 'engine' in manifest:
+                run([build/'gege_manual_backward_test'], result_dir/'native_backward.log')
+                if not gradient_gate.exists():
+                    run([python, tools/'run_local_gradient_regression.py', '--build', build,
+                         '--gege', repo/TREE, '--env', ENV,
+                         '--template-case', engine_spec['gate_template'],
+                         '--output', gradient_gate.parent], result_dir/'paired_gradient_gate.log')
+            validate_gradient_gate(json.loads(gradient_gate.read_text()), hashes)
             audits = {}
             for name in ('lj_dot', 'tw_dot', 'fb_distmult', 'wk_distmult'):
                 spec = manifest['cases'][name]
                 source, query = Path(spec['source']), Path(spec['query'])
-                if 'source_origin' in spec:
+                if 'source_origin' in spec and reused is None:
                     source.mkdir(parents=True, exist_ok=True)
                     original_source, original_query = Path(spec['source_origin']), Path(spec['query_origin'])
                     required = ['dataset.yaml'] + [f'edges/{split}_{suffix}' for split in ('train','validation','test')
@@ -325,7 +364,9 @@ def main():
                     if query.stat().st_size != 80000 or sha256_file(query) != spec['eval_sha']:
                         raise RuntimeError('LJ query hash mismatch')
                 view = source
-                if spec['graph'] in ('fb','wk'):
+                if reused is not None:
+                    view = Path(reused[spec['graph']]['view'])
+                elif spec['graph'] in ('fb','wk'):
                     view = args.work/'data'/f"{spec['graph']}_p{spec['p']}"
                     run([python, tools/'prepare_ge2_partitioned_view.py', '--source-data-dir', source,
                          '--output-dir', view, '--num-partitions', spec['p'], '--edge-columns', spec['columns']],
@@ -339,6 +380,8 @@ def main():
                 audit.update(view=str(view), metadata=md, query_sha256=sha256_file(query),
                              train_view_sha256=sha256_file(view/'edges/train_edges.bin'),
                              train_offsets_sha256=sha256_file(view/'edges/train_partition_offsets.txt'))
+                if reused is not None and audit != reused[spec['graph']]:
+                    raise RuntimeError('Reused dataset changed since its prior audit: '+spec['graph'])
                 audits[spec['graph']] = audit
             for spec in manifest['cases'].values():
                 if 'schedule' in spec:
@@ -351,6 +394,7 @@ def main():
             update(status='done', stage='prepared')
             return
 
+        validate_gradient_gate(json.loads(gradient_gate.read_text()), hashes)
         prepared = json.loads((args.work/'prepared.json').read_text())
         if (prepared['status'] != 'ready' or prepared['commit'] != args.commit
                 or prepared['manifest_sha256'] != sha256_file(args.base/'manifest.json')):
@@ -430,7 +474,7 @@ def main():
                          if r['other_jobs'] or r['other_processes']]
             write_json(case/'result.json', dict(status='done', train_status=0, exact_eval_status=0,
                        **timing, mrr=quality['mrr'], hits_at_10=quality['hits_at_10'],
-                       commit=args.commit, built_engine_commit=CORE, scope=spec['scope'], host=host,
+                       commit=args.commit, built_engine_commit=core, scope=spec['scope'], host=host,
                        config_notes=spec['notes'], checkpoint_durable=False,
                        checkpoint=str(model_dir), isolation_violations=isolation, other_jobs_at_start=other_jobs_at_start,
                        paper_readiness='pending_protocol_review' if not isolation and not other_jobs_at_start else 'shared_node_timing_provisional'))

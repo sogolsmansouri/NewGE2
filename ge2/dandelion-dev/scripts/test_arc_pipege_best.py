@@ -4,10 +4,30 @@ import tempfile
 import unittest
 import yaml
 
-from run_arc_pipege_best import configure, evaluation_check, normalize_dataset_metadata, schedule_check, training_check
+from run_arc_pipege_best import (configure, engine_contract, evaluation_check,
+                                normalize_dataset_metadata, reused_data_contract,
+                                schedule_check, training_check)
 
 
 class Contracts(unittest.TestCase):
+    def test_new_engine_requires_complete_pins_and_gate(self):
+        pinned = dict(commit='a'*40, root='/engine', gradient_gate='/gate/result.json',
+                      gate_template='/fixture', hashes=dict(libge2_so='b'*64, gege_train='c'*64))
+        self.assertEqual(engine_contract(dict(engine=pinned)), pinned)
+        for key, value in [('commit', 'latest'), ('root', 'relative'), ('hashes', {}),
+                           ('gradient_gate', ''), ('gate_template', '')]:
+            with self.assertRaises(ValueError):
+                engine_contract(dict(engine=dict(pinned, **{key:value})))
+        self.assertEqual(len(engine_contract({})['commit']), 40)
+
+    def test_dataset_reuse_requires_prior_preparation_identity(self):
+        reference = dict(commit='old', manifest_sha256='manifest')
+        prepared = dict(reference, status='ready', data={x:{} for x in ('lj', 'tw', 'fb', 'wk')})
+        self.assertEqual(reused_data_contract(prepared, reference), prepared['data'])
+        for key, value in [('status', 'failed'), ('commit', 'other'), ('manifest_sha256', 'other'), ('data', {})]:
+            with self.assertRaises(ValueError):
+                reused_data_contract(dict(prepared, **{key:value}), reference)
+
     def test_relocated_metadata_persisted_and_idempotent(self):
         with tempfile.TemporaryDirectory() as temp:
             view = Path(temp)

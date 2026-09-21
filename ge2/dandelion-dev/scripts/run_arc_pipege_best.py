@@ -206,11 +206,14 @@ def main():
         parser.add_argument('--'+name, type=Path, required=True)
     parser.add_argument('--commit', required=True)
     parser.add_argument('--case', required=True)
+    parser.add_argument('--gpu', default='0')
+    parser.add_argument('--allow-shared-node', action='store_true', help='Quality runs only; timing is provisional')
     args = parser.parse_args()
     sys.path.insert(0, str(args.base/'harness/tools'))
     from prepare_ge2_partitioned_view import sha256_file, verify_bucket_order
     from run_arc_ge2_allocated_queue import audit_data, run_logged, write_json
     from run_arc_pipege_quality import checkpoint_manifest, timing_summary, validate_gradient_gate, validate_update_checks
+    from arc_accuracy_gpu_guard import foreign_gpu_pids, guarded_run
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     manifest = json.loads((args.base/'manifest.json').read_text())
     engine_spec = engine_contract(manifest)
@@ -224,8 +227,12 @@ def main():
     lock = (args.work/'campaign.lock').open('a')
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     job, host = os.environ['SLURM_JOB_ID'], os.uname().nodename.split('.')[0]
+    gpu_uuid = subprocess.check_output(['nvidia-smi', '-i', args.gpu, '--query-gpu=uuid', '--format=csv,noheader'], text=True).strip()
+    if not re.fullmatch(r'GPU-[0-9a-f-]+', gpu_uuid):
+        raise ValueError('Exactly one physical GPU is required')
     state = dict(status='preflight', job=job, host=host, case=args.case, commit=args.commit,
-                 built_engine_commit=core, pid=os.getpid(), checkpoint_durable=False)
+                 built_engine_commit=core, pid=os.getpid(), checkpoint_durable=False, gpu_uuid=gpu_uuid,
+                 allow_shared_node=args.allow_shared_node)
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
         write_json(result_dir/'status.json', state)
@@ -240,7 +247,7 @@ def main():
     env.pop('LD_PRELOAD', None)
     env.update(PATH=f'{ENV}/bin:/usr/bin:/bin', PYTHONPATH=str(args.work/'python'),
                LD_LIBRARY_PATH=f'{build}:{ENV}/lib:{ENV}/lib/python3.9/site-packages/torch/lib:/usr/lib64',
-               PYTHONDONTWRITEBYTECODE='1', GEGE_NO_BINDINGS='1', CUDA_VISIBLE_DEVICES='0',
+               PYTHONDONTWRITEBYTECODE='1', GEGE_NO_BINDINGS='1', CUDA_VISIBLE_DEVICES=gpu_uuid,
                CUDA_DEVICE_ORDER='PCI_BUS_ID', OMP_NUM_THREADS='16', MKL_NUM_THREADS='16', OPENBLAS_NUM_THREADS='1')
     try:
         alloc = subprocess.check_output(['scontrol', 'show', 'job', job, '-o'], text=True, timeout=20)
@@ -254,8 +261,13 @@ def main():
             update(stage=log.stem, status='running')
             if time.time() >= deadline:
                 raise RuntimeError('Allocation deadline reached')
-            rc = run_logged(list(map(str, command)), dict(env, **(extra or {})), log, deadline-time.time(),
-                            log.with_suffix('.hardware.jsonl') if monitor else None)
+            if args.allow_shared_node:
+                rc = guarded_run(list(map(str, command)), dict(env, **(extra or {})), log, deadline-time.time(),
+                                 gpu_uuid, log.with_suffix('.gpu_guard.jsonl'),
+                                 hardware_monitor=log.with_suffix('.hardware.jsonl') if monitor else None)
+            else:
+                rc = run_logged(list(map(str, command)), dict(env, **(extra or {})), log, deadline-time.time(),
+                                log.with_suffix('.hardware.jsonl') if monitor else None)
             if rc:
                 raise RuntimeError(f'Exit {rc}: {log}')
         for rel, digest in {**manifest['references'], **manifest['helpers']}.items():
@@ -307,11 +319,13 @@ def main():
                    manifest_sha256=sha256_file(args.base/'manifest.json'), driver_sha256=sha256_file(Path(__file__))))
         apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True)
         jobs = subprocess.check_output(['squeue', '-h', '-t', 'RUNNING,COMPLETING', '-w', host, '-o', '%A'], text=True).split()
-        if apps.strip():
+        if foreign_gpu_pids(gpu_uuid):
+            raise RuntimeError('Selected GPU is occupied; not launching')
+        if apps.strip() and not args.allow_shared_node:
             raise RuntimeError('Idle GPUs required before correctness gates or training')
         other_jobs_at_start = [x for x in jobs if x != job]
         update(other_jobs_at_start=other_jobs_at_start,
-               timing_status='shared_node_provisional' if other_jobs_at_start else 'isolation_monitor_required')
+               timing_status='shared_node_provisional' if other_jobs_at_start or args.allow_shared_node else 'isolation_monitor_required')
 
         if args.case == 'prepare':
             native = build/'gege_manual_training_update_test'
@@ -330,6 +344,7 @@ def main():
                     run([python, tools/'run_local_gradient_regression.py', '--build', build,
                          '--gege', repo/TREE, '--env', ENV,
                          '--template-case', engine_spec['gate_template'],
+                         '--gpu', gpu_uuid,
                          '--output', gradient_gate.parent], result_dir/'paired_gradient_gate.log')
             validate_gradient_gate(json.loads(gradient_gate.read_text()), hashes)
             audits = {}
@@ -497,10 +512,11 @@ def main():
             write_json(case/'result.json', dict(status='done', train_status=0, exact_eval_status=0,
                        **timing, mrr=quality['mrr'], hits_at_10=quality['hits_at_10'],
                        negative_mass_scale=1, report_directions=report_directions(spec), num_ranks=quality['num_ranks'],
+                       gpu_uuid=gpu_uuid,
                        commit=args.commit, built_engine_commit=core, scope=spec['scope'], host=host,
                        config_notes=spec['notes'], checkpoint_durable=False,
                        checkpoint=str(model_dir), isolation_violations=isolation, other_jobs_at_start=other_jobs_at_start,
-                       paper_readiness='pending_protocol_review' if not isolation and not other_jobs_at_start else 'shared_node_timing_provisional'))
+                       paper_readiness='pending_protocol_review' if not isolation and not other_jobs_at_start and not args.allow_shared_node else 'shared_node_timing_provisional'))
         update(status='done', stage='evaluated', final_result=str(case/'result.json'))
     except BaseException as error:
         update(status='failed', error=repr(error))

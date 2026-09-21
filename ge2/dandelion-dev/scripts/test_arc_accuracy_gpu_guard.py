@@ -1,4 +1,5 @@
 import os
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -50,6 +51,27 @@ class GpuGuardTests(unittest.TestCase):
             self.assertEqual(guarded_run(*args, 10, 0, Path(temp)/'monitor'), 0)
             with self.assertRaisesRegex(RuntimeError, 'deadline'):
                 guarded_run(*args, 0, 0, Path(temp)/'monitor')
+
+    def test_hardware_monitor_keeps_foreign_node_activity(self):
+        child = subprocess.Popen(['/bin/sleep', '30'], start_new_session=True)
+        try:
+            with tempfile.TemporaryDirectory() as temp, \
+                 patch('arc_accuracy_gpu_guard.foreign_gpu_pids', return_value=[]), \
+                 patch('arc_accuracy_gpu_guard.subprocess.Popen', return_value=child), \
+                 patch.object(child, 'wait', return_value=0), \
+                 patch('arc_accuracy_gpu_guard.os.getpgid', return_value=999), \
+                 patch('arc_accuracy_gpu_guard.subprocess.check_output', side_effect=[
+                     'RUNNING '+os.uname().nodename.split('.')[0], 'hardware snapshot',
+                     'GPU-other, 123, foreign process, 1000\n', 'mine me train\nother someone serve\n']):
+                root = Path(temp)
+                guarded_run([], dict(os.environ, SLURM_JOB_ID='mine'), root/'log', 10,
+                            'GPU-selected', root/'guard', hardware_monitor=root/'hardware')
+                report = json.loads((root/'hardware').read_text())
+                self.assertEqual(report['other_jobs'], ['other someone serve'])
+                self.assertEqual(len(report['other_processes']), 1)
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
 
 
 if __name__ == '__main__':

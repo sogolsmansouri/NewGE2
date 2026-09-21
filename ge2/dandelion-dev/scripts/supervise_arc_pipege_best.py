@@ -22,6 +22,8 @@ def main():
     selection.add_argument('--only')
     selection.add_argument('--cases', nargs='+')
     parser.add_argument('--reuse-completed-commit', action='append', default=[])
+    parser.add_argument('--gpu', default='0')
+    parser.add_argument('--allow-shared-node', action='store_true')
     args = parser.parse_args()
     sys.path.insert(0, str(args.base/'harness/tools'))
     from run_arc_ge2_allocated_queue import run_logged, write_json
@@ -45,7 +47,10 @@ def main():
     alloc = subprocess.check_output(['scontrol','show','job',job,'-o'],text=True)
     deadline = datetime.datetime.fromisoformat(re.search(r'\bEndTime=(\S+)',alloc)[1]).timestamp()-180
     command = [sys.executable, str(args.base/'scripts/run_arc_pipege_best.py'),
-               '--base',str(args.base),'--work',str(args.work),'--results',str(attempt),'--commit',args.commit]
+               '--base',str(args.base),'--work',str(args.work),'--results',str(attempt),'--commit',args.commit,
+               '--gpu',args.gpu]
+    if args.allow_shared_node:
+        command.append('--allow-shared-node')
     def run(case):
         update(status='running', case=case)
         return run_logged(command+['--case',case],dict(os.environ),attempt/(case+'.supervisor.log'),deadline-time.time())

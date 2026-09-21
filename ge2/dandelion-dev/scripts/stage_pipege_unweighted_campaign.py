@@ -28,6 +28,12 @@ def main():
             raise ValueError('Historical frozen input changed: '+rel)
     for directory in ('references', 'harness'):
         shutil.copytree(args.old_base/directory, base/directory)
+    overrides = base/'helper_overrides'
+    if overrides.exists():
+        for source in overrides.iterdir():
+            if not source.is_file() or source.suffix != '.py':
+                raise ValueError('Only Python helper overrides are supported')
+            shutil.copyfile(source, base/'harness/tools'/source.name)
     build = json.loads((base/'engine_build.json').read_text())
     if build['source_commit'] != args.commit or digest(base/'engine.tar.gz') != build['archive_sha256']:
         raise ValueError('Engine archive provenance mismatch')

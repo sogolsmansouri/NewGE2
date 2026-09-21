@@ -22,7 +22,7 @@ def foreign_gpu_pids(gpu, process_group=None):
     return foreign
 
 
-def guarded_run(command, env, log, timeout, gpu, monitor):
+def guarded_run(command, env, log, timeout, gpu, monitor, hardware_monitor=None):
     if timeout <= 0:
         raise RuntimeError('Allocation deadline reached')
     foreign = foreign_gpu_pids(gpu)
@@ -46,6 +46,20 @@ def guarded_run(command, env, log, timeout, gpu, monitor):
                 with Path(monitor).open('a') as stream:
                     stream.write(json.dumps(dict(time=time.time(), gpu=gpu,
                                                  process_group=child.pid, foreign_gpu_pids=foreign))+'\n')
+                if hardware_monitor is not None:
+                    hardware = subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid,power.limit,power.draw,clocks.sm,clocks.mem,utilization.gpu,memory.used', '--format=csv,noheader'], text=True, timeout=20)
+                    apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid,pid,process_name,used_memory', '--format=csv,noheader'], text=True, timeout=20)
+                    jobs = subprocess.check_output(['squeue', '-h', '-w', os.uname().nodename.split('.')[0], '-o', '%A %u %j'], text=True, timeout=20)
+                    others = []
+                    for row in apps.splitlines():
+                        try:
+                            if os.getpgid(int(row.split(',')[1])) != child.pid:
+                                others.append(row)
+                        except ProcessLookupError:
+                            pass
+                    with Path(hardware_monitor).open('a') as stream:
+                        stream.write(json.dumps(dict(time=time.time(), gpu=hardware, apps=apps, other_processes=others,
+                            other_jobs=[r for r in jobs.splitlines() if r.split()[0] != job]))+'\n')
                 if foreign:
                     raise RuntimeError('GPU contention during accuracy control: '+repr(foreign))
                 try:

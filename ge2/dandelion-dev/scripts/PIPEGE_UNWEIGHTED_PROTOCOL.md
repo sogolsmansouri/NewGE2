@@ -22,3 +22,10 @@ Use a new frozen campaign, commit, binary hashes, native gradient parity gates,
 two-epoch update checks, full training, and evaluation. Do not overwrite old
 campaign manifests. Other sampling differences (including degree-chunk
 exclusion) remain and still need protocol review before a pipeline-only claim.
+
+When the user explicitly chooses accuracy work on a shared node, launch with
+`--allow-shared-node --gpu <physical UUID>`. Monitor the selected GPU and stop
+only our child process group upon contention. Preserve whole-node hardware
+and job records, and label timings provisional even if accuracy passes.
+Remeasure timing later on an exclusive node. This mode never silently replaces
+the default isolated-run checks.

@@ -43,7 +43,7 @@ def check_reference(config, model):
         raise ValueError('Reference no longer matches the declared FB control')
 
 
-def case_config(reference, data, model_dir, fraction, initialization=None):
+def case_config(reference, data, model_dir, fraction, initialization=None, seed=None):
     if fraction not in (0., .5):
         raise ValueError('Only the two prespecified sampling conditions are allowed')
     config = copy.deepcopy(reference)
@@ -56,6 +56,10 @@ def case_config(reference, data, model_dir, fraction, initialization=None):
             raise ValueError('Only the prespecified Normal(0, 0.001) initializer is allowed')
         config['model']['encoder']['layers'][0][0]['init'] = dict(
             type='NORMAL', options=dict(mean=0., std=.001))
+    if seed is not None:
+        if seed not in (42, 123) or initialization is not None:
+            raise ValueError('Seed controls change only the prespecified random seed')
+        config['model']['random_seed'] = seed
     return config
 
 
@@ -76,6 +80,8 @@ def conditions(study):
         return [('fixed', .5, 'fixed'), ('repartition', .5, 'repartition')]
     if study == 'initialization':
         return [('normal_0001', .5, None)]
+    if study == 'seeds':
+        return [('seed42', .5, None), ('seed123', .5, None)]
     raise ValueError('Unknown study: ' + study)
 
 
@@ -86,12 +92,13 @@ def main():
     parser.add_argument('--job', required=True)
     parser.add_argument('--gpu', type=int, required=True)
     parser.add_argument('--model', choices=('distmult', 'complex'), required=True)
-    parser.add_argument('--study', choices=('sampling', 'repartition', 'initialization'), default='sampling')
+    parser.add_argument('--study', choices=('sampling', 'repartition', 'initialization', 'seeds'), default='sampling')
     parser.add_argument('--binary', type=Path)
     args = parser.parse_args()
     sys.path.insert(0, str(args.tools))
     from prepare_ge2_partitioned_view import sha256_file
-    from run_arc_ge2_allocated_queue import run_logged, write_json
+    from run_arc_ge2_allocated_queue import write_json
+    from arc_accuracy_gpu_guard import guarded_run
     from run_arc_ge2_kge_final import inspect_data, checkpoint_names, SPECS, query_membership
     from run_arc_ge2_fb_reproduction import LIB_SHA
 
@@ -104,7 +111,8 @@ def main():
                  factors=[c[1] for c in conditions(args.study)], cases=[],
                  purpose={'sampling': 'Uniform/mixed negative sampling sensitivity',
                           'repartition': 'Disabled epoch repartitioning sensitivity',
-                          'initialization': 'Original-Marius entity initialization sensitivity'}[args.study],
+                          'initialization': 'Original-Marius entity initialization sensitivity',
+                          'seeds': 'Fixed-seed variability under the unchanged learning recipe'}[args.study],
                  study=args.study, paper_timing_eligible=False,
                  checkpoint_durable=False, checkpoint_storage='node_local_retained',
                  prediction_direction='both', test_set_tuning=False,
@@ -133,6 +141,7 @@ def main():
         raise KeyboardInterrupt('Supervisor signal ' + str(sig))
 
     signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGUSR1, interrupted)
     update()
     try:
         if args.study == 'repartition' and (args.binary is None or not args.binary.is_file()):
@@ -161,6 +170,7 @@ def main():
         shutil.copyfile(args.reference / 'result.json', args.results / 'previous_result.json')
         write_json(args.results / 'frozen_inputs.json', dict(library_sha256=LIB_SHA,
                    reference_config_sha256=frozen['config_sha256'], driver_sha256=sha256_file(Path(__file__)),
+                   gpu_guard_sha256=sha256_file(Path(__file__).with_name('arc_accuracy_gpu_guard.py')),
                    native_driver_sha256=sha256_file(args.binary) if args.binary else None,
                    helpers={name: sha256_file(args.tools / name) for name in helper_names}))
         update(stage='source_data_audit')
@@ -194,8 +204,9 @@ def main():
             write_json(args.results / 'validation_manifest.json', dict(seed=seed, rows=10000,
                        queries_sha256=query_hash, source_sha256=sha256_file(source), membership=membership,
                        selector_sha256=sha256_file(args.tools / 'deterministic_eval_subset.py')))
-            interpretation = ('Paper-described repartition path; not unchanged release' if args.study == 'repartition'
-                              else 'Single-factor original-Marius initialization; not an authors GE2 FB86M recipe')
+            interpretation = {'repartition': 'Paper-described repartition path; not unchanged release',
+                              'initialization': 'Single-factor original-Marius initialization; not an authors GE2 FB86M recipe',
+                              'seeds': 'Two predeclared seeds; no selection by held-out test accuracy'}[args.study]
             update(evaluation_scope='validation_only', interpretation=interpretation,
                    conditions=[c[0] for c in conditions(args.study)])
 
@@ -207,8 +218,8 @@ def main():
             child_env = dict(env)
             if args.binary and Path(command[0]) == args.binary:
                 child_env['GEGE_NO_BINDINGS'] = '1'
-            rc = run_logged(list(map(str, command)), child_env, case / (name + '.log'), deadline - time.time(),
-                            case / (name + '.hardware.jsonl') if name in ('train', 'evaluate') else None)
+            rc = guarded_run(list(map(str, command)), child_env, case / (name + '.log'),
+                             deadline - time.time(), args.gpu, case / (name + '.gpu_guard.jsonl'))
             if rc:
                 raise RuntimeError(f'{case.name}/{name} failed: {rc}')
 
@@ -231,8 +242,10 @@ def main():
             (data / 'dataset.yaml').write_text(yaml.safe_dump(meta, sort_keys=False))
             write_json(case / 'data_audit.json', inspect_data(data, 'FB'))
             initializer = label if args.study == 'initialization' else None
-            config = case_config(reference, data, model, fraction, initializer)
+            seed = int(label[4:]) if args.study == 'seeds' else None
+            config = case_config(reference, data, model, fraction, initializer, seed)
             row['entity_initialization'] = config['model']['encoder']['layers'][0][0]['init']
+            row['random_seed'] = config['model']['random_seed']
             config_path = case / 'config.yaml'
             config_path.write_text(yaml.safe_dump(config, sort_keys=False))
             row.update(status='training', config_sha256=sha256_file(config_path))
@@ -268,6 +281,8 @@ def main():
             shutil.copyfile(model / 'full_config.yaml', case / 'full_config.yaml')
             full_config = yaml.safe_load((case / 'full_config.yaml').read_text())
             observed_init = full_config['model']['encoder']['layers'][0][0]['init']
+            if full_config['model']['random_seed'] != row['random_seed']:
+                raise RuntimeError('Saved random seed differs from the requested control')
             if observed_init['type'] != row['entity_initialization']['type']:
                 raise RuntimeError('Saved entity initialization type differs from requested configuration')
             if initializer and observed_init['options'] != dict(mean=0., std=.001):

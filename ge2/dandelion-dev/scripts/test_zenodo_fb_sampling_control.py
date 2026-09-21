@@ -22,6 +22,19 @@ def reference():
 
 
 class SamplingControlTests(unittest.TestCase):
+    def test_seed_controls_change_only_seed(self):
+        self.assertEqual(conditions('seeds'), [('seed42', .5, None), ('seed123', .5, None)])
+        for seed in (42, 123):
+            original = reference()
+            config = case_config(original, Path('/old/data'), Path('/old/model'), .5, seed=seed)
+            self.assertEqual(config['model']['random_seed'], seed)
+            config['model']['random_seed'] = original['model']['random_seed']
+            self.assertEqual(config, original)
+        with self.assertRaises(ValueError):
+            case_config(reference(), Path('/data'), Path('/model'), .5, seed=999)
+        with self.assertRaises(ValueError):
+            case_config(reference(), Path('/data'), Path('/model'), .5, 'normal_0001', seed=42)
+
     def test_initialization_changes_only_one_learning_factor(self):
         original = reference()
         untouched = copy.deepcopy(original)

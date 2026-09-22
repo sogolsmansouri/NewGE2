@@ -3,10 +3,33 @@ import copy
 import unittest
 
 from prepare_tw_multigpu import check_config, cover_check, flags_for, make_pipege
-from run_tw_multigpu import check_evaluation, parse_training
+from run_tw_multigpu import check_evaluation, check_resource_policy, parse_training, qualify_timing
 
 
 class PreparationTests(unittest.TestCase):
+    def test_shared_mode_never_allows_selected_gpu_contention(self):
+        for shared in (False, True):
+            with self.assertRaises(RuntimeError):
+                check_resource_policy([12], '12', [], shared)
+
+    def test_shared_mode_is_opt_in(self):
+        with self.assertRaises(RuntimeError):
+            check_resource_policy([], '99', ['other_job'], False)
+        check_resource_policy([], '99', ['other_job'], True)
+        check_resource_policy([], '', [], False)
+
+    def test_shared_timing_is_always_provisional(self):
+        clean = [dict(other_jobs=[], other_processes=[])]
+        self.assertEqual(qualify_timing(clean, ['GPU-0'], True), (True, 'shared_node_provisional'))
+        busy = [dict(other_jobs=['other_job'], other_processes=['GPU-3, 99, python'])]
+        self.assertEqual(qualify_timing(busy, ['GPU-0', 'GPU-1'], True), (False, 'shared_node_provisional'))
+        with self.assertRaises(RuntimeError):
+            qualify_timing(busy, ['GPU-0'], False)
+        with self.assertRaises(RuntimeError):
+            qualify_timing(busy, ['GPU-3'], True)
+        with self.assertRaises(RuntimeError):
+            qualify_timing([], ['GPU-0'], True)
+
     def config(self):
         return dict(model=dict(encoder=dict(layers=[[dict(output_dim=100)]]),
                     dense_optimizer=dict(type='ADAGRAD', options=dict(learning_rate=.1)),

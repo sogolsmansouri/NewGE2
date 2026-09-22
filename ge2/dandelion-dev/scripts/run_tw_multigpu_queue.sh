@@ -24,6 +24,11 @@ for case in "${cases[@]}"; do
         --bundle "$BUNDLE" --case "$case" --env "$ENV_DIR" --engine "$ENGINE_DIR"
         --data "$TW_DATA" --source-archive "$GE2_ARCHIVE" --gpu-ids "$ids"
         --power-limit "$POWER_LIMIT_WATTS")
+    case "${ALLOW_SHARED_NODE:-0}" in
+        0) ;;
+        1) common+=(--allow-shared-node) ;;
+        *) printf 'ALLOW_SHARED_NODE must be 0 or 1\n' >&2; exit 2 ;;
+    esac
     "${common[@]}" --phase gate --work "$WORK_ROOT/${case}_gate" --results "$RESULT_ROOT/${case}_gate"
     "${common[@]}" --phase final --work "$WORK_ROOT/$case" --results "$RESULT_ROOT/$case" \
         --gate-result "$RESULT_ROOT/${case}_gate/result.json"

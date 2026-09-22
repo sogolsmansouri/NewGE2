@@ -17,7 +17,27 @@ import time
 
 import yaml
 
+from arc_accuracy_gpu_guard import foreign_gpu_pids, guarded_run
 from prepare_tw_multigpu import check_config, sha
+
+
+def check_resource_policy(selected_pids, all_apps, other_jobs, allow_shared):
+    if selected_pids:
+        raise RuntimeError('Selected GPUs are occupied: '+repr(selected_pids))
+    if not allow_shared and (all_apps.strip() or other_jobs):
+        raise RuntimeError('Node is busy/shared; no competing runs will be started')
+
+
+def qualify_timing(samples, uuids, allow_shared):
+    if not samples:
+        raise RuntimeError('Hardware monitoring is missing')
+    for sample in samples:
+        if any(row.split(',')[0].strip() in uuids for row in sample['other_processes']):
+            raise RuntimeError('Contention on a selected GPU')
+    isolated = all(not x['other_jobs'] and not x['other_processes'] for x in samples)
+    if not isolated and not allow_shared:
+        raise RuntimeError('Contention detected; results are not controlled timings')
+    return isolated, 'shared_node_provisional' if allow_shared else 'exclusive_node'
 
 
 def parse_training(text, system, gpus, epochs, gate=False):
@@ -71,6 +91,8 @@ def main():
     parser.add_argument('--gpu-ids', required=True, help='Physical indices or UUIDs, comma separated')
     parser.add_argument('--gate-result', type=Path)
     parser.add_argument('--power-limit', type=float, required=True, help='Verify only; never changes GPU power')
+    parser.add_argument('--allow-shared-node', action='store_true',
+                        help='Accuracy only on idle selected GPUs; timings always provisional')
     args = parser.parse_args()
     args.bundle = args.bundle.resolve()
     manifest = json.loads((args.bundle/'manifest.json').read_text())
@@ -97,8 +119,8 @@ def main():
     def exclusive():
         apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'], text=True, timeout=30).strip()
         jobs = subprocess.check_output(['squeue', '-h', '-w', host, '-o', '%A'], text=True, timeout=20).split()
-        if apps or any(j != job for j in jobs):
-            raise RuntimeError('Node is busy/shared; no competing runs will be started')
+        check_resource_policy(foreign_gpu_pids(','.join(ids)), apps,
+                              [j for j in jobs if j != job], args.allow_shared_node)
     exclusive()
     # A per-node user lock also prevents two detached copies racing the idle check.
     lock = Path('/mnt/local/smansou2/tw_multigpu_followup.lock').open('a')
@@ -118,7 +140,8 @@ def main():
     args.results.mkdir(parents=True)
     state = dict(status='preflight', case=args.case, phase=args.phase, host=host, job=job,
                  gpu_uuids=uuids, hardware=hardware, bundle_sha256=sha(args.bundle/'manifest.json'),
-                 checkpoint_durable=False, paper_ready=False)
+                 checkpoint_durable=False, paper_ready=False, allow_shared_node=args.allow_shared_node,
+                 timing_status='shared_node_provisional' if args.allow_shared_node else 'exclusive_node')
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
         write_json(args.results/'status.json', state)
@@ -138,8 +161,12 @@ def main():
         if budget < 60:
             raise RuntimeError('Allocation time exhausted')
         update(stage=name)
-        rc = run_logged(command, env, args.results/(name+'.log'), budget,
-                        args.results/(name+'.hardware.jsonl') if monitor else None)
+        hardware_log = args.results/(name+'.hardware.jsonl') if monitor else None
+        if args.allow_shared_node:
+            rc = guarded_run(command, env, args.results/(name+'.log'), budget, ','.join(uuids),
+                             args.results/(name+'.gpu_guard.jsonl'), hardware_log)
+        else:
+            rc = run_logged(command, env, args.results/(name+'.log'), budget, hardware_log)
         if rc:
             raise RuntimeError(f'{name} exited {rc}')
     try:
@@ -149,7 +176,7 @@ def main():
             if args.gate_result is None:
                 raise ValueError('Final training requires an explicit successful gate result')
             gate = json.loads(args.gate_result.read_text())
-            for key in ('case', 'bundle_sha256', 'gpu_uuids', 'hardware'):
+            for key in ('case', 'bundle_sha256', 'gpu_uuids', 'hardware', 'allow_shared_node'):
                 if gate[key] != state[key]:
                     raise ValueError('Gate provenance/hardware mismatch: '+key)
             if gate.get('status') != 'gate_passed' or gate.get('phase') != 'gate':
@@ -220,7 +247,7 @@ def main():
             max_seconds=2700 if args.phase == 'gate' else None)
         training = parse_training((args.results/'train.log').read_text(), spec['system'], spec['gpus'], epochs, args.phase == 'gate')
         samples = [json.loads(line) for line in (args.results/'train.hardware.jsonl').read_text().splitlines()]
-        isolated = bool(samples) and all(not x['other_jobs'] and not x['other_processes'] for x in samples)
+        isolated, timing_status = qualify_timing(samples, uuids, args.allow_shared_node)
         for sample in samples:
             observed = {}
             for row in sample['gpu'].splitlines():
@@ -228,9 +255,7 @@ def main():
                 observed[fields[1]] = float(fields[2].split()[0])
             if any(uuid not in observed or abs(observed[uuid]-args.power_limit) > .1 for uuid in uuids):
                 raise RuntimeError('GPU power setting changed or monitoring is incomplete')
-        state.update(training, isolation_passed=isolated)
-        if not isolated:
-            raise RuntimeError('Contention detected; results are not controlled timings')
+        state.update(training, isolation_passed=isolated, timing_status=timing_status)
         if args.phase == 'gate':
             update(status='gate_passed', scope='Two-epoch runtime and sampled peer-value checks, not a proof of convergence')
             write_json(args.results/'result.json', state)

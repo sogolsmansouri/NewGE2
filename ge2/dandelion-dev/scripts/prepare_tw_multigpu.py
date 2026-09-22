@@ -133,7 +133,8 @@ def main():
     cover = cover_check(schedule)
     args.out.mkdir(parents=True)
     scripts = Path(__file__).resolve().parent
-    for name in ('prepare_tw_multigpu.py', 'run_tw_multigpu.py', 'run_tw_multigpu_queue.sh'):
+    for name in ('prepare_tw_multigpu.py', 'run_tw_multigpu.py', 'run_tw_multigpu_queue.sh',
+                 'arc_accuracy_gpu_guard.py'):
         shutil.copyfile(scripts/name, args.out/name)
     tools = args.out/'tools'
     tools.mkdir()

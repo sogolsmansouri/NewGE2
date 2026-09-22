@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 import copy
+from pathlib import Path
+import tempfile
 import unittest
 
 from prepare_tw_multigpu import check_config, cover_check, flags_for, make_pipege
-from run_tw_multigpu import check_evaluation, check_resource_policy, parse_training, qualify_timing
+from run_tw_multigpu import check_evaluation, check_resource_policy, parse_training, pipege_python_overlay, qualify_timing
 
 
 class PreparationTests(unittest.TestCase):
+    def test_native_pipege_uses_package_parent_and_no_bindings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root/'engine/repo/ge2/dandelion-dev/gege/src/python'
+            package.mkdir(parents=True)
+            (package/'__init__.py').touch()
+            work = root/'work'
+            work.mkdir()
+            env = pipege_python_overlay(root/'engine', work)
+            self.assertEqual(env['GEGE_NO_BINDINGS'], '1')
+            self.assertEqual((Path(env['PYTHONPATH'])/'gege').resolve(), package.resolve())
+
     def test_shared_mode_never_allows_selected_gpu_contention(self):
         for shared in (False, True):
             with self.assertRaises(RuntimeError):

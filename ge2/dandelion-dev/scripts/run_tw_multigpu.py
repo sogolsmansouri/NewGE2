@@ -40,6 +40,16 @@ def qualify_timing(samples, uuids, allow_shared):
     return isolated, 'shared_node_provisional' if allow_shared else 'exclusive_node'
 
 
+def pipege_python_overlay(engine, work):
+    package = engine/'repo/ge2/dandelion-dev/gege/src/python'
+    if not (package/'__init__.py').is_file():
+        raise RuntimeError('Pinned PipeGE Python package is missing')
+    overlay = work/'python'
+    overlay.mkdir()
+    (overlay/'gege').symlink_to(package.resolve(), target_is_directory=True)
+    return dict(PYTHONPATH=str(overlay), GEGE_NO_BINDINGS='1')
+
+
 def parse_training(text, system, gpus, epochs, gate=False):
     times = [int(v)/1000 for v in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
     finished = list(map(int, re.findall(r'Finished training epoch\s+(\d+)', text)))
@@ -186,7 +196,14 @@ def main():
             for name, expected in manifest['engine_hashes'].items():
                 if sha(args.engine/'build_git'/name) != expected:
                     raise ValueError('PipeGE engine mismatch: '+name)
-            env['PYTHONPATH'] = str(args.engine/'repo/ge2/dandelion-dev/gege/src/python')
+            source_tree = subprocess.check_output(
+                ['git', '-C', str(args.engine/'repo'), 'rev-parse',
+                 'HEAD:ge2/dandelion-dev/gege'], text=True).strip()
+            if source_tree != manifest['engine_tree']:
+                raise ValueError('PipeGE Python source tree mismatch')
+            subprocess.run(['git', '-C', str(args.engine/'repo'), 'diff', '--exit-code',
+                            'HEAD', '--', 'ge2/dandelion-dev/gege/src/python'], check=True)
+            env.update(pipege_python_overlay(args.engine, args.work))
             libdir = args.engine/'build_git'
             command = [str(libdir/'gege_train')]
             env.update(json.loads((args.bundle/spec['flags']).read_text()))

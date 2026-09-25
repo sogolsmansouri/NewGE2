@@ -61,6 +61,19 @@ def reused_data_contract(prepared, reference):
     return prepared['data']
 
 
+def preparation_cases(cases):
+    """Audit each selected graph once; models must share its physical view."""
+    selected = {}
+    keys = ('source', 'query', 'eval_sha', 'p', 'columns', 'nodes', 'relations', 'edges')
+    for spec in cases.values():
+        previous = selected.setdefault(spec['graph'], spec)
+        if any(previous[key] != spec[key] for key in keys):
+            raise ValueError('Selected models disagree on dataset: '+spec['graph'])
+    if not selected:
+        raise ValueError('No cases selected')
+    return list(selected.values())
+
+
 def normalize_dataset_metadata(view, expected=None):
     """Relocate a private dataset copy without changing its data contract."""
     view = Path(view).resolve()
@@ -282,7 +295,9 @@ def main():
                               + 16*1024**3) if reused else 800*1024**3
             if shutil.disk_usage(args.work).free < required_space:
                 raise RuntimeError('Insufficient disk for gate/final state and dataset preparation')
-            if host != 'c31':
+            installed = all((engine/item).exists() for item in (
+                'repo', 'build_git/libge2.so', 'build_git/gege_train', 'build_git_completed_commit.txt'))
+            if host != 'c31' and not installed:
                 engine.mkdir(parents=True, exist_ok=True)
                 for item in ('repo', 'build_git', 'build_git_completed_commit.txt'):
                     run(['rsync', '-a', '-e', 'ssh -o BatchMode=yes -o ConnectTimeout=15',
@@ -348,8 +363,7 @@ def main():
                          '--output', gradient_gate.parent], result_dir/'paired_gradient_gate.log')
             validate_gradient_gate(json.loads(gradient_gate.read_text()), hashes)
             audits = {}
-            for name in ('lj_dot', 'tw_dot', 'fb_distmult', 'wk_distmult'):
-                spec = manifest['cases'][name]
+            for spec in preparation_cases(manifest['cases']):
                 source, query = Path(spec['source']), Path(spec['query'])
                 if 'source_origin' in spec and reused is None:
                     source.mkdir(parents=True, exist_ok=True)

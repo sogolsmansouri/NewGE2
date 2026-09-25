@@ -5,11 +5,22 @@ import unittest
 import yaml
 
 from run_arc_pipege_best import (configure, engine_contract, evaluation_check, loss_contract,
-                                normalize_dataset_metadata, reused_data_contract,
+                                normalize_dataset_metadata, preparation_cases, reused_data_contract,
                                 schedule_check, training_check)
 
 
 class Contracts(unittest.TestCase):
+    def test_prepare_only_selected_graphs_and_reject_conflicting_views(self):
+        spec = dict(graph='fb', source='/fb', query='/query', eval_sha='sha', p=32,
+                    columns=3, nodes=10, relations=2, edges=100, model='complex')
+        self.assertEqual(preparation_cases({'fb_complex': spec}), [spec])
+        self.assertEqual(preparation_cases({'fb_complex': spec,
+                         'fb_distmult': dict(spec, model='distmult')}), [spec])
+        with self.assertRaisesRegex(ValueError, 'disagree'):
+            preparation_cases({'fb_complex': spec, 'fb_distmult': dict(spec, p=16)})
+        with self.assertRaisesRegex(ValueError, 'No cases'):
+            preparation_cases({})
+
     def test_new_engine_requires_complete_pins_and_gate(self):
         pinned = dict(commit='a'*40, root='/engine', gradient_gate='/gate/result.json',
                       gate_template='/fixture', hashes=dict(libge2_so='b'*64, gege_train='c'*64))

@@ -144,6 +144,10 @@ class Contracts(unittest.TestCase):
             evaluation_check(dict(value, report_directions='both', num_ranks=20000), spec)
             with self.assertRaises(ValueError):
                 evaluation_check(value, spec)
+            tail_spec = dict(spec, report_directions='tail')
+            evaluation_check(value, tail_spec)
+            with self.assertRaises(ValueError):
+                evaluation_check(dict(value, report_directions='both', num_ranks=20000), tail_spec)
 
 
 if __name__ == '__main__':

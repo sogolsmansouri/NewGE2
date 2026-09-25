@@ -194,10 +194,10 @@ def loss_contract(flags):
 
 
 def report_directions(spec):
-    expected = 'tail' if spec['graph'] == 'tw' else 'both'
-    if spec.get('report_directions', expected) != expected:
+    directions = spec.get('report_directions', 'tail' if spec['graph'] == 'tw' else 'both')
+    if directions not in ('tail', 'both') or (spec['graph'] == 'tw' and directions != 'tail'):
         raise ValueError('Evaluation direction violates the frozen reporting protocol')
-    return expected
+    return directions
 
 
 def evaluation_check(value, spec):
@@ -512,6 +512,7 @@ def main():
                            '--src-relation-bin', model_dir/'src_relations.bin', '--dst-relation-bin', model_dir/'dst_relations.bin',
                            '--score', spec['model'], '--num-nodes', spec['nodes'], '--num-relations', spec['relations'],
                            '--embedding-dim', spec['width'], '--num-test', 10000,
+                           '--report-directions', report_directions(spec),
                            '--evaluator-contract', 'pipege_unweighted_a6000_20260921',
                            '--score-contract', 'ge2_forward_inverse_relation_embeddings']
             command += ['--eval-edges', spec['query'], '--expected-eval-sha256', spec['eval_sha'],

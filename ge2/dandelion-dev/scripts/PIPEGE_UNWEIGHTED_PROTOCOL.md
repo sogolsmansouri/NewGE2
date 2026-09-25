@@ -1,5 +1,24 @@
 # PipeGE protocol decision, 2026-09-21
 
+## Updated September 25
+
+The user explicitly selected tail-only evaluation for all subsequent runs.
+New campaign manifests must set `report_directions: tail` before training or
+evaluation. The KGE evaluator skips head ranking and saves 10,000 tail ranks;
+its default both-direction mode remains available for historical reproduction.
+Do not overwrite prior both-direction results or compare them to tail-only
+numbers without labeling and aligning the direction. WK uses the existing
+public-validation panel, not hidden test labels.
+
+The WK follow-up uses the independent head/tail training-sampling setting
+`GEGE_BASELINE_TRAINING_SEMANTICS=1`. For DistMult this also retains the original
+decoder relation initialization instead of reinitializing from the entity
+initializer. Record both training changes; this is not a sampling-only ablation.
+For ComplEx relation initialization is unchanged. Training still uses both
+directions; the new tail-only selection affects evaluation, not the objective.
+
+## Historical September 21 Decision
+
 The user requested removal of the negative-softmax mass multiplier. All new
 training uses unweighted negative mass (scale 1, log bias 0). The engine rejects
 obsolete nonunit flags in both autograd loss and explicit score gradients.

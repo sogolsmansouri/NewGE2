@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Submit one preparation gate and twelve serial measurements; persist job IDs."""
+"""Submit a preparation gate and selected serial measurements; persist job IDs."""
 import argparse
 import json
 from pathlib import Path
@@ -10,12 +10,24 @@ import subprocess
 CASES = ('lj_dot', 'fb_complex', 'tw_dot', 'fb_distmult', 'wk_distmult', 'wk_complex')
 
 
+def selected_cells(value):
+    cells = [(s, c) for c in CASES for s in ('ge2', 'pipege')]
+    if value is None:
+        return cells
+    selected = [tuple(x.split(':')) for x in value.split(',')]
+    if len(set(selected)) != len(selected) or any(x not in cells for x in selected):
+        raise ValueError('Cells must be unique system:workload entries from the campaign')
+    return selected
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument('--base', required=True)
     p.add_argument('--ledger', required=True, type=Path)
     p.add_argument('--batch-script', required=True, type=Path)
+    p.add_argument('--cells', help='Optional comma-separated system:workload selection')
     args = p.parse_args()
+    cells = selected_cells(args.cells)
     if args.ledger.exists():
         raise ValueError('Queue ledger exists; inspect it instead of submitting duplicates')
     args.ledger.parent.mkdir(parents=True, exist_ok=True)
@@ -24,7 +36,7 @@ def main():
         tmp = args.ledger.with_suffix('.tmp')
         tmp.write_text(json.dumps(dict(base=args.base, jobs=jobs), indent=2)+'\n')
         tmp.replace(args.ledger)
-    order = [('prepare','all')] + [(system,case) for case in CASES for system in ('ge2','pipege')]
+    order = [('prepare','all')] + cells
     previous = gate = None
     for system, case in order:
         cmd = ['sbatch','--parsable','--hold','--nodelist=c30',

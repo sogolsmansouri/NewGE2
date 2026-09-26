@@ -6,7 +6,10 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import yaml
+
 from run_arc_paper_case import digest
+from run_arc_pipege_best import freeze_baseline_sampling
 
 
 def main():
@@ -44,6 +47,10 @@ def main():
         flags = json.loads(flags_path.read_text())
         flags.update(GEGE_BASELINE_TRAINING_SEMANTICS='1', GEGE_SOFTMAX_NEGATIVE_MASS_SCALE='1')
         flags.pop('GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS', None)
+        config_path = base/spec['config']
+        config, flags = freeze_baseline_sampling(yaml.safe_load(config_path.read_text()), flags)
+        config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+        spec['sampling_policy'] = 'independent head/tail draws; no negative-plan or state-pool reuse'
         flags_path.write_text(json.dumps(flags, indent=2, sort_keys=True)+'\n')
         if digest(Path(spec['query'])) != spec['eval_sha']:
             raise ValueError('Query hash mismatch: '+case)

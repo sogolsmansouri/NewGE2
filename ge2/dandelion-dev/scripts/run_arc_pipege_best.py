@@ -21,6 +21,8 @@ import time
 import numpy as np
 import yaml
 
+from arc_job_support import run_logged
+
 CORE = 'fa783f4b9ef685fd5bd969d3426ddce3ee324721'
 ENGINE = Path('/mnt/local/smansou2/pipege_manual_verified_284744')
 ENV = Path('/mnt/local/smansou2/ge2-a6000-cuda121')
@@ -102,6 +104,7 @@ def resolved_config_check(config_path, dataset_path, spec):
     # override the path embedded in the generated training configuration.
     from gege.tools.configuration.gege_config import load_config
     config = load_config(str(config_path), save=False)
+    baseline_sampling_contract(yaml.safe_load(Path(config_path).read_text()), os.environ)
     actual = config.storage.dataset
     if (Path(actual.dataset_dir).resolve() != Path(dataset_path).resolve()
             or (actual.num_nodes, actual.num_relations, actual.num_train) != (
@@ -193,6 +196,28 @@ def loss_contract(flags):
             raise ValueError('Only unweighted softmax is allowed: '+name)
 
 
+def baseline_sampling_contract(config, flags):
+    if flags.get('GEGE_BASELINE_TRAINING_SEMANTICS') != '1':
+        return
+    limits = dict(superbatch_negative_plan_batches=config['training']['negative_sampling'].get(
+                    'superbatch_negative_plan_batches', 0),
+                  GEGE_BATCHED_NEGATIVE_PLAN_BATCHES=flags.get('GEGE_BATCHED_NEGATIVE_PLAN_BATCHES', 0),
+                  GEGE_STATE_NEGATIVE_POOL_REFRESH_BATCHES=flags.get('GEGE_STATE_NEGATIVE_POOL_REFRESH_BATCHES', 0))
+    for name, value in limits.items():
+        if not 0 <= int(value) <= 1:
+            raise ValueError('Baseline-compatible sampling does not reuse negative plans: '+name)
+
+
+def freeze_baseline_sampling(config, flags):
+    """Make independent per-batch sampling explicit in a new frozen campaign."""
+    config, flags = copy.deepcopy(config), dict(flags)
+    config['training']['negative_sampling']['superbatch_negative_plan_batches'] = 0
+    flags.update(GEGE_BASELINE_TRAINING_SEMANTICS='1', GEGE_BATCHED_NEGATIVE_PLAN_BATCHES='0',
+                 GEGE_STATE_NEGATIVE_POOL_REFRESH_BATCHES='0')
+    baseline_sampling_contract(config, flags)
+    return config, flags
+
+
 def report_directions(spec):
     directions = spec.get('report_directions', 'tail' if spec['graph'] == 'tw' else 'both')
     if directions not in ('tail', 'both') or (spec['graph'] == 'tw' and directions != 'tail'):
@@ -224,7 +249,7 @@ def main():
     args = parser.parse_args()
     sys.path.insert(0, str(args.base/'harness/tools'))
     from prepare_ge2_partitioned_view import sha256_file, verify_bucket_order
-    from run_arc_ge2_allocated_queue import audit_data, run_logged, write_json
+    from run_arc_ge2_allocated_queue import audit_data, write_json
     from run_arc_pipege_quality import checkpoint_manifest, timing_summary, validate_gradient_gate, validate_update_checks
     from arc_accuracy_gpu_guard import foreign_gpu_pids, guarded_run
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -431,13 +456,22 @@ def main():
                 if reused is not None and audit != reused[spec['graph']]:
                     raise RuntimeError('Reused dataset changed since its prior audit: '+spec['graph'])
                 audits[spec['graph']] = audit
-            for spec in manifest['cases'].values():
-                loss_contract(json.loads((args.base/spec['flags']).read_text()))
+            for name, spec in manifest['cases'].items():
+                flags = json.loads((args.base/spec['flags']).read_text())
+                loss_contract(flags)
+                baseline_sampling_contract(yaml.safe_load((args.base/spec['config']).read_text()), flags)
                 report_directions(spec)
                 if 'schedule' in spec:
                     schedule_check((args.base/spec['schedule']).read_text(), spec)
-                configure(yaml.safe_load((args.base/spec['config']).read_text()),
+                config = configure(yaml.safe_load((args.base/spec['config']).read_text()),
                           audits[spec['graph']]['metadata'], args.work/'placeholder_model', spec, True)
+                config_path = result_dir/(name+'_preflight.yaml')
+                config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+                run([python, '-c', 'import json,sys; from run_arc_pipege_best import resolved_config_check; '
+                     'resolved_config_check(sys.argv[1],sys.argv[2],json.loads(sys.argv[3]))',
+                     config_path, audits[spec['graph']]['view'], json.dumps(spec)],
+                    result_dir/(name+'_resolved_config.log'),
+                    dict(flags, PYTHONPATH=str(args.base/'scripts')+':'+env['PYTHONPATH']))
             write_json(args.work/'prepared.json', dict(status='ready', commit=args.commit,
                        manifest_sha256=sha256_file(args.base/'manifest.json'), data=audits))
             write_json(result_dir/'data_audits.json', audits)
@@ -462,6 +496,7 @@ def main():
                 raise RuntimeError('Source/filter split changed: '+split)
         flags = json.loads((args.base/spec['flags']).read_text())
         loss_contract(flags)
+        baseline_sampling_contract(yaml.safe_load((args.base/spec['config']).read_text()), flags)
         if 'schedule' in spec:
             schedule = args.base/spec['schedule']
             schedule_check(schedule.read_text(), spec)

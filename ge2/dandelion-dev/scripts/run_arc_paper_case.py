@@ -16,6 +16,8 @@ import sys
 import time
 import zipfile
 
+from arc_job_support import run_logged, save_failure_evidence
+
 
 def digest(path):
     h = hashlib.sha256()
@@ -29,6 +31,8 @@ def hardware_check(samples, expected_power, gpu_uuid):
     if not samples:
         raise ValueError('Missing hardware samples')
     for row in samples:
+        if row.get('probe_errors'):
+            raise ValueError('Monitoring gaps: clean timing remeasurement required')
         if row.get('other_jobs') or row.get('other_processes'):
             raise ValueError('Contended node: timing rejected')
         matches = [r.split(',') for r in row['gpu'].splitlines()
@@ -104,7 +108,7 @@ def main():
     base = args.base.resolve()
     spec = json.loads((base/'campaign.json').read_text())
     sys.path[:0] = [str(base/'scripts'), str(base/'harness/tools')]
-    from run_arc_ge2_allocated_queue import run_logged, write_json
+    from run_arc_ge2_allocated_queue import write_json
     from run_arc_pipege_best import evaluation_check, normalize_dataset_metadata
     from run_arc_pipege_quality import checkpoint_manifest, timing_summary
     import yaml
@@ -288,6 +292,12 @@ def main():
         update(status='done', stage='archived', checkpoint_durable=True, result=str(summary/'result.json'))
     except BaseException as error:
         update(status='failed', error=repr(error))
+        try:
+            evidence = save_failure_evidence(results, summary/'failure_evidence')
+            update(failure_evidence=str(summary/'failure_evidence'),
+                   evidence_errors=evidence['errors'])
+        except Exception as evidence_error:
+            print('Could not preserve failure evidence: '+repr(evidence_error), file=sys.stderr)
         raise
 
 

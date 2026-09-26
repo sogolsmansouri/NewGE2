@@ -5,6 +5,7 @@ import unittest
 import yaml
 
 from run_arc_pipege_best import (configure, engine_contract, evaluation_check, loss_contract,
+                                baseline_sampling_contract, freeze_baseline_sampling,
                                 normalize_dataset_metadata, preparation_cases, reused_data_contract,
                                 schedule_check, training_check)
 
@@ -130,6 +131,23 @@ class Contracts(unittest.TestCase):
                 dict(GEGE_SOFTMAX_NEGATIVE_LOG_MASS_BIAS='2.0794415416798357')]:
             with self.assertRaises(ValueError):
                 loss_contract(flags)
+
+    def test_baseline_sampling_rejects_inherited_eight_batch_plan(self):
+        config = copy.deepcopy(self.config)
+        config['training']['negative_sampling']['superbatch_negative_plan_batches'] = 8
+        flags = dict(GEGE_BASELINE_TRAINING_SEMANTICS='1', GEGE_BATCHED_NEGATIVE_PLAN_BATCHES='8')
+        with self.assertRaisesRegex(ValueError, 'does not reuse'):
+            baseline_sampling_contract(config, flags)
+        fixed_config, fixed_flags = freeze_baseline_sampling(config, flags)
+        baseline_sampling_contract(fixed_config, fixed_flags)
+        self.assertEqual(config['training']['negative_sampling']['superbatch_negative_plan_batches'], 8)
+        self.assertEqual(flags['GEGE_BATCHED_NEGATIVE_PLAN_BATCHES'], '8')
+        expected = copy.deepcopy(config)
+        expected['training']['negative_sampling']['superbatch_negative_plan_batches'] = 0
+        self.assertEqual(fixed_config, expected)
+        for key in ('GEGE_BATCHED_NEGATIVE_PLAN_BATCHES', 'GEGE_STATE_NEGATIVE_POOL_REFRESH_BATCHES'):
+            with self.assertRaisesRegex(ValueError, 'does not reuse'):
+                baseline_sampling_contract(fixed_config, dict(fixed_flags, **{key:'8'}))
 
     def test_tw_evaluation_requires_tail_and_pinned_subset(self):
         value = dict(num_ranks=10000, report_directions='tail', filtered=True, eval_edges_sha256='query', tie_policy='pessimistic',

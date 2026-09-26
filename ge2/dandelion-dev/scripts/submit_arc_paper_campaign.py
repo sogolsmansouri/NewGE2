@@ -26,8 +26,11 @@ def main():
     p.add_argument('--ledger', required=True, type=Path)
     p.add_argument('--batch-script', required=True, type=Path)
     p.add_argument('--cells', help='Optional comma-separated system:workload selection')
+    p.add_argument('--afterany', help='Wait for these colon-separated job IDs before preparation')
     args = p.parse_args()
     cells = selected_cells(args.cells)
+    if args.afterany is not None and not re.fullmatch(r'[0-9]+(?::[0-9]+)*', args.afterany):
+        raise ValueError('Invalid preparation dependency')
     if args.ledger.exists():
         raise ValueError('Queue ledger exists; inspect it instead of submitting duplicates')
     args.ledger.parent.mkdir(parents=True, exist_ok=True)
@@ -43,11 +46,12 @@ def main():
                '--job-name=p300_'+system+'_'+case,
                '--output='+str(args.ledger.parent/'job_%j.out'),
                '--error='+str(args.ledger.parent/'job_%j.err')]
-        dependency = None
+        dependency = 'afterany:'+args.afterany if args.afterany else None
         if previous:
             dependency = 'afterok:'+gate
             if previous != gate:
                 dependency += ',afterany:'+previous
+        if dependency:
             cmd += ['--dependency='+dependency]
         cmd += [str(args.batch_script),args.base,system,case]
         output = subprocess.check_output(cmd, text=True)

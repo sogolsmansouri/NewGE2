@@ -56,6 +56,26 @@ def multigpu_flags(reference):
     return flags
 
 
+def state_workload_check(text, spec, count, epochs):
+    # State initialization records precede Starting epoch, including epoch 1.
+    segments = re.split(r'Finished training epoch\s+\d+', text)
+    evidence = []
+    for epoch, segment in enumerate(segments[:epochs], 1):
+        rows = re.findall(r'\[initializeBatches\] device=(\d+) prepare_encode=false task_id=1 items=(\d+) batches=(\d+)', segment)
+        if len(rows) != spec['states'] or {int(row[0]) for row in rows} != set(range(count)):
+            raise ValueError('Incomplete state workload records')
+        items = sum(int(row[1]) for row in rows)
+        if items != spec['edges']:
+            raise ValueError('State workload differs from frozen edge count')
+        prepared = [sum(int(row[2]) for row in rows if int(row[0]) == gpu) for gpu in range(count)]
+        actual = re.findall(rf'\[perf\]\[epoch {epoch}\]\[gpu (\d+)\] batches=(\d+)', text)
+        if (len(actual) != count or {int(row[0]) for row in actual} != set(range(count))
+                or any(int(batches) != prepared[int(gpu)] for gpu, batches in actual)):
+            raise ValueError('Completed batches differ from initialized state batches')
+        evidence.append(dict(epoch=epoch, state_items=items, completed_batches_by_gpu=prepared))
+    return evidence
+
+
 def training_check(text, spec, count, epochs, gate):
     from run_arc_pipege_quality import timing_summary
     times = [int(x)/1000 for x in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
@@ -68,7 +88,10 @@ def training_check(text, spec, count, epochs, gate):
     workload = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)
     if workload and workload != [(str(spec['edges']), str(spec['edges']))]*epochs:
         raise ValueError('Incomplete or unexpected positive-edge workload: '+repr(workload))
-    if not workload:
+    state_workload = []
+    if not workload and spec['system'] == 'pipege':
+        state_workload = state_workload_check(text, spec, count, epochs)
+    elif not workload:
         rates = [float(x) for x in re.findall(r'Edges per Second:\s*([\d.eE+-]+)', text)]
         if len(rates) != epochs or any(not math.isclose(rate*duration, spec['edges'], rel_tol=1e-5)
                                       for rate, duration in zip(rates, times)):
@@ -93,8 +116,11 @@ def training_check(text, spec, count, epochs, gate):
             observed = set(map(int, re.findall(r'\[bounded-cover-relabel\] epoch=(\d+) seed=17', text)))
             if not set(range(epochs)) <= observed:
                 raise ValueError('FB epoch relabeling did not execute for every epoch')
-    return dict(timing_summary(text, times), observed_edge_progress=bool(workload),
+    return dict(timing_summary(text, times), observed_edge_progress=bool(workload), state_workload=state_workload,
+                throughput_counter_valid=not bool(state_workload),
                 workload_evidence=('progress totals' if workload else
+                    'state edge totals and completed per-GPU batch counts; legacy throughput bucket-pair counter is invalid'
+                    if state_workload else
                     'frozen data and completed epochs; throughput reports configured cardinality, not independently counted edges'))
 
 

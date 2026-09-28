@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, split_hash_for_view, training_check
+from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, split_hash_for_view, state_workload_check, training_check
 from prepare_tw_multigpu import flags_for
 
 
@@ -114,6 +114,21 @@ class MultiGpuCampaignTests(unittest.TestCase):
             self.assertFalse(result['observed_edge_progress'])
             with self.assertRaises(ValueError):
                 training_check(log.replace('10000\n', '9000\n'), spec, 2, 2, True)
+
+    def test_state_workload_uses_real_batch_counts_not_legacy_throughput(self):
+        spec = dict(states=2, edges=100)
+        log = ''
+        for epoch in (1, 2):
+            log += ('[initializeBatches] device=0 prepare_encode=false task_id=1 items=40 batches=4\n'
+                    '[initializeBatches] device=1 prepare_encode=false task_id=1 items=60 batches=6\n'
+                    f'Finished training epoch {epoch}\nEdges per Second: 999999\n'
+                    f'[perf][epoch {epoch}][gpu 0] batches=4\n'
+                    f'[perf][epoch {epoch}][gpu 1] batches=6\n')
+        self.assertEqual(state_workload_check(log, spec, 2, 2)[1]['state_items'], 100)
+        for broken in (log.replace('items=40', 'items=39'), log.replace('batches=4\n', 'batches=3\n', 1),
+                       log.replace('[gpu 1]', '[gpu 0]'), log.replace('device=1', 'device=0')):
+            with self.assertRaises(ValueError):
+                state_workload_check(broken, spec, 2, 2)
 
 
 if __name__ == '__main__':

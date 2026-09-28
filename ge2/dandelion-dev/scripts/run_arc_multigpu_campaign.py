@@ -6,6 +6,7 @@ import datetime
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -65,8 +66,13 @@ def training_check(text, spec, count, epochs, gate):
             or re.search(r'CUDA error|out of memory|Traceback|\b(?:nan|inf)\b', text, re.I)):
         raise ValueError('Wrong trainer or numerical/runtime failure')
     workload = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)
-    if workload != [(str(spec['edges']), str(spec['edges']))]*epochs:
+    if workload and workload != [(str(spec['edges']), str(spec['edges']))]*epochs:
         raise ValueError('Incomplete or unexpected positive-edge workload: '+repr(workload))
+    if not workload:
+        rates = [float(x) for x in re.findall(r'Edges per Second:\s*([\d.eE+-]+)', text)]
+        if len(rates) != epochs or any(not math.isclose(rate*duration, spec['edges'], rel_tol=1e-5)
+                                      for rate, duration in zip(rates, times)):
+            raise ValueError('Declared epoch cardinality does not match the frozen dataset')
     if spec['system'] == 'pipege':
         plans = re.findall(r'Stateflow multi-GPU selected family=.*gpu_count=(\d+).*lanes=(\d+).*microstates=(\d+)', text)
         if not plans or any(tuple(map(int, row)) != (count, count, spec['states']) for row in plans):
@@ -87,7 +93,9 @@ def training_check(text, spec, count, epochs, gate):
             observed = set(map(int, re.findall(r'\[bounded-cover-relabel\] epoch=(\d+) seed=17', text)))
             if not set(range(epochs)) <= observed:
                 raise ValueError('FB epoch relabeling did not execute for every epoch')
-    return timing_summary(text, times)
+    return dict(timing_summary(text, times), observed_edge_progress=bool(workload),
+                workload_evidence=('progress totals' if workload else
+                    'frozen data and completed epochs; throughput reports configured cardinality, not independently counted edges'))
 
 
 def check_replicas(model, count):
@@ -407,6 +415,10 @@ def idle_node():
 
 def main():
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
+    def interrupted(sig, frame):
+        raise KeyboardInterrupt('Supervisor interrupted by signal '+str(sig))
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', type=Path, required=True)
     parser.add_argument('--commit', required=True)

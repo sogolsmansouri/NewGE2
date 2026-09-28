@@ -102,6 +102,19 @@ class MultiGpuCampaignTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 check_replicas(root, 2)
 
+    def test_original_multigpu_logs_have_no_progress_counter(self):
+        helper = types.ModuleType('run_arc_pipege_quality')
+        helper.timing_summary = lambda text, times: dict(epoch_times_s=times)
+        spec = dict(system='ge2', edges=1000000)
+        log = 'Broadcasting model to: 2 GPUs\nSynchronousMultiGPUTrainer\n'
+        for epoch in (1, 2):
+            log += f'Finished training epoch {epoch}\nEpoch Runtime: 100000ms\nEdges per Second: 10000\n'
+        with patch.dict(sys.modules, run_arc_pipege_quality=helper):
+            result = training_check(log, spec, 2, 2, True)
+            self.assertFalse(result['observed_edge_progress'])
+            with self.assertRaises(ValueError):
+                training_check(log.replace('10000\n', '9000\n'), spec, 2, 2, True)
+
 
 if __name__ == '__main__':
     unittest.main()

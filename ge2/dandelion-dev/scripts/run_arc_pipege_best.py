@@ -186,7 +186,24 @@ def training_check(text, spec, epochs):
         raise ValueError('Manual path missing or numerical/CUDA error')
     if spec['graph'] == 'tw' and 'Using bucket-streaming LP path' not in text:
         raise ValueError('TW fast bucket-streaming execution missing')
+    if spec.get('epoch_relabel'):
+        relabel_check(text, spec['p'], epochs, spec['relabel_seed'])
     return times
+
+
+def relabel_check(text, partitions, epochs, seed):
+    records = re.findall(r'\[bounded-cover-relabel\] epoch=(\d+) seed=(\d+) labels=([0-9,]+)', text)
+    if len(records) != epochs:
+        raise ValueError('Missing per-epoch partition relabeling')
+    labels_seen = []
+    for expected_epoch, (epoch, actual_seed, labels) in enumerate(records):
+        labels = tuple(int(x) for x in labels.strip(',').split(','))
+        if (int(epoch) != expected_epoch or int(actual_seed) != seed
+                or sorted(labels) != list(range(partitions))):
+            raise ValueError('Invalid epoch relabel permutation/seed')
+        labels_seen.append(labels)
+    if epochs > 1 and len(set(labels_seen)) == 1:
+        raise ValueError('Epoch relabeling repeated a fixed permutation')
 
 
 def loss_contract(flags):

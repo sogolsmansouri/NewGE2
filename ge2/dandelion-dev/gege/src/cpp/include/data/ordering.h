@@ -1,6 +1,7 @@
 #pragma once
 
 #include "batch.h"
+#include <cstdint>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -246,6 +247,10 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
     int num_partitions,
     int buffer_capacity,
     const vector<int64_t>& edge_bucket_sizes);
+
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEpochRelabeledBoundedCoverOrdering(
+    int num_partitions, int buffer_capacity, const vector<int64_t>& edge_bucket_sizes,
+    uint64_t seed, uint64_t epoch);
 
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(
     int num_partitions,

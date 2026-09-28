@@ -26,8 +26,7 @@ def main():
     archive = Path('/mnt/beegfs/smansou2/paper_matched_300w_20260925')
     data = Path('/mnt/beegfs/smansou2/fb_eval_recheck_20260928/data')
     cases = []
-    for name in ('290698_pipege_fb_complex', '290702_pipege_fb_distmult',
-                 '290697_ge2_fb_complex', '290701_ge2_fb_distmult'):
+    for name in ('290698_pipege_fb_complex', '290702_pipege_fb_distmult'):
         source = previous/name
         destination = args.out/'previous'/name
         destination.mkdir(parents=True)

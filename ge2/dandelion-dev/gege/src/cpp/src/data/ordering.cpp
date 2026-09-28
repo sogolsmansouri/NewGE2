@@ -9786,6 +9786,59 @@ std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverEd
     return convertEdgeBucketOrderToTensors(buffer_states, edge_buckets_per_buffer);
 }
 
+std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getEpochRelabeledBoundedCoverOrdering(
+    int num_partitions, int buffer_capacity, const vector<int64_t> &edge_bucket_sizes,
+    uint64_t seed, uint64_t epoch) {
+    if (buffer_capacity < 2 || num_partitions < buffer_capacity) {
+        throw std::invalid_argument("Epoch relabeling requires 2<=q<=p");
+    }
+    auto original = getBoundedGreedyCoverEdgeBucketOrdering(num_partitions, buffer_capacity, edge_bucket_sizes);
+    if (std::get<0>(original).empty()) {
+        throw std::runtime_error("Cannot relabel an empty bounded cover");
+    }
+    // A single bijection preserves every overlap; do not shuffle the state path.
+    // Its private RNG leaves batch shuffling and negative-sampler RNGs untouched.
+    std::seed_seq seeds{static_cast<uint32_t>(seed), static_cast<uint32_t>(seed >> 32),
+                        static_cast<uint32_t>(epoch), static_cast<uint32_t>(epoch >> 32)};
+    std::mt19937_64 rng(seeds);
+    vector<int> labels(num_partitions);
+    std::iota(labels.begin(), labels.end(), 0);
+    std::shuffle(labels.begin(), labels.end(), rng);
+    vector<vector<int>> states;
+    for (const auto &tensor : std::get<0>(original)) {
+        auto ids = tensor.to(torch::kCPU).to(torch::kInt64).contiguous();
+        vector<int> state;
+        for (int64_t i = 0; i < ids.numel(); i++) {
+            state.push_back(labels.at(ids.data_ptr<int64_t>()[i]));
+        }
+        std::sort(state.begin(), state.end());
+        states.push_back(std::move(state));
+    }
+    // Rebalance against the real (unpermuted) bucket sizes after relabeling.
+    auto buckets = balancedAssignEdgeBucketsToBuffers(states, num_partitions, edge_bucket_sizes);
+    vector<int> seen(static_cast<std::size_t>(num_partitions) * num_partitions, 0);
+    for (std::size_t i = 0; i < buckets.size(); i++) {
+        for (const auto &bucket : buckets[i]) {
+            if (!std::binary_search(states.at(i).begin(), states.at(i).end(), bucket.first) ||
+                !std::binary_search(states.at(i).begin(), states.at(i).end(), bucket.second) ||
+                ++seen.at(bucket.first * num_partitions + bucket.second) != 1) {
+                throw std::runtime_error("Invalid relabeled bucket assignment");
+            }
+        }
+    }
+    if (std::any_of(seen.begin(), seen.end(), [](int count) { return count != 1; })) {
+        throw std::runtime_error("Relabeled cover omitted a directed bucket");
+    }
+    std::ostringstream label_text;
+    for (auto label : labels) {
+        label_text << label << ',';
+    }
+    SPDLOG_INFO("[bounded-cover-relabel] epoch={} seed={} labels={}", epoch, seed, label_text.str());
+    log_cover_ordering_summary("Relabeled bounded GREEDY_COVER ordering", states, buckets,
+                               num_partitions, edge_bucket_sizes);
+    return convertEdgeBucketOrderToTensors(states, buckets);
+}
+
 std::tuple<vector<torch::Tensor>, vector<torch::Tensor>> getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(
     int num_partitions,
     int buffer_capacity,

@@ -7,10 +7,19 @@ import yaml
 from run_arc_pipege_best import (configure, engine_contract, evaluation_check, loss_contract,
                                 baseline_sampling_contract, freeze_baseline_sampling,
                                 normalize_dataset_metadata, preparation_cases, reused_data_contract,
-                                schedule_check, training_check)
+                                relabel_check, schedule_check, training_check)
 
 
 class Contracts(unittest.TestCase):
+    def test_epoch_relabel_receipt(self):
+        text = ('[bounded-cover-relabel] epoch=0 seed=17 labels=1,2,0,\n'
+                '[bounded-cover-relabel] epoch=1 seed=17 labels=2,0,1,\n')
+        relabel_check(text, 3, 2, 17)
+        for invalid in (text.replace('epoch=1', 'epoch=0'), text.replace('seed=17', 'seed=18'),
+                        text.replace('2,0,1,', '1,2,0,'), text.replace('2,0,1,', '1,1,0,'), ''):
+            with self.assertRaises(ValueError):
+                relabel_check(invalid, 3, 2, 17)
+
     def test_prepare_only_selected_graphs_and_reject_conflicting_views(self):
         spec = dict(graph='fb', source='/fb', query='/query', eval_sha='sha', p=32,
                     columns=3, nodes=10, relations=2, edges=100, model='complex')

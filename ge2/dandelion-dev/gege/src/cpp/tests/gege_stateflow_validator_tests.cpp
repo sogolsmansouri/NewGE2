@@ -331,6 +331,68 @@ void test_bounded_q4_scheduler_is_parameterized() {
     expect_tensor_schedule_max_admits(buffer_states, kBufferCapacity, 3);
 }
 
+void test_epoch_relabel_preserves_cover_and_overlap() {
+    ScopedEnvVar order_file("GEGE_BOUNDED_STATE_ORDER_FILE", nullptr);
+    ScopedEnvVar optimal88("GEGE_BOUNDED_Q4_OPTIMAL88", "1");
+    ScopedEnvVar iterations("GEGE_BOUNDED_Q4_OPTIMAL88_ITERS", "0");
+    ScopedEnvVar max_admits("GEGE_STATEFLOW_MAX_ADMITS", "3");
+    constexpr int p = 32;
+    vector<int64_t> sizes(p * p);
+    for (int i = 0; i < p * p; i++) {
+        sizes[i] = (i % 19 == 0) ? 100000 : i % 7;
+    }
+    auto original = getBoundedGreedyCoverEdgeBucketOrdering(p, 4, sizes);
+    auto first = getEpochRelabeledBoundedCoverOrdering(p, 4, sizes, 17, 0);
+    auto repeated = getEpochRelabeledBoundedCoverOrdering(p, 4, sizes, 17, 0);
+    auto next = getEpochRelabeledBoundedCoverOrdering(p, 4, sizes, 17, 1);
+    expect_true(std::get<0>(original).size() == 88, "p32 relabel fixture must have 88 states");
+    bool changed = false;
+    auto overlap = [](torch::Tensor a, torch::Tensor b) {
+        auto left = tensor_to_vector(a), right = tensor_to_vector(b);
+        int count = 0;
+        for (auto id : left) {
+            count += std::find(right.begin(), right.end(), id) != right.end();
+        }
+        return count;
+    };
+    for (std::size_t i = 0; i < std::get<0>(first).size(); i++) {
+        expect_true(torch::equal(std::get<0>(first)[i], std::get<0>(repeated)[i]) &&
+                    torch::equal(std::get<1>(first)[i], std::get<1>(repeated)[i]),
+                    "same epoch and seed must reproduce the entire schedule");
+        changed |= !torch::equal(std::get<0>(first)[i], std::get<0>(next)[i]);
+    }
+    expect_true(changed, "consecutive epochs should not repeat the partition groupings");
+    for (const auto &ordering : {first, next}) {
+        const auto &states = std::get<0>(ordering), &buckets = std::get<1>(ordering);
+        expect_true(states.size() == 88 && buckets.size() == 88, "state count must be preserved");
+        vector<int> seen(p * p, 0);
+        for (std::size_t i = 0; i < states.size(); i++) {
+            auto ids = tensor_to_vector(states[i]), pairs = tensor_to_vector(buckets[i]);
+            expect_true(ids.size() == 4, "capacity changed");
+            expect_true(pairs.size() % 2 == 0, "invalid bucket shape");
+            for (std::size_t j = 0; j < pairs.size(); j += 2) {
+                expect_true(std::find(ids.begin(), ids.end(), pairs[j]) != ids.end() &&
+                            std::find(ids.begin(), ids.end(), pairs[j+1]) != ids.end(),
+                            "bucket endpoint missing from state");
+                seen.at(pairs[j] * p + pairs[j+1])++;
+            }
+            if (i > 0) {
+                expect_true(overlap(states[i-1], states[i]) ==
+                            overlap(std::get<0>(original)[i-1], std::get<0>(original)[i]),
+                            "per-transition overlap changed");
+            }
+        }
+        expect_true(std::all_of(seen.begin(), seen.end(), [](int n) { return n == 1; }),
+                    "every directed bucket including diagonals must be assigned once");
+        expect_tensor_schedule_max_admits(states, 4, 3);
+    }
+    torch::manual_seed(456);
+    auto expected_random = torch::rand({8});
+    torch::manual_seed(456);
+    getEpochRelabeledBoundedCoverOrdering(p, 4, sizes, 17, 0);
+    expect_true(torch::equal(expected_random, torch::rand({8})), "relabeling consumed the training RNG");
+}
+
 StateflowPlan build_bounded_q4_multi_gpu_plan(int active_devices) {
     constexpr int kNumPartitions = 32;
     constexpr int kBufferCapacity = 4;
@@ -395,6 +457,7 @@ int main() {
         {"bounded_q4_static_p30_schedule_stats", test_bounded_q4_static_p30_schedule_stats},
         {"bounded_q4_scheduler_trains_diagonal_buckets_once", test_bounded_q4_scheduler_trains_diagonal_buckets_once},
         {"bounded_q4_scheduler_is_parameterized", test_bounded_q4_scheduler_is_parameterized},
+        {"epoch_relabel_preserves_cover_and_overlap", test_epoch_relabel_preserves_cover_and_overlap},
         {"bounded_q4_lane_matched_respects_three_admit_cap", test_bounded_q4_lane_matched_respects_three_admit_cap},
     };
 

@@ -1366,6 +1366,12 @@ void DataLoader::setBufferOrdering() {
             bool used_stateflow_lane_matching = false;
             bool used_bounded_greedy_cover_q4 = false;
             bool stateflow_single_gpu_planner_requested = parse_env_flag("GEGE_STATEFLOW_PLANNER", false);
+            bool epoch_relabel = train_ && parse_env_flag("GEGE_BOUNDED_COVER_EPOCH_RELABEL", false);
+            if (epoch_relabel && (!bounded_greedy_cover_q4_supported || requested_active_devices != 1 ||
+                                  physical_devices != 1 || hybrid_cover_schedule_requested ||
+                                  stateflow_single_gpu_planner_requested)) {
+                throw GegeRuntimeException("Epoch relabeling requires the single-GPU bounded-cover path");
+            }
             if (bounded_greedy_cover_q4_requested && !bounded_greedy_cover_q4_supported) {
                 SPDLOG_WARN(
                     "Ignoring bounded GREEDY_COVER because it requires CUSTOM ordering, a valid buffer capacity, "
@@ -1413,6 +1419,13 @@ void DataLoader::setBufferOrdering() {
                 if (requested_active_devices > 1) {
                     tup = getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(options->num_partitions, options->buffer_capacity,
                                                                           requested_active_devices, edge_bucket_sizes);
+                } else if (epoch_relabel) {
+                    int64_t seed = parse_env_int("GEGE_BOUNDED_COVER_RELABEL_SEED", 17);
+                    if (seed < 0) {
+                        throw GegeRuntimeException("Epoch relabel seed must be nonnegative");
+                    }
+                    tup = getEpochRelabeledBoundedCoverOrdering(options->num_partitions, options->buffer_capacity,
+                                                               edge_bucket_sizes, seed, epochs_processed_);
                 } else {
                     tup = getBoundedGreedyCoverEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, edge_bucket_sizes);
                 }

@@ -6,11 +6,22 @@ import types
 import unittest
 from unittest.mock import patch
 
-from run_arc_multigpu_campaign import check_replicas, multigpu_config, training_check
+from run_arc_multigpu_campaign import check_replicas, multigpu_config, split_hash_for_view, training_check
 from prepare_tw_multigpu import flags_for
 
 
 class MultiGpuCampaignTests(unittest.TestCase):
+    def test_repartitioned_heldout_rows_use_view_hash(self):
+        canonical = dict(splits=dict(validation=dict(sha256='source')))
+        view = dict(num_partitions=32, splits=dict(validation=dict(source_sha256='source', output_sha256='reordered')))
+        self.assertEqual(split_hash_for_view('validation', canonical, view, 32), 'reordered')
+        self.assertEqual(split_hash_for_view('validation', canonical, {}, 16), 'source')
+        with self.assertRaises(ValueError):
+            split_hash_for_view('validation', canonical, view, 16)
+        view['splits']['validation']['source_sha256'] = 'different'
+        with self.assertRaises(ValueError):
+            split_hash_for_view('validation', canonical, view, 32)
+
     def test_preserves_fb_reference_and_disables_native_eval(self):
         reference = dict(model=dict(random_seed=17), storage=dict(device_ids=[0], prefetch=False,
             embeddings=dict(options=dict(num_partitions=32, buffer_capacity=4))),

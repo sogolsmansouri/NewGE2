@@ -36,6 +36,15 @@ def multigpu_config(reference, count, system):
     return cfg
 
 
+def split_hash_for_view(split, canonical, view, partitions):
+    if not view:
+        return canonical['splits'][split]['sha256']
+    item = view['splits'][split]
+    if view['num_partitions'] != partitions or item['source_sha256'] != canonical['splits'][split]['sha256']:
+        raise ValueError('Partitioned view does not derive from the audited canonical split')
+    return item['output_sha256']
+
+
 def training_check(text, spec, count, epochs, gate):
     from run_arc_pipege_quality import timing_summary
     times = [int(x)/1000 for x in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
@@ -126,17 +135,23 @@ def prepare(base, commit, execute):
         data = Path(audited['data'][cell['graph']]['view'] if system == 'pipege' else cell['source'])
         expected = dict(audited['data'][cell['graph']])
         expected_train = expected['train_view_sha256'] if system == 'pipege' else expected['splits']['train']['sha256']
+        view_path = data/'partitioned_view_manifest.json'
+        view = json.loads(view_path.read_text()) if view_path.exists() and system == 'pipege' and cell['p'] != 16 else {}
         data_hashes = {}
         for split in ('train', 'validation', 'test'):
             path = data/'edges'/f'{split}_edges.bin'
             value = digest(path)
-            wanted = expected_train if split == 'train' else expected['splits'][split]['sha256']
+            wanted = split_hash_for_view(split, expected, view, cfg['storage']['embeddings']['options']['num_partitions'])
+            if split == 'train' and wanted != expected_train:
+                raise ValueError('Training view disagrees with its previously verified fingerprint')
             if value != wanted:
                 raise ValueError('Prepared input changed: '+str(path))
             data_hashes[str(path.relative_to(data))] = value
         for split in ('train', 'validation', 'test'):
             offsets = data/'edges'/f'{split}_partition_offsets.txt'
             data_hashes[str(offsets.relative_to(data))] = digest(offsets)
+            if view and data_hashes[str(offsets.relative_to(data))] != view['splits'][split]['partition_offsets_sha256']:
+                raise ValueError('Partitioned view bucket counts changed')
         if system == 'pipege' and data_hashes['edges/train_partition_offsets.txt'] != expected['train_offsets_sha256']:
             raise ValueError('Audited bucket counts changed')
         if digest(Path(cell['query'])) != cell['eval_sha']:

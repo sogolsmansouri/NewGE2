@@ -86,10 +86,28 @@ def main():
         if digest(Path(__file__)) != digest(scripts/Path(__file__).name):
             raise RuntimeError('Control driver is not from the pinned commit')
         build = engine/'build_git'
-        shutil.copytree(args.payload/'build', build)
-        for name, expected in build_info['binaries'].items():
-            if digest(build/name) != expected:
-                raise RuntimeError('Native binary changed: '+name)
+        prefix = Path('/mnt/local/smansou2/ge2-a6000-cuda121')
+        compiler = prefix/'bin/x86_64-conda-linux-gnu-c++'
+        build_env = dict(os.environ, PATH=f'{prefix}/bin:/usr/bin:/bin',
+                         CUDA_HOME=str(prefix), CUDA_PATH=str(prefix),
+                         CXX=str(compiler), CUDACXX=str(prefix/'bin/nvcc'),
+                         LD_LIBRARY_PATH=f'{prefix}/lib:{prefix}/lib/python3.9/site-packages/torch/lib:/usr/lib64')
+        build_env.pop('PYTHONPATH', None)
+        build_env.pop('PYTHONHOME', None)
+        command([prefix/'bin/cmake', '-S', engine/'repo/ge2/dandelion-dev/gege', '-B', build,
+                 '-DUSE_CUDA=ON', '-DUSE_OMP=OFF', '-DBUILD_TESTING=ON', '-DCMAKE_BUILD_TYPE=Release',
+                 '-DCMAKE_CUDA_ARCHITECTURES=86', '-DCMAKE_CUDA_COMPILER='+str(prefix/'bin/nvcc'),
+                 '-DCMAKE_CXX_COMPILER='+str(compiler), '-DCMAKE_CUDA_HOST_COMPILER='+str(compiler),
+                 '-DCUDA_TOOLKIT_ROOT_DIR='+str(prefix), '-DPYTHON_EXECUTABLE='+sys.executable,
+                 '-DPython3_EXECUTABLE='+sys.executable,
+                 f'-DCMAKE_BUILD_RPATH={build};{prefix}/lib;{prefix}/lib/python3.9/site-packages/torch/lib'],
+                'configure_arc', build_env)
+        command([prefix/'bin/cmake', '--build', build, '--target', 'gege_train',
+                 'gege_stateflow_validator_tests', 'gege_manual_training_update_test',
+                 'gege_manual_backward_test', '-j', '4'], 'build_arc', build_env)
+        build_info['local_verified_binaries'] = build_info['binaries']
+        build_info['binaries'] = {name: digest(build/name) for name in build_info['binaries']}
+        build_info['deployment_build'] = 'Compiled natively on c30 from the pinned source'
         (engine/'build_git_completed_commit.txt').write_text(args.commit+'\n')
         cases = {}
         for name in ('fb_complex', 'fb_distmult'):

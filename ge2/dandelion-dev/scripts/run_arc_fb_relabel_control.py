@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -15,6 +16,8 @@ from run_arc_paper_case import archive_checkpoint, digest, verify_evaluation_art
 
 
 def main():
+    # Some Slurm launchers leave SIGCHLD blocked; CMake/libuv needs delivery.
+    signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--payload', type=Path, required=True)
     parser.add_argument('--commit', required=True)
@@ -98,7 +101,12 @@ def main():
                  '-DUSE_CUDA=ON', '-DUSE_OMP=OFF', '-DBUILD_TESTING=ON', '-DCMAKE_BUILD_TYPE=Release',
                  '-DCMAKE_CUDA_ARCHITECTURES=86', '-DCMAKE_CUDA_COMPILER='+str(prefix/'bin/nvcc'),
                  '-DCMAKE_CXX_COMPILER='+str(compiler), '-DCMAKE_CUDA_HOST_COMPILER='+str(compiler),
-                 '-DCUDA_TOOLKIT_ROOT_DIR='+str(prefix), '-DPYTHON_EXECUTABLE='+sys.executable,
+                 '-DCUDA_HOST_COMPILER='+str(compiler),
+                 '-DCUDA_TOOLKIT_ROOT_DIR='+str(prefix), '-DCUDAToolkit_ROOT='+str(prefix),
+                 '-DCUDA_CUDA_LIBRARY=/usr/lib64/libcuda.so', '-DCUDA_CUDA_LIB=/usr/lib64/libcuda.so',
+                 '-DLIBNVTOOLSEXT='+str(prefix/'lib/libnvToolsExt.so'),
+                 f'-DCMAKE_LIBRARY_PATH={prefix}/lib;{prefix}/targets/x86_64-linux/lib;/usr/lib64',
+                 '-DPYTHON_EXECUTABLE='+sys.executable,
                  '-DPython3_EXECUTABLE='+sys.executable,
                  f'-DCMAKE_BUILD_RPATH={build};{prefix}/lib;{prefix}/lib/python3.9/site-packages/torch/lib'],
                 'configure_arc', build_env)

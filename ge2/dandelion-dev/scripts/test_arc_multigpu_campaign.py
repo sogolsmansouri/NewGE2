@@ -6,7 +6,7 @@ import types
 import unittest
 from unittest.mock import patch
 
-from run_arc_multigpu_campaign import check_replicas, multigpu_config, split_hash_for_view, training_check
+from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, split_hash_for_view, training_check
 from prepare_tw_multigpu import flags_for
 
 
@@ -43,13 +43,17 @@ class MultiGpuCampaignTests(unittest.TestCase):
             multigpu_config(reference, 4, 'pipege')
 
     def test_flags_preserve_relabel_and_frame_budget(self):
-        flags = flags_for(dict(GEGE_BOUNDED_COVER_EPOCH_RELABEL='1', GEGE_BOUNDED_COVER_RELABEL_SEED='17',
+        flags = multigpu_flags(dict(GEGE_BOUNDED_COVER_EPOCH_RELABEL='1', GEGE_BOUNDED_COVER_RELABEL_SEED='17',
                               GEGE_FRAME_CACHE_HIDDEN_FRAMES='6', GEGE_FRAME_CACHE_FIXED_PRELOAD_FRAMES='-1'))
         self.assertEqual(flags['GEGE_BOUNDED_COVER_EPOCH_RELABEL'], '1')
         self.assertEqual(flags['GEGE_BOUNDED_COVER_RELABEL_SEED'], '17')
         self.assertEqual(flags['GEGE_FRAME_CACHE_HIDDEN_FRAMES'], '6')
         self.assertEqual(flags['GEGE_FRAME_CACHE_FIXED_PRELOAD_FRAMES'], '-1')
         self.assertEqual(flags['GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD'], '1')
+        self.assertEqual(flags['GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET'], '0')
+        self.assertEqual(flags['GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH'], '1')
+        with self.assertRaises(ValueError):
+            multigpu_flags({'GEGE_FRAME_CACHE_FIXED_PRELOAD_FRAMES': '3'})
 
     def log(self, spec, count):
         rows = (spec['nodes']+spec['p']-1)//spec['p']

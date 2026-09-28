@@ -45,6 +45,16 @@ def split_hash_for_view(split, canonical, view, partitions):
     return item['output_sha256']
 
 
+def multigpu_flags(reference):
+    if int(reference.get('GEGE_FRAME_CACHE_FIXED_PRELOAD_FRAMES', '-1')) >= 0:
+        raise ValueError('Dedicated fixed-frame multi-GPU execution is not implemented')
+    flags = flags_for(reference)
+    # The existing peer path has independent source snapshots. Do not advertise
+    # the single-GPU no-extra-staging contract for that implementation.
+    flags['GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET'] = '0'
+    return flags
+
+
 def training_check(text, spec, count, epochs, gate):
     from run_arc_pipege_quality import timing_summary
     times = [int(x)/1000 for x in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
@@ -95,7 +105,7 @@ def check_replicas(model, count):
     return dict(replicas=count, equal=True, hashes={p.name:digest(p) for p in paths})
 
 
-def prepare(base, commit, execute):
+def prepare(base, commit, execute, reuse_build=None):
     old = Path('/mnt/local/smansou2/paper_matched_300w_20260925')
     old_manifest = json.loads((old/'manifest.json').read_text())
     audited = json.loads((old/'work/prepared.json').read_text())
@@ -161,7 +171,7 @@ def prepare(base, commit, execute):
         shutil.copy2(reference/'config.yaml', ref/'single_gpu.yaml')
         write_json(ref/'single_gpu.flags.json', flags)
         if system == 'pipege':
-            flags = flags_for(flags)
+            flags = multigpu_flags(flags)
             if case == 'tw_dot':
                 schedule = old/old_manifest['cases'][case]['schedule']
                 cover_check(schedule.read_text())
@@ -176,6 +186,8 @@ def prepare(base, commit, execute):
             cellspec = dict(cell, system=system, gpus=count, reference=str(reference),
                 config=str(path), flags=str(ref/f'{count}gpu.flags.json'), data=str(data),
                 data_hashes=data_hashes, batch_semantics='50K per GPU, not fixed global batch',
+                memory_contract=('unchanged visible/shared cache plus separate P2P snapshot workspace; '
+                                 'not a strict total-frame-budget experiment' if system == 'pipege' else 'released GE2'),
                 p=multi['storage']['embeddings']['options']['num_partitions'])
             cases[name] = cellspec
     prefix = Path('/mnt/local/smansou2/ge2-a6000-cuda121')
@@ -185,7 +197,22 @@ def prepare(base, commit, execute):
         LD_LIBRARY_PATH=f'{prefix}/lib:{prefix}/lib/python3.9/site-packages/torch/lib:/usr/lib64')
     env.pop('PYTHONPATH', None)
     env.pop('PYTHONHOME', None)
-    execute([prefix/'bin/cmake', '-S', repo/'ge2/dandelion-dev/gege', '-B', build,
+    build_commit = commit
+    if reuse_build is not None:
+        prior = json.loads((reuse_build/'manifest.json').read_text())
+        old_tree = subprocess.check_output(['git', '-C', str(reuse_build/'engine/repo'), 'rev-parse',
+                                           prior['commit']+':ge2/dandelion-dev/gege'], text=True).strip()
+        new_tree = subprocess.check_output(['git', '-C', str(repo), 'rev-parse',
+                                           commit+':ge2/dandelion-dev/gege'], text=True).strip()
+        if old_tree != new_tree:
+            raise ValueError('Cannot reuse native build: engine source tree differs')
+        for name, expected in prior['engine_hashes'].items():
+            if digest(reuse_build/'engine/build_git'/name) != expected:
+                raise ValueError('Reused native binary changed')
+        build.symlink_to((reuse_build/'engine/build_git').resolve(), target_is_directory=True)
+        build_commit = prior.get('built_engine_commit', prior['commit'])
+    else:
+        execute([prefix/'bin/cmake', '-S', repo/'ge2/dandelion-dev/gege', '-B', build,
         '-DUSE_CUDA=ON', '-DUSE_OMP=OFF', '-DBUILD_TESTING=ON', '-DCMAKE_BUILD_TYPE=Release',
         '-DCMAKE_CUDA_ARCHITECTURES=86', '-DCMAKE_CUDA_COMPILER='+str(prefix/'bin/nvcc'),
         '-DCMAKE_CXX_COMPILER='+str(compiler), '-DCMAKE_CUDA_HOST_COMPILER='+str(compiler),
@@ -194,12 +221,12 @@ def prepare(base, commit, execute):
         '-DCUDA_CUDA_LIB=/usr/lib64/libcuda.so', '-DLIBNVTOOLSEXT='+str(prefix/'lib/libnvToolsExt.so'),
         f'-DCMAKE_LIBRARY_PATH={prefix}/lib;{prefix}/targets/x86_64-linux/lib;/usr/lib64',
         '-DPYTHON_EXECUTABLE='+sys.executable, '-DPython3_EXECUTABLE='+sys.executable,
-        f'-DCMAKE_BUILD_RPATH={build};{prefix}/lib;{prefix}/lib/python3.9/site-packages/torch/lib'], env, 'configure')
-    execute([prefix/'bin/cmake', '--build', build, '--target', 'gege_train', 'gege_stateflow_validator_tests',
-             'gege_manual_training_update_test', 'gege_manual_backward_test', '-j', '4'], env, 'build')
+            f'-DCMAKE_BUILD_RPATH={build};{prefix}/lib;{prefix}/lib/python3.9/site-packages/torch/lib'], env, 'configure')
+        execute([prefix/'bin/cmake', '--build', build, '--target', 'gege_train', 'gege_stateflow_validator_tests',
+                 'gege_manual_training_update_test', 'gege_manual_backward_test', '-j', '4'], env, 'build')
     for target in ('gege_stateflow_validator_tests', 'gege_manual_backward_test', 'gege_manual_training_update_test'):
         execute([build/target], env, target)
-    manifest = dict(commit=commit, cases=cases, env=str(prefix), power_w=300,
+    manifest = dict(commit=commit, built_engine_commit=build_commit, cases=cases, env=str(prefix), power_w=300,
         engine_hashes={name:digest(build/name) for name in ('libge2.so', 'gege_train')},
         ge2_library_sha256=GE2_LIB, ge2_source_sha256=digest(base/'ge2.zip'),
         files={str(p.relative_to(base)):digest(p) for directory in ('references', 'harness', 'scripts')
@@ -219,6 +246,8 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
     work.mkdir(parents=True, exist_ok=False)
     model, data = work/'model', work/'data'
     state = dict(case=name, phase=phase, status='preflight', commit=manifest['commit'],
+                 built_engine_commit=manifest.get('built_engine_commit', manifest['commit']),
+                 memory_contract=spec['memory_contract'],
                  manifest_sha256=digest(base/'manifest.json'), paper_ready=False, checkpoint_durable=False)
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
@@ -382,6 +411,8 @@ def main():
     parser.add_argument('--base', type=Path, required=True)
     parser.add_argument('--commit', required=True)
     parser.add_argument('--cases', nargs='+')
+    parser.add_argument('--reuse-build', type=Path)
+    parser.add_argument('--wait-for-lock', action='store_true')
     args = parser.parse_args()
     base = args.base.resolve()
     if not str(base).startswith('/mnt/local/smansou2/'):
@@ -398,7 +429,6 @@ def main():
     archive = Path('/mnt/beegfs/smansou2')/base.name
     archive.mkdir(parents=True, exist_ok=True)
     lock = Path('/mnt/local/smansou2/paper_multigpu.lock').open('a')
-    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     state = dict(job=job, commit=args.commit, status='preparing', completed=[], failures={}, remaining=[])
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
@@ -413,13 +443,25 @@ def main():
             raise RuntimeError(f'{name} exited {rc}')
     try:
         update()
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if not args.wait_for_lock:
+                    raise
+                if deadline-time.time() < 1800:
+                    update(status='waiting_next_allocation', stage='node_lock_not_acquired')
+                    return
+                update(status='queued', stage='waiting_for_serial_node_lock', remaining=args.cases or [])
+                time.sleep(30)
         idle_node()
         if (base/'manifest.json').exists():
             manifest = json.loads((base/'manifest.json').read_text())
             if manifest['commit'] != args.commit:
                 raise ValueError('Cannot reuse a campaign with a different commit')
         else:
-            manifest = prepare(base, args.commit, execute)
+            manifest = prepare(base, args.commit, execute, args.reuse_build)
         sys.path.insert(0, str(base/'harness/tools'))
         shutil.copy2(base/'manifest.json', summary/'manifest.json')
         order = args.cases or [f'{system}_{case}_{count}gpu' for count in (2, 4)

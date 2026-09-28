@@ -1367,10 +1367,12 @@ void DataLoader::setBufferOrdering() {
             bool used_bounded_greedy_cover_q4 = false;
             bool stateflow_single_gpu_planner_requested = parse_env_flag("GEGE_STATEFLOW_PLANNER", false);
             bool epoch_relabel = train_ && parse_env_flag("GEGE_BOUNDED_COVER_EPOCH_RELABEL", false);
-            if (epoch_relabel && (!bounded_greedy_cover_q4_supported || requested_active_devices != 1 ||
-                                  physical_devices != 1 || hybrid_cover_schedule_requested ||
-                                  stateflow_single_gpu_planner_requested)) {
-                throw GegeRuntimeException("Epoch relabeling requires the single-GPU bounded-cover path");
+            bool relabel_devices_supported = requested_active_devices == physical_devices &&
+                (physical_devices == 1 || ((physical_devices == 2 || physical_devices == 4) &&
+                                          options->buffer_capacity == 4 && stateflow_lane_matching_requested));
+            if (epoch_relabel && (!bounded_greedy_cover_q4_supported || !relabel_devices_supported ||
+                                  hybrid_cover_schedule_requested || stateflow_single_gpu_planner_requested)) {
+                throw GegeRuntimeException("Epoch relabeling requires a bounded cover and either one GPU or 2/4 lane-matched GPUs with q=4");
             }
             if (bounded_greedy_cover_q4_requested && !bounded_greedy_cover_q4_supported) {
                 SPDLOG_WARN(
@@ -1416,16 +1418,17 @@ void DataLoader::setBufferOrdering() {
                 }
             } else if (bounded_greedy_cover_q4_supported) {
                 auto edge_bucket_sizes = graph_storage_->storage_ptrs_.edges->getEdgeBucketSizes();
-                if (requested_active_devices > 1) {
-                    tup = getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(options->num_partitions, options->buffer_capacity,
-                                                                          requested_active_devices, edge_bucket_sizes);
-                } else if (epoch_relabel) {
+                if (epoch_relabel) {
                     int64_t seed = parse_env_int("GEGE_BOUNDED_COVER_RELABEL_SEED", 17);
                     if (seed < 0) {
                         throw GegeRuntimeException("Epoch relabel seed must be nonnegative");
                     }
                     tup = getEpochRelabeledBoundedCoverOrdering(options->num_partitions, options->buffer_capacity,
                                                                edge_bucket_sizes, seed, epochs_processed_);
+                    // Compile lane ownership and peer descriptors from these actual labels below.
+                } else if (requested_active_devices > 1) {
+                    tup = getBoundedGreedyCoverMultiGpuEdgeBucketOrdering(options->num_partitions, options->buffer_capacity,
+                                                                          requested_active_devices, edge_bucket_sizes);
                 } else {
                     tup = getBoundedGreedyCoverEdgeBucketOrdering(options->num_partitions, options->buffer_capacity, edge_bucket_sizes);
                 }

@@ -393,6 +393,29 @@ void test_epoch_relabel_preserves_cover_and_overlap() {
     expect_true(torch::equal(expected_random, torch::rand({8})), "relabeling consumed the training RNG");
 }
 
+void test_epoch_relabel_multi_gpu_plans() {
+    ScopedEnvVar order_file("GEGE_BOUNDED_STATE_ORDER_FILE", nullptr);
+    ScopedEnvVar optimal88("GEGE_BOUNDED_Q4_OPTIMAL88", "1");
+    ScopedEnvVar iterations("GEGE_BOUNDED_Q4_OPTIMAL88_ITERS", "0");
+    ScopedEnvVar max_admits("GEGE_STATEFLOW_MAX_ADMITS", "3");
+    constexpr int p = 32;
+    vector<int64_t> sizes(p * p, 1), rows(p, 1024);
+    for (int i = 0; i < p * p; i++) sizes[i] += (i % 19 == 0) ? 1000 : i % 7;
+    for (int devices : {2, 4}) {
+        for (uint64_t epoch : {0, 1}) {
+            auto [states, buckets] = getEpochRelabeledBoundedCoverOrdering(p, 4, sizes, 17, epoch);
+            expect_true(states.size() == 88, "FB relabeled input cover must retain 88 states");
+            auto plan = compileMultiGpuStateflowPlan(states, buckets, devices, sizes, rows, {});
+            expect_true(plan.total_bucket_assignments == p * p, "relabel must preserve directed bucket coverage");
+            expect_true(validateStateflowPlanExactSemantics(plan), "relabeled lane ownership/coverage is invalid");
+            expect_lane_max_admits(plan, 3);
+            auto schedule = projectStateflowPlanToMultiGpuSchedule(plan);
+            expect_true(static_cast<int64_t>(schedule.peer_handoffs.size()) == plan.total_cross_lane_handoffs,
+                        "relabeled peer descriptors must match the compiled plan");
+        }
+    }
+}
+
 StateflowPlan build_bounded_q4_multi_gpu_plan(int active_devices) {
     constexpr int kNumPartitions = 32;
     constexpr int kBufferCapacity = 4;
@@ -458,6 +481,7 @@ int main() {
         {"bounded_q4_scheduler_trains_diagonal_buckets_once", test_bounded_q4_scheduler_trains_diagonal_buckets_once},
         {"bounded_q4_scheduler_is_parameterized", test_bounded_q4_scheduler_is_parameterized},
         {"epoch_relabel_preserves_cover_and_overlap", test_epoch_relabel_preserves_cover_and_overlap},
+        {"epoch_relabel_multi_gpu_plans", test_epoch_relabel_multi_gpu_plans},
         {"bounded_q4_lane_matched_respects_three_admit_cap", test_bounded_q4_lane_matched_respects_three_admit_cap},
     };
 

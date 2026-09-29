@@ -17,6 +17,24 @@ PREFIX=/mnt/local/$USER/ge2-a6000-cuda121
 export PATH="$PREFIX/bin:/usr/bin:/bin"
 export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib/python3.9/site-packages/torch/lib:/usr/lib64"
 unset PYTHONPATH PYTHONHOME LD_PRELOAD
+# A predecessor's GPU context can outlive its Slurm accounting transition.
+# Wait for cleanup, but never terminate another workload or bypass isolation.
+idle_samples=0
+for ((attempt=0; attempt<40; attempt++)); do
+    apps=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader)
+    if [[ -z "$apps" ]]; then
+        idle_samples=$((idle_samples + 1))
+        if ((idle_samples >= 3)); then break; fi
+    else
+        idle_samples=0
+        echo "Waiting for existing GPU contexts to exit: $apps"
+    fi
+    sleep 15
+done
+if ((idle_samples < 3)); then
+    echo "Node remained busy; refusing competing measurements" >&2
+    exit 1
+fi
 exec "$PREFIX/bin/python" -B -u "$PAYLOAD/run_arc_memory_budget.py" \
     --payload "$PAYLOAD" \
     --root "/mnt/local/$USER/paper_memory_budget_20260929" \

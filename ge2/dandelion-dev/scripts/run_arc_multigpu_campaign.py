@@ -351,6 +351,13 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
                 env.update(GEGE_STATEFLOW_PEER_RELAY_VALIDATE='1', GEGE_STATEFLOW_PEER_RELAY_VALIDATE_FAIL_FAST='1',
                     GEGE_STATEFLOW_PEER_RELAY_VALIDATE_MAX_CHECKS='100000', GEGE_STATEFLOW_DEBUG_VALIDATE='1')
         env['LD_LIBRARY_PATH'] = f'{lib}:{envdir}/lib/python3.9/site-packages/torch/lib:{envdir}/lib'
+        repair = manifest.get('ge2_dense_repair') if spec['system'] == 'ge2' else None
+        if repair:
+            if (repair['original_library_sha256'] != manifest['ge2_library_sha256']
+                    or digest(Path(repair['binary'])) != repair['binary_sha256']):
+                raise ValueError('Released-library correction identity mismatch')
+            env['LD_PRELOAD'] = repair['binary']
+            update(ge2_dense_repair=repair, baseline_classification='released GE2 with disclosed dense-sync correction')
         python = envdir/'bin/python'
         execute([python, '-c', 'import torch,gege,json; n=torch.cuda.device_count(); '
             f'assert n=={count}; '
@@ -380,6 +387,8 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
         write_json(results/'flags.json', {k:v for k,v in env.items() if k.startswith(('GEGE_', 'CUDA_', 'OMP_', 'PYTORCH_'))})
         idle_node()
         execute([binary, config], 'train', monitor=True, timeout=2700 if phase == 'gate' else None)
+        if repair and '[ge2-repair] dense_barrier=generation_two_phase_v1' not in (results/'train.log').read_text():
+            raise ValueError('Dense-sync correction did not execute')
         timing = training_check((results/'train.log').read_text(), spec, count, epochs, phase == 'gate')
         samples = [json.loads(line) for line in (results/'train.hardware.jsonl').read_text().splitlines()]
         timing_error = None

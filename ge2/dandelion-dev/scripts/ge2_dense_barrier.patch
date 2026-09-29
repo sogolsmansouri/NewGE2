@@ -1,0 +1,60 @@
+diff --git a/src/cpp/src/engine/trainer.cpp b/src/cpp/src/engine/trainer.cpp
+--- a/src/cpp/src/engine/trainer.cpp
++++ b/src/cpp/src/engine/trainer.cpp
+@@ -1,4 +1,5 @@
+ #include "engine/trainer.h"
++#include "ge2_dense_barrier.h"
+ 
+ #include "configuration/options.h"
+ #include "reporting/logger.h"
+@@ -146,7 +147,7 @@
+     Timer timer = Timer(false); 
+ 
+-    std::atomic<int64_t> need_sync = 0;
+-    std::atomic<bool> sync_finished = false;
++    Ge2DenseBarrier dense_barrier;
++    SPDLOG_INFO("[ge2-repair] dense_barrier=generation_two_phase_v1");
+     
+     for (int epoch = 0; epoch < num_epochs; epoch++) {
+         timer.start();
+@@ -155,7 +156,7 @@
+         SPDLOG_INFO("################ Starting training epoch {} ################", dataloader_->getEpochsProcessed() + 1);
+         for (int32_t device_idx = 0; device_idx < model_->device_models_.size(); device_idx ++) {
+-            threads.emplace_back(std::thread([this, &need_sync, &sync_finished, device_idx] {
++            threads.emplace_back(std::thread([this, &dense_barrier, device_idx] {
+                 while (dataloader_->hasNextBatch(device_idx)) {
+                     // gets data and parameters for the next batch
+ 
+@@ -208,21 +209,17 @@
+                     if(has_relation) {
+-                        // if ((batch->batch_id_ + 1) % 1 == 0 || dataloader_->batches_left_[device_idx] == 1) {
+-                        {
+-                            sync_finished = false;
+-                            need_sync ++;
+-
+-                            if (need_sync == dataloader_->activate_devices_) {
+-                                model_->all_reduce();
+-                                sync_finished = true;
+-                                need_sync = 0;
+-                            }
+-                            while (!sync_finished) {
+-                                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+-                            }
+-                        }
++                        dense_barrier.run(
++                            [this] { return dataloader_->activate_devices_.load(); },
++                            [this] { model_->all_reduce(); },
++                            [this, batch, device_idx] {
++                                batch->clear();
++                                dataloader_->finishedBatch(device_idx);
++                            });
++                    } else {
++                        batch->clear();
++                        dataloader_->finishedBatch(device_idx);
+                     }
+-                    
+-                    batch->clear();
+-                    // notify that the batch has been completed
+-                    dataloader_->finishedBatch(device_idx);
+                  }
+             }));

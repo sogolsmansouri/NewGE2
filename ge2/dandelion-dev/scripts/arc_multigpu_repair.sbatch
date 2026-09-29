@@ -19,9 +19,12 @@ export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib/python3.9/site-packages/torch/li
 unset PYTHONPATH PYTHONHOME LD_PRELOAD
 echo "Waiting for the verified repair payload on $(hostname), job $SLURM_JOB_ID"
 for ((attempt=0; attempt<180; attempt++)); do
-    if [[ -f "$PAYLOAD/READY" ]]; then
-        exec "$PREFIX/bin/python" -B -u "$PAYLOAD/run_arc_multigpu_repair.py" \
-            --payload "$PAYLOAD" --base "/mnt/local/$USER/fb_multigpu_repair_$SLURM_JOB_ID"
+    if [[ -f "$PAYLOAD/READY" && -f "$PAYLOAD/run_arc_multigpu_repair.py" ]]; then
+        LOCAL_PAYLOAD="/mnt/local/$USER/fb_multigpu_repair_payload_$SLURM_JOB_ID"
+        mkdir -p "$LOCAL_PAYLOAD"
+        cp -a "$PAYLOAD/." "$LOCAL_PAYLOAD/"
+        exec "$PREFIX/bin/python" -B -u "$LOCAL_PAYLOAD/run_arc_multigpu_repair.py" \
+            --payload "$LOCAL_PAYLOAD" --base "/mnt/local/$USER/fb_multigpu_repair_$SLURM_JOB_ID"
     fi
     sleep 10
 done

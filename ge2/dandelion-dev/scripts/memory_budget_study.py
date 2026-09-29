@@ -16,6 +16,7 @@ from pathlib import Path
 import re
 import resource
 import shutil
+import signal
 import statistics
 import subprocess
 import sys
@@ -517,6 +518,9 @@ def sweep(args):
 
 
 def main():
+    def terminate(signum, frame):
+        raise InterruptedError('Study received termination signal; stopping its child')
+    signal.signal(signal.SIGTERM,terminate)
     resource.setrlimit(resource.RLIMIT_CORE,(0,0))
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('mode',choices=('plan','smoke','sweep'))

@@ -43,6 +43,9 @@ def archive(root, destination, index=None):
 
 
 def main():
+    def terminate(signum, frame):
+        raise InterruptedError('ARC launcher received termination signal')
+    signal.signal(signal.SIGTERM,terminate)
     parser=argparse.ArgumentParser(description=__doc__)
     for name in ('payload','root','results'):
         parser.add_argument('--'+name,type=Path,required=True)

@@ -137,9 +137,11 @@ def main():
         check_evaluation(quality, spec['eval_sha'])
         write_json(eval_dir/'evaluation_identity.json', verify_evaluation_artifacts(quality, checkpoints))
         result = json.loads((original/'status.json').read_text())
+        result['previous_error'] = result.pop('error', None)
         result.update(status='done_pending_review', stage='evaluation_recovered', paper_ready=False,
                       mrr=quality['mrr'], hits_at_10=quality['hits_at_10'], evaluation_retry=str(eval_dir),
-                      original_training=str(original), evaluation_only=True)
+                      original_training=str(original), evaluation_only=True, recovery_job=job,
+                      updated=datetime.datetime.now().isoformat())
         write_json(eval_dir/'result.json', result)
         shutil.copytree(eval_dir, archive/eval_dir.name)
         save_failure_evidence(eval_dir, summary/eval_dir.name)

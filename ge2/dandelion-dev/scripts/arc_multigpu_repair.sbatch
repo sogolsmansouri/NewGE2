@@ -13,17 +13,19 @@
 
 set -euo pipefail
 PAYLOAD=${1:?Pass repair payload directory}
+ENTRY=${2:-run_arc_multigpu_repair.py}
+ulimit -c 0
 PREFIX=/mnt/local/$USER/ge2-a6000-cuda121
 export PATH="$PREFIX/bin:/usr/bin:/bin"
 export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib/python3.9/site-packages/torch/lib:/usr/lib64"
 unset PYTHONPATH PYTHONHOME LD_PRELOAD
 echo "Waiting for the verified repair payload on $(hostname), job $SLURM_JOB_ID"
 for ((attempt=0; attempt<180; attempt++)); do
-    if [[ -f "$PAYLOAD/READY" && -f "$PAYLOAD/run_arc_multigpu_repair.py" ]]; then
+    if [[ -f "$PAYLOAD/READY" && -f "$PAYLOAD/$ENTRY" ]]; then
         LOCAL_PAYLOAD="/mnt/local/$USER/fb_multigpu_repair_payload_$SLURM_JOB_ID"
         mkdir -p "$LOCAL_PAYLOAD"
         cp -a "$PAYLOAD/." "$LOCAL_PAYLOAD/"
-        exec "$PREFIX/bin/python" -B -u "$LOCAL_PAYLOAD/run_arc_multigpu_repair.py" \
+        exec "$PREFIX/bin/python" -B -u "$LOCAL_PAYLOAD/$ENTRY" \
             --payload "$LOCAL_PAYLOAD" --base "/mnt/local/$USER/fb_multigpu_repair_$SLURM_JOB_ID"
     fi
     sleep 10

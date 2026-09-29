@@ -6,11 +6,27 @@ import types
 import unittest
 from unittest.mock import patch
 
-from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, native_score_environment, runtime_environment, validate_runtime_policy, split_hash_for_view, state_workload_check, training_check
+from run_arc_multigpu_campaign import check_replicas, idle_devices, multigpu_config, multigpu_flags, native_score_environment, run_case, runtime_environment, validate_runtime_policy, split_hash_for_view, state_workload_check, training_check
 from prepare_tw_multigpu import flags_for
 
 
 class MultiGpuCampaignTests(unittest.TestCase):
+    def test_shared_node_diagnostic_cannot_be_used_for_final(self):
+        with self.assertRaisesRegex(ValueError, 'cannot run final'):
+            run_case(None, None, None, 'final', 0, None, None, diagnostic_gate=True)
+
+    def test_diagnostic_checks_all_selected_gpus(self):
+        with patch('run_arc_multigpu_campaign.foreign_gpu_pids', return_value=[]) as check:
+            idle_devices(2)
+            check.assert_called_with('0,1')
+            idle_devices(4)
+            check.assert_called_with('0,1,2,3')
+        with patch('run_arc_multigpu_campaign.foreign_gpu_pids', return_value=[42]):
+            with self.assertRaisesRegex(RuntimeError, 'occupied'):
+                idle_devices(2)
+        with self.assertRaises(ValueError):
+            idle_devices(3)
+
     def test_runtime_policy_is_explicit_and_does_not_disable_frame_relay(self):
         self.assertEqual(runtime_environment({}), {})
         manifest = dict(runtime_policy='c30_nccl_shm_v1')

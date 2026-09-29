@@ -19,6 +19,7 @@ import time
 import yaml
 
 from arc_job_support import run_logged, save_failure_evidence, write_json
+from arc_accuracy_gpu_guard import foreign_gpu_pids, guarded_run
 from prepare_tw_multigpu import GE2_LIB, cover_check, flags_for
 from run_arc_paper_case import archive_checkpoint, digest, hardware_check, verify_evaluation_artifacts
 from run_tw_multigpu import check_evaluation, pipege_python_overlay
@@ -296,7 +297,9 @@ def prepare(base, commit, execute, reuse_build=None):
     return manifest
 
 
-def run_case(base, manifest, name, phase, deadline, archive_root, summary):
+def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, diagnostic_gate=False):
+    if diagnostic_gate and phase != 'gate':
+        raise ValueError('Shared-node diagnostic mode cannot run final training')
     from run_arc_pipege_quality import checkpoint_manifest
     spec = manifest['cases'][name]
     count = spec['gpus']
@@ -308,7 +311,13 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
     state = dict(case=name, phase=phase, status='preflight', commit=manifest['commit'],
                  built_engine_commit=manifest.get('built_engine_commit', manifest['commit']),
                  memory_contract=spec['memory_contract'],
-                 manifest_sha256=digest(base/'manifest.json'), paper_ready=False, checkpoint_durable=False)
+                 manifest_sha256=digest(base/'manifest.json'), paper_ready=False, checkpoint_durable=False,
+                 diagnostic_only=diagnostic_gate)
+    def check_idle():
+        if diagnostic_gate:
+            idle_devices(count)
+        else:
+            idle_node()
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
         write_json(results/'status.json', state)
@@ -329,13 +338,18 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
         budget = min(deadline-time.time(), timeout or float('inf'))
         if budget < 60:
             raise RuntimeError('Allocation safety deadline reached')
-        rc = run_logged(list(map(str, command)), process_env or env, results/(label+'.log'), budget,
-                        results/(label+'.hardware.jsonl') if monitor else None)
+        if diagnostic_gate:
+            rc = guarded_run(list(map(str, command)), process_env or env, results/(label+'.log'), budget,
+                             ','.join(uuids), results/(label+'.gpu_guard.jsonl'),
+                             results/(label+'.hardware.jsonl') if monitor else None)
+        else:
+            rc = run_logged(list(map(str, command)), process_env or env, results/(label+'.log'), budget,
+                            results/(label+'.hardware.jsonl') if monitor else None)
         if rc:
             raise RuntimeError(f'{label} exited {rc}')
     try:
         update()
-        idle_node()
+        check_idle()
         for rel, value in manifest['files'].items():
             if digest(base/rel) != value:
                 raise ValueError('Frozen file changed: '+rel)
@@ -406,7 +420,7 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
         config = results/'config.yaml'
         config.write_text(yaml.safe_dump(cfg, sort_keys=False))
         write_json(results/'flags.json', {k:v for k,v in env.items() if k.startswith(('GEGE_', 'CUDA_', 'OMP_', 'PYTORCH_', 'NCCL_'))})
-        idle_node()
+        check_idle()
         execute([binary, config], 'train', monitor=True, timeout=2700 if phase == 'gate' else None)
         if repair and '[ge2-repair] dense_barrier=generation_two_phase_v1' not in (results/'train.log').read_text():
             raise ValueError('Dense-sync correction did not execute')
@@ -419,6 +433,8 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
                 hardware_check(samples, manifest['power_w'], uuid)
         except ValueError as error:
             timing_error = str(error)
+        if diagnostic_gate:
+            timing_error = 'Functional gate on a shared node; not eligible for paper timing'
         update(**timing, timing_eligible=timing_error is None, timing_error=timing_error)
         if spec['model'] != 'dot':
             write_json(results/'replica_check.json', check_replicas(model, count))
@@ -471,6 +487,14 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
         update(status='failed', error=repr(error))
         save_failure_evidence(results, summary/(name+'_'+phase+'_evidence'))
         raise
+
+
+def idle_devices(count):
+    if count not in (2, 4):
+        raise ValueError('Requires two or four diagnostic GPUs')
+    foreign = foreign_gpu_pids(','.join(map(str, range(count))))
+    if foreign:
+        raise RuntimeError('Diagnostic GPUs are occupied: '+repr(foreign))
 
 
 def idle_node():

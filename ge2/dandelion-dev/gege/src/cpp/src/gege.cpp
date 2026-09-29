@@ -12,8 +12,43 @@
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
 
 namespace {
+
+void configure_memory_budget(const std::vector<torch::Device>& devices) {
+    const char *raw = std::getenv("GEGE_CUDA_ALLOCATOR_LIMIT_MIB");
+    if (raw == nullptr) return;
+    const std::string value(raw);
+    TORCH_CHECK(!value.empty() && value.find_first_not_of("0123456789") == std::string::npos,
+                "GEGE_CUDA_ALLOCATOR_LIMIT_MIB must be a positive integer");
+    const auto mib = std::stoull(value);
+    TORCH_CHECK(mib > 0 && mib <= (1ULL << 30), "Invalid allocator limit");
+    for (const auto& device : devices) {
+        TORCH_CHECK(device.is_cuda(), "CUDA memory limit requires CUDA execution");
+        c10::cuda::CUDAGuard guard(device);
+        size_t free_bytes = 0, total_bytes = 0;
+        C10_CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+        const uint64_t limit = mib * 1024ULL * 1024ULL;
+        TORCH_CHECK(limit <= total_bytes, "Allocator limit exceeds device capacity");
+        c10::cuda::CUDACachingAllocator::setMemoryFraction(
+            static_cast<double>(limit) / total_bytes, device.index());
+        SPDLOG_INFO("[memory-budget] device={} allocator_limit_bytes={} device_total_bytes={} free_bytes={} scope=torch_allocator_only",
+                    device.index(), limit, total_bytes, free_bytes);
+    }
+}
+
+void log_memory_peaks(const std::vector<torch::Device>& devices, int epoch) {
+    const char *raw = std::getenv("GEGE_CUDA_MEMORY_STATS");
+    if (raw == nullptr || std::string(raw) != "1") return;
+    for (const auto& device : devices) {
+        if (!device.is_cuda()) continue;
+        const auto stats = c10::cuda::CUDACachingAllocator::getDeviceStats(device.index());
+        SPDLOG_INFO("[memory-budget-peak] epoch={} device={} allocated_peak_bytes={} reserved_peak_bytes={} cumulative=true",
+                    epoch, device.index(), stats.allocated_bytes[0].peak, stats.reserved_bytes[0].peak);
+    }
+}
 
 bool startup_timing_enabled() {
     const char *raw = std::getenv("GEGE_STARTUP_TIMING");
@@ -81,6 +116,8 @@ std::tuple<shared_ptr<Model>, shared_ptr<GraphModelStorage>, shared_ptr<DataLoad
     srand(gege_config->model->random_seed);
 
     std::vector<torch::Device> devices = devices_from_config(gege_config->storage);
+
+    configure_memory_budget(devices);
 
     shared_ptr<Model> model;
     shared_ptr<GraphModelStorage> graph_model_storage;
@@ -206,6 +243,7 @@ void gege_train(shared_ptr<GegeConfig> gege_config) {
     int checkpoint_interval = gege_config->training->checkpoint->interval;
     for (int epoch = 0; epoch < gege_config->training->num_epochs; epoch++) {
         trainer->train(1);
+        log_memory_peaks(devices, epoch + 1);
 
         if (gege_config->evaluation->epochs_per_eval > 0 && (epoch + 1) % gege_config->evaluation->epochs_per_eval == 0) {
             if (gege_config->storage->dataset->num_valid != -1) {

@@ -6,11 +6,22 @@ import types
 import unittest
 from unittest.mock import patch
 
-from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, split_hash_for_view, state_workload_check, training_check
+from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, native_score_environment, split_hash_for_view, state_workload_check, training_check
 from prepare_tw_multigpu import flags_for
 
 
 class MultiGpuCampaignTests(unittest.TestCase):
+    def test_native_score_environment_does_not_inherit_training_overlay(self):
+        original = dict(PYTHONPATH='/overlay', GEGE_NO_BINDINGS='1',
+                        PYTHONHOME='/wrong', LD_PRELOAD='/wrong',
+                        LD_LIBRARY_PATH='/pipege/build', CUDA_VISIBLE_DEVICES='GPU-0')
+        env = native_score_environment(original, Path('/runtime'))
+        for key in ('PYTHONPATH', 'PYTHONHOME', 'GEGE_NO_BINDINGS', 'LD_PRELOAD'):
+            self.assertNotIn(key, env)
+        self.assertEqual(env['CUDA_VISIBLE_DEVICES'], 'GPU-0')
+        self.assertTrue(env['LD_LIBRARY_PATH'].startswith('/runtime/lib/python3.9/site-packages/gege:'))
+        self.assertEqual(original['GEGE_NO_BINDINGS'], '1')
+
     def test_repartitioned_heldout_rows_use_view_hash(self):
         canonical = dict(splits=dict(validation=dict(sha256='source')))
         view = dict(num_partitions=32, splits=dict(validation=dict(source_sha256='source', output_sha256='reordered')))

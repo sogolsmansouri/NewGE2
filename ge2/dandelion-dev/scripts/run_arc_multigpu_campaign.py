@@ -139,6 +139,16 @@ def check_replicas(model, count):
     return dict(replicas=count, equal=True, hashes={p.name:digest(p) for p in paths})
 
 
+def native_score_environment(training_env, prefix):
+    """Score with released bindings, not the training-only Python overlay."""
+    env = dict(training_env)
+    for key in ('PYTHONPATH', 'PYTHONHOME', 'GEGE_NO_BINDINGS', 'LD_PRELOAD'):
+        env.pop(key, None)
+    lib = prefix/'lib/python3.9/site-packages'
+    env['LD_LIBRARY_PATH'] = f'{lib}/gege:{lib}/torch/lib:{prefix}/lib'
+    return env
+
+
 def prepare(base, commit, execute, reuse_build=None):
     old = Path('/mnt/local/smansou2/paper_matched_300w_20260925')
     old_manifest = json.loads((old/'manifest.json').read_text())
@@ -293,12 +303,12 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
     env.update(PATH=f'{envdir}/bin:/usr/bin:/bin', PYTHONDONTWRITEBYTECODE='1',
                CUDA_VISIBLE_DEVICES=','.join(map(str, range(count))), CUDA_DEVICE_ORDER='PCI_BUS_ID',
                OMP_NUM_THREADS='8', MKL_NUM_THREADS='8', OPENBLAS_NUM_THREADS='1')
-    def execute(command, label, monitor=False, timeout=None):
+    def execute(command, label, monitor=False, timeout=None, process_env=None):
         update(stage=label)
         budget = min(deadline-time.time(), timeout or float('inf'))
         if budget < 60:
             raise RuntimeError('Allocation safety deadline reached')
-        rc = run_logged(list(map(str, command)), env, results/(label+'.log'), budget,
+        rc = run_logged(list(map(str, command)), process_env or env, results/(label+'.log'), budget,
                         results/(label+'.hardware.jsonl') if monitor else None)
         if rc:
             raise RuntimeError(f'{label} exited {rc}')
@@ -402,7 +412,8 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
         else:
             execute([python, helpers/'verify_ge2_native_checkpoint_scores.py', '--run', model,
                 '--eval-edges', spec['query'], '--score', spec['model'], '--nodes', spec['nodes'],
-                '--relations', spec['relations'], '--width', spec['width'], '--out', results/'native_score.json'], 'native_score')
+                '--relations', spec['relations'], '--width', spec['width'], '--out', results/'native_score.json'],
+                'native_score', process_env=native_score_environment(env, envdir))
             execute([python, helpers/'extract_ge2_relation_embeddings.py', '--model', model/'model.pt_0',
                 '--src-out', model/'src_relations.bin', '--dst-out', model/'dst_relations.bin',
                 '--expected-relations', spec['relations'], '--expected-dim', spec['width'],

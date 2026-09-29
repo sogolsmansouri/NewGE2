@@ -6,11 +6,25 @@ import types
 import unittest
 from unittest.mock import patch
 
-from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, native_score_environment, split_hash_for_view, state_workload_check, training_check
+from run_arc_multigpu_campaign import check_replicas, multigpu_config, multigpu_flags, native_score_environment, runtime_environment, validate_runtime_policy, split_hash_for_view, state_workload_check, training_check
 from prepare_tw_multigpu import flags_for
 
 
 class MultiGpuCampaignTests(unittest.TestCase):
+    def test_runtime_policy_is_explicit_and_does_not_disable_frame_relay(self):
+        self.assertEqual(runtime_environment({}), {})
+        manifest = dict(runtime_policy='c30_nccl_shm_v1')
+        self.assertEqual(runtime_environment(manifest), dict(NCCL_P2P_DISABLE='1', NCCL_DEBUG='INFO'))
+        for bad in ('unknown', {'LD_PRELOAD': 'patch.so'}):
+            with self.assertRaises(ValueError):
+                runtime_environment(dict(runtime_policy=bad))
+        log = 'NCCL_P2P_LEVEL set by environment to LOC\nNCCL INFO via SHM/direct/direct'
+        validate_runtime_policy(log, manifest, dict(model='complex'))
+        validate_runtime_policy('', manifest, dict(model='dot'))
+        for bad in ('', log.replace('SHM', 'P2P'), log+'\nvia P2P/direct pointer'):
+            with self.assertRaises(ValueError):
+                validate_runtime_policy(bad, manifest, dict(model='complex'))
+
     def test_native_score_environment_does_not_inherit_training_overlay(self):
         original = dict(PYTHONPATH='/overlay', GEGE_NO_BINDINGS='1',
                         PYTHONHOME='/wrong', LD_PRELOAD='/wrong',

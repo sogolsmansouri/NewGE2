@@ -149,6 +149,22 @@ def native_score_environment(training_env, prefix):
     return env
 
 
+def runtime_environment(manifest):
+    policy = manifest.get('runtime_policy', 'default')
+    if policy == 'default':
+        return {}
+    if policy == 'c30_nccl_shm_v1':
+        return dict(NCCL_P2P_DISABLE='1', NCCL_DEBUG='INFO')
+    raise ValueError('Unknown frozen runtime policy: '+str(policy))
+
+
+def validate_runtime_policy(text, manifest, spec):
+    if manifest.get('runtime_policy', 'default') == 'c30_nccl_shm_v1' and spec['model'] != 'dot':
+        if ('NCCL_P2P_LEVEL set by environment to LOC' not in text
+                or 'via SHM/' not in text or 'via P2P/' in text):
+            raise ValueError('Expected NCCL shared-memory transport was not verified')
+
+
 def prepare(base, commit, execute, reuse_build=None):
     old = Path('/mnt/local/smansou2/paper_matched_300w_20260925')
     old_manifest = json.loads((old/'manifest.json').read_text())
@@ -298,11 +314,16 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
         write_json(results/'status.json', state)
         write_json(summary/(name+'_'+phase+'.json'), state)
     envdir = Path(manifest['env'])
-    env = {k:v for k,v in os.environ.items() if not k.startswith(('GEGE_', 'OURS_', 'PYTHON', 'CONDA'))}
+    env = {k:v for k,v in os.environ.items()
+           if not k.startswith(('GEGE_', 'OURS_', 'PYTHON', 'PYTORCH_', 'CONDA', 'CUDA_', 'NCCL_'))}
     env.pop('LD_PRELOAD', None)
     env.update(PATH=f'{envdir}/bin:/usr/bin:/bin', PYTHONDONTWRITEBYTECODE='1',
                CUDA_VISIBLE_DEVICES=','.join(map(str, range(count))), CUDA_DEVICE_ORDER='PCI_BUS_ID',
                OMP_NUM_THREADS='8', MKL_NUM_THREADS='8', OPENBLAS_NUM_THREADS='1')
+    env.update(runtime_environment(manifest))
+    state.update(runtime_policy=manifest.get('runtime_policy', 'default'),
+                 runtime_environment=runtime_environment(manifest),
+                 launcher_commit=manifest.get('launcher_commit', manifest['commit']))
     def execute(command, label, monitor=False, timeout=None, process_env=None):
         update(stage=label)
         budget = min(deadline-time.time(), timeout or float('inf'))
@@ -384,11 +405,12 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary):
         cfg['training']['num_epochs'] = epochs
         config = results/'config.yaml'
         config.write_text(yaml.safe_dump(cfg, sort_keys=False))
-        write_json(results/'flags.json', {k:v for k,v in env.items() if k.startswith(('GEGE_', 'CUDA_', 'OMP_', 'PYTORCH_'))})
+        write_json(results/'flags.json', {k:v for k,v in env.items() if k.startswith(('GEGE_', 'CUDA_', 'OMP_', 'PYTORCH_', 'NCCL_'))})
         idle_node()
         execute([binary, config], 'train', monitor=True, timeout=2700 if phase == 'gate' else None)
         if repair and '[ge2-repair] dense_barrier=generation_two_phase_v1' not in (results/'train.log').read_text():
             raise ValueError('Dense-sync correction did not execute')
+        validate_runtime_policy((results/'train.log').read_text(), manifest, spec)
         timing = training_check((results/'train.log').read_text(), spec, count, epochs, phase == 'gate')
         samples = [json.loads(line) for line in (results/'train.hardware.jsonl').read_text().splitlines()]
         timing_error = None

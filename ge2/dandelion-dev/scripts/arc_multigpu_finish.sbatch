@@ -10,6 +10,7 @@
 #SBATCH --time=06:00:00
 #SBATCH --output=/home/smansou2/arc_results/logs/multigpu_final_%j.out
 #SBATCH --error=/home/smansou2/arc_results/logs/multigpu_final_%j.err
+#SBATCH --open-mode=append
 
 set -euo pipefail
 PAYLOAD=${1:?Pass frozen payload directory}
@@ -20,7 +21,9 @@ export LD_LIBRARY_PATH="$PREFIX/lib:$PREFIX/lib/python3.9/site-packages/torch/li
 unset PYTHONPATH PYTHONHOME LD_PRELOAD
 ulimit -c 0
 test -s "$PAYLOAD/READY"
-LOCAL_PAYLOAD="/mnt/local/$USER/multigpu_finish_payload_$SLURM_JOB_ID"
+RESTART=${SLURM_RESTART_COUNT:-0}
+[[ "$RESTART" =~ ^(0|[1-9][0-9]*)$ ]] || exit 2
+LOCAL_PAYLOAD="/mnt/local/$USER/multigpu_finish_payload_${SLURM_JOB_ID}_r${RESTART}"
 mkdir "$LOCAL_PAYLOAD"
 cp -a "$PAYLOAD/." "$LOCAL_PAYLOAD/"
 exec "$PREFIX/bin/python" -B -u "$LOCAL_PAYLOAD/run_arc_multigpu_finish.py" \

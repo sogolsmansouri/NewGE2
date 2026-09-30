@@ -14,13 +14,54 @@ import subprocess
 import sys
 import time
 
+import yaml
+
 from arc_job_support import run_logged, save_failure_evidence, write_json
-from run_arc_multigpu_campaign import idle_node, native_score_environment, run_case, runtime_environment
+from run_arc_multigpu_campaign import (idle_node, multigpu_config, multigpu_flags,
+                                      native_score_environment, run_case, runtime_environment)
+from prepare_tw_multigpu import cover_check
 from run_arc_paper_case import digest
 
 
 CASES = ('ge2_fb_complex_2gpu', 'pipege_fb_complex_2gpu', 'pipege_tw_dot_4gpu',
          'ge2_tw_dot_4gpu', 'pipege_fb_complex_4gpu', 'ge2_fb_complex_4gpu')
+
+
+def restart_base(base, restart_count):
+    if not re.fullmatch(r'0|[1-9][0-9]*', restart_count):
+        raise ValueError('Invalid Slurm restart count')
+    # A requeue starts fresh training, never overwrites or resumes a partial run.
+    return base if restart_count == '0' else base.with_name(base.name+'_r'+restart_count)
+
+
+def validate_reference_contract(spec):
+    config = Path(spec['config'])
+    reference = config.parent/'single_gpu.yaml'
+    cfg = yaml.safe_load(config.read_text())
+    expected = multigpu_config(yaml.safe_load(reference.read_text()), spec['gpus'], spec['system'])
+    if cfg != expected:
+        raise ValueError('Multi-GPU configuration drifted from its frozen 50K single-GPU reference')
+    flags = json.loads(Path(spec['flags']).read_text())
+    reference_flags = json.loads((config.parent/'single_gpu.flags.json').read_text())
+    expected_flags = multigpu_flags(reference_flags) if spec['system'] == 'pipege' else {}
+    schedule_sha = None
+    if spec['system'] == 'pipege' and spec['graph'] == 'tw':
+        schedule = config.parent/'schedule.txt'
+        cover_check(schedule.read_text())
+        expected_flags['GEGE_BOUNDED_STATE_ORDER_FILE'] = str(schedule)
+        schedule_sha = digest(schedule)
+    if flags != expected_flags:
+        raise ValueError('Multi-GPU flags drifted from the frozen single-GPU reference and peer policy')
+    if spec['system'] == 'pipege':
+        if (flags.get('GEGE_BATCHED_NEGATIVE_PLAN_BATCHES', '0') != '0'
+                or cfg['training']['negative_sampling'].get('superbatch_negative_plan_batches', 0) != 0):
+            raise ValueError('Final protocol requires independent per-batch negative draws')
+        if spec['graph'] == 'fb' and flags.get('GEGE_BOUNDED_COVER_EPOCH_RELABEL') != '1':
+            raise ValueError('FB must retain the validated epoch-relabel accuracy fix')
+    return dict(status='pass', batch_per_gpu=50000, final_epochs=10,
+                single_gpu_config_sha256=digest(reference), multigpu_config_sha256=digest(config),
+                multigpu_flags_sha256=digest(Path(spec['flags'])), schedule_sha256=schedule_sha,
+                contract='Frozen single-GPU recipe plus explicit multi-GPU execution changes')
 
 
 def freeze_retry(old, base, payload, name, launcher_commit):
@@ -44,6 +85,7 @@ def freeze_retry(old, base, payload, name, launcher_commit):
     if schedule:
         flags['GEGE_BOUNDED_STATE_ORDER_FILE'] = str(base/Path(schedule).relative_to(old))
     write_json(Path(spec['flags']), flags)
+    write_json(base/'reference_contract.json', validate_reference_contract(spec))
     manifest.update(cases={name: spec}, launcher_commit=launcher_commit,
                     source_campaign=str(old), source_manifest_sha256=digest(old/'manifest.json'),
                     runtime_policy='c30_nccl_shm_v1' if spec['graph'] == 'fb' else 'default',
@@ -83,7 +125,8 @@ def main():
     for name, expected in payload_manifest['files'].items():
         if digest(args.payload/name) != expected:
             raise ValueError('Payload checksum mismatch: '+name)
-    base = args.base.resolve()
+    restart_count = os.environ.get('SLURM_RESTART_COUNT', '0')
+    base = restart_base(args.base.resolve(), restart_count)
     if base.parent != Path('/mnt/local/smansou2'):
         raise ValueError('Dedicated node-local run directory required')
     base.mkdir(exist_ok=False)
@@ -92,7 +135,8 @@ def main():
     summary.mkdir(parents=True, exist_ok=True)
     archive.mkdir(parents=True, exist_ok=True)
     state = dict(job=job, case=args.case, status='preflight', paper_ready=False,
-                 launcher_commit=payload_manifest['commit'])
+                 launcher_commit=payload_manifest['commit'], restart_count=int(restart_count),
+                 restart_policy='Fresh gate and ten fresh epochs; preserve earlier attempt directories')
 
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
@@ -120,6 +164,8 @@ def main():
             manifest = freeze_retry(old, base, args.payload, args.case, payload_manifest['commit'])
             for target in (summary, archive):
                 shutil.copy2(base/'manifest.json', target/'manifest.json')
+                shutil.copy2(base/'reference_contract.json', target/'reference_contract.json')
+                shutil.copytree(base/'references', target/'references')
             sys.path.insert(0, str(base/'harness/tools'))
             if args.case.startswith('pipege_'):
                 prefix = Path(manifest['env'])

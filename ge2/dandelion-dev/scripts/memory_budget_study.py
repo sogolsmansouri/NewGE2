@@ -272,8 +272,31 @@ def schedule_evidence(text, epochs, edges, p, expected=None):
             or (expected is not None and (n,admissions)!=(expected.state_count,expected.total_admissions))):
         raise ValueError('Executed schedule differs from validated plan')
     lower=math.ceil(p*math.ceil((p-1)/3)/4)
+    proof = getattr(expected, 'optimality', None) or {}
     return dict(states=n,transitions=transitions,admissions=admissions,max_admits=max_admits,
-                state_lower_bound=lower,state_count_certified_minimum=n==lower)
+                state_lower_bound=lower,state_count_certified_minimum=n==lower or bool(proof.get('state_count_optimal')),
+                overlap_certified_maximum=proof.get('overlap_optimality')=='proven')
+
+
+def certified_schedule(root, p):
+    from dataclasses import replace
+    from plan_pipege_cover import parse_schedule, summarize_cover
+    folder = Path(root)/f'p{p}'
+    evidence = json.loads((folder/'cover.json').read_text())
+    states = parse_schedule(folder/'states.txt')
+    summary = summarize_cover(states,p,4)
+    proof = evidence.get('optimality') or {}
+    if (evidence.get('status')!='valid' or not proof.get('state_count_optimal')
+            or proof.get('overlap_optimality')!='proven'
+            or proof.get('overlap_scope')!='all_minimum_covers_and_path_orders'
+            or proof.get('minimum_state_count')!=summary.state_count
+            or proof.get('maximum_overlap')!=summary.total_overlap
+            or proof.get('schedule_sha256')!=summary.schedule_sha256
+            or evidence.get('schedule_sha256')!=summary.schedule_sha256
+            or evidence.get('partitions')!=p or evidence.get('capacity')!=4
+            or summary.max_admits>3):
+        raise ValueError(f'Uncertified or changed schedule for p={p}')
+    return states,replace(summary,optimality=proof),evidence
 
 
 def smoke(args):
@@ -293,7 +316,8 @@ def smoke(args):
                   binaries={n:digest(args.build/n) for n in ('gege_train','libge2.so')}, cases={})
     write_json(root/'result.json',report)
     try:
-        for workload,p in [('tw',16),('fb',32),('tw',8),('fb',8)]:
+        geometries=getattr(args,'geometries',None) or [('tw',16),('fb',32),('tw',8),('fb',8)]
+        for workload,p in geometries:
             spec = WORKLOADS[workload]
             prefix = f'{workload}_p{p}'
             data_dir = root/(prefix+'_data')
@@ -317,9 +341,11 @@ def smoke(args):
                         num_train=len(edges),num_relations=1 if workload=='tw' else 7,
                         num_valid=-1,num_test=-1)
             (data_dir/'dataset.yaml').write_text(yaml.safe_dump(data))
-            schedule,summary,_ = plan_cover(p,4,max_admits=3,restarts=2)
+            if getattr(args,'schedule_root',None):
+                schedule,summary,proof=certified_schedule(args.schedule_root,p)
+            else:
+                schedule,summary,_ = plan_cover(p,4,max_admits=3,restarts=2)
             schedule_path = root/(prefix+'_states.txt')
-            # FB p32 uses the engine's certified dynamic 88-state path.
             write_schedule(schedule_path,schedule)
             outputs = []
             for hidden in HIDDEN_COUNTS:
@@ -330,14 +356,14 @@ def smoke(args):
                 flags = json.loads(Path(reference['flags']).read_text())
                 cfg = configuration(template,data,case/'model',workload,p,2,gate=True)
                 flags = policy(flags,workload,p,hidden,p*size,cap,gate=True)
-                if p!=32:
-                    flags['GEGE_BOUNDED_STATE_ORDER_FILE'] = str(schedule_path)
+                flags['GEGE_BOUNDED_Q4_OPTIMAL88']='0'
+                flags['GEGE_BOUNDED_STATE_ORDER_FILE'] = str(schedule_path)
                 (case/'config.yaml').write_text(yaml.safe_dump(cfg,sort_keys=False))
                 write_json(case/'flags.json',flags)
                 text = run_training([str(args.build/'gege_train'),str(case/'config.yaml')],
                                     dict(env,**flags),case,cap,180)
                 metrics = check_log(text,2,len(edges),hidden,p,p*size)
-                metrics['schedule']=schedule_evidence(text,2,len(edges),p)
+                metrics['schedule']=schedule_evidence(text,2,len(edges),p,summary)
                 if workload=='fb':
                     from run_arc_pipege_best import relabel_check
                     relabel_check(text,p,2,17)
@@ -410,15 +436,21 @@ def prepare_view(source, expected_sha, spec, p, target):
 
 def sweep(args):
     import yaml
-    from plan_pipege_cover import plan_cover, write_schedule
+    from plan_pipege_cover import write_schedule
     root=args.output.resolve()
     root.mkdir(parents=True,exist_ok=True)
     with (root/'serial.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         refs=json.loads(args.references.read_text())
         sources=json.loads(args.sources.read_text())
-        if json.loads(args.gate.read_text())['status']!='pass':
+        gate=json.loads(args.gate.read_text())
+        binaries={n:digest(args.build/n) for n in ('gege_train','libge2.so')}
+        if gate['status']!='pass' or gate.get('binaries')!=binaries:
             raise RuntimeError('Local/ARC synthetic acceptance gate has not passed')
+        if not getattr(args,'schedule_root',None):
+            raise RuntimeError('Certified schedules are required before running the sweep')
+        scratch=(getattr(args,'scratch_root',None) or root).resolve()
+        scratch.mkdir(parents=True,exist_ok=True)
         overlay=root/'python'
         overlay.mkdir(exist_ok=True)
         if not (overlay/'gege').exists():
@@ -429,6 +461,9 @@ def sweep(args):
             selected=[tuple(json.loads(args.case))]
         else:
             selected=json.loads(args.plan.read_text())['selection_points']
+        # Reuse each physical layout for all its h/budget cases before deleting it.
+        groups=list(dict.fromkeys((x[0],x[2]) for x in selected))
+        selected=[x for w,p in groups for x in selected if (x[0],x[2])==(w,p)]
         state=dict(status='running',phase='10_epoch_configuration_selection_not_final_repeats',completed={},
                    source_commit=args.commit,points=selected)
         write_json(root/'status.json',state)
@@ -446,26 +481,27 @@ def sweep(args):
                 if deadline-time.monotonic()<3600:
                     state['status']='allocation_budget_reached'
                     break
+                schedule,summary,evidence=certified_schedule(args.schedule_root,p)
                 case.mkdir()
                 state['case']=name
                 write_json(root/'status.json',state)
                 cap=limits(budget)
                 spec=WORKLOADS[workload]
                 source=sources[workload]
-                view=root/'data'/f'{workload}_p{p}'
+                view=scratch/'data'/f'{workload}_p{p}'
                 data=prepare_view(Path(source['path']),source['train_sha256'],spec,p,view)
                 ref=refs[workload]
+                model=scratch/'models'/name
+                if model.exists():
+                    raise RuntimeError('Refusing to reuse previous model scratch: '+str(model))
                 cfg=configuration(yaml.safe_load(Path(ref['config']).read_text()),data,
-                                  case/'model',workload,p,args.epochs)
+                                  model,workload,p,args.epochs)
                 flags=policy(json.loads(Path(ref['flags']).read_text()),workload,p,hidden,
                              spec['nodes'],cap)
-                summary=None
-                if p!=32:
-                    schedule,summary,origin=plan_cover(p,4,max_admits=3,restarts=8)
-                    write_schedule(case/'states.txt',schedule)
-                    flags['GEGE_BOUNDED_STATE_ORDER_FILE']=str(case/'states.txt')
-                    write_json(case/'schedule.json',dict(asdict(summary),origin=origin,
-                               note='Minimum only certified when state_gap=0; no global optimality claim'))
+                write_schedule(case/'states.txt',schedule)
+                flags['GEGE_BOUNDED_Q4_OPTIMAL88']='0'
+                flags['GEGE_BOUNDED_STATE_ORDER_FILE']=str(case/'states.txt')
+                write_json(case/'schedule.json',evidence)
                 (case/'config.yaml').write_text(yaml.safe_dump(cfg,sort_keys=False))
                 write_json(case/'flags.json',flags)
                 result=dict(status='running',source_commit=args.commit,workload=workload,
@@ -474,7 +510,7 @@ def sweep(args):
                             frame_bytes=800*math.ceil(spec['nodes']/p),
                             graph_prefetch=spec['graph_prefetch'],paper_ready=False,
                             source_sha256=source['train_sha256'],
-                            binaries={n:digest(args.build/n) for n in ('gege_train','libge2.so')},
+                            binaries=binaries,schedule_sha256=summary.schedule_sha256,
                             config_sha256=digest(case/'config.yaml'),flags_sha256=digest(case/'flags.json'))
                 write_json(case/'result.json',result)
                 try:
@@ -499,13 +535,17 @@ def sweep(args):
                 finally:
                     write_json(case/'result.json',result)
                     # These are timing-only scratch runs; no checkpoint is promised.
-                    if result['status'] in ('pass','infeasible_oom','infeasible_total_memory') and (case/'model').exists():
-                        shutil.rmtree(case/'model')
+                    if result['status'] in ('pass','infeasible_oom','infeasible_total_memory') and model.exists():
+                        shutil.rmtree(model)
                     if result['status'] in ('pass','infeasible_oom','infeasible_total_memory'):
                         # Keep hashes/counts but regenerate disposable edge views as
                         # needed, so the sweep does not accumulate terabytes.
                         shutil.copy2(view/'manifest.json',case/'data_manifest.json')
-                        shutil.rmtree(view)
+                        remaining=[x for x in selected if (x[0],x[2])==(workload,p)
+                                   and f'{x[0]}_m{x[1]}_p{x[2]}_q4_h{x[3]}' not in state['completed']
+                                   and tuple(x)!=(workload,budget,p,hidden)]
+                        if not remaining:
+                            shutil.rmtree(view)
                 state['completed'][name]=result['status']
                 write_json(root/'status.json',state)
             else:
@@ -535,6 +575,9 @@ def main():
     parser.add_argument('--sources',type=Path)
     parser.add_argument('--plan',type=Path)
     parser.add_argument('--gate',type=Path)
+    parser.add_argument('--schedule-root',type=Path)
+    parser.add_argument('--scratch-root',type=Path)
+    parser.add_argument('--geometries',type=json.loads,help='Synthetic cases: JSON [[workload,p],...]')
     parser.add_argument('--commit')
     parser.add_argument('--seconds',type=int,default=18000)
     parser.add_argument('--power-w',type=float,default=300)

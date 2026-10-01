@@ -152,7 +152,8 @@ def main():
                 files[key]=str(args.payload/value)
         write_json(args.root/'references.json',refs)
         common=['--references',args.root/'references.json','--gege',repo/'ge2/dandelion-dev/gege',
-                '--build',build,'--env',prefix,'--helpers',args.payload/'helpers']
+                '--build',build,'--env',prefix,'--helpers',args.payload/'helpers',
+                '--schedule-root',args.payload/'schedules']
         gate=args.root/'smoke/result.json'
         if not gate.exists():
             command([prefix/'bin/python',scripts/'memory_budget_study.py','smoke',

@@ -7,15 +7,20 @@ import shutil
 import subprocess
 
 from arc_job_support import write_json
-from memory_budget_study import make_plan
+from memory_budget_study import certified_schedule, make_plan
 from run_arc_paper_case import digest
 
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    for name in ('repo','out','references','sources','helpers','gate'):
+    for name in ('repo','out','references','sources','helpers','gate','schedules'):
         parser.add_argument('--'+name,type=Path,required=True)
     args=parser.parse_args()
+    import sys
+    sys.path.insert(0,str(args.helpers.resolve()))
+    plan=make_plan(49140)
+    for p in sorted({point[2] for point in plan['selection_points']}):
+        certified_schedule(args.schedules,p)
     if subprocess.check_output(['git','-C',str(args.repo),'diff','HEAD']):
         raise RuntimeError('Commit tracked changes before packaging')
     commit=subprocess.check_output(['git','-C',str(args.repo),'rev-parse','HEAD'],text=True).strip()
@@ -35,7 +40,12 @@ def main():
     write_json(args.out/'references.json',normalized)
     shutil.copy2(args.sources,args.out/'sources.json')
     shutil.copy2(args.gate,args.out/'local_gate.json')
-    write_json(args.out/'plan.json',make_plan(49140))
+    write_json(args.out/'plan.json',plan)
+    for p in sorted({point[2] for point in plan['selection_points']}):
+        target=args.out/'schedules'/f'p{p}'
+        target.mkdir(parents=True)
+        for name in ('states.txt','cover.json'):
+            shutil.copy2(args.schedules/f'p{p}'/name,target/name)
     helpers=args.out/'helpers'
     helpers.mkdir()
     for name in ('plan_pipege_cover.py','prepare_ge2_partitioned_view.py'):

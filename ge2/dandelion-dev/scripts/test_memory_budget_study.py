@@ -5,7 +5,7 @@ import os
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
-from memory_budget_study import limits, estimate, make_plan, policy, configuration, check_log, selection_points, schedule_evidence
+from memory_budget_study import limits, estimate, make_plan, policy, configuration, check_log, selection_points, schedule_evidence, certified_schedule
 
 
 class MemoryBudgetStudyTest(unittest.TestCase):
@@ -132,6 +132,39 @@ Edges processed: [100/100], 100.00%
             with self.assertRaises(ValueError):
                 schedule_evidence(bad,2,8192,16)
 
+    def test_schedule_certificate_required_and_hash_checked(self):
+        from dataclasses import asdict
+        from plan_pipege_cover import plan_cover,write_schedule
+        states,summary,_=plan_cover(5,4,solver='optimal',restarts=1)
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            folder=root/'p5'
+            folder.mkdir()
+            write_schedule(folder/'states.txt',states)
+            evidence=asdict(summary)
+            (folder/'cover.json').write_text(json.dumps(evidence))
+            self.assertEqual(certified_schedule(root,5)[1].state_count,3)
+            for field,value in [('state_count_optimal',False),('overlap_optimality','not_proven'),
+                                ('maximum_overlap',999),('schedule_sha256','changed')]:
+                changed=json.loads(json.dumps(evidence))
+                changed['optimality'][field]=value
+                (folder/'cover.json').write_text(json.dumps(changed))
+                with self.assertRaises(ValueError):
+                    certified_schedule(root,5)
+            (folder/'cover.json').write_text(json.dumps(evidence))
+            write_schedule(folder/'states.txt',list(reversed(states)))
+            with self.assertRaises(ValueError):
+                certified_schedule(root,5)
+
+    def test_all_requested_partitions_are_in_certificate_plan(self):
+        from certify_memory_schedules import required_geometries
+        plan=make_plan(49140)
+        groups=required_geometries(plan)
+        self.assertEqual(set(groups),{point[2] for point in plan['selection_points']})
+        self.assertEqual(sum(map(len,groups.values())),len(plan['selection_points']))
+        self.assertIn(67,groups)
+        self.assertTrue(all(r['k']==4+r['h'] for rows in groups.values() for r in rows))
+
     @unittest.skipUnless(os.environ.get('PIPEGE_GPU_INTEGRATION'),'opt-in local GPU integration')
     def test_ten_epoch_sweep_and_cleanup(self):
         import yaml
@@ -150,7 +183,7 @@ Edges processed: [100/100], 100.00%
                 gege=Path(os.environ['PIPEGE_TEST_GEGE']),
                 build=Path(os.environ['PIPEGE_TEST_BUILD']),env=Path(os.environ['PIPEGE_TEST_ENV']),
                 gpu='0',seconds=6000,case=json.dumps(['tw',16384,8,2]),commit='synthetic-integration',
-                epochs=10,power_w=350)
+                epochs=10,power_w=350,schedule_root=Path(os.environ['PIPEGE_TEST_SCHEDULES']))
             spec=dict(study.WORKLOADS['tw'],nodes=metadata['num_nodes'],edges=metadata['num_train'])
             with patch.dict(study.WORKLOADS,tw=spec):
                 study.sweep(args)

@@ -165,6 +165,24 @@ Edges processed: [100/100], 100.00%
         self.assertIn(67,groups)
         self.assertTrue(all(r['k']==4+r['h'] for rows in groups.values() for r in rows))
 
+    def test_native_witness_uses_supported_cli_and_checks_bucket_ownership(self):
+        from certify_memory_schedules import native_witness
+        buckets=','.join(f'({a},{b})' for a in range(4) for b in range(4))
+        native='state 0 partitions=[0,1,2,3] assigned_buckets=16 buckets=['+buckets+']\n'
+        with tempfile.TemporaryDirectory() as directory:
+            root=Path(directory)
+            args=SimpleNamespace(env=root,build=root)
+            def run(command,**kwargs):
+                self.assertEqual(command[1],'CUSTOM')
+                kwargs['stdout'].write(native)
+            with patch('certify_memory_schedules.subprocess.run',side_effect=run):
+                self.assertEqual(native_witness(args,4,root),[(0,1,2,3)])
+            def invalid(command,**kwargs):
+                kwargs['stdout'].write(native.replace('(3,3)','(3,4)'))
+            with patch('certify_memory_schedules.subprocess.run',side_effect=invalid):
+                with self.assertRaises(ValueError):
+                    native_witness(args,4,root)
+
     @unittest.skipUnless(os.environ.get('PIPEGE_GPU_INTEGRATION'),'opt-in local GPU integration')
     def test_ten_epoch_sweep_and_cleanup(self):
         import yaml

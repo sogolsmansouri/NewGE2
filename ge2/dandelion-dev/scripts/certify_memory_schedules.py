@@ -33,7 +33,7 @@ def native_witness(args,p,folder):
     env=make_env(args.env,args.build,folder/'unused_overlay','0')
     env.update(GEGE_BOUNDED_GREEDY_COVER_Q4='1',GEGE_STATEFLOW_MAX_ADMITS='3',
                GEGE_BOUNDED_Q4_OPTIMAL88=str(int(p==32)))
-    command=[str(args.build/'gege_cover_schedule_analyzer'),'GREEDY_COVER',str(p),'4','1','0','0','1','--dump-buckets']
+    command=[str(args.build/'gege_cover_schedule_analyzer'),'CUSTOM',str(p),'4','1','0','0','1','--dump-buckets']
     with (folder/'native.log').open('w') as out:
         subprocess.run(command,env=env,stdout=out,stderr=subprocess.STDOUT,check=True,timeout=300)
     text=(folder/'native.log').read_text()
@@ -61,9 +61,18 @@ def solve_one(args):
     states=parse_schedule(folder/'incumbent.txt')
     proof={}
     try:
-        states,proof=build_minimum_cover(args.one,4,incumbent=states,restarts=1,
-            time_limit_s=args.solver_seconds,max_candidates=args.max_candidates)
-        states=order_cover(states,4,allow_bridges=False,overlap_first=True)
+        initial=summarize_cover(states,args.one,4)
+        if initial.state_count==initial.covering_lower_bound:
+            proof=dict(state_count_optimal=True,minimum_state_count=initial.state_count,
+                covering_lower_bound=initial.covering_lower_bound,feasible_upper_bound=initial.state_count,
+                scope='full_pair_cover_without_transition_constraints',
+                method='feasible_cover_matches_lower_bound')
+        else:
+            states,proof=build_minimum_cover(args.one,4,incumbent=states,restarts=1,
+                time_limit_s=args.solver_seconds,max_candidates=args.max_candidates)
+        ordered=order_cover(states,4,allow_bridges=False,overlap_first=True)
+        if summarize_cover(ordered,args.one,4).total_overlap>summarize_cover(states,args.one,4).total_overlap:
+            states=ordered
         write_schedule(folder/'minimum.txt',states)
         write_json(folder/'minimum.json',dict(asdict(summarize_cover(states,args.one,4)),optimality=proof))
         states,overlap=maximize_cover_overlap(args.one,4,states,time_limit_s=args.solver_seconds,
@@ -97,6 +106,7 @@ def campaign(args):
     args.output.mkdir(parents=True,exist_ok=True)
     geometries=required_geometries(json.loads(args.plan.read_text()))
     state=dict(status='running',scope='schedule certificates and synthetic correctness; no timing measurements',
+        runner=str(Path(__file__).resolve()),runner_sha256=digest(Path(__file__)),
         plan_sha256=digest(args.plan),helper_sha256=digest(args.helpers/'plan_pipege_cover.py'),
         binaries={n:digest(args.build/n) for n in ('gege_train','libge2.so','gege_cover_schedule_analyzer')},
         counts=len(geometries),results={})

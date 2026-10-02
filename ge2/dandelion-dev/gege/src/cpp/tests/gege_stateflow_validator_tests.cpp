@@ -1,7 +1,9 @@
 #include "data/ordering.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <functional>
 #include <iostream>
 #include <stdexcept>
@@ -470,7 +472,45 @@ void test_bounded_q4_lane_matched_respects_three_admit_cap() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char **argv) {
+    // Export complete plans for before/after compiler comparisons, not just costs.
+    if (argc == 4 && std::string(argv[1]) == "--dump-multigpu-plans") {
+        ScopedEnvVar optimal88("GEGE_BOUNDED_Q4_OPTIMAL88", "1");
+        ScopedEnvVar iterations("GEGE_BOUNDED_Q4_OPTIMAL88_ITERS", "0");
+        ScopedEnvVar max_admits("GEGE_STATEFLOW_MAX_ADMITS", "3");
+        ScopedEnvVar peer("GEGE_STATEFLOW_ALLOW_PEER_RELAY", "1");
+        for (int p : {16, 32}) {
+            ScopedEnvVar order_file("GEGE_BOUNDED_STATE_ORDER_FILE", p == 16 ? argv[3] : nullptr);
+            vector<int64_t> sizes(p * p), rows(p, 1024);
+            rows.back() -= 2;
+            for (int i = 0; i < p * p; ++i) sizes[i] = 1 + (i % 19 == 0 ? 1000 : i % 7);
+            for (int devices : {2, 4}) {
+                for (uint64_t epoch : {0, 1}) {
+                    auto [states, buckets] = p == 16 ? getBoundedGreedyCoverEdgeBucketOrdering(p, 4, sizes)
+                                                    : getEpochRelabeledBoundedCoverOrdering(p, 4, sizes, 17, epoch);
+                    torch::manual_seed(456);
+                    auto expected_random = torch::rand({8});
+                    torch::manual_seed(456);
+                    auto start = std::chrono::steady_clock::now();
+                    auto plan = compileMultiGpuStateflowPlan(states, buckets, devices, sizes, rows, {100, 4, 2});
+                    double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+                    expect_true(torch::equal(expected_random, torch::rand({8})), "compiler consumed training RNG");
+                    expect_true(validateStateflowPlanExactSemantics(plan), "compiled plan failed validation");
+                    expect_true(plan.total_microstates == (p == 16 ? 20 : 88), "state count changed");
+                    expect_true(plan.total_bucket_assignments == p * p, "bucket coverage changed");
+                    expect_lane_max_admits(plan, 3);
+                    std::string name = "p" + std::to_string(p) + "_g" + std::to_string(devices) + "_e" + std::to_string(epoch);
+                    std::ofstream out(std::string(argv[2]) + "/" + name + ".json");
+                    expect_true(out.is_open(), "cannot open plan output");
+                    out << stateflowPlanToJson(plan, true) << '\n';
+                    expect_true(out.good(), "cannot write plan output");
+                    std::cout << "plan_fixture=" << name << " compiler_ms=" << ms << '\n';
+                }
+            }
+        }
+        return 0;
+    }
+    if (argc != 1) return 2;
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
         {"reject_cross_lane_handoff_in_lane_plan", test_reject_cross_lane_handoff_in_lane_plan},
         {"reject_peer_relay_without_cross_lane_descriptor", test_reject_peer_relay_without_cross_lane_descriptor},

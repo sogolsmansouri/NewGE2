@@ -14,6 +14,8 @@ class MultiGpuCampaignTests(unittest.TestCase):
     def test_shared_node_diagnostic_cannot_be_used_for_final(self):
         with self.assertRaisesRegex(ValueError, 'cannot run final'):
             run_case(None, None, None, 'final', 0, None, None, diagnostic_gate=True)
+        with self.assertRaisesRegex(ValueError, 'requires diagnostic mode'):
+            run_case(None, None, None, 'final', 0, None, None, physical_devices=[2, 3])
 
     def test_diagnostic_checks_all_selected_gpus(self):
         with patch('run_arc_multigpu_campaign.foreign_gpu_pids', return_value=[]) as check:
@@ -21,11 +23,16 @@ class MultiGpuCampaignTests(unittest.TestCase):
             check.assert_called_with('0,1')
             idle_devices(4)
             check.assert_called_with('0,1,2,3')
+            idle_devices(2, [2, 3])
+            check.assert_called_with('2,3')
         with patch('run_arc_multigpu_campaign.foreign_gpu_pids', return_value=[42]):
             with self.assertRaisesRegex(RuntimeError, 'occupied'):
                 idle_devices(2)
         with self.assertRaises(ValueError):
             idle_devices(3)
+        for devices in ([2, 2], [1], [-1, 2], ['2', '3'], [False, 1]):
+            with self.assertRaises(ValueError):
+                idle_devices(2, devices)
 
     def test_runtime_policy_is_explicit_and_does_not_disable_frame_relay(self):
         self.assertEqual(runtime_environment({}), {})

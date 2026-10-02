@@ -3152,18 +3152,20 @@ MultiGpuTransitionCost best_multi_gpu_group_transition_cost(const MultiGpuRoundG
                                                             int64_t bytes_per_row) {
     MultiGpuTransitionCost best;
     bool have_best = false;
-    auto prev_orientations = multi_gpu_group_orientations(prev_group);
+    // Transition cost is invariant under a common permutation of lane IDs.
+    // Fix the source order and enumerate relative destination assignments only.
+    // This function returns a cost, not the selected lane orientation.
+    auto canonical_prev = prev_group;
+    std::sort(canonical_prev.states.begin(), canonical_prev.states.end());
     auto next_orientations = multi_gpu_group_orientations(next_group);
-    for (const auto &prev_orientation : prev_orientations) {
-        for (const auto &next_orientation : next_orientations) {
-            auto candidate = multi_gpu_transition_cost(prev_orientation, next_orientation, summaries,
-                                                       partition_row_counts, cfg, bytes_per_row);
-            auto candidate_key = path_cost_from_transition(candidate);
-            auto best_key = path_cost_from_transition(best);
-            if (!have_best || multi_gpu_path_cost_less(candidate_key, best_key)) {
-                best = candidate;
-                have_best = true;
-            }
+    for (const auto &next_orientation : next_orientations) {
+        auto candidate = multi_gpu_transition_cost(canonical_prev, next_orientation, summaries,
+                                                   partition_row_counts, cfg, bytes_per_row);
+        auto candidate_key = path_cost_from_transition(candidate);
+        auto best_key = path_cost_from_transition(best);
+        if (!have_best || multi_gpu_path_cost_less(candidate_key, best_key)) {
+            best = candidate;
+            have_best = true;
         }
     }
     return best;
@@ -7975,62 +7977,8 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
     std::vector<StateflowPlan> candidates;
     const LaneMatchCostConfig lane_match_cfg = lane_match_cost_config_from_env();
 
-    std::vector<int64_t> identity_permutation(buffer_states.size());
-    std::iota(identity_permutation.begin(), identity_permutation.end(), 0);
-    StateflowPlan input_round_plan =
-        build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, identity_permutation, active_devices,
-                                                        PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
-                                                        partition_row_counts, layout);
-    if (stateflow_plan_valid(input_round_plan) &&
-        stateflow_plan_respects_max_admits(input_round_plan, lane_match_cfg.max_admits_per_transition) &&
-        validateStateflowPlanExactSemantics(input_round_plan)) {
-        score_stateflow_plan(input_round_plan, edge_bucket_sizes, layout);
-        SPDLOG_DEBUG(
-            "Stateflow multi-GPU candidate policy=input_rounds cost={:.3f} rounds={} loads={} boundaries={} "
-            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
-            input_round_plan.estimated_cost, input_round_plan.total_superstates, input_round_plan.total_partition_loads,
-            input_round_plan.boundary_count, input_round_plan.total_bucket_assignments, input_round_plan.estimated_bucket_edges,
-            overlap_histogram_string(input_round_plan));
-        candidates.emplace_back(std::move(input_round_plan));
-    }
-
-    auto grouped_permutation = getDisjointBufferStatePermutation(buffer_states, active_devices);
-    StateflowPlan grouped_plan =
-        build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, grouped_permutation, active_devices,
-                                                        PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
-                                                        partition_row_counts, layout);
-    if (stateflow_plan_valid(grouped_plan) &&
-        stateflow_plan_respects_max_admits(grouped_plan, lane_match_cfg.max_admits_per_transition) &&
-        validateStateflowPlanExactSemantics(grouped_plan)) {
-        score_stateflow_plan(grouped_plan, edge_bucket_sizes, layout);
-        SPDLOG_DEBUG(
-            "Stateflow multi-GPU candidate policy=disjoint_rounds cost={:.3f} rounds={} loads={} boundaries={} "
-            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
-            grouped_plan.estimated_cost, grouped_plan.total_superstates, grouped_plan.total_partition_loads,
-            grouped_plan.boundary_count, grouped_plan.total_bucket_assignments, grouped_plan.estimated_bucket_edges,
-            overlap_histogram_string(grouped_plan));
-        candidates.emplace_back(std::move(grouped_plan));
-    }
-
-    auto lane_matched_permutation =
-        getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, active_devices, partition_row_counts, layout);
-    StateflowPlan lane_matched_plan = build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer,
-                                                                                      lane_matched_permutation, active_devices,
-                                                                                      PlanVariant::MULTI_GPU_LANE_MATCHED,
-                                                                                      edge_bucket_sizes, partition_row_counts, layout);
-    if (stateflow_plan_valid(lane_matched_plan) &&
-        stateflow_plan_respects_max_admits(lane_matched_plan, lane_match_cfg.max_admits_per_transition) &&
-        validateStateflowPlanExactSemantics(lane_matched_plan)) {
-        score_stateflow_plan(lane_matched_plan, edge_bucket_sizes, layout);
-        SPDLOG_DEBUG(
-            "Stateflow multi-GPU candidate policy=lane_matched cost={:.3f} rounds={} loads={} boundaries={} "
-            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
-            lane_matched_plan.estimated_cost, lane_matched_plan.total_superstates, lane_matched_plan.total_partition_loads,
-            lane_matched_plan.boundary_count, lane_matched_plan.total_bucket_assignments, lane_matched_plan.estimated_bucket_edges,
-            overlap_histogram_string(lane_matched_plan));
-        candidates.emplace_back(std::move(lane_matched_plan));
-    }
-
+    // These validated schedules already take precedence over generic candidates.
+    // Try them first so each epoch does not build and discard an expensive search.
     if (active_devices == 2 && buffer_states.size() == 20) {
         auto tw16_permutation =
             getTw16TwentyStateTwoGpuLaneMatchedPermutation(buffer_states, edge_buckets_per_buffer,
@@ -8142,6 +8090,62 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
                 candidates.emplace_back(std::move(optimal88_plan));
             }
         }
+    }
+
+    std::vector<int64_t> identity_permutation(buffer_states.size());
+    std::iota(identity_permutation.begin(), identity_permutation.end(), 0);
+    StateflowPlan input_round_plan =
+        build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, identity_permutation, active_devices,
+                                                        PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
+                                                        partition_row_counts, layout);
+    if (stateflow_plan_valid(input_round_plan) &&
+        stateflow_plan_respects_max_admits(input_round_plan, lane_match_cfg.max_admits_per_transition) &&
+        validateStateflowPlanExactSemantics(input_round_plan)) {
+        score_stateflow_plan(input_round_plan, edge_bucket_sizes, layout);
+        SPDLOG_DEBUG(
+            "Stateflow multi-GPU candidate policy=input_rounds cost={:.3f} rounds={} loads={} boundaries={} "
+            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
+            input_round_plan.estimated_cost, input_round_plan.total_superstates, input_round_plan.total_partition_loads,
+            input_round_plan.boundary_count, input_round_plan.total_bucket_assignments, input_round_plan.estimated_bucket_edges,
+            overlap_histogram_string(input_round_plan));
+        candidates.emplace_back(std::move(input_round_plan));
+    }
+
+    auto grouped_permutation = getDisjointBufferStatePermutation(buffer_states, active_devices);
+    StateflowPlan grouped_plan =
+        build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer, grouped_permutation, active_devices,
+                                                        PlanVariant::MULTI_GPU_DISJOINT_ROUNDS, edge_bucket_sizes,
+                                                        partition_row_counts, layout);
+    if (stateflow_plan_valid(grouped_plan) &&
+        stateflow_plan_respects_max_admits(grouped_plan, lane_match_cfg.max_admits_per_transition) &&
+        validateStateflowPlanExactSemantics(grouped_plan)) {
+        score_stateflow_plan(grouped_plan, edge_bucket_sizes, layout);
+        SPDLOG_DEBUG(
+            "Stateflow multi-GPU candidate policy=disjoint_rounds cost={:.3f} rounds={} loads={} boundaries={} "
+            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
+            grouped_plan.estimated_cost, grouped_plan.total_superstates, grouped_plan.total_partition_loads,
+            grouped_plan.boundary_count, grouped_plan.total_bucket_assignments, grouped_plan.estimated_bucket_edges,
+            overlap_histogram_string(grouped_plan));
+        candidates.emplace_back(std::move(grouped_plan));
+    }
+
+    auto lane_matched_permutation =
+        getAccessAwareDisjointBufferStatePermutation(buffer_states, edge_buckets_per_buffer, active_devices, partition_row_counts, layout);
+    StateflowPlan lane_matched_plan = build_multi_gpu_stateflow_plan_from_permutation(buffer_states, edge_buckets_per_buffer,
+                                                                                      lane_matched_permutation, active_devices,
+                                                                                      PlanVariant::MULTI_GPU_LANE_MATCHED,
+                                                                                      edge_bucket_sizes, partition_row_counts, layout);
+    if (stateflow_plan_valid(lane_matched_plan) &&
+        stateflow_plan_respects_max_admits(lane_matched_plan, lane_match_cfg.max_admits_per_transition) &&
+        validateStateflowPlanExactSemantics(lane_matched_plan)) {
+        score_stateflow_plan(lane_matched_plan, edge_bucket_sizes, layout);
+        SPDLOG_DEBUG(
+            "Stateflow multi-GPU candidate policy=lane_matched cost={:.3f} rounds={} loads={} boundaries={} "
+            "directed_buckets={} estimated_bucket_edges={} overlap_hist={}",
+            lane_matched_plan.estimated_cost, lane_matched_plan.total_superstates, lane_matched_plan.total_partition_loads,
+            lane_matched_plan.boundary_count, lane_matched_plan.total_bucket_assignments, lane_matched_plan.estimated_bucket_edges,
+            overlap_histogram_string(lane_matched_plan));
+        candidates.emplace_back(std::move(lane_matched_plan));
     }
 
     return candidates;

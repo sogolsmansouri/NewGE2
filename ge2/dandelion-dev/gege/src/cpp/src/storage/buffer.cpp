@@ -3248,7 +3248,7 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
                         device_.str(), active_slots, capacity_, partition_size_, embedding_size_, total_embeddings_);
         }
 
-#pragma omp parallel for
+#pragma omp parallel for reduction(+:num_nodes)
         for (int64_t i = 0; i < active_slots; i++) {
             int partition_id = buffer_state_[i].item<int>();
             Partition *partition = partition_table_[partition_id];
@@ -3260,8 +3260,10 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
             num_nodes += partition->partition_size_;
         }
 
-        loaded_ = true;
-        size_.store(num_nodes);
+        // resetFrameCacheState_ installs visible slots in the physical prefix.
+        // Hidden frames are free; their contents are filled on admission.
+        auto host_visible = buffer_tensor_view_.narrow(0, 0, active_slots * partition_size_);
+        auto gpu_visible = buffer_tensor_gpu_view_.narrow(0, 0, active_slots * partition_size_);
 #ifdef GEGE_CUDA
         if (device_.is_cuda()) {
             c10::cuda::CUDAGuard device_guard(device_);
@@ -3269,25 +3271,27 @@ void MemPartitionBuffer::load(torch::Tensor data_storage) {
             if (non_blocking_host_copy) {
                 auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
                 c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
-                buffer_tensor_gpu_view_.copy_(buffer_tensor_view_, true);
-                cudaStreamSynchronize(copy_stream.stream());
+                gpu_visible.copy_(host_visible, true);
+                AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
             } else {
-                buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
+                gpu_visible.copy_(host_visible);
             }
         } else {
-            buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
+            gpu_visible.copy_(host_visible);
         }
 #else
-        buffer_tensor_gpu_view_.copy_(buffer_tensor_view_);
+        gpu_visible.copy_(host_visible);
 #endif
+        loaded_ = true;
+        size_.store(num_nodes);
         ensureDirtyRowMaskAllocated_();
         if (dirty_row_mask_.defined()) {
             dirty_row_mask_.zero_();
         }
         auto t2 = std::chrono::high_resolution_clock::now();
         if (log_startup_timing) {
-            SPDLOG_INFO("[startup-timing][MemPartitionBuffer::load] end device={} nodes={} total_ms={:.3f}",
-                        device_.str(), num_nodes, elapsed_ms(t1, t2));
+            SPDLOG_INFO("[startup-timing][MemPartitionBuffer::load] end device={} nodes={} total_ms={:.3f} h2d_bytes={} allocated_bytes={}",
+                        device_.str(), num_nodes, elapsed_ms(t1, t2), host_visible.nbytes(), buffer_tensor_view_.nbytes());
         }
     }
 }
@@ -4703,6 +4707,20 @@ double MemPartitionBuffer::copyGpuBufferToHostStaging_() {
     }
 
     auto copy_start = std::chrono::high_resolution_clock::now();
+    int64_t active_slots = get_active_slot_count(buffer_state_, capacity_, "MemPartitionBuffer::copyGpuBufferToHostStaging_");
+    int64_t copied_bytes = 0;
+    // The caller drains stale writebacks first. Only current visible frames
+    // remain to synchronize, and publication may have moved them out of the prefix.
+    auto copy_visible = [&](bool non_blocking) {
+        for (int64_t i = 0; i < active_slots; ++i) {
+            Partition *partition = partition_table_[buffer_state_[i].item<int>()];
+            int64_t offset = partitionRowOffset_(partition);
+            auto host = buffer_tensor_view_.narrow(0, offset, partition->partition_size_);
+            auto gpu = buffer_tensor_gpu_view_.narrow(0, offset, partition->partition_size_);
+            host.copy_(gpu.detach(), non_blocking);
+            copied_bytes += host.nbytes();
+        }
+    };
 #ifdef GEGE_CUDA
     c10::cuda::CUDAGuard device_guard(device_);
     int device_index = device_.index();
@@ -4720,10 +4738,10 @@ double MemPartitionBuffer::copyGpuBufferToHostStaging_() {
             auto copy_stream = c10::cuda::getStreamFromPool(false, device_index);
             c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
             AT_CUDA_CHECK(cudaStreamWaitEvent(copy_stream.stream(), ready_event, 0));
-            buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach(), true);
+            copy_visible(true);
             AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
         } else {
-            buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
+            copy_visible(false);
         }
     } catch (...) {
         if (ready_event != nullptr) {
@@ -4735,9 +4753,14 @@ double MemPartitionBuffer::copyGpuBufferToHostStaging_() {
         AT_CUDA_CHECK(cudaEventDestroy(ready_event));
     }
 #else
-    buffer_tensor_view_.copy_(buffer_tensor_gpu_view_.detach());
+    copy_visible(false);
 #endif
-    return elapsed_ms(copy_start, std::chrono::high_resolution_clock::now());
+    double copy_ms = elapsed_ms(copy_start, std::chrono::high_resolution_clock::now());
+    if (startup_timing_enabled()) {
+        SPDLOG_INFO("[startup-timing][MemPartitionBuffer::host_sync] device={} d2h_bytes={} allocated_bytes={} total_ms={:.3f}",
+                    device_.str(), copied_bytes, buffer_tensor_view_.nbytes(), copy_ms);
+    }
+    return copy_ms;
 }
 
 void MemPartitionBuffer::sync(bool host_staging_current) {

@@ -297,12 +297,16 @@ def prepare(base, commit, execute, reuse_build=None):
     return manifest
 
 
-def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, diagnostic_gate=False):
+def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, diagnostic_gate=False,
+             physical_devices=None):
     if diagnostic_gate and phase != 'gate':
         raise ValueError('Shared-node diagnostic mode cannot run final training')
+    if physical_devices is not None and not diagnostic_gate:
+        raise ValueError('GPU selection override requires diagnostic mode')
     from run_arc_pipege_quality import checkpoint_manifest
     spec = manifest['cases'][name]
     count = spec['gpus']
+    devices = diagnostic_devices(count, physical_devices)
     results = base/'results'/name/phase
     results.mkdir(parents=True, exist_ok=False)
     work = base/'work'/name/phase
@@ -312,10 +316,10 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
                  built_engine_commit=manifest.get('built_engine_commit', manifest['commit']),
                  memory_contract=spec['memory_contract'],
                  manifest_sha256=digest(base/'manifest.json'), paper_ready=False, checkpoint_durable=False,
-                 diagnostic_only=diagnostic_gate)
+                 diagnostic_only=diagnostic_gate, physical_devices=devices)
     def check_idle():
         if diagnostic_gate:
-            idle_devices(count)
+            idle_devices(count, devices)
         else:
             idle_node()
     def update(**changes):
@@ -327,7 +331,7 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
            if not k.startswith(('GEGE_', 'OURS_', 'PYTHON', 'PYTORCH_', 'CONDA', 'CUDA_', 'NCCL_'))}
     env.pop('LD_PRELOAD', None)
     env.update(PATH=f'{envdir}/bin:/usr/bin:/bin', PYTHONDONTWRITEBYTECODE='1',
-               CUDA_VISIBLE_DEVICES=','.join(map(str, range(count))), CUDA_DEVICE_ORDER='PCI_BUS_ID',
+               CUDA_VISIBLE_DEVICES=','.join(map(str, devices)), CUDA_DEVICE_ORDER='PCI_BUS_ID',
                OMP_NUM_THREADS='8', MKL_NUM_THREADS='8', OPENBLAS_NUM_THREADS='1')
     env.update(runtime_environment(manifest))
     state.update(runtime_policy=manifest.get('runtime_policy', 'default'),
@@ -358,7 +362,7 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
             if gate['status'] != 'gate_passed' or gate['manifest_sha256'] != state['manifest_sha256']:
                 raise ValueError('Requires a successful gate for this frozen configuration')
         uuids = []
-        for gpu in range(count):
+        for gpu in devices:
             row = subprocess.check_output(['nvidia-smi', '-i', str(gpu), '--query-gpu=uuid,name,power.limit',
                                            '--format=csv,noheader,nounits'], text=True).strip().split(',')
             if row[1].strip() != 'NVIDIA RTX A6000' or float(row[2]) != manifest['power_w']:
@@ -489,10 +493,19 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
         raise
 
 
-def idle_devices(count):
+def diagnostic_devices(count, physical_devices=None):
     if count not in (2, 4):
         raise ValueError('Requires two or four diagnostic GPUs')
-    foreign = foreign_gpu_pids(','.join(map(str, range(count))))
+    devices = list(range(count)) if physical_devices is None else list(physical_devices)
+    if (len(devices) != count or len(set(devices)) != count
+            or any(type(gpu) is not int or gpu < 0 for gpu in devices)):
+        raise ValueError('Requires distinct nonnegative physical GPU indices matching the count')
+    return devices
+
+
+def idle_devices(count, physical_devices=None):
+    devices = diagnostic_devices(count, physical_devices)
+    foreign = foreign_gpu_pids(','.join(map(str, devices)))
     if foreign:
         raise RuntimeError('Diagnostic GPUs are occupied: '+repr(foreign))
 

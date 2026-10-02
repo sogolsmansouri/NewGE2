@@ -5,6 +5,13 @@
 #include <cuda_runtime.h>
 #include "storage/buffer.h"
 
+class TestMemPartitionBuffer : public MemPartitionBuffer {
+ public:
+    using MemPartitionBuffer::MemPartitionBuffer;
+    torch::Tensor hostStaging() { return buffer_tensor_view_; }
+    int64_t loadedRows() const { return size_.load(); }
+};
+
 // Exact integer updates test retention, partial admits, delayed host freshness,
 // frame reuse, and the shortened final partition independently of training.
 int main(int argc, char **argv) {
@@ -34,15 +41,35 @@ int main(int argc, char **argv) {
     std::ofstream(argv[3]).close();
     auto host = torch::zeros({nodes, 8});
     auto expected = host.clone();
-    MemPartitionBuffer buffer(q, p, 1, rows, 8, nodes, torch::kFloat32, argv[3], false, torch::Device(torch::kCUDA, 0));
+    TestMemPartitionBuffer buffer(q, p, 1, rows, 8, nodes, torch::kFloat32, argv[3], false, torch::Device(torch::kCUDA, 0));
     const int k = q + std::stoi(std::getenv("GEGE_FRAME_CACHE_HIDDEN_FRAMES"));
     const int hs = std::stoi(std::getenv("GEGE_FRAME_CACHE_MAX_STALE_BACKLOG"));
     const char *preload_flag = std::getenv("GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD");
     const bool preload_off = preload_flag != nullptr && std::string(preload_flag) == "0";
+    // Allocate once, then poison the free frames differently on host and device.
+    buffer.setBufferOrdering(states);
+    buffer.load(host);
+    buffer.unload(false);
+    buffer.hostStaging().fill_(37);
+    buffer.buffer_tensor_gpu_view_.fill_(-73);
+    buffer.setBufferOrdering(states);
+    buffer.load(host);
+    TORCH_CHECK((buffer.buffer_tensor_gpu_view_.slice(0, q * rows) == -73).all().item<bool>(),
+                "Reload copied free hidden frames H2D");
+    buffer.hostStaging().fill_(37);
+    buffer.unload(true);
+    TORCH_CHECK(torch::equal(host, expected), "Reload/unload changed entity values");
+    TORCH_CHECK((buffer.hostStaging().slice(0, q * rows) == 37).all().item<bool>(),
+                "Unload copied free hidden frames D2H");
     for (int epoch = 0; epoch < 5; ++epoch) {
         buffer.setBufferOrdering(states);
         buffer.load(host);
         TORCH_CHECK(buffer.buffer_tensor_gpu_view_.size(0) == k * rows, "Physical allocation grew");
+        int64_t expected_rows = 0;
+        for (int slot = 0; slot < q; ++slot) {
+            expected_rows += states.front()[slot].item<int64_t>() == p - 1 ? rows - 2 : rows;
+        }
+        TORCH_CHECK(buffer.loadedRows() == expected_rows, "Incorrect loaded-row count");
         for (std::size_t step = 0; step < states.size(); ++step) {
             auto map = buffer.getGlobalToLocalMap(true);
             auto global = torch::nonzero(map >= 0).flatten();

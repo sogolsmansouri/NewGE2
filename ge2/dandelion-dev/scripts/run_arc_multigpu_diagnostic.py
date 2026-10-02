@@ -17,6 +17,15 @@ from run_arc_multigpu_campaign import diagnostic_devices, idle_devices, prepare,
 from run_arc_multigpu_finish import freeze_retry
 
 
+def stage_scripts(source, destination):
+    # Do not follow historical machine-local package/build symlinks in scripts/.
+    destination.mkdir(exist_ok=False)
+    for path in source.glob('*.py'):
+        if path.is_symlink():
+            raise ValueError('Launcher scripts must be regular source files: '+str(path))
+        shutil.copy2(path, destination/path.name)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', required=True, type=Path)
@@ -79,7 +88,7 @@ def main():
                     '--query-gpu=power.limit', '--format=csv,noheader,nounits'], text=True)
                 if float(power.strip()) != args.power_w:
                     raise ValueError('Diagnostic power cohort does not match selected GPU')
-            shutil.copytree(scripts, base/'scripts', ignore=shutil.ignore_patterns('__pycache__'))
+            stage_scripts(scripts, base/'scripts')
             prepare(base, args.commit, execute)
             update(status='testing', stage='native_tests_passed')
             for workload in ('fb_complex', 'tw_dot'):
@@ -91,7 +100,7 @@ def main():
                 evidence.mkdir()
                 update(active_case=name)
                 try:
-                    manifest = freeze_retry(base, case, scripts, name, args.commit)
+                    manifest = freeze_retry(base, case, base/'scripts', name, args.commit)
                     manifest.update(power_w=args.power_w, diagnostic_only=True,
                                     native_build_policy='Fresh native build from the pinned source commit')
                     write_json(case/'manifest.json', manifest)

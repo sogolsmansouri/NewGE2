@@ -389,6 +389,9 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
             if phase == 'gate':
                 env.update(GEGE_STATEFLOW_PEER_RELAY_VALIDATE='1', GEGE_STATEFLOW_PEER_RELAY_VALIDATE_FAIL_FAST='1',
                     GEGE_STATEFLOW_PEER_RELAY_VALIDATE_MAX_CHECKS='100000', GEGE_STATEFLOW_DEBUG_VALIDATE='1')
+            else:
+                env.update(GEGE_STATEFLOW_PEER_RELAY_VALIDATE='0',
+                           GEGE_STATEFLOW_PEER_RELAY_VALIDATE_MAX_CHECKS='0', GEGE_STATEFLOW_DEBUG_VALIDATE='0')
         env['LD_LIBRARY_PATH'] = f'{lib}:{envdir}/lib/python3.9/site-packages/torch/lib:{envdir}/lib'
         repair = manifest.get('ge2_dense_repair') if spec['system'] == 'ge2' else None
         if repair:

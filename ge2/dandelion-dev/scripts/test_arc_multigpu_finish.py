@@ -2,16 +2,43 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import yaml
 
 from arc_job_support import write_json
 from run_arc_multigpu_campaign import multigpu_config, multigpu_flags
-from run_arc_multigpu_finish import freeze_retry, restart_base, validate_reference_contract
+from run_arc_multigpu_finish import (apply_final_cohort, freeze_retry, restart_base,
+                                     source_campaign, validate_reference_contract)
 from run_arc_paper_case import digest
 
 
 class MultiGpuFinishTests(unittest.TestCase):
+    def test_source_override_requires_manifest_pin_and_node_local_path(self):
+        self.assertEqual(source_campaign({}), Path('/mnt/local/smansou2/paper_multigpu_293571'))
+        metadata = dict(source_campaign='/mnt/local/smansou2/new_build', source_manifest_sha256='known')
+        with patch('run_arc_multigpu_finish.digest', return_value='known'):
+            self.assertEqual(source_campaign(metadata), Path(metadata['source_campaign']))
+        with patch('run_arc_multigpu_finish.digest', return_value='different'):
+            with self.assertRaisesRegex(ValueError, 'manifest changed'):
+                source_campaign(metadata)
+        for path in ('relative', '/tmp/source', '/mnt/local/smansou2/a/b'):
+            with self.assertRaises(ValueError):
+                source_campaign(dict(metadata, source_campaign=path))
+
+    def test_final_cohort_is_explicit_and_preserves_engine(self):
+        manifest = dict(power_w=300, commit='engine', engine_hashes={'libge2.so': 'hash'})
+        result = apply_final_cohort(manifest, dict(power_w=200, cohort='matched_200w_v2'))
+        self.assertEqual(result['power_w'], 200)
+        self.assertEqual(result['cohort'], 'matched_200w_v2')
+        self.assertEqual(result['commit'], 'engine')
+        self.assertEqual(result['engine_hashes'], {'libge2.so': 'hash'})
+        for power in ('200', 0, 201, True):
+            with self.assertRaises(ValueError):
+                apply_final_cohort(dict(power_w=300), dict(power_w=power))
+        with self.assertRaisesRegex(ValueError, 'Diagnostic'):
+            apply_final_cohort(dict(power_w=200, diagnostic_only=True), {})
+
     def fixture(self, root, graph='fb', system='pipege'):
         old, base, payload = (root/name for name in ('old', 'new', 'payload'))
         for directory in (old/'references', old/'harness/tools', old/'engine', base, payload):

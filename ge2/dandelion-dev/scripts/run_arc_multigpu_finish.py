@@ -24,7 +24,29 @@ from run_arc_paper_case import digest
 
 
 CASES = ('ge2_fb_complex_2gpu', 'pipege_fb_complex_2gpu', 'pipege_tw_dot_4gpu',
-         'ge2_tw_dot_4gpu', 'pipege_fb_complex_4gpu', 'ge2_fb_complex_4gpu')
+         'ge2_tw_dot_4gpu', 'pipege_fb_complex_4gpu', 'ge2_fb_complex_4gpu',
+         'pipege_tw_dot_2gpu', 'ge2_tw_dot_2gpu')
+
+
+def source_campaign(metadata):
+    source = Path(metadata.get('source_campaign', '/mnt/local/smansou2/paper_multigpu_293571'))
+    if 'source_campaign' in metadata:
+        if not source.is_absolute() or source.resolve().parent != Path('/mnt/local/smansou2'):
+            raise ValueError('Source campaign must be a dedicated node-local directory')
+        if digest(source/'manifest.json') != metadata.get('source_manifest_sha256'):
+            raise ValueError('Pinned source campaign manifest changed')
+    return source
+
+
+def apply_final_cohort(manifest, metadata):
+    power = metadata.get('power_w', manifest['power_w'])
+    if type(power) is not int or power not in (200, 300):
+        raise ValueError('Requires an explicit supported A6000 power cohort')
+    if manifest.get('diagnostic_only'):
+        raise ValueError('Diagnostic manifest cannot authorize final timing')
+    manifest.update(power_w=power, cohort=metadata.get('cohort', 'legacy_300w'),
+                    power_policy='Verify observed limits; never change device power settings')
+    return manifest
 
 
 def restart_base(base, restart_count):
@@ -160,8 +182,10 @@ def main():
                 time.sleep(15)
             else:
                 raise RuntimeError('Node did not become exclusively idle within ten minutes')
-            old = Path('/mnt/local/smansou2/paper_multigpu_293571')
+            old = source_campaign(payload_manifest)
             manifest = freeze_retry(old, base, args.payload, args.case, payload_manifest['commit'])
+            apply_final_cohort(manifest, payload_manifest)
+            write_json(base/'manifest.json', manifest)
             for target in (summary, archive):
                 shutil.copy2(base/'manifest.json', target/'manifest.json')
                 shutil.copy2(base/'reference_contract.json', target/'reference_contract.json')

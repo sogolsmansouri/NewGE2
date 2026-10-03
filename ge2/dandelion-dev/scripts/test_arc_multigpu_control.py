@@ -1,13 +1,28 @@
 import json
 from pathlib import Path
 import tempfile
+import sys
 import unittest
+from unittest.mock import patch
 
-from run_arc_multigpu_control import CASES, verify_payload
+from run_arc_multigpu_control import CASES, load_runtime_helpers, verify_payload
 from run_arc_paper_case import digest
 
 
 class MultiGpuControlTests(unittest.TestCase):
+    def test_runtime_helpers_are_loaded_from_frozen_harness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            tools = base/'harness/tools'
+            tools.mkdir(parents=True)
+            (tools/'run_arc_pipege_quality.py').write_text(
+                'def checkpoint_manifest(): pass\ndef timing_summary(): pass\n')
+            with patch.object(sys, 'path', list(sys.path)), patch.dict(sys.modules):
+                sys.modules.pop('run_arc_pipege_quality', None)
+                load_runtime_helpers(base)
+                self.assertEqual(sys.path[0], str(tools))
+                self.assertEqual(Path(sys.modules['run_arc_pipege_quality'].__file__).parent, tools)
+
     def test_scope_is_four_gpu_tw_and_fb_for_both_systems(self):
         self.assertEqual(set(CASES), {f'{system}_{workload}_4gpu'
             for system in ('pipege', 'ge2') for workload in ('tw_dot', 'fb_complex')})

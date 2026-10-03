@@ -9,6 +9,7 @@ from pathlib import Path
 import shutil
 import signal
 import subprocess
+import sys
 import time
 
 from arc_job_support import save_failure_evidence, write_json
@@ -31,6 +32,13 @@ def verify_payload(payload):
     if metadata.get('power_w') not in (200, 300):
         raise ValueError('Explicit power cohort required')
     return metadata
+
+
+def load_runtime_helpers(base):
+    sys.path.insert(0, str(base/'harness/tools'))
+    from run_arc_pipege_quality import checkpoint_manifest, timing_summary
+    if not callable(checkpoint_manifest) or not callable(timing_summary):
+        raise ValueError('Frozen checkpoint/timing helpers are unavailable')
 
 
 def main():
@@ -103,6 +111,7 @@ def main():
                     case = base/name
                     update(status='running', active_case=name, stage=phase)
                     try:
+                        load_runtime_helpers(case)
                         run_case(case, manifests[name], name, phase, deadline, archive/name,
                                  summary/name, diagnostic_gate=(phase == 'gate'),
                                  physical_devices=[0, 1, 2, 3])

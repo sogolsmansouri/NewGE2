@@ -6,11 +6,25 @@ import types
 import unittest
 from unittest.mock import patch
 
-from run_arc_multigpu_campaign import check_replicas, idle_devices, multigpu_config, multigpu_flags, native_score_environment, run_case, runtime_environment, validate_runtime_policy, split_hash_for_view, state_workload_check, training_check
+from run_arc_multigpu_campaign import check_replicas, guarded_execution, idle_devices, multigpu_config, multigpu_flags, native_score_environment, run_case, runtime_environment, validate_runtime_policy, split_hash_for_view, state_workload_check, training_check
 from prepare_tw_multigpu import flags_for
 
 
 class MultiGpuCampaignTests(unittest.TestCase):
+    def test_control_mode_is_guarded_and_cannot_be_promoted_to_final(self):
+        manifest = dict(control_only=True)
+        self.assertTrue(guarded_execution('gate', manifest, True, [0, 1, 2, 3]))
+        self.assertTrue(guarded_execution('control', manifest, False, [0, 1, 2, 3]))
+        self.assertFalse(guarded_execution('final', {}))
+        for bad in ({}, dict(diagnostic_only=True)):
+            with self.assertRaisesRegex(ValueError, 'explicitly non-paper'):
+                guarded_execution('control', bad)
+        for nonpaper in (manifest, dict(diagnostic_only=True)):
+            with self.assertRaisesRegex(ValueError, 'cannot authorize final'):
+                guarded_execution('final', nonpaper)
+        with self.assertRaisesRegex(ValueError, 'Unknown'):
+            guarded_execution('typo', {})
+
     def test_shared_node_diagnostic_cannot_be_used_for_final(self):
         with self.assertRaisesRegex(ValueError, 'cannot run final'):
             run_case(None, None, None, 'final', 0, None, None, diagnostic_gate=True)

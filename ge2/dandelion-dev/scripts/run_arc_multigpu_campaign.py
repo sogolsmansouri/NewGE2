@@ -297,12 +297,25 @@ def prepare(base, commit, execute, reuse_build=None):
     return manifest
 
 
-def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, diagnostic_gate=False,
-             physical_devices=None):
+def guarded_execution(phase, manifest, diagnostic_gate=False, physical_devices=None):
+    if phase not in ('gate', 'final', 'control'):
+        raise ValueError('Unknown multi-GPU execution phase')
     if diagnostic_gate and phase != 'gate':
         raise ValueError('Shared-node diagnostic mode cannot run final training')
-    if physical_devices is not None and not diagnostic_gate:
+    control = phase == 'control'
+    if control and not manifest.get('control_only'):
+        raise ValueError('Control training requires an explicitly non-paper manifest')
+    if phase == 'final' and manifest and (manifest.get('control_only') or manifest.get('diagnostic_only')):
+        raise ValueError('Non-paper manifest cannot authorize final timing')
+    guarded = diagnostic_gate or control
+    if physical_devices is not None and not guarded:
         raise ValueError('GPU selection override requires diagnostic mode')
+    return guarded
+
+
+def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, diagnostic_gate=False,
+             physical_devices=None):
+    guarded = guarded_execution(phase, manifest, diagnostic_gate, physical_devices)
     from run_arc_pipege_quality import checkpoint_manifest
     spec = manifest['cases'][name]
     count = spec['gpus']
@@ -316,9 +329,10 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
                  built_engine_commit=manifest.get('built_engine_commit', manifest['commit']),
                  memory_contract=spec['memory_contract'],
                  manifest_sha256=digest(base/'manifest.json'), paper_ready=False, checkpoint_durable=False,
-                 diagnostic_only=diagnostic_gate, physical_devices=devices)
+                 diagnostic_only=diagnostic_gate, control_only=bool(manifest.get('control_only')),
+                 physical_devices=devices)
     def check_idle():
-        if diagnostic_gate:
+        if guarded:
             idle_devices(count, devices)
         else:
             idle_node()
@@ -342,7 +356,7 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
         budget = min(deadline-time.time(), timeout or float('inf'))
         if budget < 60:
             raise RuntimeError('Allocation safety deadline reached')
-        if diagnostic_gate:
+        if guarded:
             rc = guarded_run(list(map(str, command)), process_env or env, results/(label+'.log'), budget,
                              ','.join(uuids), results/(label+'.gpu_guard.jsonl'),
                              results/(label+'.hardware.jsonl') if monitor else None)
@@ -357,7 +371,7 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
         for rel, value in manifest['files'].items():
             if digest(base/rel) != value:
                 raise ValueError('Frozen file changed: '+rel)
-        if phase == 'final':
+        if phase in ('final', 'control'):
             gate = json.loads((base/'results'/name/'gate/status.json').read_text())
             if gate['status'] != 'gate_passed' or gate['manifest_sha256'] != state['manifest_sha256']:
                 raise ValueError('Requires a successful gate for this frozen configuration')
@@ -440,8 +454,8 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
                 hardware_check(samples, manifest['power_w'], uuid)
         except ValueError as error:
             timing_error = str(error)
-        if diagnostic_gate:
-            timing_error = 'Functional gate on a shared node; not eligible for paper timing'
+        if guarded:
+            timing_error = 'Guarded shared-allocation run; not eligible for paper timing'
         update(**timing, timing_eligible=timing_error is None, timing_error=timing_error)
         if spec['model'] != 'dot':
             write_json(results/'replica_check.json', check_replicas(model, count))
@@ -485,8 +499,10 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
         check_evaluation(quality, spec['eval_sha'])
         identity = verify_evaluation_artifacts(quality, checkpoints)
         write_json(results/'evaluation_identity.json', identity)
-        update(status='done_pending_review', stage='complete', mrr=quality['mrr'], hits_at_10=quality['hits_at_10'],
-               review='One run; verify multi-GPU accuracy and paired timing before paper inclusion')
+        update(status='control_complete_not_timing' if guarded else 'done_pending_review',
+               stage='complete', mrr=quality['mrr'], hits_at_10=quality['hits_at_10'],
+               review=('Accuracy control only; repeat timing on an isolated node' if guarded else
+                       'One run; verify multi-GPU accuracy and paired timing before paper inclusion'))
         write_json(results/'result.json', state)
         shutil.copytree(results, archive_root/name/'evidence')
         shutil.rmtree(data)

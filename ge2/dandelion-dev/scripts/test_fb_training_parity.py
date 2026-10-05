@@ -7,6 +7,7 @@ import torch
 
 from check_fb_multigpu_training_parity import comparison_passed, relay_validation_counts, tensor_comparison, validate_execution_scope
 from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags
+from run_workstation_fb_single_gpu_queue import QUEUES
 
 
 class TrainingParityTests(unittest.TestCase):
@@ -177,6 +178,14 @@ class SingleGpuConfigTests(unittest.TestCase):
     def test_absent_trace_is_not_successful_audit(self):
         with self.assertRaises(ValueError):
             audited_input_trace('Training completed')
+
+    def test_queued_controls_keep_partition_and_execution_comparisons_separate(self):
+        cases = [case for queue in QUEUES.values() for case in queue]
+        self.assertEqual(len({case[0] for case in cases}), 4)
+        self.assertEqual({case[1] for case in cases}, {16, 32})
+        self.assertIn(('p32_pipeline_manual', 32, 'on', 'manual'), cases)
+        self.assertIn(('p32_sync_manual', 32, 'off', 'manual'), cases)
+        self.assertIn(('p32_sync_autograd', 32, 'off', 'autograd'), cases)
 
 
 if __name__ == '__main__':

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate native graph remapping across randomized full-reload transitions."""
+"""Validate native graph remapping against storage for a selected schedule."""
 import argparse
 import hashlib
 import json
@@ -12,6 +12,23 @@ import subprocess
 import yaml
 
 from run_workstation_fb_accuracy_control import schedule_flags
+
+
+def validation_flags(original, schedule, retain, pipeline):
+    if pipeline and (schedule != 'bounded' or not retain):
+        raise ValueError('Pipeline validation requires bounded scheduling and retention')
+    flags = schedule_flags(original, schedule)
+    flags.update(GEGE_PARTITION_BUFFER_LP_FAST_PATH='1',
+                 GEGE_PARTITION_BUFFER_LP_FAST_PATH_VALIDATE='1',
+                 GEGE_PARTITION_BUFFER_LP_FAST_PATH_VALIDATE_MAX='100000',
+                 GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM='1' if retain else '0',
+                 GEGE_FRAME_CACHE_HIDDEN_FRAMES='6' if pipeline else '0',
+                 GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD='1' if pipeline else '0',
+                 GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK='1' if pipeline else '0',
+                 GEGE_FRAME_CACHE_MAX_STALE_BACKLOG='3' if pipeline else '0',
+                 GEGE_PARTITION_BUFFER_PEER_RELAY='0',
+                 GEGE_STATEFLOW_ALLOW_PEER_RELAY='0')
+    return flags
 
 
 def digest(path):
@@ -27,26 +44,23 @@ def main():
     parser.add_argument('--work', type=Path, required=True)
     parser.add_argument('--gpu', type=int, default=0)
     parser.add_argument('--retain', action='store_true', help='Check the stable-slot retention control')
+    parser.add_argument('--schedule', choices=('legacy-random', 'bounded'), default='legacy-random')
+    parser.add_argument('--pipeline', action='store_true', help='Check hidden-frame publication too')
     args = parser.parse_args()
-    args.work.mkdir(parents=True, exist_ok=False)
     config = yaml.safe_load((args.fixture/'config.yaml').read_text())
-    flags = schedule_flags(json.loads((args.fixture/'flags.json').read_text()), 'legacy-random')
+    flags = validation_flags(json.loads((args.fixture/'flags.json').read_text()),
+                             args.schedule, args.retain, args.pipeline)
+    apps = subprocess.check_output(['nvidia-smi', '-i', str(args.gpu), '--query-compute-apps=pid',
+                                    '--format=csv,noheader'], text=True).strip()
+    if apps:
+        raise RuntimeError('Selected GPU is busy: '+apps)
+    args.work.mkdir(parents=True, exist_ok=False)
     config['storage']['model_dir'] = str(args.work/'model')+'/'
     config['storage']['device_ids'] = [0]
     # Compare after storage publication; the dense validator has no future-state map.
     config['storage']['prefetch'] = False
     config['evaluation']['checkpoint_dir'] = str(args.work/'model')+'/'
     config['training']['num_epochs'] = 2
-    flags.update(GEGE_PARTITION_BUFFER_LP_FAST_PATH='1',
-                 GEGE_PARTITION_BUFFER_LP_FAST_PATH_VALIDATE='1',
-                 GEGE_PARTITION_BUFFER_LP_FAST_PATH_VALIDATE_MAX='100000',
-                 GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM='1' if args.retain else '0',
-                 GEGE_FRAME_CACHE_HIDDEN_FRAMES='0',
-                 GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD='0',
-                 GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK='0',
-                 GEGE_FRAME_CACHE_MAX_STALE_BACKLOG='0',
-                 GEGE_PARTITION_BUFFER_PEER_RELAY='0',
-                 GEGE_STATEFLOW_ALLOW_PEER_RELAY='0')
     config_path = args.work/'config.yaml'
     config_path.write_text(yaml.safe_dump(config, sort_keys=False))
     (args.work/'flags.json').write_text(json.dumps(flags, indent=2)+'\n')
@@ -70,7 +84,7 @@ def main():
                              env=env, stdout=log, stderr=subprocess.STDOUT)
     text = (args.work/'train.log').read_text()
     result = dict(exit_code=run.returncode, prefetch=False,
-                  retention=args.retain,
+                  retention=args.retain, schedule=args.schedule, pipeline=args.pipeline,
                   binary_sha256=digest(args.binary),
                   library_sha256=digest(args.binary.parent/'libge2.so'),
                   remap_mismatch='LP fast path remap mismatch' in text,

@@ -78,12 +78,15 @@ def main():
     execution.add_argument('--workstation-host', help='Exact hostname explicitly authorized for this test')
     parser.add_argument('--transport', choices=('host', 'peer'), default='peer')
     parser.add_argument('--gpus', type=int, choices=(1, 2), default=2)
+    parser.add_argument('--visible', type=int, choices=(4, 8), default=4)
     parser.add_argument('--decoder', choices=('DISTMULT', 'COMPLEX', 'both'), default='both')
     parser.add_argument('--parameter-audit', action='store_true')
     parser.add_argument('--prepared-batches', action='store_true')
     parser.add_argument('--observe-validation-mismatches', action='store_true',
                         help='Complete diagnostic checkpoints despite relay mismatches; final gate still fails')
     args = parser.parse_args()
+    if args.visible != 4 and args.gpus != 1:
+        parser.error('Non-q4 controls currently support one GPU only')
     validate_execution_scope(args.job, args.workstation_host)
     host = os.uname().nodename
     apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid',
@@ -127,6 +130,7 @@ def main():
         flags.update(GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK='1')
     report = dict(status='running', job=args.job, host=host, paper_ready=False,
                   transport=args.transport, gpus=args.gpus,
+                  visible_frames=args.visible,
                   workstation_host=args.workstation_host, prepared_batches=args.prepared_batches,
                   observe_validation_mismatches=args.observe_validation_mismatches,
                   scope='small correctness fixture, not full-data accuracy or timing',
@@ -153,6 +157,7 @@ def main():
                 config['model']['decoder']['type'] = decoder
                 config['storage']['dataset']['dataset_dir'] = str(data)+'/'
                 config['storage']['device_ids'] = list(range(args.gpus))
+                config['storage']['embeddings']['options']['buffer_capacity'] = args.visible
                 config['storage']['model_dir'] = str(model)+'/'
                 config['evaluation']['checkpoint_dir'] = str(model)+'/'
                 config['training'].update(logical_active_devices=args.gpus, num_epochs=2, save_model=True)

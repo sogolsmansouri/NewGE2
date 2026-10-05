@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Full FB partition controls on an explicitly authorized, idle workstation GPU."""
+"""Frozen full-FB controls on an authorized workstation or owned ARC allocation."""
 import argparse
 import csv
 import datetime
@@ -20,6 +20,9 @@ import time
 import numpy as np
 import yaml
 
+from arc_job_support import save_failure_evidence
+from check_fb_multigpu_training_parity import validate_execution_scope
+
 
 NODES, RELATIONS, WIDTH, EDGES = 86054151, 14824, 100, 304727650
 QUERY_SHA = 'a4f3bf65bdff5ce735946982f57950f55f64a52470eca1eeff9c41fa01912685'
@@ -33,7 +36,7 @@ def digest(path):
     return value.hexdigest()
 
 
-def control_flags(original, partitions):
+def control_flags(original, partitions, pipeline=None):
     flags = dict(original)
     if (flags.get('GEGE_BASELINE_TRAINING_SEMANTICS') != '1'
             or flags.get('GEGE_SOFTMAX_NEGATIVE_MASS_SCALE') != '1'
@@ -41,11 +44,12 @@ def control_flags(original, partitions):
         raise ValueError('Expected the corrected, unweighted, epoch-relabeled recipe')
     if partitions not in (16, 32):
         raise ValueError('This paired control supports p16 and p32 only')
-    hidden = '6' if partitions == 32 else '0'
+    enabled = partitions == 32 if pipeline is None else pipeline
+    hidden = '6' if enabled else '0'
     flags.update(GEGE_FRAME_CACHE_HIDDEN_FRAMES=hidden,
-                 GEGE_FRAME_CACHE_MAX_STALE_BACKLOG='3' if partitions == 32 else '0',
-                 GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK='1' if partitions == 32 else '0',
-                 GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD='1' if partitions == 32 else '0',
+                 GEGE_FRAME_CACHE_MAX_STALE_BACKLOG='3' if enabled else '0',
+                 GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK='1' if enabled else '0',
+                 GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD='1' if enabled else '0',
                  GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD='0',
                  GEGE_PARTITION_BUFFER_PEER_RELAY='0', GEGE_STATEFLOW_ALLOW_PEER_RELAY='0',
                  GEGE_STATEFLOW_ENABLE_UNVERIFIED_PEER_RELAY_RUNTIME='0',
@@ -56,22 +60,46 @@ def control_flags(original, partitions):
     return flags
 
 
+def allocation_seconds(job, safety_seconds=300):
+    allocation = subprocess.check_output(['scontrol', 'show', 'job', job, '-o'],
+                                         text=True, timeout=20)
+    match = re.search(r'\bEndTime=(\S+)', allocation)
+    if not match or match[1] == 'Unknown':
+        raise RuntimeError('Allocation must have a known deadline')
+    remaining = datetime.datetime.fromisoformat(match[1]).timestamp()-time.time()-safety_seconds
+    if remaining <= 0:
+        raise RuntimeError('Allocation safety deadline reached')
+    return remaining
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ('binary', 'source', 'prefix', 'data16', 'data32', 'tools', 'template', 'flags', 'gate', 'work'):
         parser.add_argument('--'+name, required=True, type=Path)
-    parser.add_argument('--workstation-host', required=True)
+    execution = parser.add_mutually_exclusive_group(required=True)
+    execution.add_argument('--workstation-host')
+    execution.add_argument('--job')
     parser.add_argument('--commit', required=True)
-    parser.add_argument('--gpu', type=int, choices=(0, 1), required=True)
+    parser.add_argument('--gpu', type=int, choices=range(4), required=True)
     parser.add_argument('--partitions', type=int, choices=(16, 32), required=True)
+    parser.add_argument('--visible', type=int, choices=(4, 8), default=4)
+    parser.add_argument('--pipeline', choices=('default', 'on', 'off'), default='default')
+    parser.add_argument('--expected-power', type=float)
+    parser.add_argument('--evidence', type=Path, help='Small persistent evidence outside the checkpoint directory')
     args = parser.parse_args()
-    if os.uname().nodename != args.workstation_host:
-        raise RuntimeError('Wrong explicitly authorized workstation')
+    validate_execution_scope(args.job, args.workstation_host)
+    if args.job:
+        allocation_seconds(args.job)
+    if args.evidence and (args.evidence.resolve() == args.work.resolve()
+                          or args.work.resolve() in args.evidence.resolve().parents):
+        raise ValueError('Evidence must be outside the run directory')
+    pipeline = None if args.pipeline == 'default' else args.pipeline == 'on'
+    flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     gate = json.loads(args.gate.read_text())
     hashes = dict(binary_sha256=digest(args.binary), library_sha256=digest(args.binary.parent/'libge2.so'))
     if gate['status'] != 'passed' or any(gate[key] != value for key, value in hashes.items()):
-        raise RuntimeError('The native binary/library must match the passing real-P2P gate')
+        raise RuntimeError('The native binary/library must match a passing training-parity gate')
     for name, expected in gate['source_sha256'].items():
         if digest(args.source/name) != expected:
             raise RuntimeError('Source changed after the passing gate: '+name)
@@ -91,16 +119,23 @@ def main():
     if shutil.disk_usage(args.work.parent).free < 80 * 2**30:
         raise RuntimeError('Need 80 GiB free for this preserved checkpoint')
     args.work.mkdir(exist_ok=False)
-    state = dict(status='preflight', host=args.workstation_host, gpu=args.gpu, gpu_uuid=gpu_uuid,
-                 partitions=args.partitions, visible_frames=4, hidden_frames=6 if args.partitions == 32 else 0,
-                 commit=args.commit, paper_ready=False, timing_status='A5000 diagnostic; not A6000 paper timing',
-                 purpose='Fixed-recipe partition/negative-domain control, not hyperparameter selection', **hashes)
+    state = dict(status='preflight', host=os.uname().nodename, job=args.job,
+                 gpu=args.gpu, gpu_uuid=gpu_uuid, partitions=args.partitions,
+                 visible_frames=args.visible, hidden_frames=int(flags['GEGE_FRAME_CACHE_HIDDEN_FRAMES']),
+                 commit=args.commit, paper_ready=False, timing_status='Accuracy diagnostic; timing requires isolation review',
+                 purpose='Partition, visible-negative-domain and pipeline controls; not hyperparameter selection',
+                 expected_power_w=args.expected_power, foreign_gpu_observations=[], **hashes)
 
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
         temporary = args.work/'progress.json.tmp'
         temporary.write_text(json.dumps(state, indent=2)+'\n')
         temporary.replace(args.work/'progress.json')
+        if args.evidence:
+            args.evidence.mkdir(parents=True, exist_ok=True)
+            temporary = args.evidence/'progress.json.tmp'
+            temporary.write_text(json.dumps(state, indent=2)+'\n')
+            temporary.replace(args.evidence/'progress.json')
 
     def interrupted(signum, frame):
         raise KeyboardInterrupt('Supervisor signal '+str(signum))
@@ -143,13 +178,12 @@ def main():
                 or config['model']['encoder']['embedding_dim'] != WIDTH):
             raise RuntimeError('Wrong paired DistMult/50K/width100 recipe')
         config['storage']['dataset']['dataset_dir'] = str(data)+'/'
-        config['storage']['embeddings']['options'].update(num_partitions=args.partitions, buffer_capacity=4)
+        config['storage']['embeddings']['options'].update(num_partitions=args.partitions, buffer_capacity=args.visible)
         config['storage'].update(device_ids=[0], model_dir=str(model)+'/')
         config['evaluation']['checkpoint_dir'] = str(model)+'/'
         config['training'].update(logical_active_devices=1, num_epochs=10, save_model=True)
         config_path = args.work/'config.yaml'
         config_path.write_text(yaml.safe_dump(config, sort_keys=False))
-        flags = control_flags(json.loads(args.flags.read_text()), args.partitions)
         (args.work/'flags.json').write_text(json.dumps(flags, indent=2)+'\n')
         package = args.work/'python'
         package.mkdir()
@@ -162,26 +196,45 @@ def main():
                    PYTHONPATH=f'{package}:{args.tools}', GEGE_NO_BINDINGS='1', PYTHONNOUSERSITE='1',
                    CUDA_VISIBLE_DEVICES=str(args.gpu), CUDA_DEVICE_ORDER='PCI_BUS_ID',
                    OMP_NUM_THREADS='12', MKL_NUM_THREADS='12', OPENBLAS_NUM_THREADS='1')
+        if args.job:
+            env['SLURM_JOB_ID'] = args.job
 
         def command(argv, stage, timeout):
             update(status=stage, command=list(map(str, argv)))
             log = args.work/(stage+'.log')
+            deadline = time.monotonic()+min(timeout, allocation_seconds(args.job) if args.job else timeout)
             with log.open('x') as output:
                 child = subprocess.Popen(list(map(str, argv)), env=env, stdin=subprocess.DEVNULL,
                                          stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
                 update(child_pid=child.pid)
-                deadline = time.monotonic()+timeout
                 try:
                     while child.poll() is None:
                         if time.monotonic() > deadline:
                             raise TimeoutError(stage)
+                        if args.job:
+                            validate_execution_scope(args.job, None)
+                        if args.expected_power is not None:
+                            power = float(subprocess.check_output(['nvidia-smi', '-i', str(args.gpu),
+                                          '--query-gpu=power.limit', '--format=csv,noheader,nounits'],
+                                          text=True, timeout=20).strip())
+                            if abs(power-args.expected_power) > .1:
+                                raise RuntimeError('GPU power cap changed; refusing a mixed timing cohort')
                         foreign = []
-                        for row in apps():
+                        all_apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid,pid,process_name',
+                                                            '--format=csv,noheader'], text=True, timeout=20)
+                        observed_foreign = []
+                        for row in csv.reader(io.StringIO(all_apps), skipinitialspace=True):
+                            if not row:
+                                continue
                             try:
                                 if os.getpgid(int(row[1])) != child.pid:
-                                    foreign.append(row)
+                                    observed_foreign.append(row)
+                                    if row[0] == gpu_uuid:
+                                        foreign.append(row)
                             except ProcessLookupError:
                                 pass
+                        if observed_foreign and not state['foreign_gpu_observations']:
+                            update(foreign_gpu_observations=observed_foreign)
                         if foreign:
                             raise RuntimeError('Foreign GPU workload appeared: '+repr(foreign))
                         if stage == 'train':
@@ -206,8 +259,9 @@ def main():
         command([args.binary, config_path], 'train', 12*3600)
         text = (args.work/'train.log').read_text()
         times = [int(v)/1000 for v in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
-        if len(times) != 10:
-            raise RuntimeError('Expected ten complete epochs')
+        edge_counts = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)
+        if len(times) != 10 or edge_counts != [(str(EDGES), str(EDGES))]*10:
+            raise RuntimeError('Expected ten complete epochs of the full positive-edge workload')
         for name in ('embeddings.bin', 'embeddings_state.bin'):
             if (model/name).stat().st_size != NODES*WIDTH*4:
                 raise RuntimeError('Incomplete checkpoint: '+name)
@@ -239,6 +293,12 @@ def main():
     except BaseException as error:
         update(status='failed', error=repr(error))
         raise
+    finally:
+        if args.evidence:
+            save_failure_evidence(args.work, args.evidence)
+            ranks = args.work/'exact_eval.ranks.npz'
+            if ranks.is_file():
+                shutil.copy2(ranks, args.evidence/ranks.name)
 
 
 if __name__ == '__main__':

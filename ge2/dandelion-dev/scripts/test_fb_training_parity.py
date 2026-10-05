@@ -102,6 +102,19 @@ class FullControlFlagsTests(unittest.TestCase):
         self.assertEqual(flags['GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK'], '1')
         self.assertEqual(flags['GEGE_TRAINING_PARAMETER_AUDIT'], '0')
 
+    def test_p32_sync_changes_only_movement_flags(self):
+        flags = control_flags(self.flags, 32, False)
+        self.assertEqual(flags['GEGE_FRAME_CACHE_HIDDEN_FRAMES'], '0')
+        self.assertEqual(flags['GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD'], '0')
+        self.assertEqual(flags['GEGE_FRAME_CACHE_DELAYED_STALE_WRITEBACK'], '0')
+        self.assertEqual(flags['GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS'], '1')
+        self.assertEqual(flags['GEGE_BOUNDED_COVER_EPOCH_RELABEL'], '1')
+
+    def test_explicit_pipeline_is_not_derived_from_partition_count(self):
+        flags = control_flags(self.flags, 16, True)
+        self.assertEqual(flags['GEGE_FRAME_CACHE_HIDDEN_FRAMES'], '6')
+        self.assertEqual(flags['GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD'], '1')
+
     def test_old_weighted_recipe_is_rejected(self):
         self.flags['GEGE_SOFTMAX_NEGATIVE_MASS_SCALE'] = '8'
         with self.assertRaises(ValueError):

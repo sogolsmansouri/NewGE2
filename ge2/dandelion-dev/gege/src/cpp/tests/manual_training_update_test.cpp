@@ -4,6 +4,7 @@
 #include <torch/cuda.h>
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <vector>
 #include "nn/model.h"
@@ -24,6 +25,7 @@ int main(int argc, char **argv) {
     bool benchmark = false, expect_rejection = false, production_reductions = false;
     std::string selected_decoder, selected_scenario;
     int64_t paper_batch_size = 50000;
+    int64_t global_rows = 0, relation_count = 7;
     const std::vector<std::string> scenarios = {"sum", "partial", "mean", "cross_entropy", "bce", "bias", "activation",
         "zero_state", "paper_batch", "learned_relations", "paper_learned", "paper_mean", "no_mask", "mean_no_mask"};
     for (int arg = 2; arg < argc; ++arg) {
@@ -35,6 +37,8 @@ int main(int argc, char **argv) {
         else if (key == "--batch-size" && arg+1 < argc) paper_batch_size = std::stoll(argv[++arg]);
         else if (key == "--seed" && arg+1 < argc) seed = std::stoll(argv[++arg]);
         else if (key == "--width" && arg+1 < argc) width = std::stoll(argv[++arg]);
+        else if (key == "--global-rows" && arg+1 < argc) global_rows = std::stoll(argv[++arg]);
+        else if (key == "--relations" && arg+1 < argc) relation_count = std::stoll(argv[++arg]);
         else if (key == "--mass" && arg+1 < argc) mass = argv[++arg];
         else if (key == "--log-mass" && arg+1 < argc) log_mass = argv[++arg];
         else if (key == "--expect-unweighted-rejection") expect_rejection = true;
@@ -42,7 +46,9 @@ int main(int argc, char **argv) {
     }
     if ((!selected_decoder.empty() && selected_decoder != "dot" && selected_decoder != "distmult" && selected_decoder != "complex") ||
         (!selected_scenario.empty() && std::find(scenarios.begin(), scenarios.end(), selected_scenario) == scenarios.end()) ||
-        paper_batch_size <= 0 || (benchmark && !selected_scenario.empty() && selected_scenario != "paper_batch")) {
+        paper_batch_size <= 0 || global_rows < 0 || relation_count < 1 ||
+        (global_rows > 0 && global_rows < 150000) ||
+        (benchmark && !selected_scenario.empty() && selected_scenario != "paper_batch")) {
         std::cerr << "Invalid decoder, scenario, or batch size\n";
         return 2;
     }
@@ -101,8 +107,8 @@ int main(int argc, char **argv) {
         }
         auto encoder = std::make_shared<GeneralEncoder>(std::vector<std::vector<std::shared_ptr<Layer>>>{{layer}});
         std::shared_ptr<EdgeDecoder> decoder;
-        if (decoder_name == "complex") decoder = std::make_shared<ComplEx>(7, width, f, true, EdgeDecoderMethod::CORRUPT_NODE);
-        else decoder = std::make_shared<DistMult>(7, width, f, true, EdgeDecoderMethod::CORRUPT_NODE);
+        if (decoder_name == "complex") decoder = std::make_shared<ComplEx>(relation_count, width, f, true, EdgeDecoderMethod::CORRUPT_NODE);
+        else decoder = std::make_shared<DistMult>(relation_count, width, f, true, EdgeDecoderMethod::CORRUPT_NODE);
         if (scenario == "learned_relations" || scenario == "paper_learned") {
             torch::NoGradGuard guard;
             decoder->relations_.copy_(torch::randn_like(decoder->relations_));
@@ -118,11 +124,14 @@ int main(int argc, char **argv) {
         model.negative_sampling_method_ = NegativeSamplingMethod::RNS;
         model.negative_sampling_selected_ratio_ = 1;
         model.sparse_lr_ = .1;
-        auto embeddings = torch::randn({rows, width}, f) * .02;
+        // Match a global table's Glorot scale without allocating the whole table.
+        auto embeddings = global_rows > 0
+            ? (torch::rand({rows, width}, f) * 2 - 1) * std::sqrt(6.0 / (global_rows + width))
+            : torch::randn({rows, width}, f) * .02;
         auto state = (scenario == "zero_state" || paper)
             ? torch::zeros_like(embeddings) : torch::ones_like(embeddings) * .1;
         auto edges = torch::randint(rows-10, {n, decoder_name == "dot" ? 2 : 3}, i);
-        if (decoder_name != "dot") edges.select(1, 1).copy_(torch::randint(7, {n}, i));
+        if (decoder_name != "dot") edges.select(1, 1).copy_(torch::randint(relation_count, {n}, i));
         auto head = torch::randint(rows-10, {chunks, negatives}, i);
         auto tail = torch::randint(rows-10, {chunks, negatives}, i);
         // Include real filters and padding sentinels used by bitmap batching.
@@ -210,6 +219,7 @@ int main(int argc, char **argv) {
                   << ",\"exact\":" << (exact ? "true" : "false")
                   << ",\"manual_executed\":" << (manual_executed ? "true" : "false")
                   << ",\"seed\":" << seed << ",\"width\":" << width << ",\"negative_mass\":" << mass
+                  << ",\"global_init_rows\":" << global_rows << ",\"relations\":" << relation_count
                   << ",\"delta_max_abs\":" << difference.max().item<double>()
                   << ",\"state_max_abs\":" << (actual->node_state_update_-reference->node_state_update_).abs().max().item<double>()
                   << ",\"worst_ref_raw_gradient\":" << raw.flatten()[worst].item<double>()

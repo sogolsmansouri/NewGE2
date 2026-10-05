@@ -185,7 +185,8 @@ class SingleGpuConfigTests(unittest.TestCase):
     def setUp(self):
         self.template = dict(model=dict(decoder=dict(type='DISTMULT'), encoder=dict(embedding_dim=100)),
                              storage=dict(dataset={}, embeddings=dict(options={})),
-                             training=dict(batch_size=50000), evaluation={})
+                             training=dict(batch_size=50000, negative_sampling=dict(
+                                 degree_fraction=0.5, negatives_per_positive=1000, num_chunks=50)), evaluation={})
 
     def test_complex_has_matching_training_decoder_and_frozen_workload(self):
         config = control_config(self.template, 'complex', 32, 4, Path('/data'), Path('/model'))
@@ -213,6 +214,20 @@ class SingleGpuConfigTests(unittest.TestCase):
         self.assertEqual(early, full)
         with self.assertRaises(ValueError):
             control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'), 0)
+
+    def test_sampling_intervention_changes_only_requested_fraction(self):
+        original = control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'), 3)
+        for fraction in (0.0, 0.5, 1.0):
+            changed = control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'), 3, fraction)
+            self.assertEqual(changed['training']['negative_sampling']['degree_fraction'], fraction)
+            changed['training']['negative_sampling']['degree_fraction'] = 0.5
+            self.assertEqual(changed, original)
+        self.assertEqual(self.template['training']['negative_sampling']['degree_fraction'], 0.5)
+
+    def test_invalid_sampling_intervention_is_rejected(self):
+        for fraction in (-0.1, 1.1, float('nan'), float('inf')):
+            with self.assertRaises(ValueError):
+                control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'), 3, fraction)
 
     def test_replay_trace_is_order_independent_but_not_content_independent(self):
         a = '[training-input] epoch=0 batch=0 edges=a\n[training-input] epoch=0 batch=1 edges=b\n'

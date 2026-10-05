@@ -8,6 +8,7 @@ import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -66,11 +67,13 @@ def control_flags(original, partitions, pipeline=None, gradients=None):
     return flags
 
 
-def control_config(template, decoder, partitions, visible, data, model, epochs=10):
+def control_config(template, decoder, partitions, visible, data, model, epochs=10, degree_fraction=None):
     if decoder not in ('distmult', 'complex'):
         raise ValueError('Unsupported single-GPU decoder')
     if epochs < 1:
         raise ValueError('Control needs at least one complete epoch')
+    if degree_fraction is not None and (not math.isfinite(degree_fraction) or not 0 <= degree_fraction <= 1):
+        raise ValueError('Diagnostic degree fraction must be finite and in [0, 1]')
     if (template['model']['decoder']['type'] not in ('DISTMULT', 'COMPLEX')
             or template['training']['batch_size'] != 50000
             or template['model']['encoder']['embedding_dim'] != WIDTH):
@@ -82,6 +85,8 @@ def control_config(template, decoder, partitions, visible, data, model, epochs=1
     config['storage'].update(device_ids=[0], model_dir=str(model)+'/')
     config['evaluation']['checkpoint_dir'] = str(model)+'/'
     config['training'].update(logical_active_devices=1, num_epochs=epochs, save_model=True)
+    if degree_fraction is not None:
+        config['training']['negative_sampling']['degree_fraction'] = degree_fraction
     return config
 
 
@@ -166,6 +171,8 @@ def main():
     parser.add_argument('--eval-queries', type=int, default=10000,
                         help='Smaller fixed random query panel for early accuracy diagnostics only')
     parser.add_argument('--eval-seed', type=int, default=17)
+    parser.add_argument('--degree-fraction', type=float,
+                        help='Diagnostic-only sampling intervention; default preserves the template recipe')
     parser.add_argument('--replay-seed', type=int,
                         help='Audit reproducible batch inputs; diagnostic timings only')
     parser.add_argument('--expected-power', type=float)
@@ -175,6 +182,8 @@ def main():
         parser.error('Need positive epochs, 1..10000 queries, and nonnegative selection seed')
     if args.replay_seed is not None and args.replay_seed < 0:
         parser.error('Replay seed must be nonnegative')
+    if args.degree_fraction is not None and (not math.isfinite(args.degree_fraction) or not 0 <= args.degree_fraction <= 1):
+        parser.error('Degree fraction must be finite and in [0, 1]')
     validate_execution_scope(args.job, args.workstation_host)
     if args.job:
         allocation_seconds(args.job)
@@ -221,6 +230,7 @@ def main():
     state['gradients'] = args.gradients
     state.update(decoder=args.decoder, replay_seed=args.replay_seed, schedule=args.schedule,
                  requested_epochs=args.epochs, requested_eval_queries=args.eval_queries,
+                 requested_degree_fraction=args.degree_fraction,
                  evaluation_status='early diagnostic' if args.epochs < 10 or args.eval_queries < 10000 else 'full control')
 
     def update(**changes):
@@ -275,7 +285,9 @@ def main():
         (data/'dataset.yaml').write_text(yaml.safe_dump(metadata, sort_keys=False))
         model = args.work/'model'
         config = control_config(yaml.safe_load(args.template.read_text()), args.decoder,
-                                args.partitions, args.visible, data, model, args.epochs)
+                                args.partitions, args.visible, data, model, args.epochs, args.degree_fraction)
+        update(negative_sampling=config['training']['negative_sampling'],
+               sampling_status='diagnostic intervention' if args.degree_fraction is not None else 'template recipe')
         config_path = args.work/'config.yaml'
         config_path.write_text(yaml.safe_dump(config, sort_keys=False))
         (args.work/'flags.json').write_text(json.dumps(flags, indent=2)+'\n')

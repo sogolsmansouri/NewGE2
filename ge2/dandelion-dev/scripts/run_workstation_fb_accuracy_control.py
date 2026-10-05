@@ -36,7 +36,7 @@ def digest(path):
     return value.hexdigest()
 
 
-def control_flags(original, partitions, pipeline=None):
+def control_flags(original, partitions, pipeline=None, gradients=None):
     flags = dict(original)
     if (flags.get('GEGE_BASELINE_TRAINING_SEMANTICS') != '1'
             or flags.get('GEGE_SOFTMAX_NEGATIVE_MASS_SCALE') != '1'
@@ -57,6 +57,10 @@ def control_flags(original, partitions, pipeline=None):
                  GEGE_STATEFLOW_PEER_RELAY_VALIDATE='0',
                  GEGE_MULTI_GPU_PREPARED_BATCH_PIPELINE='0', GEGE_PREPARED_BATCH_PIPELINE='0')
     flags.pop('GEGE_TRAINING_REPLAY_SEED', None)
+    if gradients is not None:
+        if gradients not in ('manual', 'autograd'):
+            raise ValueError('Unknown gradient control')
+        flags['GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS'] = '1' if gradients == 'manual' else '0'
     return flags
 
 
@@ -84,6 +88,8 @@ def main():
     parser.add_argument('--partitions', type=int, choices=(16, 32), required=True)
     parser.add_argument('--visible', type=int, choices=(4, 8), default=4)
     parser.add_argument('--pipeline', choices=('default', 'on', 'off'), default='default')
+    parser.add_argument('--gradients', choices=('manual', 'autograd'), default='manual',
+                        help='Autograd is a diagnostic reference, not a production fallback')
     parser.add_argument('--expected-power', type=float)
     parser.add_argument('--evidence', type=Path, help='Small persistent evidence outside the checkpoint directory')
     args = parser.parse_args()
@@ -94,7 +100,7 @@ def main():
                           or args.work.resolve() in args.evidence.resolve().parents):
         raise ValueError('Evidence must be outside the run directory')
     pipeline = None if args.pipeline == 'default' else args.pipeline == 'on'
-    flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline)
+    flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline, args.gradients)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     gate = json.loads(args.gate.read_text())
     hashes = dict(binary_sha256=digest(args.binary), library_sha256=digest(args.binary.parent/'libge2.so'))
@@ -125,6 +131,7 @@ def main():
                  commit=args.commit, paper_ready=False, timing_status='Accuracy diagnostic; timing requires isolation review',
                  purpose='Partition, visible-negative-domain and pipeline controls; not hyperparameter selection',
                  expected_power_w=args.expected_power, foreign_gpu_observations=[], **hashes)
+    state['gradients'] = args.gradients
 
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())

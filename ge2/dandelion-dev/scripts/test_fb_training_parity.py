@@ -115,6 +115,18 @@ class FullControlFlagsTests(unittest.TestCase):
         self.assertEqual(flags['GEGE_FRAME_CACHE_HIDDEN_FRAMES'], '6')
         self.assertEqual(flags['GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD'], '1')
 
+    def test_autograd_reference_preserves_sampling_and_loss(self):
+        flags = control_flags(self.flags, 32, False, 'autograd')
+        self.assertEqual(flags['GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS'], '0')
+        self.assertEqual(flags['GEGE_BASELINE_TRAINING_SEMANTICS'], '1')
+        self.assertEqual(flags['GEGE_SOFTMAX_NEGATIVE_MASS_SCALE'], '1')
+        self.assertEqual(flags['GEGE_BOUNDED_COVER_RELABEL_SEED'], '17')
+        self.assertEqual(self.flags['GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS'], '1')
+
+    def test_unknown_gradient_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            control_flags(self.flags, 32, False, 'unknown')
+
     def test_old_weighted_recipe_is_rejected(self):
         self.flags['GEGE_SOFTMAX_NEGATIVE_MASS_SCALE'] = '8'
         with self.assertRaises(ValueError):

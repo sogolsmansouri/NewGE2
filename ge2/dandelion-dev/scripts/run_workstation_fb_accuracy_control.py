@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Frozen full-FB controls on an authorized workstation or owned ARC allocation."""
 import argparse
+import copy
 import csv
 import datetime
 import fcntl
@@ -60,8 +61,33 @@ def control_flags(original, partitions, pipeline=None, gradients=None):
     if gradients is not None:
         if gradients not in ('manual', 'autograd'):
             raise ValueError('Unknown gradient control')
-        flags['GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS'] = '1' if gradients == 'manual' else '0'
+        for decoder in ('DISTMULT', 'COMPLEX'):
+            flags['GEGE_FIXED_BUFFER_MANUAL_'+decoder+'_RNS'] = '1' if gradients == 'manual' else '0'
     return flags
+
+
+def control_config(template, decoder, partitions, visible, data, model):
+    if decoder not in ('distmult', 'complex'):
+        raise ValueError('Unsupported single-GPU decoder')
+    if (template['model']['decoder']['type'] not in ('DISTMULT', 'COMPLEX')
+            or template['training']['batch_size'] != 50000
+            or template['model']['encoder']['embedding_dim'] != WIDTH):
+        raise ValueError('Expected a full-FB/50K/width100 control template')
+    config = copy.deepcopy(template)
+    config['model']['decoder']['type'] = decoder.upper()
+    config['storage']['dataset']['dataset_dir'] = str(data)+'/'
+    config['storage']['embeddings']['options'].update(num_partitions=partitions, buffer_capacity=visible)
+    config['storage'].update(device_ids=[0], model_dir=str(model)+'/')
+    config['evaluation']['checkpoint_dir'] = str(model)+'/'
+    config['training'].update(logical_active_devices=1, num_epochs=10, save_model=True)
+    return config
+
+
+def audited_input_trace(text):
+    rows = sorted(re.findall(r'\[training-input\] (.*)', text))
+    if not rows:
+        raise ValueError('Requested replay has no audited input evidence')
+    return dict(batches=len(rows), sha256=hashlib.sha256('\n'.join(rows).encode()).hexdigest())
 
 
 def allocation_seconds(job, safety_seconds=300):
@@ -90,9 +116,14 @@ def main():
     parser.add_argument('--pipeline', choices=('default', 'on', 'off'), default='default')
     parser.add_argument('--gradients', choices=('manual', 'autograd'), default='manual',
                         help='Autograd is a diagnostic reference, not a production fallback')
+    parser.add_argument('--decoder', choices=('distmult', 'complex'), default='distmult')
+    parser.add_argument('--replay-seed', type=int,
+                        help='Audit reproducible batch inputs; diagnostic timings only')
     parser.add_argument('--expected-power', type=float)
     parser.add_argument('--evidence', type=Path, help='Small persistent evidence outside the checkpoint directory')
     args = parser.parse_args()
+    if args.replay_seed is not None and args.replay_seed < 0:
+        parser.error('Replay seed must be nonnegative')
     validate_execution_scope(args.job, args.workstation_host)
     if args.job:
         allocation_seconds(args.job)
@@ -101,6 +132,8 @@ def main():
         raise ValueError('Evidence must be outside the run directory')
     pipeline = None if args.pipeline == 'default' else args.pipeline == 'on'
     flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline, args.gradients)
+    if args.replay_seed is not None:
+        flags.update(GEGE_TRAINING_REPLAY_SEED=str(args.replay_seed), GEGE_TRAINING_INPUT_AUDIT='1')
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     gate = json.loads(args.gate.read_text())
     hashes = dict(binary_sha256=digest(args.binary), library_sha256=digest(args.binary.parent/'libge2.so'))
@@ -132,6 +165,7 @@ def main():
                  purpose='Partition, visible-negative-domain and pipeline controls; not hyperparameter selection',
                  expected_power_w=args.expected_power, foreign_gpu_observations=[], **hashes)
     state['gradients'] = args.gradients
+    state.update(decoder=args.decoder, replay_seed=args.replay_seed)
 
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
@@ -180,15 +214,8 @@ def main():
         metadata['dataset_dir'] = str(data)+'/'
         (data/'dataset.yaml').write_text(yaml.safe_dump(metadata, sort_keys=False))
         model = args.work/'model'
-        config = yaml.safe_load(args.template.read_text())
-        if (config['model']['decoder']['type'] != 'DISTMULT' or config['training']['batch_size'] != 50000
-                or config['model']['encoder']['embedding_dim'] != WIDTH):
-            raise RuntimeError('Wrong paired DistMult/50K/width100 recipe')
-        config['storage']['dataset']['dataset_dir'] = str(data)+'/'
-        config['storage']['embeddings']['options'].update(num_partitions=args.partitions, buffer_capacity=args.visible)
-        config['storage'].update(device_ids=[0], model_dir=str(model)+'/')
-        config['evaluation']['checkpoint_dir'] = str(model)+'/'
-        config['training'].update(logical_active_devices=1, num_epochs=10, save_model=True)
+        config = control_config(yaml.safe_load(args.template.read_text()), args.decoder,
+                                args.partitions, args.visible, data, model)
         config_path = args.work/'config.yaml'
         config_path.write_text(yaml.safe_dump(config, sort_keys=False))
         (args.work/'flags.json').write_text(json.dumps(flags, indent=2)+'\n')
@@ -269,6 +296,8 @@ def main():
         edge_counts = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)
         if len(times) != 10 or edge_counts != [(str(EDGES), str(EDGES))]*10:
             raise RuntimeError('Expected ten complete epochs of the full positive-edge workload')
+        if args.replay_seed is not None:
+            update(input_trace=audited_input_trace(text))
         for name in ('embeddings.bin', 'embeddings_state.bin'):
             if (model/name).stat().st_size != NODES*WIDTH*4:
                 raise RuntimeError('Incomplete checkpoint: '+name)
@@ -280,7 +309,7 @@ def main():
         command([python, args.tools/'eval_marius_kge_exact10k.py', '--entity-bin', model/'embeddings.bin',
                  '--src-relation-bin', model/'forward_relations.bin', '--dst-relation-bin', model/'inverse_relations.bin',
                  '--ge2-data-dir', args.data16, '--eval-edges', query, '--expected-eval-sha256', QUERY_SHA,
-                 '--score', 'distmult', '--report-directions', 'tail', '--filtered', '--tie-policy', 'pessimistic',
+                 '--score', args.decoder, '--report-directions', 'tail', '--filtered', '--tie-policy', 'pessimistic',
                  '--num-test', 10000, '--num-nodes', NODES, '--num-relations', RELATIONS, '--embedding-dim', WIDTH,
                  '--batch-size', 32, '--candidate-chunk', 500000, '--filter-chunk', 2000000, '--device', 'cuda:0',
                  '--evaluator-contract', 'fb_partition_control_20261004', '--score-contract',
@@ -289,6 +318,7 @@ def main():
         with np.load(args.work/'exact_eval.ranks.npz') as saved:
             ranks = saved['tail_ranks']
         if (quality['eval_edges_sha256'] != QUERY_SHA or quality['report_directions'] != 'tail'
+                or quality['score'] != args.decoder
                 or not quality['filtered'] or quality['tf32'] is not False or ranks.shape != (10000,)
                 or np.any(ranks < 1) or np.any(ranks > NODES)
                 or not np.isclose(quality['mrr'], np.mean(1/ranks), atol=1.e-12, rtol=0)

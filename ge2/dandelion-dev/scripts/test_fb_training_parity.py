@@ -1,11 +1,12 @@
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+from pathlib import Path
 
 import torch
 
 from check_fb_multigpu_training_parity import comparison_passed, relay_validation_counts, tensor_comparison, validate_execution_scope
-from run_workstation_fb_accuracy_control import control_flags
+from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags
 
 
 class TrainingParityTests(unittest.TestCase):
@@ -118,6 +119,7 @@ class FullControlFlagsTests(unittest.TestCase):
     def test_autograd_reference_preserves_sampling_and_loss(self):
         flags = control_flags(self.flags, 32, False, 'autograd')
         self.assertEqual(flags['GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS'], '0')
+        self.assertEqual(flags['GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS'], '0')
         self.assertEqual(flags['GEGE_BASELINE_TRAINING_SEMANTICS'], '1')
         self.assertEqual(flags['GEGE_SOFTMAX_NEGATIVE_MASS_SCALE'], '1')
         self.assertEqual(flags['GEGE_BOUNDED_COVER_RELABEL_SEED'], '17')
@@ -127,6 +129,11 @@ class FullControlFlagsTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             control_flags(self.flags, 32, False, 'unknown')
 
+    def test_manual_reference_enables_both_model_kernels(self):
+        flags = control_flags(self.flags, 32, True, 'manual')
+        self.assertEqual(flags['GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS'], '1')
+        self.assertEqual(flags['GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS'], '1')
+
     def test_old_weighted_recipe_is_rejected(self):
         self.flags['GEGE_SOFTMAX_NEGATIVE_MASS_SCALE'] = '8'
         with self.assertRaises(ValueError):
@@ -135,6 +142,41 @@ class FullControlFlagsTests(unittest.TestCase):
     def test_unplanned_partition_count_is_rejected(self):
         with self.assertRaises(ValueError):
             control_flags(self.flags, 20)
+
+
+class SingleGpuConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.template = dict(model=dict(decoder=dict(type='DISTMULT'), encoder=dict(embedding_dim=100)),
+                             storage=dict(dataset={}, embeddings=dict(options={})),
+                             training=dict(batch_size=50000), evaluation={})
+
+    def test_complex_has_matching_training_decoder_and_frozen_workload(self):
+        config = control_config(self.template, 'complex', 32, 4, Path('/data'), Path('/model'))
+        self.assertEqual(config['model']['decoder']['type'], 'COMPLEX')
+        self.assertEqual(config['training']['batch_size'], 50000)
+        self.assertEqual(config['training']['num_epochs'], 10)
+        self.assertEqual(config['storage']['device_ids'], [0])
+        self.assertEqual(config['storage']['embeddings']['options'], dict(num_partitions=32, buffer_capacity=4))
+        self.assertEqual(self.template['model']['decoder']['type'], 'DISTMULT')
+        self.assertNotIn('num_epochs', self.template['training'])
+
+    def test_unplanned_decoder_or_workload_is_rejected(self):
+        with self.assertRaises(ValueError):
+            control_config(self.template, 'dot', 32, 4, Path('/data'), Path('/model'))
+        self.template['training']['batch_size'] = 150000
+        with self.assertRaises(ValueError):
+            control_config(self.template, 'complex', 32, 4, Path('/data'), Path('/model'))
+
+    def test_replay_trace_is_order_independent_but_not_content_independent(self):
+        a = '[training-input] epoch=0 batch=0 edges=a\n[training-input] epoch=0 batch=1 edges=b\n'
+        b = '\n'.join(reversed(a.splitlines()))
+        self.assertEqual(audited_input_trace(a), audited_input_trace(b))
+        self.assertNotEqual(audited_input_trace(a), audited_input_trace(a.replace('edges=a', 'edges=c')))
+        self.assertEqual(audited_input_trace(a)['batches'], 2)
+
+    def test_absent_trace_is_not_successful_audit(self):
+        with self.assertRaises(ValueError):
+            audited_input_trace('Training completed')
 
 
 if __name__ == '__main__':

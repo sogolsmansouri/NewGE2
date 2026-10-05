@@ -2,8 +2,10 @@
 // Supported manual cases must execute without autograd and match bitwise.
 #include <ATen/Context.h>
 #include <torch/cuda.h>
+#include <algorithm>
 #include <chrono>
 #include <iostream>
+#include <vector>
 #include "nn/model.h"
 #include "nn/layers/embedding/embedding.h"
 #include "nn/decoders/edge/distmult.h"
@@ -19,16 +21,30 @@ int main(int argc, char **argv) {
     int64_t seed = 20260919, width = 100;
     std::string mass = "1";
     std::string log_mass = "0";
-    bool benchmark = false, expect_rejection = false;
+    bool benchmark = false, expect_rejection = false, production_reductions = false;
+    std::string selected_decoder, selected_scenario;
+    int64_t paper_batch_size = 50000;
+    const std::vector<std::string> scenarios = {"sum", "partial", "mean", "cross_entropy", "bce", "bias", "activation",
+        "zero_state", "paper_batch", "learned_relations", "paper_learned", "paper_mean", "no_mask", "mean_no_mask"};
     for (int arg = 2; arg < argc; ++arg) {
         const std::string key = argv[arg];
         if (key == "--benchmark") benchmark = true;
+        else if (key == "--production-reductions") production_reductions = true;
+        else if (key == "--decoder" && arg+1 < argc) selected_decoder = argv[++arg];
+        else if (key == "--scenario" && arg+1 < argc) selected_scenario = argv[++arg];
+        else if (key == "--batch-size" && arg+1 < argc) paper_batch_size = std::stoll(argv[++arg]);
         else if (key == "--seed" && arg+1 < argc) seed = std::stoll(argv[++arg]);
         else if (key == "--width" && arg+1 < argc) width = std::stoll(argv[++arg]);
         else if (key == "--mass" && arg+1 < argc) mass = argv[++arg];
         else if (key == "--log-mass" && arg+1 < argc) log_mass = argv[++arg];
         else if (key == "--expect-unweighted-rejection") expect_rejection = true;
         else { std::cerr << "Unknown/incomplete argument: " << key << "\n"; return 2; }
+    }
+    if ((!selected_decoder.empty() && selected_decoder != "dot" && selected_decoder != "distmult" && selected_decoder != "complex") ||
+        (!selected_scenario.empty() && std::find(scenarios.begin(), scenarios.end(), selected_scenario) == scenarios.end()) ||
+        paper_batch_size <= 0 || (benchmark && !selected_scenario.empty() && selected_scenario != "paper_batch")) {
+        std::cerr << "Invalid decoder, scenario, or batch size\n";
+        return 2;
     }
     setenv("GEGE_EMULATE_DOT_SINGLE_RELATION", "1", 1);
     setenv("GEGE_FIXED_BUFFER_MANUAL_DOT_RNS", enabled, 1);
@@ -52,7 +68,8 @@ int main(int argc, char **argv) {
         return rejected == 2 ? 0 : 1;
     }
     setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8", 1);
-    at::globalContext().setDeterministicAlgorithms(!benchmark, false);
+    const bool deterministic = !benchmark && !production_reductions;
+    at::globalContext().setDeterministicAlgorithms(deterministic, false);
     at::globalContext().setAllowTF32CuBLAS(false);
     torch::set_num_threads(4);
     torch::Device device(torch::kCUDA, 0);
@@ -60,12 +77,14 @@ int main(int argc, char **argv) {
     auto i = torch::TensorOptions().dtype(torch::kInt64).device(device);
     bool passed = true;
     for (const std::string &decoder_name : {"dot", "distmult", "complex"}) {
-      for (const std::string &scenario : {"sum", "partial", "mean", "cross_entropy", "bce", "bias", "activation", "zero_state", "paper_batch", "learned_relations", "paper_learned", "paper_mean", "no_mask", "mean_no_mask"}) {
+      if (!selected_decoder.empty() && decoder_name != selected_decoder) continue;
+      for (const std::string &scenario : scenarios) {
+        if (!selected_scenario.empty() && scenario != selected_scenario) continue;
         if (benchmark && scenario != "paper_batch") continue;
         torch::manual_seed(seed);
         bool paper = scenario.rfind("paper_", 0) == 0;
         int64_t rows = paper ? 150000 : 4096;
-        int64_t n = paper ? 50000 : scenario == "partial" ? 1003 : 1000;
+        int64_t n = paper ? paper_batch_size : scenario == "partial" ? 1003 : 1000;
         int64_t chunks = 50, negatives = paper ? 1000 : 32;
         auto layer_cfg = std::make_shared<LayerConfig>();
         layer_cfg->type = LayerType::EMBEDDING;
@@ -184,6 +203,10 @@ int main(int argc, char **argv) {
         passed &= ok;
         std::cout << "{\"mode\":\"" << mode << "\",\"decoder\":\"" << decoder_name
                   << "\",\"scenario\":\"" << scenario << "\",\"pass\":" << (ok ? "true" : "false")
+                  << ",\"deterministic_algorithms\":" << (deterministic ? "true" : "false")
+                  << ",\"batch\":" << n
+                  << ",\"updates_within_tolerance\":" << (deltas ? "true" : "false")
+                  << ",\"state_within_tolerance\":" << (accumulators ? "true" : "false")
                   << ",\"exact\":" << (exact ? "true" : "false")
                   << ",\"manual_executed\":" << (manual_executed ? "true" : "false")
                   << ",\"seed\":" << seed << ",\"width\":" << width << ",\"negative_mass\":" << mass

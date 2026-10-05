@@ -8,12 +8,84 @@ import yaml
 
 from arc_job_support import write_json
 from run_arc_multigpu_campaign import multigpu_config, multigpu_flags
-from run_arc_multigpu_finish import (apply_final_cohort, freeze_retry, restart_base,
+from run_arc_multigpu_finish import (apply_engine_override, apply_final_cohort, completed_case, freeze_retry, restart_base,
                                      source_campaign, validate_reference_contract)
 from run_arc_paper_case import digest
 
 
 class MultiGpuFinishTests(unittest.TestCase):
+    def test_engine_override_is_optional(self):
+        manifest = {'commit': 'unchanged'}
+        self.assertIs(apply_engine_override(Path('/unused'), manifest, {}), manifest)
+
+    def test_engine_override_rejects_unpinned_or_nonlocal_builds(self):
+        for directory in ('relative', '/tmp/engine', '/mnt/local/smansou2/a/b'):
+            with self.assertRaisesRegex(ValueError, 'node-local'):
+                apply_engine_override(Path('/unused'), {},
+                    {'engine_override': {'directory': directory}})
+        with patch('run_arc_multigpu_finish.digest', return_value='changed'):
+            with self.assertRaisesRegex(ValueError, 'identity changed'):
+                apply_engine_override(Path('/unused'), {}, {'engine_override':
+                    dict(directory='/mnt/local/smansou2/fixed', identity_sha256='pinned')})
+
+    def test_engine_override_checks_sources_and_binaries_before_repointing(self):
+        engine = Path('/mnt/local/smansou2/fixed')
+        identity = dict(commit='new', source_comparison_status='pass',
+            source_hashes={'native.cpp': 'source'}, engine_hashes={'gege_train': 'train', 'libge2.so': 'lib'})
+        metadata = {'engine_override': dict(directory=str(engine), identity_sha256='identity', commit='new')}
+        hashes = {str(engine/'build_identity.json'): 'identity', str(engine/'repo/native.cpp'): 'source',
+                  str(engine/'build_git/gege_train'): 'train', str(engine/'build_git/libge2.so'): 'lib'}
+        for corrupt in (None, 'source', 'train', 'lib'):
+            with self.subTest(corrupt=corrupt), tempfile.TemporaryDirectory() as directory:
+                base = Path(directory)
+                (base/'engine').symlink_to('/old/engine')
+                with patch('pathlib.Path.read_text', return_value=json.dumps(identity)), patch(
+                        'run_arc_multigpu_finish.subprocess.check_output', return_value='new\n'), patch(
+                        'run_arc_multigpu_finish.subprocess.run'), patch(
+                        'run_arc_multigpu_finish.digest', side_effect=lambda path:
+                            'changed' if hashes[str(path)] == corrupt else hashes[str(path)]):
+                    if corrupt:
+                        with self.assertRaisesRegex(ValueError, 'changed'):
+                            apply_engine_override(base, {}, metadata)
+                        self.assertEqual((base/'engine').readlink(), Path('/old/engine'))
+                    else:
+                        result = apply_engine_override(base, {'ge2_library_sha256': 'original'}, metadata)
+                        self.assertEqual(result['commit'], 'new')
+                        self.assertEqual(result['engine_hashes'], identity['engine_hashes'])
+                        self.assertEqual(result['ge2_library_sha256'], 'original')
+                        self.assertEqual((base/'engine').readlink(), engine)
+
+    def test_completion_is_optional_and_requires_evidence_directory(self):
+        self.assertIsNone(completed_case({}, 'payload', 'case'))
+        with self.assertRaisesRegex(ValueError, 'evidence directory'):
+            completed_case({'completion_root': '/tmp/receipts'}, 'payload', 'case')
+
+    def test_completed_receipt_rejects_control_results_and_changed_evidence(self):
+        root = Path('/home/smansou2/arc_results/test_receipts')
+        receipt = dict(payload_sha256='payload', evidence_hashes={'/evidence/result.json': 'hash'},
+                       result='/evidence/result.json')
+        result = dict(status='done_pending_review', timing_eligible=True, checkpoint_durable=True)
+        with patch('pathlib.Path.exists', return_value=True), patch(
+                'pathlib.Path.read_text', side_effect=[json.dumps(receipt), json.dumps(result)]), patch(
+                'run_arc_multigpu_finish.digest', return_value='hash'):
+            self.assertEqual(completed_case({'completion_root': str(root)}, 'payload', 'case'), receipt)
+        for changes in ({'timing_eligible': False}, {'checkpoint_durable': False},
+                        {'control_only': True}, {'diagnostic_only': True}, {'status': 'failed'}):
+            with self.subTest(changes=changes), patch('pathlib.Path.exists', return_value=True), patch(
+                    'pathlib.Path.read_text', side_effect=[json.dumps(receipt), json.dumps(dict(result, **changes))]), patch(
+                    'run_arc_multigpu_finish.digest', return_value='hash'):
+                with self.assertRaisesRegex(ValueError, 'eligible final'):
+                    completed_case({'completion_root': str(root)}, 'payload', 'case')
+        with patch('pathlib.Path.exists', return_value=True), patch(
+                'pathlib.Path.read_text', return_value=json.dumps(receipt)), patch(
+                'run_arc_multigpu_finish.digest', return_value='changed'):
+            with self.assertRaisesRegex(ValueError, 'evidence changed'):
+                completed_case({'completion_root': str(root)}, 'payload', 'case')
+        with patch('pathlib.Path.exists', return_value=True), patch(
+                'pathlib.Path.read_text', return_value=json.dumps(receipt)):
+            with self.assertRaisesRegex(ValueError, 'different frozen payload'):
+                completed_case({'completion_root': str(root)}, 'different', 'case')
+
     def test_source_override_requires_manifest_pin_and_node_local_path(self):
         self.assertEqual(source_campaign({}), Path('/mnt/local/smansou2/paper_multigpu_293571'))
         metadata = dict(source_campaign='/mnt/local/smansou2/new_build', source_manifest_sha256='known')

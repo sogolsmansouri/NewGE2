@@ -49,6 +49,67 @@ def apply_final_cohort(manifest, metadata):
     return manifest
 
 
+def apply_engine_override(base, manifest, metadata):
+    override = metadata.get('engine_override')
+    if not override:
+        return manifest
+    engine = Path(override['directory'])
+    if not engine.is_absolute() or engine.resolve().parent != Path('/mnt/local/smansou2'):
+        raise ValueError('Replacement engine requires a dedicated node-local directory')
+    identity_path = engine/'build_identity.json'
+    if digest(identity_path) != override['identity_sha256']:
+        raise ValueError('Replacement engine identity changed')
+    identity = json.loads(identity_path.read_text())
+    repo = engine/'repo'
+    head = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+    if head != identity['commit'] or head != override['commit']:
+        raise ValueError('Replacement engine source commit mismatch')
+    subprocess.run(['git', '-C', str(repo), 'diff', '--exit-code', 'HEAD'], check=True)
+    if not identity.get('source_hashes') or identity.get('source_comparison_status') != 'pass':
+        raise ValueError('Replacement build lacks verified compiled-source provenance')
+    for rel, expected in identity['source_hashes'].items():
+        path = Path(rel)
+        if path.is_absolute() or '..' in path.parts or digest(repo/path) != expected:
+            raise ValueError('Replacement compiled source changed: '+rel)
+    for name in ('gege_train', 'libge2.so'):
+        if digest(engine/'build_git'/name) != identity['engine_hashes'][name]:
+            raise ValueError('Replacement native binary changed: '+name)
+    link = base/'engine'
+    if not link.is_symlink():
+        raise ValueError('Expected a frozen engine symlink')
+    link.unlink()
+    link.symlink_to(engine, target_is_directory=True)
+    manifest.update(commit=head, built_engine_commit=head,
+                    engine_hashes=identity['engine_hashes'],
+                    engine_identity_sha256=override['identity_sha256'],
+                    native_build_policy='Pinned replacement build with verified compiled-source hashes')
+    return manifest
+
+
+def completed_case(metadata, payload_sha, case):
+    root = metadata.get('completion_root')
+    if not root:
+        return None
+    root = Path(root)
+    if not root.is_absolute() or root.parent != Path('/home/smansou2/arc_results'):
+        raise ValueError('Completion receipts require a dedicated ARC evidence directory')
+    receipt = root/(case+'.json')
+    if not receipt.exists():
+        return None
+    saved = json.loads(receipt.read_text())
+    if saved['payload_sha256'] != payload_sha:
+        raise ValueError('Completion receipt belongs to a different frozen payload')
+    for path, expected in saved['evidence_hashes'].items():
+        if digest(Path(path)) != expected:
+            raise ValueError('Completed case evidence changed: '+path)
+    result = json.loads(Path(saved['result']).read_text())
+    if (result['status'] != 'done_pending_review' or not result['timing_eligible']
+            or not result['checkpoint_durable'] or result.get('control_only')
+            or result.get('diagnostic_only')):
+        raise ValueError('Completion receipt does not establish eligible final measurements')
+    return saved
+
+
 def restart_base(base, restart_count):
     if not re.fullmatch(r'0|[1-9][0-9]*', restart_count):
         raise ValueError('Invalid Slurm restart count')
@@ -147,6 +208,11 @@ def main():
     for name, expected in payload_manifest['files'].items():
         if digest(args.payload/name) != expected:
             raise ValueError('Payload checksum mismatch: '+name)
+    payload_sha = digest(args.payload/'payload_manifest.json')
+    completed = completed_case(payload_manifest, payload_sha, args.case)
+    if completed:
+        print(json.dumps(dict(status='already_complete', case=args.case, receipt=completed)), flush=True)
+        return
     restart_count = os.environ.get('SLURM_RESTART_COUNT', '0')
     base = restart_base(args.base.resolve(), restart_count)
     if base.parent != Path('/mnt/local/smansou2'):
@@ -184,6 +250,7 @@ def main():
                 raise RuntimeError('Node did not become exclusively idle within ten minutes')
             old = source_campaign(payload_manifest)
             manifest = freeze_retry(old, base, args.payload, args.case, payload_manifest['commit'])
+            apply_engine_override(base, manifest, payload_manifest)
             apply_final_cohort(manifest, payload_manifest)
             write_json(base/'manifest.json', manifest)
             for target in (summary, archive):
@@ -206,6 +273,18 @@ def main():
                 update(status='running', stage=phase, runtime_policy=manifest['runtime_policy'])
                 run_case(base, manifest, args.case, phase, deadline, archive, summary)
             update(status='done_pending_review', stage='complete')
+            final = base/'results'/args.case/'final'
+            result = json.loads((final/'result.json').read_text())
+            if payload_manifest.get('completion_root') and result['timing_eligible']:
+                receipt_root = Path(payload_manifest['completion_root'])
+                receipt_root.mkdir(exist_ok=True)
+                evidence = [base/'manifest.json', final/'result.json', final/'exact_eval.json',
+                            final/'evaluation_identity.json', final/'archive_receipt.json',
+                            final/'train.log', final/'train.hardware.jsonl']
+                write_json(receipt_root/(args.case+'.json'), dict(case=args.case,
+                    payload_sha256=payload_sha, result=str(final/'result.json'),
+                    evidence_hashes={str(path): digest(path) for path in evidence},
+                    paper_ready=False, review='Matched measurements complete; protocol review remains required'))
     except BaseException as error:
         update(status='failed', error=repr(error))
         save_failure_evidence(base/'results', summary/'failure')

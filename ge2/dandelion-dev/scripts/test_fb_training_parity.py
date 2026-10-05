@@ -8,7 +8,7 @@ import torch
 import numpy as np
 
 from check_fb_multigpu_training_parity import comparison_passed, relay_validation_counts, tensor_comparison, validate_execution_scope
-from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags, schedule_flags, evaluation_panel, engine_flags
+from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags, schedule_flags, evaluation_panel, engine_flags, data_path_flags
 from run_workstation_fb_single_gpu_queue import QUEUES
 
 
@@ -179,6 +179,34 @@ class PartitionScheduleControlTests(unittest.TestCase):
     def test_unknown_schedule_is_rejected(self):
         with self.assertRaises(ValueError):
             schedule_flags({}, 'unknown')
+
+
+class DataPathControlTests(unittest.TestCase):
+    def test_default_preserves_existing_controls(self):
+        original = dict(GEGE_FAST_MAP_TENSORS='1', GEGE_FIXED_BUFFER_MASKED_UPDATE='1')
+        result = data_path_flags(original, 'current')
+        self.assertEqual(result, original)
+        self.assertIsNot(result, original)
+
+    def test_reference_disables_fast_paths_without_changing_objective(self):
+        original = dict(GEGE_FAST_MAP_TENSORS='1', GEGE_FIXED_BUFFER_MASKED_UPDATE='1',
+                        GEGE_BASELINE_TRAINING_SEMANTICS='1', GEGE_SOFTMAX_NEGATIVE_MASS_SCALE='1',
+                        GEGE_GLOBAL_DEGREE_SAMPLING='0', GEGE_FRAME_CACHE_HIDDEN_FRAMES='0')
+        result = data_path_flags(original, 'reference')
+        self.assertEqual(result['GEGE_UNIQUE_BACKEND'], 'sort')
+        self.assertEqual(result['GEGE_SYNC_BEFORE_SWAP'], '1')
+        for key in ('GEGE_FAST_MAP_TENSORS', 'GEGE_FIXED_BUFFER_BITMAP_MAP',
+                    'GEGE_FIXED_BUFFER_MASKED_UPDATE', 'GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS',
+                    'GEGE_PARTITION_BUFFER_LP_FAST_PATH', 'GEGE_GPU_ACTIVE_EDGE_SHUFFLE'):
+            self.assertEqual(result[key], '0')
+        for key in ('GEGE_BASELINE_TRAINING_SEMANTICS', 'GEGE_SOFTMAX_NEGATIVE_MASS_SCALE',
+                    'GEGE_GLOBAL_DEGREE_SAMPLING', 'GEGE_FRAME_CACHE_HIDDEN_FRAMES'):
+            self.assertEqual(result[key], original[key])
+        self.assertEqual(original['GEGE_FAST_MAP_TENSORS'], '1')
+
+    def test_unknown_mode_is_rejected(self):
+        with self.assertRaises(ValueError):
+            data_path_flags({}, 'unknown')
 
 
 class SingleGpuConfigTests(unittest.TestCase):

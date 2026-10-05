@@ -141,6 +141,27 @@ def engine_flags(original, engine):
     return {}
 
 
+def data_path_flags(original, mode):
+    """Disable shared fast paths without changing the sampler or numerical recipe."""
+    if mode == 'current':
+        return dict(original)
+    if mode != 'reference':
+        raise ValueError('Unknown data-path control')
+    flags = dict(original)
+    for key in ('GEGE_FAST_MAP_TENSORS', 'GEGE_FIXED_BUFFER_BITMAP_MAP',
+                'GEGE_FIXED_BUFFER_BITMAP_REUSE_OUTPUTS', 'GEGE_FIXED_BUFFER_MASKED_UPDATE',
+                'GEGE_FIXED_BUFFER_COMPACT_ACTIVE', 'GEGE_FIXED_BUFFER_COMPACT_ACTIVE_PREFIX',
+                'GEGE_PARTITION_BUFFER_LP_FAST_PATH', 'GEGE_GPU_ACTIVE_EDGE_SHUFFLE',
+                'GEGE_KEEP_STORAGE_HOT_BETWEEN_EPOCHS', 'GEGE_MEM_SWAP_EVENT_SYNC',
+                'GEGE_SCORE_FILTER_CUDA', 'GEGE_DEG_LOCAL_FILTER_PADDED',
+                'GEGE_RESIDENT_LOCAL_LP_DIRECT', 'GEGE_CSR_GATHER', 'GEGE_CSR_UPDATE',
+                'GEGE_CSR_UPDATE_REDUCE'):
+        flags[key] = '0'
+    flags['GEGE_UNIQUE_BACKEND'] = 'sort'
+    flags['GEGE_SYNC_BEFORE_SWAP'] = '1'
+    return flags
+
+
 def audited_input_trace(text):
     rows = sorted(re.findall(r'\[training-input\] (.*)', text))
     if not rows:
@@ -177,6 +198,8 @@ def main():
     parser.add_argument('--decoder', choices=('distmult', 'complex'), default='distmult')
     parser.add_argument('--engine', choices=('optimized', 'zenodo'), default='optimized',
                         help='Zenodo is the frozen released GE2 library, without PipeGE feature flags')
+    parser.add_argument('--data-path', choices=('current', 'reference'), default='current',
+                        help='Reference disables mapping/update/storage fast paths for diagnosis only')
     parser.add_argument('--schedule', choices=('bounded', 'legacy-random'), default='bounded',
                         help='Legacy randomized CUSTOM isolates partition-dependent schedule effects')
     parser.add_argument('--epochs', type=int, default=10)
@@ -208,8 +231,12 @@ def main():
     if args.engine == 'zenodo' and (args.schedule != 'legacy-random' or pipeline is not False
                                    or args.gradients != 'autograd' or args.replay_seed is not None):
         parser.error('Released GE2 requires legacy-random, pipeline off, autograd, and no PipeGE replay seed')
+    if args.data_path == 'reference' and (args.engine != 'optimized' or pipeline is not False
+                                         or args.gradients != 'autograd' or args.schedule != 'legacy-random'):
+        parser.error('Reference data path requires optimized engine, legacy-random, pipeline off, and autograd')
     flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline, args.gradients)
     flags = schedule_flags(flags, args.schedule)
+    flags = data_path_flags(flags, args.data_path)
     if args.replay_seed is not None:
         flags.update(GEGE_TRAINING_REPLAY_SEED=str(args.replay_seed), GEGE_TRAINING_INPUT_AUDIT='1')
     flags = engine_flags(flags, args.engine)
@@ -247,7 +274,8 @@ def main():
     state = dict(status='preflight', host=os.uname().nodename, job=args.job,
                  gpu=args.gpu, gpu_uuid=gpu_uuid, partitions=args.partitions,
                  visible_frames=args.visible, hidden_frames=int(flags.get('GEGE_FRAME_CACHE_HIDDEN_FRAMES', '0')),
-                 commit=args.commit, paper_ready=False, timing_status='Accuracy diagnostic; timing requires isolation review',
+                 commit=args.commit, data_path=args.data_path, paper_ready=False,
+                 timing_status='Accuracy diagnostic; timing requires isolation review',
                  purpose='Partition, visible-negative-domain and pipeline controls; not hyperparameter selection',
                  expected_power_w=args.expected_power, foreign_gpu_observations=[], **hashes)
     state.update(gradients=args.gradients, engine=args.engine, driver_sha256=digest(__file__))

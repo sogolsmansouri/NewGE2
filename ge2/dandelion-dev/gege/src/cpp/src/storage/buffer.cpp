@@ -4660,6 +4660,22 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
     double unload_ms = 0.0;
     double load_ms = 0.0;
 
+    // Graph prefetch and retained mapped buckets use stable logical slots,
+    // even when storage reloads all visible frames instead of retaining them.
+    auto next_state = buffer_state_.to(torch::kCPU).to(torch::kInt64).contiguous().clone();
+    const auto evict_ids = getNextEvict();
+    const auto admit_ids = getNextAdmit();
+    if (next_state.numel() != buffer_state_iterator_->numel() || evict_ids.size() != admit_ids.size()) {
+        throw GegeRuntimeException("MemPartitionBuffer full reload requires equal-sized states and matched evict/admit counts");
+    }
+    auto next_slots = next_state.accessor<int64_t, 1>();
+    for (int64_t slot = 0; slot < next_state.numel(); ++slot) {
+        auto evict = std::find(evict_ids.begin(), evict_ids.end(), next_slots[slot]);
+        if (evict != evict_ids.end()) {
+            next_slots[slot] = admit_ids[std::distance(evict_ids.begin(), evict)];
+        }
+    }
+
     // evict partition
     unload(true);
     auto t2 = std::chrono::high_resolution_clock::now();
@@ -4668,7 +4684,7 @@ void MemPartitionBuffer::performNextSwap(std::uintptr_t swap_ready_event) {
     empty_cache_for_storage_device(device_);
 #endif
     
-    buffer_state_ = *buffer_state_iterator_;
+    buffer_state_ = next_state;
 
     for(int i = 0; i < buffer_sizes_; i ++) {
         if (buffer_states_.end() != buffer_state_iterator_)

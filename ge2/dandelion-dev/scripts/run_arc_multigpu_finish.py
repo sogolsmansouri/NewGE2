@@ -17,7 +17,7 @@ import time
 import yaml
 
 from arc_job_support import run_logged, save_failure_evidence, write_json
-from run_arc_multigpu_campaign import (idle_node, multigpu_config, multigpu_flags,
+from run_arc_multigpu_campaign import (idle_devices, idle_node, multigpu_config, multigpu_flags,
                                       native_score_environment, run_case, runtime_environment)
 from prepare_tw_multigpu import cover_check
 from run_arc_paper_case import digest
@@ -187,6 +187,8 @@ def main():
     parser.add_argument('--payload', required=True, type=Path)
     parser.add_argument('--base', required=True, type=Path)
     parser.add_argument('--case', required=True, choices=CASES)
+    parser.add_argument('--accuracy-control', action='store_true',
+                        help='Guard selected idle GPUs; never authorize final timing or completion receipts')
     args = parser.parse_args()
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGCHLD})
 
@@ -209,7 +211,7 @@ def main():
         if digest(args.payload/name) != expected:
             raise ValueError('Payload checksum mismatch: '+name)
     payload_sha = digest(args.payload/'payload_manifest.json')
-    completed = completed_case(payload_manifest, payload_sha, args.case)
+    completed = None if args.accuracy_control else completed_case(payload_manifest, payload_sha, args.case)
     if completed:
         print(json.dumps(dict(status='already_complete', case=args.case, receipt=completed)), flush=True)
         return
@@ -223,6 +225,7 @@ def main():
     summary.mkdir(parents=True, exist_ok=True)
     archive.mkdir(parents=True, exist_ok=True)
     state = dict(job=job, case=args.case, status='preflight', paper_ready=False,
+                 control_only=args.accuracy_control,
                  launcher_commit=payload_manifest['commit'], restart_count=int(restart_count),
                  restart_policy='Fresh gate and ten fresh epochs; preserve earlier attempt directories')
 
@@ -237,9 +240,11 @@ def main():
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             # Allow the preceding allocation's CUDA contexts to disappear.
             samples = 0
+            old = source_campaign(payload_manifest)
+            count = json.loads((old/'manifest.json').read_text())['cases'][args.case]['gpus']
             for attempt in range(40):
                 try:
-                    idle_node()
+                    idle_devices(count) if args.accuracy_control else idle_node()
                     samples += 1
                 except RuntimeError:
                     samples = 0
@@ -248,10 +253,11 @@ def main():
                 time.sleep(15)
             else:
                 raise RuntimeError('Node did not become exclusively idle within ten minutes')
-            old = source_campaign(payload_manifest)
             manifest = freeze_retry(old, base, args.payload, args.case, payload_manifest['commit'])
             apply_engine_override(base, manifest, payload_manifest)
             apply_final_cohort(manifest, payload_manifest)
+            if args.accuracy_control:
+                manifest.update(control_only=True, cohort='accuracy_control_'+job)
             write_json(base/'manifest.json', manifest)
             for target in (summary, archive):
                 shutil.copy2(base/'manifest.json', target/'manifest.json')
@@ -269,13 +275,17 @@ def main():
                                     summary/(test+'.log'), min(600, deadline-time.time()))
                     if rc:
                         raise RuntimeError(f'{test} exited {rc}')
-            for phase in ('gate', 'final'):
+            for phase in ('gate', 'control' if args.accuracy_control else 'final'):
                 update(status='running', stage=phase, runtime_policy=manifest['runtime_policy'])
-                run_case(base, manifest, args.case, phase, deadline, archive, summary)
-            update(status='done_pending_review', stage='complete')
-            final = base/'results'/args.case/'final'
+                run_case(base, manifest, args.case, phase, deadline, archive, summary,
+                         diagnostic_gate=args.accuracy_control and phase == 'gate',
+                         physical_devices=list(range(count)) if args.accuracy_control else None)
+            update(status='control_complete_not_timing' if args.accuracy_control else 'done_pending_review',
+                   stage='complete')
+            final = base/'results'/args.case/('control' if args.accuracy_control else 'final')
             result = json.loads((final/'result.json').read_text())
-            if payload_manifest.get('completion_root') and result['timing_eligible']:
+            if (not args.accuracy_control and payload_manifest.get('completion_root')
+                    and result['timing_eligible']):
                 receipt_root = Path(payload_manifest['completion_root'])
                 receipt_root.mkdir(exist_ok=True)
                 evidence = [base/'manifest.json', final/'result.json', final/'exact_eval.json',

@@ -84,7 +84,7 @@ def execution_flags(original, gpus, transport, peer_scratch='shared'):
                      GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH='1' if peer_scratch == 'independent' else '0',
                      GEGE_STATEFLOW_PEER_RELAY_WAIT_HOST_READY='1',
                      GEGE_STATEFLOW_SERIALIZE_MEM_SWAPS='1',
-                     GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET='0' if peer_scratch == 'independent' else '1')
+                     GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET='0')
     return flags
 
 

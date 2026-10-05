@@ -21,7 +21,8 @@ class MultiGpuAccuracyTests(unittest.TestCase):
         self.assertEqual(result['GEGE_STATEFLOW_ENABLE_UNVERIFIED_PEER_RELAY_RUNTIME'], '1')
         self.assertEqual(result['GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK'], '0')
         self.assertEqual(result['GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH'], '0')
-        self.assertEqual(result['GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET'], '1')
+        # The native strict checker rejects more than one CUDA buffer.
+        self.assertEqual(result['GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET'], '0')
 
     def test_host_keeps_coordinated_handoffs(self):
         peer = execution_flags({}, 2, 'peer')

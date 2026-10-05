@@ -124,7 +124,7 @@ def main():
                  GEGE_PREPARED_BATCH_PIPELINE='1' if args.prepared_batches else '0')
     if args.gpus > 1:
         flags.update(GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH='1' if args.peer_scratch == 'independent' else '0',
-                     GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET='0' if args.peer_scratch == 'independent' else '1')
+                     GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET='0')
     if args.parameter_audit:
         flags['GEGE_TRAINING_PARAMETER_AUDIT'] = '1'
     if args.observe_validation_mismatches:

@@ -66,9 +66,11 @@ def control_flags(original, partitions, pipeline=None, gradients=None):
     return flags
 
 
-def control_config(template, decoder, partitions, visible, data, model):
+def control_config(template, decoder, partitions, visible, data, model, epochs=10):
     if decoder not in ('distmult', 'complex'):
         raise ValueError('Unsupported single-GPU decoder')
+    if epochs < 1:
+        raise ValueError('Control needs at least one complete epoch')
     if (template['model']['decoder']['type'] not in ('DISTMULT', 'COMPLEX')
             or template['training']['batch_size'] != 50000
             or template['model']['encoder']['embedding_dim'] != WIDTH):
@@ -79,8 +81,29 @@ def control_config(template, decoder, partitions, visible, data, model):
     config['storage']['embeddings']['options'].update(num_partitions=partitions, buffer_capacity=visible)
     config['storage'].update(device_ids=[0], model_dir=str(model)+'/')
     config['evaluation']['checkpoint_dir'] = str(model)+'/'
-    config['training'].update(logical_active_devices=1, num_epochs=10, save_model=True)
+    config['training'].update(logical_active_devices=1, num_epochs=epochs, save_model=True)
     return config
+
+
+def evaluation_panel(source, count, seed, work):
+    """Use a fixed random subpanel, not an order-dependent prefix of test rows."""
+    if not 1 <= count <= 10000 or seed < 0:
+        raise ValueError('Invalid diagnostic query count or selection seed')
+    if source.stat().st_size != 10000 * 3 * np.dtype('<i4').itemsize:
+        raise ValueError('Expected the frozen 10000-query int32 triple file')
+    if count == 10000:
+        return source, dict(selection='full_frozen_10000', num_queries=count,
+                            query_sha256=digest(source))
+    rows = np.fromfile(source, dtype='<i4').reshape(10000, 3)
+    indices = np.sort(np.random.default_rng(seed).choice(10000, count, replace=False))
+    query = work/'diagnostic_queries.bin'
+    index_path = work/'diagnostic_query_indices_u64.bin'
+    rows[indices].tofile(query)
+    indices.astype('<u8').tofile(index_path)
+    return query, dict(selection='uniform_without_replacement_from_frozen_10000',
+                       selection_seed=seed, num_queries=count,
+                       parent_query_sha256=digest(source), query_sha256=digest(query),
+                       selected_indices_path=str(index_path), selected_indices_sha256=digest(index_path))
 
 
 def schedule_flags(original, schedule):
@@ -139,11 +162,17 @@ def main():
     parser.add_argument('--decoder', choices=('distmult', 'complex'), default='distmult')
     parser.add_argument('--schedule', choices=('bounded', 'legacy-random'), default='bounded',
                         help='Legacy randomized CUSTOM isolates partition-dependent schedule effects')
+    parser.add_argument('--epochs', type=int, default=10)
+    parser.add_argument('--eval-queries', type=int, default=10000,
+                        help='Smaller fixed random query panel for early accuracy diagnostics only')
+    parser.add_argument('--eval-seed', type=int, default=17)
     parser.add_argument('--replay-seed', type=int,
                         help='Audit reproducible batch inputs; diagnostic timings only')
     parser.add_argument('--expected-power', type=float)
     parser.add_argument('--evidence', type=Path, help='Small persistent evidence outside the checkpoint directory')
     args = parser.parse_args()
+    if args.epochs < 1 or not 1 <= args.eval_queries <= 10000 or args.eval_seed < 0:
+        parser.error('Need positive epochs, 1..10000 queries, and nonnegative selection seed')
     if args.replay_seed is not None and args.replay_seed < 0:
         parser.error('Replay seed must be nonnegative')
     validate_execution_scope(args.job, args.workstation_host)
@@ -190,7 +219,9 @@ def main():
                  purpose='Partition, visible-negative-domain and pipeline controls; not hyperparameter selection',
                  expected_power_w=args.expected_power, foreign_gpu_observations=[], **hashes)
     state['gradients'] = args.gradients
-    state.update(decoder=args.decoder, replay_seed=args.replay_seed, schedule=args.schedule)
+    state.update(decoder=args.decoder, replay_seed=args.replay_seed, schedule=args.schedule,
+                 requested_epochs=args.epochs, requested_eval_queries=args.eval_queries,
+                 evaluation_status='early diagnostic' if args.epochs < 10 or args.eval_queries < 10000 else 'full control')
 
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())
@@ -211,10 +242,10 @@ def main():
     try:
         selected = args.data32 if args.partitions == 32 else args.data16
         metadata = yaml.safe_load((selected/'dataset.yaml').read_text())
-        query = args.data16/'exact10000_uniform_v1/edges/test_edges.bin'
+        parent_query = args.data16/'exact10000_uniform_v1/edges/test_edges.bin'
         source_audit = json.loads((args.data16/'source_audit.json').read_text())
         partition_audit = json.loads((args.data32/'data_audit.json').read_text())
-        if (digest(query) != QUERY_SHA or source_audit['status'] != 'valid_raw_reconstruction'
+        if (digest(parent_query) != QUERY_SHA or source_audit['status'] != 'valid_raw_reconstruction'
                 or partition_audit['status'] != 'pass' or not partition_audit['exact_train_match']):
             raise RuntimeError('Frozen FB data/query identity gate failed')
         data_hashes = {}
@@ -231,7 +262,11 @@ def main():
                 raise RuntimeError('ID mappings must match between partition controls')
         if metadata['num_nodes'] != NODES or metadata['num_relations'] != RELATIONS or metadata['num_train'] != EDGES:
             raise RuntimeError('Wrong full-Freebase dataset')
-        (args.work/'data_identity.json').write_text(json.dumps(dict(query_sha256=QUERY_SHA, splits=data_hashes), indent=2)+'\n')
+        query, panel = evaluation_panel(parent_query, args.eval_queries, args.eval_seed, args.work)
+        query_sha = panel['query_sha256']
+        (args.work/'data_identity.json').write_text(json.dumps(dict(evaluation_panel=panel, query_sha256=query_sha,
+                                                                  parent_query_sha256=QUERY_SHA, splits=data_hashes), indent=2)+'\n')
+        update(evaluation_panel=panel)
         data = args.work/'data'
         data.mkdir()
         for directory in ('edges', 'nodes'):
@@ -240,7 +275,7 @@ def main():
         (data/'dataset.yaml').write_text(yaml.safe_dump(metadata, sort_keys=False))
         model = args.work/'model'
         config = control_config(yaml.safe_load(args.template.read_text()), args.decoder,
-                                args.partitions, args.visible, data, model)
+                                args.partitions, args.visible, data, model, args.epochs)
         config_path = args.work/'config.yaml'
         config_path.write_text(yaml.safe_dump(config, sort_keys=False))
         (args.work/'flags.json').write_text(json.dumps(flags, indent=2)+'\n')
@@ -319,8 +354,8 @@ def main():
         text = (args.work/'train.log').read_text()
         times = [int(v)/1000 for v in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
         edge_counts = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)
-        if len(times) != 10 or edge_counts != [(str(EDGES), str(EDGES))]*10:
-            raise RuntimeError('Expected ten complete epochs of the full positive-edge workload')
+        if len(times) != args.epochs or edge_counts != [(str(EDGES), str(EDGES))]*args.epochs:
+            raise RuntimeError('Expected '+str(args.epochs)+' complete epochs of the full positive-edge workload')
         if args.replay_seed is not None:
             update(input_trace=audited_input_trace(text))
         for name in ('embeddings.bin', 'embeddings_state.bin'):
@@ -333,25 +368,28 @@ def main():
                 'extract', 600)
         command([python, args.tools/'eval_marius_kge_exact10k.py', '--entity-bin', model/'embeddings.bin',
                  '--src-relation-bin', model/'forward_relations.bin', '--dst-relation-bin', model/'inverse_relations.bin',
-                 '--ge2-data-dir', args.data16, '--eval-edges', query, '--expected-eval-sha256', QUERY_SHA,
+                 '--ge2-data-dir', args.data16, '--eval-edges', query, '--expected-eval-sha256', query_sha,
                  '--score', args.decoder, '--report-directions', 'tail', '--filtered', '--tie-policy', 'pessimistic',
-                 '--num-test', 10000, '--num-nodes', NODES, '--num-relations', RELATIONS, '--embedding-dim', WIDTH,
+                 '--num-test', args.eval_queries, '--num-nodes', NODES, '--num-relations', RELATIONS, '--embedding-dim', WIDTH,
                  '--batch-size', 32, '--candidate-chunk', 500000, '--filter-chunk', 2000000, '--device', 'cuda:0',
-                 '--evaluator-contract', 'fb_partition_control_20261004', '--score-contract',
+                 '--evaluator-contract', 'fb_partition_control_early_20261005' if args.epochs < 10 or args.eval_queries < 10000
+                     else 'fb_partition_control_20261004', '--score-contract',
                  'ge2_forward_inverse_relation_embeddings', '--out', args.work/'exact_eval.json'], 'evaluate', 12*3600)
         quality = json.loads((args.work/'exact_eval.json').read_text())
         with np.load(args.work/'exact_eval.ranks.npz') as saved:
             ranks = saved['tail_ranks']
-        if (quality['eval_edges_sha256'] != QUERY_SHA or quality['report_directions'] != 'tail'
+            ranked_queries = saved['triples']
+        if (quality['eval_edges_sha256'] != query_sha or quality['report_directions'] != 'tail'
                 or quality['score'] != args.decoder
-                or not quality['filtered'] or quality['tf32'] is not False or ranks.shape != (10000,)
+                or not quality['filtered'] or quality['tf32'] is not False or ranks.shape != (args.eval_queries,)
+                or not np.array_equal(ranked_queries, np.fromfile(query, dtype='<i4').reshape(-1, 3))
                 or np.any(ranks < 1) or np.any(ranks > NODES)
                 or not np.isclose(quality['mrr'], np.mean(1/ranks), atol=1.e-12, rtol=0)
                 or not np.isclose(quality['hits_at_10'], np.mean(ranks <= 10), atol=1.e-12, rtol=0)):
             raise RuntimeError('Saved ranks do not reproduce the frozen tail-only evaluator contract')
-        update(status='done', epoch_times_s=times, epochs_completed=10, mrr=quality['mrr'],
+        update(status='done', epoch_times_s=times, epochs_completed=args.epochs, mrr=quality['mrr'],
                hits_at_10=quality['hits_at_10'], average_epoch_s=float(np.mean(times)),
-               steady_epoch_s=float(np.mean(times[1:])), checkpoint=str(model))
+               steady_epoch_s=float(np.mean(times[1:])) if len(times) > 1 else None, checkpoint=str(model))
     except BaseException as error:
         update(status='failed', error=repr(error))
         raise

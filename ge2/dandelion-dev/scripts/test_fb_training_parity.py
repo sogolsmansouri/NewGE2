@@ -1,12 +1,14 @@
 import unittest
+import tempfile
 from types import SimpleNamespace
 from unittest import mock
 from pathlib import Path
 
 import torch
+import numpy as np
 
 from check_fb_multigpu_training_parity import comparison_passed, relay_validation_counts, tensor_comparison, validate_execution_scope
-from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags, schedule_flags
+from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags, schedule_flags, evaluation_panel
 from run_workstation_fb_single_gpu_queue import QUEUES
 
 
@@ -202,6 +204,16 @@ class SingleGpuConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             control_config(self.template, 'complex', 32, 4, Path('/data'), Path('/model'))
 
+    def test_early_control_changes_only_epoch_count(self):
+        full = control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'))
+        early = control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'), 3)
+        self.assertEqual(early['training']['num_epochs'], 3)
+        self.assertEqual(early['training']['batch_size'], 50000)
+        early['training']['num_epochs'] = 10
+        self.assertEqual(early, full)
+        with self.assertRaises(ValueError):
+            control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'), 0)
+
     def test_replay_trace_is_order_independent_but_not_content_independent(self):
         a = '[training-input] epoch=0 batch=0 edges=a\n[training-input] epoch=0 batch=1 edges=b\n'
         b = '\n'.join(reversed(a.splitlines()))
@@ -220,6 +232,43 @@ class SingleGpuConfigTests(unittest.TestCase):
         self.assertIn(('p32_pipeline_manual', 32, 'on', 'manual'), cases)
         self.assertIn(('p32_sync_manual', 32, 'off', 'manual'), cases)
         self.assertIn(('p32_sync_autograd', 32, 'off', 'autograd'), cases)
+
+
+class DiagnosticQueryPanelTests(unittest.TestCase):
+    def test_fixed_seed_selects_same_nonprefix_panel_for_both_controls(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'queries.bin'
+            rows = np.arange(30000, dtype='<i4').reshape(10000, 3)
+            rows.tofile(source)
+            for name in ('a', 'b', 'c'):
+                (root/name).mkdir()
+            a, info_a = evaluation_panel(source, 1000, 17, root/'a')
+            b, info_b = evaluation_panel(source, 1000, 17, root/'b')
+            c, info_c = evaluation_panel(source, 1000, 18, root/'c')
+            self.assertEqual(a.read_bytes(), b.read_bytes())
+            self.assertEqual(info_a['query_sha256'], info_b['query_sha256'])
+            self.assertNotEqual(info_a['query_sha256'], info_c['query_sha256'])
+            indices = np.fromfile(info_a['selected_indices_path'], dtype='<u8')
+            self.assertEqual(len(np.unique(indices)), 1000)
+            self.assertTrue(np.all(indices[:-1] < indices[1:]))
+            self.assertFalse(np.array_equal(indices, np.arange(1000)))
+            self.assertTrue(np.array_equal(np.fromfile(a, dtype='<i4').reshape(-1, 3), rows[indices]))
+
+    def test_full_panel_and_invalid_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root/'queries.bin'
+            np.zeros((10000, 3), dtype='<i4').tofile(source)
+            path, info = evaluation_panel(source, 10000, 17, root)
+            self.assertEqual(path, source)
+            self.assertEqual(info['selection'], 'full_frozen_10000')
+            for count, seed in [(0, 17), (10001, 17), (1000, -1)]:
+                with self.assertRaises(ValueError):
+                    evaluation_panel(source, count, seed, root)
+            np.zeros((1000, 3), dtype='<i4').tofile(source)
+            with self.assertRaises(ValueError):
+                evaluation_panel(source, 1000, 17, root)
 
 
 if __name__ == '__main__':

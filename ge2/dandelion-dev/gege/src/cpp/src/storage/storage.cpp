@@ -1024,10 +1024,16 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
         return;
     }
 
+    // Forced host handoffs still need the version-safe source/destination protocol,
+    // but must not require hardware peer access when no peer copy is issued.
+    bool host_handoffs_only = stateflow_peer_relay_force_host_fallback_enabled();
     for (std::size_t src = 0; src < devices_.size(); src++) {
         if (!devices_[src].is_cuda()) {
             fail_or_fallback("Stateflow/partition peer relay requires CUDA devices only; falling back to CPU-backed swaps");
             return;
+        }
+        if (host_handoffs_only) {
+            continue;
         }
         for (std::size_t dst = 0; dst < devices_.size(); dst++) {
             if (src == dst) {
@@ -1043,7 +1049,7 @@ void MemPartitionBufferStorage::initializePeerRelay_() {
         }
     }
 
-    for (std::size_t src = 0; src < devices_.size(); src++) {
+    for (std::size_t src = 0; !host_handoffs_only && src < devices_.size(); src++) {
         c10::cuda::CUDAGuard device_guard(devices_[src]);
         for (std::size_t dst = 0; dst < devices_.size(); dst++) {
             if (src == dst) {
@@ -1491,8 +1497,21 @@ void MemPartitionBufferStorage::publishStateflowPeerSourcesForNextRound(int32_t 
 #endif
 }
 
+void MemPartitionBufferStorage::requireCoordinatedHandoffs_() const {
+    for (const auto &handoffs : stateflow_peer_handoff_index_per_device_) {
+        if (!handoffs.empty()) {
+            throw GegeRuntimeException(
+                "Stateflow cross-lane handoffs require coordinated storage transitions; "
+                "disabling the runtime can admit stale weights and optimizer state. "
+                "For host-only transport, enable the runtime with "
+                "GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK=1.");
+        }
+    }
+}
+
 void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr_t swap_ready_event) {
     if (!peerRelayEnabled_()) {
+        requireCoordinatedHandoffs_();
         buffers_[device_idx]->performNextSwap(swap_ready_event);
         return;
     }
@@ -2027,6 +2046,15 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 host_evict_slots.emplace_back(src_slot);
                 int64_t buffer_offset = buffer->logicalSlotRowOffset_(src_slot);
                 torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
+                if (stateflow_peer_relay_validate_enabled()) {
+                    auto snapshot = published_source_scratch.find(partition_id);
+                    if (snapshot != published_source_scratch.end()) {
+                        auto difference = (cpu_view - snapshot->second.detach().to(torch::kCPU)).abs();
+                        double max_abs = difference.numel() ? difference.max().item<double>() : 0.0;
+                        SPDLOG_INFO("[stateflow-host-store-validate] file={} round={} partition={} source_lane={} staging_vs_source_max_abs={:.9g}",
+                                    filename_, transition_round_idx, partition_id, device_idx, max_abs);
+                    }
+                }
                 write_partition_to_host(partition, cpu_view);
             }
             buffer->clearDirtyRowsForSlots_(host_evict_slots, host_evict_ids);
@@ -2245,9 +2273,9 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         }
         std::vector<std::pair<std::size_t, int64_t>> peer_host_ready_waits;
         auto wait_for_peer_copy_host_ready = [&](std::size_t source_idx, int64_t pending_key) {
-            if (pending_key < 0) {
-                return;
-            }
+            // Handoff keys are opaque signed hashes; negative values are valid.
+            // Only scheduled handoffs reach this helper, including those whose
+            // source host writeback has not completed yet.
             auto already_waited = std::find(peer_host_ready_waits.begin(), peer_host_ready_waits.end(),
                                             std::make_pair(source_idx, pending_key));
             if (already_waited != peer_host_ready_waits.end()) {
@@ -2269,6 +2297,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
 
             torch::Tensor dst_diff = (dst_cpu - expected_cpu).abs();
             torch::Tensor src_diff = (src_cpu - expected_cpu).abs();
+            double dst_vs_source_max_abs = dst_cpu.numel() ? (dst_cpu - src_cpu).abs().max().item<double>() : 0.0;
             double dst_max_abs = dst_diff.numel() > 0 ? dst_diff.max().item<double>() : 0.0;
             double src_max_abs = src_diff.numel() > 0 ? src_diff.max().item<double>() : 0.0;
             double dst_mean_abs = dst_diff.numel() > 0 ? dst_diff.mean().item<double>() : 0.0;
@@ -2278,17 +2307,19 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             bool mismatch = dst_mismatch_values != 0 || src_mismatch_values != 0;
             if (mismatch) {
                 SPDLOG_ERROR(
-                    "[stateflow-peer-validate {}] partition={} src_dev={} dst_dev={} dst_slot={} "
+                    "[stateflow-peer-validate {}] partition={} src_dev={} dst_dev={} dst_slot={} file={} round={} pending_key={} dst_vs_source_max_abs={:.9g} "
                     "dst_vs_host_max_abs={:.9g} dst_vs_host_mean_abs={:.9g} dst_mismatch_values={} "
                     "src_vs_host_max_abs={:.9g} src_vs_host_mean_abs={:.9g} src_mismatch_values={}",
                     validation.check_id, validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
+                    filename_, transition_round_idx, validation.pending_key, dst_vs_source_max_abs,
                     dst_max_abs, dst_mean_abs, dst_mismatch_values, src_max_abs, src_mean_abs, src_mismatch_values);
             } else {
                 SPDLOG_INFO(
-                    "[stateflow-peer-validate {}] partition={} src_dev={} dst_dev={} dst_slot={} "
+                    "[stateflow-peer-validate {}] partition={} src_dev={} dst_dev={} dst_slot={} file={} round={} pending_key={} dst_vs_source_max_abs={:.9g} "
                     "dst_vs_host_max_abs={:.9g} dst_vs_host_mean_abs={:.9g} dst_mismatch_values={} "
                     "src_vs_host_max_abs={:.9g} src_vs_host_mean_abs={:.9g} src_mismatch_values={}",
                     validation.check_id, validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
+                    filename_, transition_round_idx, validation.pending_key, dst_vs_source_max_abs,
                     dst_max_abs, dst_mean_abs, dst_mismatch_values, src_max_abs, src_mean_abs, src_mismatch_values);
             }
             if (mismatch && stateflow_peer_relay_validate_fail_fast_enabled()) {
@@ -2456,6 +2487,7 @@ void MemPartitionBufferStorage::startAsyncAdmitPreload(int32_t device_idx) {
         throw GegeRuntimeException("MemPartitionBufferStorage::startAsyncAdmitPreload received an invalid device index");
     }
     if (!peerRelayEnabled_()) {
+        requireCoordinatedHandoffs_();
         buffers_[device_idx]->startAsyncAdmitPreload();
         return;
     }

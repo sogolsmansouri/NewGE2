@@ -280,6 +280,7 @@ class MemPartitionBufferStorage : public Storage {
     void ensureHostLoaded_();
     void initializePeerRelay_();
     bool peerRelayEnabled_();
+    void requireCoordinatedHandoffs_() const;
     void waitForPeerRelaySourcePendingHandoffs_(std::size_t source_idx);
     void markPeerRelaySourceHandoffConsumed_(std::size_t source_idx, int64_t pending_key);
     void markPeerRelaySourceHostHandoffReady_(std::size_t source_idx, int64_t pending_key);

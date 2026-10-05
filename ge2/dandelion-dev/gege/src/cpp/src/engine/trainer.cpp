@@ -16,6 +16,7 @@
 
 #include "configuration/options.h"
 #include "common/pipeline_nvtx.h"
+#include "common/training_contract.h"
 #include "reporting/logger.h"
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDAGuard.h>
@@ -825,6 +826,7 @@ SynchronousMultiGPUTrainer::SynchronousMultiGPUTrainer(shared_ptr<DataLoader> da
 }
 
 void SynchronousMultiGPUTrainer::train(int num_epochs) {
+    const bool parameter_audit_enabled = env_flag_enabled("GEGE_TRAINING_PARAMETER_AUDIT");
     if (!dataloader_->single_dataset_) {
         dataloader_->setTrainSet();
     }
@@ -913,7 +915,7 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
         for (int32_t device_idx = 0; device_idx < model_->device_models_.size(); device_idx++) {
             threads.emplace_back(std::thread([this, &need_sync, &sync_round, &all_reduce_ns, &all_reduce_calls, &device_timings, &sync_batch_counts,
                                               &sync_round_all_reduce_ns, dense_sync_batches, prepared_batch_pipeline_enabled,
-                                              prepared_batch_launch_stage, prepared_batch_low_priority, device_idx] {
+                                              prepared_batch_launch_stage, prepared_batch_low_priority, parameter_audit_enabled, device_idx] {
                 int64_t local_batches_since_sync = 0;
                 std::future<shared_ptr<Batch>> prepared_batch_future;
                 int prepare_stream_priority = 0;
@@ -983,6 +985,13 @@ void SynchronousMultiGPUTrainer::train(int num_epochs) {
 
                     auto gpu_load_start = std::chrono::high_resolution_clock::now();
                     dataloader_->loadGPUParameters(batch, device_idx);
+                    if (parameter_audit_enabled) {
+                        SPDLOG_INFO("[training-parameters] epoch={} state={} batch={} lane={} indices={} weights={} optimizer={}",
+                                    dataloader_->getEpochsProcessed(), dataloader_->device_current_state_index_[device_idx],
+                                    batch->batch_id_, device_idx, training_contract::tensor_fingerprint(batch->unique_node_indices_),
+                                    training_contract::tensor_fingerprint(batch->node_embeddings_),
+                                    training_contract::tensor_fingerprint(batch->node_embeddings_state_));
+                    }
                     auto gpu_load_end = std::chrono::high_resolution_clock::now();
                     device_timings[device_idx].gpu_load_region_ns += elapsed_ns(gpu_load_start, gpu_load_end);
 #ifdef GEGE_CUDA

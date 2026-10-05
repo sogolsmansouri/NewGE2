@@ -83,6 +83,26 @@ def control_config(template, decoder, partitions, visible, data, model):
     return config
 
 
+def schedule_flags(original, schedule):
+    """Separate the schedule control from movement and optimizer controls."""
+    if schedule == 'bounded':
+        return dict(original)
+    if schedule != 'legacy-random':
+        raise ValueError('Unknown partition schedule control')
+    flags = dict(original)
+    for key in ('GEGE_BOUNDED_GREEDY_COVER', 'GEGE_BOUNDED_GREEDY_COVER_Q4',
+                'GEGE_BOUNDED_COVER_EPOCH_RELABEL', 'GEGE_BOUNDED_Q4_OPTIMAL88',
+                'GEGE_BOUNDED_GREEDY_COVER_REVERSE', 'GEGE_OPTIMIZED_CUSTOM_SCHEDULE',
+                'GEGE_CONTRASTIVE_GREEDY_COVER_ORDERING', 'GEGE_HYBRID_COVER',
+                'GEGE_STATEFLOW_PLANNER', 'GEGE_STATEFLOW_LANE_MATCHING',
+                'GEGE_ACCESS_AWARE_STATE_GENERATION', 'GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM'):
+        flags[key] = '0'
+    flags.pop('GEGE_BOUNDED_STATE_ORDER_FILE', None)
+    # Randomized paths may replace all four frames; these controls are synchronous.
+    flags['GEGE_STATEFLOW_MAX_ADMITS'] = '4'
+    return flags
+
+
 def audited_input_trace(text):
     rows = sorted(re.findall(r'\[training-input\] (.*)', text))
     if not rows:
@@ -117,6 +137,8 @@ def main():
     parser.add_argument('--gradients', choices=('manual', 'autograd'), default='manual',
                         help='Autograd is a diagnostic reference, not a production fallback')
     parser.add_argument('--decoder', choices=('distmult', 'complex'), default='distmult')
+    parser.add_argument('--schedule', choices=('bounded', 'legacy-random'), default='bounded',
+                        help='Legacy randomized CUSTOM isolates partition-dependent schedule effects')
     parser.add_argument('--replay-seed', type=int,
                         help='Audit reproducible batch inputs; diagnostic timings only')
     parser.add_argument('--expected-power', type=float)
@@ -131,7 +153,10 @@ def main():
                           or args.work.resolve() in args.evidence.resolve().parents):
         raise ValueError('Evidence must be outside the run directory')
     pipeline = None if args.pipeline == 'default' else args.pipeline == 'on'
+    if args.schedule == 'legacy-random' and (args.visible != 4 or pipeline is not False):
+        parser.error('Legacy randomized schedule control requires q=4 and --pipeline off')
     flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline, args.gradients)
+    flags = schedule_flags(flags, args.schedule)
     if args.replay_seed is not None:
         flags.update(GEGE_TRAINING_REPLAY_SEED=str(args.replay_seed), GEGE_TRAINING_INPUT_AUDIT='1')
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
@@ -165,7 +190,7 @@ def main():
                  purpose='Partition, visible-negative-domain and pipeline controls; not hyperparameter selection',
                  expected_power_w=args.expected_power, foreign_gpu_observations=[], **hashes)
     state['gradients'] = args.gradients
-    state.update(decoder=args.decoder, replay_seed=args.replay_seed)
+    state.update(decoder=args.decoder, replay_seed=args.replay_seed, schedule=args.schedule)
 
     def update(**changes):
         state.update(changes, updated=datetime.datetime.now().isoformat())

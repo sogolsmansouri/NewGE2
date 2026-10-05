@@ -6,7 +6,7 @@ from pathlib import Path
 import torch
 
 from check_fb_multigpu_training_parity import comparison_passed, relay_validation_counts, tensor_comparison, validate_execution_scope
-from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags
+from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags, schedule_flags
 from run_workstation_fb_single_gpu_queue import QUEUES
 
 
@@ -143,6 +143,40 @@ class FullControlFlagsTests(unittest.TestCase):
     def test_unplanned_partition_count_is_rejected(self):
         with self.assertRaises(ValueError):
             control_flags(self.flags, 20)
+
+
+class PartitionScheduleControlTests(unittest.TestCase):
+    def test_bounded_control_preserves_flags_without_mutation(self):
+        flags = dict(GEGE_BOUNDED_GREEDY_COVER_Q4='1', GEGE_STATEFLOW_MAX_ADMITS='3')
+        result = schedule_flags(flags, 'bounded')
+        self.assertEqual(result, flags)
+        self.assertIsNot(result, flags)
+
+    def test_legacy_schedule_clears_all_alternate_ordering_routes(self):
+        flags = dict(GEGE_BOUNDED_GREEDY_COVER='1', GEGE_BOUNDED_GREEDY_COVER_Q4='1',
+                     GEGE_BOUNDED_COVER_EPOCH_RELABEL='1', GEGE_STATEFLOW_PLANNER='1',
+                     GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM='1', GEGE_BOUNDED_STATE_ORDER_FILE='/cover',
+                     GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS='1', GEGE_SOFTMAX_NEGATIVE_MASS_SCALE='1',
+                     GEGE_STATEFLOW_MAX_ADMITS='3', GEGE_GLOBAL_DEGREE_SAMPLING='0')
+        result = schedule_flags(flags, 'legacy-random')
+        for key in ('GEGE_BOUNDED_GREEDY_COVER', 'GEGE_BOUNDED_GREEDY_COVER_Q4',
+                    'GEGE_BOUNDED_COVER_EPOCH_RELABEL', 'GEGE_BOUNDED_Q4_OPTIMAL88',
+                    'GEGE_BOUNDED_GREEDY_COVER_REVERSE', 'GEGE_OPTIMIZED_CUSTOM_SCHEDULE',
+                    'GEGE_CONTRASTIVE_GREEDY_COVER_ORDERING', 'GEGE_HYBRID_COVER',
+                    'GEGE_STATEFLOW_PLANNER', 'GEGE_STATEFLOW_LANE_MATCHING',
+                    'GEGE_ACCESS_AWARE_STATE_GENERATION', 'GEGE_SINGLE_GPU_GPU_AWARE_CUSTOM'):
+            self.assertEqual(result[key], '0', key)
+        self.assertNotIn('GEGE_BOUNDED_STATE_ORDER_FILE', result)
+        self.assertEqual(result['GEGE_STATEFLOW_MAX_ADMITS'], '4')
+        for key in ('GEGE_FIXED_BUFFER_MANUAL_DISTMULT_RNS', 'GEGE_SOFTMAX_NEGATIVE_MASS_SCALE',
+                    'GEGE_GLOBAL_DEGREE_SAMPLING'):
+            self.assertEqual(result[key], flags[key])
+        self.assertEqual(flags['GEGE_BOUNDED_GREEDY_COVER'], '1')
+        self.assertEqual(flags['GEGE_BOUNDED_STATE_ORDER_FILE'], '/cover')
+
+    def test_unknown_schedule_is_rejected(self):
+        with self.assertRaises(ValueError):
+            schedule_flags({}, 'unknown')
 
 
 class SingleGpuConfigTests(unittest.TestCase):

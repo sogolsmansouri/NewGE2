@@ -23,7 +23,8 @@ import numpy as np
 import yaml
 
 from arc_job_support import save_failure_evidence
-from check_fb_multigpu_training_parity import validate_execution_scope
+from check_fb_multigpu_training_parity import (comparison_passed, tensor_comparison,
+                                             validate_execution_scope)
 
 
 NODES, RELATIONS, WIDTH, EDGES = 86054151, 14824, 100, 304727650
@@ -68,11 +69,59 @@ def control_flags(original, partitions, pipeline=None, gradients=None):
     return flags
 
 
-def control_config(template, decoder, partitions, visible, data, model, epochs=10, degree_fraction=None):
+def execution_flags(original, gpus, transport, peer_scratch='shared'):
+    if gpus not in (1, 2) or transport not in ('peer', 'host') or peer_scratch not in ('shared', 'independent'):
+        raise ValueError('Unsupported GPU count or transport')
+    flags = dict(original)
+    if gpus == 2:
+        flags.update(GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD='0',
+                     GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD='1',
+                     GEGE_PARTITION_BUFFER_PEER_RELAY='1',
+                     GEGE_STATEFLOW_ALLOW_PEER_RELAY='1',
+                     GEGE_STATEFLOW_ENABLE_UNVERIFIED_PEER_RELAY_RUNTIME='1',
+                     GEGE_STATEFLOW_PEER_RUNTIME='on', GEGE_STATEFLOW_PEER_RUNTIME_SCOPE='all',
+                     GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK='1' if transport == 'host' else '0',
+                     GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH='1' if peer_scratch == 'independent' else '0',
+                     GEGE_STATEFLOW_PEER_RELAY_WAIT_HOST_READY='1',
+                     GEGE_STATEFLOW_SERIALIZE_MEM_SWAPS='1',
+                     GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET='0' if peer_scratch == 'independent' else '1')
+    return flags
+
+
+def check_execution_gate(gate, gpus, visible, transport, peer_scratch='shared'):
+    if (gate.get('gpus') != gpus or gate.get('visible_frames') != visible
+            or (gpus > 1 and (gate.get('transport') != transport
+                             or gate.get('peer_scratch', 'independent') != peer_scratch))):
+        raise RuntimeError('Training-parity gate does not match GPU count, capacity or transport')
+
+
+def transport_counts(text):
+    rows = re.findall(r'\[perf\]\[epoch \d+\]\[peer_relay\][^\n]*', text)
+    return {key: sum(int(value) for row in rows for value in re.findall(key+r'=(\d+)', row))
+            for key in ('peer_bytes_executed', 'host_fallback_bytes', 'descriptor_mismatch_count')}
+
+
+def check_dense_replicas(model, gpus):
+    import torch
+    reference = torch.jit.load(str(model/'model.pt_0'), map_location='cpu').state_dict()
+    if not reference:
+        raise RuntimeError('Missing dense checkpoint tensors')
+    result = {}
+    for lane in range(1, gpus):
+        current = torch.jit.load(str(model/('model.pt_'+str(lane))), map_location='cpu').state_dict()
+        if reference.keys() != current.keys():
+            raise RuntimeError('Dense replica checkpoint keys differ')
+        result[str(lane)] = {key: tensor_comparison(reference[key], current[key]) for key in reference}
+    return result
+
+
+def control_config(template, decoder, partitions, visible, data, model, epochs=10, degree_fraction=None, gpus=1):
     if decoder not in ('distmult', 'complex'):
         raise ValueError('Unsupported single-GPU decoder')
     if epochs < 1:
         raise ValueError('Control needs at least one complete epoch')
+    if gpus not in (1, 2) or (gpus == 2 and (partitions != 32 or visible != 4)):
+        raise ValueError('Two-GPU controls require p32/q4')
     if degree_fraction is not None and (not math.isfinite(degree_fraction) or not 0 <= degree_fraction <= 1):
         raise ValueError('Diagnostic degree fraction must be finite and in [0, 1]')
     if (template['model']['decoder']['type'] not in ('DISTMULT', 'COMPLEX')
@@ -83,9 +132,9 @@ def control_config(template, decoder, partitions, visible, data, model, epochs=1
     config['model']['decoder']['type'] = decoder.upper()
     config['storage']['dataset']['dataset_dir'] = str(data)+'/'
     config['storage']['embeddings']['options'].update(num_partitions=partitions, buffer_capacity=visible)
-    config['storage'].update(device_ids=[0], model_dir=str(model)+'/')
+    config['storage'].update(device_ids=list(range(gpus)), model_dir=str(model)+'/')
     config['evaluation']['checkpoint_dir'] = str(model)+'/'
-    config['training'].update(logical_active_devices=1, num_epochs=epochs, save_model=True)
+    config['training'].update(logical_active_devices=gpus, num_epochs=epochs, save_model=True)
     if degree_fraction is not None:
         config['training']['negative_sampling']['degree_fraction'] = degree_fraction
     return config
@@ -190,6 +239,9 @@ def main():
     execution.add_argument('--job')
     parser.add_argument('--commit', required=True)
     parser.add_argument('--gpu', type=int, choices=range(4), required=True)
+    parser.add_argument('--gpus', type=int, choices=(1, 2), default=1)
+    parser.add_argument('--transport', choices=('peer', 'host'), default='peer')
+    parser.add_argument('--peer-scratch', choices=('shared', 'independent'), default='shared')
     parser.add_argument('--partitions', type=int, choices=(16, 32), required=True)
     parser.add_argument('--visible', type=int, choices=(4, 8), default=4)
     parser.add_argument('--pipeline', choices=('default', 'on', 'off'), default='default')
@@ -226,6 +278,10 @@ def main():
                           or args.work.resolve() in args.evidence.resolve().parents):
         raise ValueError('Evidence must be outside the run directory')
     pipeline = None if args.pipeline == 'default' else args.pipeline == 'on'
+    if args.gpus == 2 and (args.engine != 'optimized' or args.gpu != 0 or args.visible != 4
+                          or args.partitions != 32 or pipeline is False or args.schedule != 'bounded'
+                          or args.data_path != 'current'):
+        parser.error('Two-GPU control requires optimized p32/q4, GPUs 0,1, bounded schedule and pipeline')
     if args.schedule == 'legacy-random' and (args.visible != 4 or pipeline is not False):
         parser.error('Legacy randomized schedule control requires q=4 and --pipeline off')
     if args.engine == 'zenodo' and (args.schedule != 'legacy-random' or pipeline is not False
@@ -237,6 +293,7 @@ def main():
     flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline, args.gradients)
     flags = schedule_flags(flags, args.schedule)
     flags = data_path_flags(flags, args.data_path)
+    flags = execution_flags(flags, args.gpus, args.transport, args.peer_scratch)
     if args.replay_seed is not None:
         flags.update(GEGE_TRAINING_REPLAY_SEED=str(args.replay_seed), GEGE_TRAINING_INPUT_AUDIT='1')
     flags = engine_flags(flags, args.engine)
@@ -247,6 +304,7 @@ def main():
         hashes = dict(binary_sha256=digest(args.binary), library_sha256=digest(args.binary.parent/'libge2.so'))
         if gate['status'] != 'passed' or any(gate[key] != value for key, value in hashes.items()):
             raise RuntimeError('The native binary/library must match a passing training-parity gate')
+        check_execution_gate(gate, args.gpus, args.visible, args.transport, args.peer_scratch)
         for name, expected in gate['source_sha256'].items():
             if digest(args.source/name) != expected:
                 raise RuntimeError('Source changed after the passing gate: '+name)
@@ -255,16 +313,20 @@ def main():
                       library_sha256=digest(released_package/'libge2.so'))
         if hashes['library_sha256'] != ZENODO_LIBRARY_SHA:
             raise RuntimeError('Unexpected released GE2 library; refusing an unverified baseline')
-    gpu_uuid = subprocess.check_output(['nvidia-smi', '-i', str(args.gpu), '--query-gpu=uuid',
-                                        '--format=csv,noheader'], text=True).strip()
-    lock = Path('/home/'+os.environ['USER'])/('.fb_accuracy_gpu_'+gpu_uuid+'.lock')
-    lock_file = lock.open('a')
-    fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    devices = [args.gpu] if args.gpus == 1 else [0, 1]
+    gpu_uuids = [subprocess.check_output(['nvidia-smi', '-i', str(device), '--query-gpu=uuid',
+                                        '--format=csv,noheader'], text=True).strip() for device in devices]
+    locks = []
+    for uuid in sorted(gpu_uuids):
+        lock = Path('/home/'+os.environ['USER'])/('.fb_accuracy_gpu_'+uuid+'.lock')
+        locks.append(lock.open('a'))
+        fcntl.flock(locks[-1], fcntl.LOCK_EX | fcntl.LOCK_NB)
+    gpu_uuid = gpu_uuids[0]
 
     def apps():
         output = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid,pid,process_name',
                                           '--format=csv,noheader'], text=True)
-        return [row for row in csv.reader(io.StringIO(output), skipinitialspace=True) if row and row[0] == gpu_uuid]
+        return [row for row in csv.reader(io.StringIO(output), skipinitialspace=True) if row and row[0] in gpu_uuids]
 
     if apps():
         raise RuntimeError('Selected GPU is busy; no process will be displaced')
@@ -273,6 +335,10 @@ def main():
     args.work.mkdir(exist_ok=False)
     state = dict(status='preflight', host=os.uname().nodename, job=args.job,
                  gpu=args.gpu, gpu_uuid=gpu_uuid, partitions=args.partitions,
+                 gpus=args.gpus, physical_devices=devices, gpu_uuids=gpu_uuids,
+                 transport=args.transport if args.gpus > 1 else 'single',
+                 batch_per_gpu=50000, maximum_global_batch=50000*args.gpus,
+                 peer_scratch_outside_hidden_pool=args.gpus > 1 and args.peer_scratch == 'independent',
                  visible_frames=args.visible, hidden_frames=int(flags.get('GEGE_FRAME_CACHE_HIDDEN_FRAMES', '0')),
                  commit=args.commit, data_path=args.data_path, paper_ready=False,
                  timing_status='Accuracy diagnostic; timing requires isolation review',
@@ -336,7 +402,7 @@ def main():
         (data/'dataset.yaml').write_text(yaml.safe_dump(metadata, sort_keys=False))
         model = args.work/'model'
         config = control_config(yaml.safe_load(args.template.read_text()), args.decoder,
-                                args.partitions, args.visible, data, model, args.epochs, args.degree_fraction)
+                                args.partitions, args.visible, data, model, args.epochs, args.degree_fraction, args.gpus)
         update(negative_sampling=config['training']['negative_sampling'],
                sampling_status='diagnostic intervention' if args.degree_fraction is not None else 'template recipe')
         config_path = args.work/'config.yaml'
@@ -352,8 +418,10 @@ def main():
         env.update(PATH=str(args.prefix/'bin')+':/usr/bin:/bin',
                    LD_LIBRARY_PATH=f'{args.binary.parent}:{args.prefix}/lib:{args.prefix}/lib/python3.9/site-packages/torch/lib',
                    PYTHONPATH=f'{package}:{args.tools}', GEGE_NO_BINDINGS='1', PYTHONNOUSERSITE='1',
-                   CUDA_VISIBLE_DEVICES=str(args.gpu), CUDA_DEVICE_ORDER='PCI_BUS_ID',
+                   CUDA_VISIBLE_DEVICES=','.join(map(str, devices)), CUDA_DEVICE_ORDER='PCI_BUS_ID',
                    OMP_NUM_THREADS='12', MKL_NUM_THREADS='12', OPENBLAS_NUM_THREADS='1')
+        if args.gpus > 1:
+            env.update(NCCL_P2P_DISABLE='1', NCCL_DEBUG='WARN')
         if args.engine == 'zenodo':
             env.pop('GEGE_NO_BINDINGS', None)
             env.update(LD_LIBRARY_PATH=f'{released_package}:{args.prefix}/lib/python3.9/site-packages/torch/lib:{args.prefix}/lib',
@@ -376,10 +444,10 @@ def main():
                         if args.job:
                             validate_execution_scope(args.job, None)
                         if args.expected_power is not None:
-                            power = float(subprocess.check_output(['nvidia-smi', '-i', str(args.gpu),
+                            powers = subprocess.check_output(['nvidia-smi', '-i', ','.join(map(str, devices)),
                                           '--query-gpu=power.limit', '--format=csv,noheader,nounits'],
-                                          text=True, timeout=20).strip())
-                            if abs(power-args.expected_power) > .1:
+                                          text=True, timeout=20).splitlines()
+                            if any(abs(float(power)-args.expected_power) > .1 for power in powers):
                                 raise RuntimeError('GPU power cap changed; refusing a mixed timing cohort')
                         foreign = []
                         all_apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=gpu_uuid,pid,process_name',
@@ -391,7 +459,7 @@ def main():
                             try:
                                 if os.getpgid(int(row[1])) != child.pid:
                                     observed_foreign.append(row)
-                                    if row[0] == gpu_uuid:
+                                    if row[0] in gpu_uuids:
                                         foreign.append(row)
                             except ProcessLookupError:
                                 pass
@@ -438,6 +506,17 @@ def main():
             raise RuntimeError('Expected '+str(args.epochs)+' complete epochs of the full positive-edge workload')
         if args.replay_seed is not None:
             update(input_trace=audited_input_trace(text))
+        if args.gpus > 1:
+            movement = transport_counts(text)
+            update(transport_counts=movement)
+            if (movement['descriptor_mismatch_count'] or
+                    (args.transport == 'peer' and not movement['peer_bytes_executed']) or
+                    (args.transport == 'host' and (movement['peer_bytes_executed'] or not movement['host_fallback_bytes']))):
+                raise RuntimeError('The requested coordinated transport was not verified in the training log')
+            replicas = check_dense_replicas(model, args.gpus)
+            update(dense_replica_comparison=replicas)
+            if not comparison_passed(replicas):
+                raise RuntimeError('Dense relation replicas diverged; do not silently evaluate only replica zero')
         for name in ('embeddings.bin', 'embeddings_state.bin'):
             if (model/name).stat().st_size != NODES*WIDTH*4:
                 raise RuntimeError('Incomplete checkpoint: '+name)

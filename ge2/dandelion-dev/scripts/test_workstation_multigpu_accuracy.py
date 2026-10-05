@@ -1,0 +1,77 @@
+import unittest
+from pathlib import Path
+
+from run_workstation_fb_accuracy_control import (check_execution_gate, control_config,
+                                                 execution_flags, transport_counts)
+from run_workstation_fb_multigpu_queue import CASES
+
+
+class MultiGpuAccuracyTests(unittest.TestCase):
+    def test_single_flags_are_not_changed(self):
+        flags = {'GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD': '1'}
+        self.assertEqual(flags, execution_flags(flags, 1, 'host'))
+
+    def test_peer_keeps_optimized_math_and_pipeline(self):
+        flags = dict(GEGE_FIXED_BUFFER_MANUAL_COMPLEX_RNS='1', GEGE_SOFTMAX_NEGATIVE_MASS_SCALE='1',
+                     GEGE_FRAME_CACHE_HIDDEN_FRAMES='6', GEGE_FRAME_CACHE_MAX_STALE_BACKLOG='3')
+        result = execution_flags(flags, 2, 'peer')
+        for key, value in flags.items():
+            self.assertEqual(result[key], value)
+        self.assertEqual(result['GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD'], '1')
+        self.assertEqual(result['GEGE_STATEFLOW_ENABLE_UNVERIFIED_PEER_RELAY_RUNTIME'], '1')
+        self.assertEqual(result['GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK'], '0')
+        self.assertEqual(result['GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH'], '0')
+        self.assertEqual(result['GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET'], '1')
+
+    def test_host_keeps_coordinated_handoffs(self):
+        peer = execution_flags({}, 2, 'peer')
+        host = execution_flags({}, 2, 'host')
+        changed = {key for key in peer if peer[key] != host[key]}
+        self.assertEqual(changed, {'GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK'})
+        self.assertEqual(host['GEGE_STATEFLOW_PEER_RUNTIME'], 'on')
+
+    def test_independent_scratch_is_explicit(self):
+        flags = execution_flags({}, 2, 'peer', 'independent')
+        self.assertEqual(flags['GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH'], '1')
+        self.assertEqual(flags['GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET'], '0')
+
+    def test_no_unverified_four_gpu_control(self):
+        with self.assertRaises(ValueError):
+            execution_flags({}, 4, 'peer')
+
+    def test_gate_must_match_count_capacity_transport_and_scratch(self):
+        gate = dict(gpus=2, visible_frames=4, transport='peer', peer_scratch='shared')
+        check_execution_gate(gate, 2, 4, 'peer')
+        for changed in ({'gpus': 1}, {'visible_frames': 8}, {'transport': 'host'},
+                        {'peer_scratch': 'independent'}):
+            with self.subTest(changed=changed), self.assertRaises(RuntimeError):
+                check_execution_gate(dict(gate, **changed), 2, 4, 'peer')
+
+    def test_config_keeps_batch_per_gpu_q_and_sampler(self):
+        template = dict(model=dict(decoder=dict(type='COMPLEX'), encoder=dict(embedding_dim=100)),
+                        storage=dict(dataset={}, embeddings=dict(options={})), evaluation={},
+                        training=dict(batch_size=50000, dense_sync_batches=1,
+                                      negative_sampling=dict(degree_fraction=0.5)))
+        config = control_config(template, 'complex', 32, 4, Path('/data'), Path('/model'), epochs=3, gpus=2)
+        self.assertEqual(config['storage']['device_ids'], [0, 1])
+        self.assertEqual(config['training']['logical_active_devices'], 2)
+        self.assertEqual(config['training']['batch_size'], 50000)
+        self.assertEqual(config['training']['dense_sync_batches'], 1)
+        self.assertEqual(config['training']['negative_sampling'], template['training']['negative_sampling'])
+        self.assertEqual(config['storage']['embeddings']['options']['buffer_capacity'], 4)
+        with self.assertRaises(ValueError):
+            control_config(template, 'complex', 32, 8, Path('/data'), Path('/model'), gpus=2)
+
+    def test_transport_counters_use_only_epoch_summaries(self):
+        text = ('unrelated peer_bytes_executed=900\n'
+                '[perf][epoch 1][peer_relay] peer_bytes_executed=123 host_fallback_bytes=0 descriptor_mismatch_count=0\n'
+                '[perf][epoch 2][peer_relay] peer_bytes_executed=12 host_fallback_bytes=5 descriptor_mismatch_count=1\n')
+        self.assertEqual(transport_counts(text), dict(peer_bytes_executed=135, host_fallback_bytes=5,
+                                                     descriptor_mismatch_count=1))
+
+    def test_queue_is_only_complex_one_two_gpu_controls(self):
+        self.assertEqual(CASES, (('single', 1, 'host'), ('peer', 2, 'peer'), ('host', 2, 'host')))
+
+
+if __name__ == '__main__':
+    unittest.main()

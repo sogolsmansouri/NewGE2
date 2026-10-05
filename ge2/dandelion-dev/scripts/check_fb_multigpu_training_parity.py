@@ -77,6 +77,7 @@ def main():
     execution.add_argument('--job')
     execution.add_argument('--workstation-host', help='Exact hostname explicitly authorized for this test')
     parser.add_argument('--transport', choices=('host', 'peer'), default='peer')
+    parser.add_argument('--peer-scratch', choices=('shared', 'independent'), default='independent')
     parser.add_argument('--gpus', type=int, choices=(1, 2), default=2)
     parser.add_argument('--visible', type=int, choices=(4, 8), default=4)
     parser.add_argument('--decoder', choices=('DISTMULT', 'COMPLEX', 'both'), default='both')
@@ -121,6 +122,9 @@ def main():
                  GEGE_STATEFLOW_PEER_RELAY_VALIDATE_MAX_CHECKS='100000',
                  GEGE_MULTI_GPU_PREPARED_BATCH_PIPELINE='1' if args.prepared_batches else '0',
                  GEGE_PREPARED_BATCH_PIPELINE='1' if args.prepared_batches else '0')
+    if args.gpus > 1:
+        flags.update(GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH='1' if args.peer_scratch == 'independent' else '0',
+                     GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET='0' if args.peer_scratch == 'independent' else '1')
     if args.parameter_audit:
         flags['GEGE_TRAINING_PARAMETER_AUDIT'] = '1'
     if args.observe_validation_mismatches:
@@ -130,6 +134,7 @@ def main():
         flags.update(GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK='1')
     report = dict(status='running', job=args.job, host=host, paper_ready=False,
                   transport=args.transport, gpus=args.gpus,
+                  peer_scratch=args.peer_scratch,
                   visible_frames=args.visible,
                   workstation_host=args.workstation_host, prepared_batches=args.prepared_batches,
                   observe_validation_mismatches=args.observe_validation_mismatches,

@@ -8,7 +8,7 @@ import torch
 import numpy as np
 
 from check_fb_multigpu_training_parity import comparison_passed, relay_validation_counts, tensor_comparison, validate_execution_scope
-from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags, schedule_flags, evaluation_panel
+from run_workstation_fb_accuracy_control import audited_input_trace, control_config, control_flags, schedule_flags, evaluation_panel, engine_flags
 from run_workstation_fb_single_gpu_queue import QUEUES
 
 
@@ -228,6 +228,15 @@ class SingleGpuConfigTests(unittest.TestCase):
         for fraction in (-0.1, 1.1, float('nan'), float('inf')):
             with self.assertRaises(ValueError):
                 control_config(self.template, 'distmult', 32, 4, Path('/data'), Path('/model'), 3, fraction)
+
+    def test_released_engine_has_no_optimized_feature_flags(self):
+        flags = dict(GEGE_FIXED_BUFFER_BITMAP_MAP='1', GEGE_SOFTMAX_NEGATIVE_MASS_SCALE='1')
+        self.assertEqual(engine_flags(flags, 'zenodo'), {})
+        self.assertEqual(engine_flags(flags, 'optimized'), flags)
+        self.assertIsNot(engine_flags(flags, 'optimized'), flags)
+        self.assertEqual(flags['GEGE_FIXED_BUFFER_BITMAP_MAP'], '1')
+        with self.assertRaises(ValueError):
+            engine_flags(flags, 'unknown')
 
     def test_replay_trace_is_order_independent_but_not_content_independent(self):
         a = '[training-input] epoch=0 batch=0 edges=a\n[training-input] epoch=0 batch=1 edges=b\n'

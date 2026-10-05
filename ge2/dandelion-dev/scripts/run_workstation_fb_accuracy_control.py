@@ -28,6 +28,7 @@ from check_fb_multigpu_training_parity import validate_execution_scope
 
 NODES, RELATIONS, WIDTH, EDGES = 86054151, 14824, 100, 304727650
 QUERY_SHA = 'a4f3bf65bdff5ce735946982f57950f55f64a52470eca1eeff9c41fa01912685'
+ZENODO_LIBRARY_SHA = '9dfa5dc17ab5fee3874d8d449260e0fe17557e23a4691becbe5883fa55c53cf5'
 
 
 def digest(path):
@@ -131,6 +132,15 @@ def schedule_flags(original, schedule):
     return flags
 
 
+def engine_flags(original, engine):
+    if engine == 'optimized':
+        return dict(original)
+    if engine != 'zenodo':
+        raise ValueError('Unknown training engine')
+    # Do not expose PipeGE feature switches to the released-library reference.
+    return {}
+
+
 def audited_input_trace(text):
     rows = sorted(re.findall(r'\[training-input\] (.*)', text))
     if not rows:
@@ -165,6 +175,8 @@ def main():
     parser.add_argument('--gradients', choices=('manual', 'autograd'), default='manual',
                         help='Autograd is a diagnostic reference, not a production fallback')
     parser.add_argument('--decoder', choices=('distmult', 'complex'), default='distmult')
+    parser.add_argument('--engine', choices=('optimized', 'zenodo'), default='optimized',
+                        help='Zenodo is the frozen released GE2 library, without PipeGE feature flags')
     parser.add_argument('--schedule', choices=('bounded', 'legacy-random'), default='bounded',
                         help='Legacy randomized CUSTOM isolates partition-dependent schedule effects')
     parser.add_argument('--epochs', type=int, default=10)
@@ -193,18 +205,29 @@ def main():
     pipeline = None if args.pipeline == 'default' else args.pipeline == 'on'
     if args.schedule == 'legacy-random' and (args.visible != 4 or pipeline is not False):
         parser.error('Legacy randomized schedule control requires q=4 and --pipeline off')
+    if args.engine == 'zenodo' and (args.schedule != 'legacy-random' or pipeline is not False
+                                   or args.gradients != 'autograd' or args.replay_seed is not None):
+        parser.error('Released GE2 requires legacy-random, pipeline off, autograd, and no PipeGE replay seed')
     flags = control_flags(json.loads(args.flags.read_text()), args.partitions, pipeline, args.gradients)
     flags = schedule_flags(flags, args.schedule)
     if args.replay_seed is not None:
         flags.update(GEGE_TRAINING_REPLAY_SEED=str(args.replay_seed), GEGE_TRAINING_INPUT_AUDIT='1')
+    flags = engine_flags(flags, args.engine)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    gate = json.loads(args.gate.read_text())
-    hashes = dict(binary_sha256=digest(args.binary), library_sha256=digest(args.binary.parent/'libge2.so'))
-    if gate['status'] != 'passed' or any(gate[key] != value for key, value in hashes.items()):
-        raise RuntimeError('The native binary/library must match a passing training-parity gate')
-    for name, expected in gate['source_sha256'].items():
-        if digest(args.source/name) != expected:
-            raise RuntimeError('Source changed after the passing gate: '+name)
+    released_package = args.prefix/'lib/python3.9/site-packages/gege'
+    if args.engine == 'optimized':
+        gate = json.loads(args.gate.read_text())
+        hashes = dict(binary_sha256=digest(args.binary), library_sha256=digest(args.binary.parent/'libge2.so'))
+        if gate['status'] != 'passed' or any(gate[key] != value for key, value in hashes.items()):
+            raise RuntimeError('The native binary/library must match a passing training-parity gate')
+        for name, expected in gate['source_sha256'].items():
+            if digest(args.source/name) != expected:
+                raise RuntimeError('Source changed after the passing gate: '+name)
+    else:
+        hashes = dict(entrypoint_sha256=digest(args.prefix/'bin/gege_train'),
+                      library_sha256=digest(released_package/'libge2.so'))
+        if hashes['library_sha256'] != ZENODO_LIBRARY_SHA:
+            raise RuntimeError('Unexpected released GE2 library; refusing an unverified baseline')
     gpu_uuid = subprocess.check_output(['nvidia-smi', '-i', str(args.gpu), '--query-gpu=uuid',
                                         '--format=csv,noheader'], text=True).strip()
     lock = Path('/home/'+os.environ['USER'])/('.fb_accuracy_gpu_'+gpu_uuid+'.lock')
@@ -223,11 +246,11 @@ def main():
     args.work.mkdir(exist_ok=False)
     state = dict(status='preflight', host=os.uname().nodename, job=args.job,
                  gpu=args.gpu, gpu_uuid=gpu_uuid, partitions=args.partitions,
-                 visible_frames=args.visible, hidden_frames=int(flags['GEGE_FRAME_CACHE_HIDDEN_FRAMES']),
+                 visible_frames=args.visible, hidden_frames=int(flags.get('GEGE_FRAME_CACHE_HIDDEN_FRAMES', '0')),
                  commit=args.commit, paper_ready=False, timing_status='Accuracy diagnostic; timing requires isolation review',
                  purpose='Partition, visible-negative-domain and pipeline controls; not hyperparameter selection',
                  expected_power_w=args.expected_power, foreign_gpu_observations=[], **hashes)
-    state['gradients'] = args.gradients
+    state.update(gradients=args.gradients, engine=args.engine, driver_sha256=digest(__file__))
     state.update(decoder=args.decoder, replay_seed=args.replay_seed, schedule=args.schedule,
                  requested_epochs=args.epochs, requested_eval_queries=args.eval_queries,
                  requested_degree_fraction=args.degree_fraction,
@@ -293,7 +316,8 @@ def main():
         (args.work/'flags.json').write_text(json.dumps(flags, indent=2)+'\n')
         package = args.work/'python'
         package.mkdir()
-        (package/'gege').symlink_to((args.source/'src/python').resolve(), target_is_directory=True)
+        if args.engine == 'optimized':
+            (package/'gege').symlink_to((args.source/'src/python').resolve(), target_is_directory=True)
         env = {k: v for k, v in os.environ.items() if not k.startswith(('GEGE_', 'PYTHON', 'CONDA', 'SLURM_', 'OMP_', 'MKL_'))}
         env.pop('LD_PRELOAD', None)
         env.update(flags)
@@ -302,6 +326,10 @@ def main():
                    PYTHONPATH=f'{package}:{args.tools}', GEGE_NO_BINDINGS='1', PYTHONNOUSERSITE='1',
                    CUDA_VISIBLE_DEVICES=str(args.gpu), CUDA_DEVICE_ORDER='PCI_BUS_ID',
                    OMP_NUM_THREADS='12', MKL_NUM_THREADS='12', OPENBLAS_NUM_THREADS='1')
+        if args.engine == 'zenodo':
+            env.pop('GEGE_NO_BINDINGS', None)
+            env.update(LD_LIBRARY_PATH=f'{released_package}:{args.prefix}/lib/python3.9/site-packages/torch/lib:{args.prefix}/lib',
+                       PYTHONPATH=str(args.prefix/'lib/python3.9/site-packages')+':'+str(args.tools))
         if args.job:
             env['SLURM_JOB_ID'] = args.job
 
@@ -362,7 +390,19 @@ def main():
                             child.wait()
                     update(child_pid=None)
 
-        command([args.binary, config_path], 'train', 12*3600)
+        if args.engine == 'zenodo':
+            probe = ('import gege, json, pathlib, sys, torch; '
+                     'expected=pathlib.Path(sys.argv[1]).resolve(); '
+                     'package=pathlib.Path(gege.__file__).resolve().parent; '
+                     'libraries={pathlib.Path(line.split()[-1]).resolve() for line in '
+                     'pathlib.Path("/proc/self/maps").read_text().splitlines() if "libge2.so" in line}; '
+                     'assert package == expected, (package, expected); '
+                     'assert libraries == {expected/"libge2.so"}, libraries; '
+                     'print(json.dumps(dict(package=str(package), libraries=sorted(map(str, libraries)), torch=torch.__version__)))')
+            command([args.prefix/'bin/python', '-c', probe, released_package], 'released_import', 120)
+        train_command = ([args.binary, config_path] if args.engine == 'optimized' else
+                         [args.prefix/'bin/python', args.prefix/'bin/gege_train', config_path])
+        command(train_command, 'train', 12*3600)
         text = (args.work/'train.log').read_text()
         times = [int(v)/1000 for v in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
         edge_counts = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)

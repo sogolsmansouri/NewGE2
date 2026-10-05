@@ -109,7 +109,14 @@ def training_check(text, spec, count, epochs, gate):
             raise ValueError('Unexpected embedding/optimizer frame allocation')
         if re.search(r'descriptor_mismatch_count=[1-9]|(?:dst|src)_mismatch_values=[1-9]', text):
             raise ValueError('Peer-copy descriptor or value mismatch')
-        if gate:
+        if spec.get('transport') == 'host':
+            transfers = re.findall(
+                r'\[perf\]\[epoch (\d+)\]\[peer_relay\] peer_bytes_executed=(\d+) '
+                r'host_bytes_saved=\d+ host_fallback_bytes=(\d+)', text)
+            if (len(transfers) != epochs or {int(row[0]) for row in transfers} != set(range(1, epochs+1))
+                    or any(int(peer) != 0 or int(host) <= 0 for _, peer, host in transfers)):
+                raise ValueError('Coordinated host-only handoffs were not verified')
+        elif gate:
             checks = re.findall(r'\[stateflow-peer-validate \d+\].*dst_mismatch_values=0.*src_mismatch_values=0', text)
             if len(checks) < 16:
                 raise ValueError('Insufficient live peer-copy value checks')
@@ -399,6 +406,10 @@ def run_case(base, manifest, name, phase, deadline, archive_root, summary, *, di
                     raise ValueError('PipeGE binary changed')
             env.update(pipege_python_overlay(engine, work))
             env.update(json.loads(Path(spec['flags']).read_text()))
+            if spec.get('transport') in ('host', 'peer'):
+                forced_host = env.get('GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK', '0') == '1'
+                if forced_host != (spec['transport'] == 'host'):
+                    raise ValueError('Transport flags differ from the declared accuracy control')
             binary = lib/'gege_train'
             if phase == 'gate':
                 env.update(GEGE_STATEFLOW_PEER_RELAY_VALIDATE='1', GEGE_STATEFLOW_PEER_RELAY_VALIDATE_FAIL_FAST='1',

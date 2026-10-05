@@ -164,6 +164,22 @@ class MultiGpuCampaignTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 check_replicas(root, 2)
 
+    def test_host_control_requires_executed_coordinated_handoffs(self):
+        helper = types.ModuleType('run_arc_pipege_quality')
+        helper.timing_summary = lambda text, times: dict(epoch_times_s=times)
+        spec = dict(system='pipege', graph='fb', p=32, hidden=6, states=88,
+                    width=100, nodes=86054151, edges=304727650, transport='host')
+        log = self.log(spec, 4).replace('[stateflow-peer-validate', '[unused')
+        transfers = ''.join(f'\n[perf][epoch {i}][peer_relay] peer_bytes_executed=0 '
+                            'host_bytes_saved=0 host_fallback_bytes=4096' for i in (1, 2))
+        with patch.dict(sys.modules, run_arc_pipege_quality=helper):
+            training_check(log+transfers, spec, 4, 2, True)
+            for bad in (log, log+transfers.replace('peer_bytes_executed=0', 'peer_bytes_executed=8'),
+                        log+transfers.replace('host_fallback_bytes=4096', 'host_fallback_bytes=0'),
+                        log+transfers+transfers):
+                with self.assertRaisesRegex(ValueError, 'host-only'):
+                    training_check(bad, spec, 4, 2, True)
+
     def test_original_multigpu_logs_have_no_progress_counter(self):
         helper = types.ModuleType('run_arc_pipege_quality')
         helper.timing_summary = lambda text, times: dict(epoch_times_s=times)

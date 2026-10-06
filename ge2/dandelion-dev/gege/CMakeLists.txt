@@ -267,6 +267,9 @@ if(BUILD_TESTING)
     add_test(NAME gege_order_window_tests COMMAND gege_order_window_tests)
     # Torch's dependency configuration can shadow USE_CUDA after CUDA was enabled.
     if(CMAKE_CUDA_COMPILER_LOADED)
+        add_library(gege_frame_transition_audit SHARED EXCLUDE_FROM_ALL
+                    ${CMAKE_CURRENT_LIST_DIR}/../scripts/check_frame_transition_state.cpp)
+        target_link_libraries(gege_frame_transition_audit ${PROJECT_NAME} ${CMAKE_DL_LIBS})
         add_executable(gege_fixed_frame_buffer_test ${GEGE_CPP_SOURCE}/tests/fixed_frame_buffer_test.cpp)
         target_link_libraries(gege_fixed_frame_buffer_test ${PROJECT_NAME})
         add_executable(gege_manual_training_update_test ${GEGE_CPP_SOURCE}/tests/manual_training_update_test.cpp)

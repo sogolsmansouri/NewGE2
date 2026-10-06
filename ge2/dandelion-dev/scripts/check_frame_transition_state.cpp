@@ -77,7 +77,29 @@ void compare_visible(MemPartitionBuffer *buffer, const char *where) {
     auto ids = torch::arange(buffer->getNumInMemory(),
                             torch::TensorOptions().dtype(torch::kInt64).device(buffer->device_));
     auto global_ids = host_ids(buffer, ids);
-    compare(state.value.index_select(0, global_ids), buffer->indexRead(ids), where);
+    auto expected = state.value.index_select(0, global_ids);
+    auto actual = buffer->indexRead(ids).to(torch::kCPU);
+    if (!(expected == actual).all().item<bool>()) {
+        auto map = buffer->getPartitionToBufferSlotMap().to(torch::kCPU);
+        for (int64_t partition = 0; partition < map.numel(); ++partition) {
+            auto slot = map[partition].item<int64_t>();
+            if (slot < 0) continue;
+            auto begin = slot * buffer->getPartitionSize();
+            auto end = begin + buffer->getPartitionSize();
+            auto reference = expected.slice(0, begin, end);
+            auto value = actual.slice(0, begin, end);
+            auto differences = (reference != value).sum().item<int64_t>();
+            if (differences == 0) continue;
+            auto host = buffer->data_storage_.index_select(0, global_ids.slice(0, begin, end));
+            SPDLOG_ERROR("[frame-audit-mismatch] device={} phase={} partition={} slot={} values={} "
+                         "max_abs={} host_vs_expected_max={} gpu_vs_host_max={}",
+                         buffer->device_.str(), where, partition, slot, differences,
+                         (reference - value).abs().max().item<float>(),
+                         (host - reference).abs().max().item<float>(),
+                         (value - host).abs().max().item<float>());
+        }
+    }
+    compare(expected, actual, where);
     ++state.checks;
 }
 

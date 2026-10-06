@@ -28,10 +28,11 @@ def main():
     parser.add_argument('--source', type=Path)
     parser.add_argument('--order-window', type=int)
     args = parser.parse_args()
-    apps = subprocess.check_output(['nvidia-smi', '-i', str(args.gpu),
+    selected_gpus = [args.gpu] if args.gpus == 1 else list(range(args.gpus))
+    apps = subprocess.check_output(['nvidia-smi', '-i', ','.join(map(str, selected_gpus)),
         '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
     if apps:
-        raise RuntimeError('Correctness fixture requires an idle GPU: ' + apps)
+        raise RuntimeError('Correctness fixture requires idle selected GPUs: ' + apps)
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     root = args.root
     prefix = root / 'ge2-a6000-cuda121'
@@ -41,10 +42,6 @@ def main():
     binary = args.binary or binary
     if args.gpus == 2:
         from run_workstation_fb_accuracy_control import execution_flags
-        apps = subprocess.check_output(['nvidia-smi', '--query-compute-apps=pid',
-                                       '--format=csv,noheader'], text=True).strip()
-        if apps:
-            raise RuntimeError('Two-GPU fixture requires both GPUs idle: ' + apps)
     template = yaml.safe_load((root / 'evidence/schedule_order_fixture_20261006/config.yaml').read_text())
     flags = json.loads((root / 'templates/flags.json').read_text())
     flags.update(GEGE_TRAINING_REPLAY_SEED='17', GEGE_TRAINING_INPUT_AUDIT='1',

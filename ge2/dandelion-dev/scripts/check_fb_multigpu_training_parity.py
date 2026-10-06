@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare manual/autograd FB-shaped training with the production two-GPU runtime."""
+"""Compare manual/autograd FB-shaped training with the production multi-GPU runtime."""
 import argparse
 import copy
 import hashlib
@@ -78,7 +78,7 @@ def main():
     execution.add_argument('--workstation-host', help='Exact hostname explicitly authorized for this test')
     parser.add_argument('--transport', choices=('host', 'peer'), default='peer')
     parser.add_argument('--peer-scratch', choices=('shared', 'independent'), default='independent')
-    parser.add_argument('--gpus', type=int, choices=(1, 2), default=2)
+    parser.add_argument('--gpus', type=int, choices=(1, 2, 4), default=2)
     parser.add_argument('--visible', type=int, choices=(4, 8), default=4)
     parser.add_argument('--decoder', choices=('DISTMULT', 'COMPLEX', 'both'), default='both')
     parser.add_argument('--parameter-audit', action='store_true')
@@ -96,8 +96,8 @@ def main():
         raise RuntimeError('Fixture requires idle GPUs: '+apps)
     if torch.cuda.device_count() != args.gpus:
         raise RuntimeError('The selected GPU count does not match --gpus')
-    if args.transport == 'peer' and (args.gpus != 2 or not all(torch.cuda.can_device_access_peer(a, b)
-                                            for a, b in ((0, 1), (1, 0)))):
+    if args.transport == 'peer' and (args.gpus == 1 or not all(torch.cuda.can_device_access_peer(a, b)
+                                            for a in range(args.gpus) for b in range(args.gpus) if a != b)):
         raise RuntimeError('Peer transport requires actual bidirectional CUDA peer access')
     args.work.mkdir(parents=True, exist_ok=False)
     overlay = args.work/'python'
@@ -113,7 +113,7 @@ def main():
     # Changes only execution mode. Replay keys isolate RNG from host-thread scheduling.
     flags.update(GEGE_TRAINING_REPLAY_SEED='17', GEGE_TRAINING_INPUT_AUDIT='1',
                  GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD='1' if args.gpus == 1 else '0',
-                 GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD='1' if args.gpus == 2 else '0',
+                 GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD='1' if args.gpus > 1 else '0',
                  GEGE_PARTITION_BUFFER_PEER_RELAY='1', GEGE_STATEFLOW_ALLOW_PEER_RELAY='1',
                  GEGE_STATEFLOW_ENABLE_UNVERIFIED_PEER_RELAY_RUNTIME='1',
                  GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK='0',
@@ -142,7 +142,7 @@ def main():
                   binary_sha256=digest(args.binary), library_sha256=digest(args.binary.parent/'libge2.so'),
                   source_sha256={str(path): digest(args.source/path) for path in
                       map(Path, ('src/cpp/src/engine/trainer.cpp', 'src/cpp/src/storage/storage.cpp',
-                                 'src/cpp/include/storage/storage.h'))},
+                                 'src/cpp/include/storage/storage.h', 'src/cpp/src/storage/buffer.cpp'))},
                   cases={}, comparisons={})
     result = args.work/'result.json'
 
@@ -212,7 +212,7 @@ def main():
                 save()
                 if (process.returncode or entry['completed_epochs'] != [1, 2] or not trace
                         or (args.transport == 'peer' and not entry['negative_handoff_key_checks'])
-                        or (args.transport == 'host' and args.gpus == 2 and (not host_bytes or peer_bytes))
+                        or (args.transport == 'host' and args.gpus > 1 and (not host_bytes or peer_bytes))
                         or (entry['validation_mismatch_lines'] and not args.observe_validation_mismatches)):
                     raise RuntimeError('Training/peer gate failed: '+name)
             for reference in ('autograd', 'manual_sync'):
@@ -225,7 +225,7 @@ def main():
                 save()
                 if not comparison_passed(comparison):
                     raise RuntimeError('Checkpoint mismatch: '+decoder+'_'+reference)
-        if args.gpus == 2:
+        if args.gpus > 1:
             case = args.work/'unsafe_host_rejection'
             case.mkdir()
             config['storage']['model_dir'] = str(case/'model')+'/'

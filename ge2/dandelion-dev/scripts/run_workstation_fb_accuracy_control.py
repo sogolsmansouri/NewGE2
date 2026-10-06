@@ -70,10 +70,10 @@ def control_flags(original, partitions, pipeline=None, gradients=None):
 
 
 def execution_flags(original, gpus, transport, peer_scratch='shared'):
-    if gpus not in (1, 2) or transport not in ('peer', 'host') or peer_scratch not in ('shared', 'independent'):
+    if gpus not in (1, 2, 4) or transport not in ('peer', 'host') or peer_scratch not in ('shared', 'independent'):
         raise ValueError('Unsupported GPU count or transport')
     flags = dict(original)
-    if gpus == 2:
+    if gpus > 1:
         flags.update(GEGE_SINGLE_GPU_ASYNC_ADMIT_PRELOAD='0',
                      GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD='1',
                      GEGE_PARTITION_BUFFER_PEER_RELAY='1',
@@ -115,13 +115,44 @@ def check_dense_replicas(model, gpus):
     return result
 
 
+def training_workload(text, epochs, gpus):
+    finished = list(map(int, re.findall(r'Finished training epoch\s+(\d+)', text)))
+    times = re.findall(r'Epoch Runtime:\s*(\d+)ms', text)
+    if finished != list(range(1, epochs + 1)) or len(times) != epochs:
+        raise RuntimeError('Missing or duplicate completed training epochs')
+    if gpus == 1:
+        counts = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)
+        if counts != [(str(EDGES), str(EDGES))] * epochs:
+            raise RuntimeError('Incomplete single-GPU positive-edge workload')
+        return dict(method='completed_edge_progress', positive_edges_per_epoch=EDGES)
+    from run_arc_multigpu_campaign import state_workload_check
+    rows = state_workload_check(text, dict(states=88, edges=EDGES), gpus, epochs)
+    return dict(method='initialized_state_items_and_completed_lane_batches', epochs=rows)
+
+
+def epoch_wall_times(text, times):
+    stamp = r'\[(\d\d/\d\d/\d\d \d\d:\d\d:\d\d\.\d+)\]'
+    starts = re.findall(stamp + r'.*Starting training epoch \d+', text)
+    ends = re.findall(stamp + r' Epoch Runtime: \d+ms', text)
+    if len(starts) != len(times) or len(ends) != len(times):
+        raise RuntimeError('Missing epoch timestamps for wall-time accounting')
+    parse = lambda value: datetime.datetime.strptime(value, '%m/%d/%y %H:%M:%S.%f')
+    starts, ends = list(map(parse, starts)), list(map(parse, ends))
+    wall = [(starts[i + 1] - starts[i]).total_seconds() for i in range(len(starts) - 1)]
+    wall.append((ends[-1] - starts[-1]).total_seconds())
+    return dict(epoch_start_to_next_start_s=wall, wall_epoch_mean_s=float(np.mean(wall)),
+                wall_epoch_steady_mean_s=float(np.mean(wall[1:])) if len(wall) > 1 else None,
+                definition='Start-to-next-start intervals including inter-epoch work; '
+                           'last interval ends at final epoch timer; excludes checkpoint saving and evaluation')
+
+
 def control_config(template, decoder, partitions, visible, data, model, epochs=10, degree_fraction=None, gpus=1):
     if decoder not in ('distmult', 'complex'):
         raise ValueError('Unsupported single-GPU decoder')
     if epochs < 1:
         raise ValueError('Control needs at least one complete epoch')
-    if gpus not in (1, 2) or (gpus == 2 and (partitions != 32 or visible != 4)):
-        raise ValueError('Two-GPU controls require p32/q4')
+    if gpus not in (1, 2, 4) or (gpus > 1 and (partitions != 32 or visible != 4)):
+        raise ValueError('Multi-GPU controls require p32/q4')
     if degree_fraction is not None and (not math.isfinite(degree_fraction) or not 0 <= degree_fraction <= 1):
         raise ValueError('Diagnostic degree fraction must be finite and in [0, 1]')
     if (template['model']['decoder']['type'] not in ('DISTMULT', 'COMPLEX')
@@ -239,7 +270,7 @@ def main():
     execution.add_argument('--job')
     parser.add_argument('--commit', required=True)
     parser.add_argument('--gpu', type=int, choices=range(4), required=True)
-    parser.add_argument('--gpus', type=int, choices=(1, 2), default=1)
+    parser.add_argument('--gpus', type=int, choices=(1, 2, 4), default=1)
     parser.add_argument('--transport', choices=('peer', 'host'), default='peer')
     parser.add_argument('--peer-scratch', choices=('shared', 'independent'), default='shared')
     parser.add_argument('--partitions', type=int, choices=(16, 32), required=True)
@@ -278,10 +309,10 @@ def main():
                           or args.work.resolve() in args.evidence.resolve().parents):
         raise ValueError('Evidence must be outside the run directory')
     pipeline = None if args.pipeline == 'default' else args.pipeline == 'on'
-    if args.gpus == 2 and (args.engine != 'optimized' or args.gpu != 0 or args.visible != 4
+    if args.gpus > 1 and (args.engine != 'optimized' or args.gpu != 0 or args.visible != 4
                           or args.partitions != 32 or pipeline is False or args.schedule != 'bounded'
                           or args.data_path != 'current'):
-        parser.error('Two-GPU control requires optimized p32/q4, GPUs 0,1, bounded schedule and pipeline')
+        parser.error('Multi-GPU control requires optimized p32/q4, contiguous GPUs, bounded schedule and pipeline')
     if args.schedule == 'legacy-random' and (args.visible != 4 or pipeline is not False):
         parser.error('Legacy randomized schedule control requires q=4 and --pipeline off')
     if args.engine == 'zenodo' and (args.schedule != 'legacy-random' or pipeline is not False
@@ -313,7 +344,7 @@ def main():
                       library_sha256=digest(released_package/'libge2.so'))
         if hashes['library_sha256'] != ZENODO_LIBRARY_SHA:
             raise RuntimeError('Unexpected released GE2 library; refusing an unverified baseline')
-    devices = [args.gpu] if args.gpus == 1 else [0, 1]
+    devices = [args.gpu] if args.gpus == 1 else list(range(args.gpus))
     gpu_uuids = [subprocess.check_output(['nvidia-smi', '-i', str(device), '--query-gpu=uuid',
                                         '--format=csv,noheader'], text=True).strip() for device in devices]
     locks = []
@@ -465,6 +496,12 @@ def main():
                                 pass
                         if observed_foreign and not state['foreign_gpu_observations']:
                             update(foreign_gpu_observations=observed_foreign)
+                        if stage == 'train':
+                            with (args.work/'train.hardware.jsonl').open('a') as sample:
+                                sample.write(json.dumps(dict(timestamp=datetime.datetime.now().isoformat(),
+                                    gpu=subprocess.check_output(['nvidia-smi', '--query-gpu=index,uuid,power.limit,utilization.gpu,memory.used',
+                                                                 '--format=csv,noheader'], text=True, timeout=20),
+                                    foreign_gpu_processes=observed_foreign))+'\n')
                         if foreign:
                             raise RuntimeError('Foreign GPU workload appeared: '+repr(foreign))
                         if stage == 'train':
@@ -501,9 +538,8 @@ def main():
         command(train_command, 'train', 12*3600)
         text = (args.work/'train.log').read_text()
         times = [int(v)/1000 for v in re.findall(r'Epoch Runtime:\s*(\d+)ms', text)]
-        edge_counts = re.findall(r'Edges processed:\s*\[(\d+)/(\d+)\],\s*100\.00%', text)
-        if len(times) != args.epochs or edge_counts != [(str(EDGES), str(EDGES))]*args.epochs:
-            raise RuntimeError('Expected '+str(args.epochs)+' complete epochs of the full positive-edge workload')
+        update(workload_audit=training_workload(text, args.epochs, args.gpus),
+               epoch_timing=epoch_wall_times(text, times))
         if args.replay_seed is not None:
             update(input_trace=audited_input_trace(text))
         if args.gpus > 1:

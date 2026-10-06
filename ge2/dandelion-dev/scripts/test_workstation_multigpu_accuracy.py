@@ -2,7 +2,8 @@ import unittest
 from pathlib import Path
 
 from run_workstation_fb_accuracy_control import (check_execution_gate, control_config,
-                                                 execution_flags, transport_counts)
+                                                 execution_flags, transport_counts, training_workload,
+                                                 epoch_wall_times, EDGES)
 from run_workstation_fb_multigpu_queue import CASES
 
 
@@ -36,9 +37,12 @@ class MultiGpuAccuracyTests(unittest.TestCase):
         self.assertEqual(flags['GEGE_STATEFLOW_PEER_RELAY_INDEPENDENT_SCRATCH'], '1')
         self.assertEqual(flags['GEGE_FRAME_CACHE_STRICT_FRAME_BUDGET'], '0')
 
-    def test_no_unverified_four_gpu_control(self):
-        with self.assertRaises(ValueError):
-            execution_flags({}, 4, 'peer')
+    def test_four_gpu_control_requires_its_own_gate(self):
+        flags = execution_flags({}, 4, 'peer')
+        self.assertEqual(flags['GEGE_MULTI_GPU_ASYNC_ADMIT_PRELOAD'], '1')
+        gate = dict(gpus=2, visible_frames=4, transport='peer', peer_scratch='shared')
+        with self.assertRaises(RuntimeError):
+            check_execution_gate(gate, 4, 4, 'peer')
 
     def test_gate_must_match_count_capacity_transport_and_scratch(self):
         gate = dict(gpus=2, visible_frames=4, transport='peer', peer_scratch='shared')
@@ -62,6 +66,9 @@ class MultiGpuAccuracyTests(unittest.TestCase):
         self.assertEqual(config['storage']['embeddings']['options']['buffer_capacity'], 4)
         with self.assertRaises(ValueError):
             control_config(template, 'complex', 32, 8, Path('/data'), Path('/model'), gpus=2)
+        four = control_config(template, 'complex', 32, 4, Path('/data'), Path('/model'), gpus=4)
+        self.assertEqual(four['storage']['device_ids'], [0, 1, 2, 3])
+        self.assertEqual(four['training']['batch_size'], 50000)
 
     def test_transport_counters_use_only_epoch_summaries(self):
         text = ('unrelated peer_bytes_executed=900\n'
@@ -72,6 +79,29 @@ class MultiGpuAccuracyTests(unittest.TestCase):
 
     def test_queue_is_only_complex_one_two_gpu_controls(self):
         self.assertEqual(CASES, (('single', 1, 'host'), ('peer', 2, 'peer'), ('host', 2, 'host')))
+
+    def test_multigpu_workload_does_not_require_single_gpu_progress(self):
+        rows = []
+        for state in range(88):
+            items = EDGES if state == 0 else 0
+            rows.append(f'[initializeBatches] device={state % 2} prepare_encode=false task_id=1 items={items} batches=1')
+        rows.extend(['Finished training epoch 1', 'Epoch Runtime: 1000ms',
+                     '[perf][epoch 1][gpu 0] batches=44', '[perf][epoch 1][gpu 1] batches=44'])
+        result = training_workload('\n'.join(rows), 1, 2)
+        self.assertEqual(result['epochs'][0]['state_items'], EDGES)
+        with self.assertRaises(ValueError):
+            training_workload('\n'.join(rows).replace('gpu 1] batches=44', 'gpu 1] batches=43'), 1, 2)
+        with self.assertRaises(ValueError):
+            training_workload('\n'.join(rows).replace('items='+str(EDGES), 'items=1'), 1, 2)
+
+    def test_wall_times_include_inter_epoch_gap(self):
+        text = ('[10/06/26 08:00:00.000] Starting training epoch 1\n'
+                '[10/06/26 08:00:10.000] Epoch Runtime: 10000ms\n'
+                '[10/06/26 08:00:15.000] Starting training epoch 2\n'
+                '[10/06/26 08:00:25.000] Epoch Runtime: 10000ms\n')
+        result = epoch_wall_times(text, [10., 10.])
+        self.assertEqual(result['epoch_start_to_next_start_s'], [15., 10.])
+        self.assertEqual(result['wall_epoch_mean_s'], 12.5)
 
 
 if __name__ == '__main__':

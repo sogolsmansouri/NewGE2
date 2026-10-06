@@ -270,6 +270,12 @@ if(BUILD_TESTING)
         add_library(gege_frame_transition_audit SHARED EXCLUDE_FROM_ALL
                     ${CMAKE_CURRENT_LIST_DIR}/../scripts/check_frame_transition_state.cpp)
         target_link_libraries(gege_frame_transition_audit ${PROJECT_NAME} ${CMAKE_DL_LIBS})
+        add_library(gege_dense_local_steps SHARED EXCLUDE_FROM_ALL
+                    ${CMAKE_CURRENT_LIST_DIR}/../scripts/check_dense_local_steps.cpp)
+        target_link_libraries(gege_dense_local_steps ${PROJECT_NAME})
+        add_executable(gege_dense_local_steps_test
+                       ${CMAKE_CURRENT_LIST_DIR}/../scripts/test_dense_local_steps.cpp)
+        target_link_libraries(gege_dense_local_steps_test ${PROJECT_NAME})
         add_executable(gege_fixed_frame_buffer_test ${GEGE_CPP_SOURCE}/tests/fixed_frame_buffer_test.cpp)
         target_link_libraries(gege_fixed_frame_buffer_test ${PROJECT_NAME})
         add_executable(gege_manual_training_update_test ${GEGE_CPP_SOURCE}/tests/manual_training_update_test.cpp)

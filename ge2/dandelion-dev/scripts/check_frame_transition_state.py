@@ -27,7 +27,10 @@ def main():
     parser.add_argument('--binary', type=Path)
     parser.add_argument('--source', type=Path)
     parser.add_argument('--order-window', type=int)
+    parser.add_argument('--dense-step-library', type=Path)
     args = parser.parse_args()
+    if args.dense_step_library and args.gpus != 2:
+        parser.error('Separate dense local steps require a two-GPU fixture')
     selected_gpus = [args.gpu] if args.gpus == 1 else list(range(args.gpus))
     apps = subprocess.check_output(['nvidia-smi', '-i', ','.join(map(str, selected_gpus)),
         '--query-compute-apps=pid', '--format=csv,noheader'], text=True).strip()
@@ -65,6 +68,8 @@ def main():
         audit_library_sha256=digest(args.audit_library), cases={})
     report['gpus'] = args.gpus
     report['order_window'] = args.order_window
+    if args.dense_step_library:
+        report['dense_step_library_sha256'] = digest(args.dense_step_library)
     report_path = args.work / 'result.json'
 
     def save():
@@ -112,6 +117,8 @@ def main():
                 libraries.insert(0, str(args.order_library))
             if audit:
                 libraries.insert(0, str(args.audit_library))
+            if args.dense_step_library:
+                libraries.insert(0, str(args.dense_step_library))
             env.update(PATH=f'{prefix}/bin:/usr/bin:/bin',
                 CUDA_VISIBLE_DEVICES=str(args.gpu) if args.gpus == 1 else '0,1', CUDA_DEVICE_ORDER='PCI_BUS_ID',
                 PYTHONHOME=str(prefix), PYTHONPATH=str(package),
@@ -143,6 +150,8 @@ def main():
             else:
                 assert run.returncode == 0 and row['completed_epochs'] == [1, 2], label
                 assert row['manual_backward_used'], 'Manual optimized backward did not run'
+                if args.dense_step_library:
+                    assert '[diagnostic-dense-steps] separate_local_gradients=1 averaged_update=0' in text
                 if audit:
                     assert row['states_checked'] == 176 and row['host_checks'] >= 4, label
                 if args.gpus == 2:

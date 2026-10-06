@@ -26,6 +26,7 @@ enum class PlanVariant {
     MULTI_GPU_DISJOINT_ROUNDS = 8,
     MULTI_GPU_LANE_MATCHED = 9,
     MULTI_GPU_OPTIMAL88_LANE_MATCHED = 10,
+    MULTI_GPU_ORDER_WINDOW = 11,
 };
 
 enum class ResidentObjectRole {

@@ -263,6 +263,8 @@ add_executable(gege_direct_state_local_exec_analyzer ${project_SOURCE_DIR}/gege_
 add_executable(gege_state_local_accumulator_analyzer ${project_SOURCE_DIR}/gege_state_local_accumulator_analyzer.cpp)
 if(BUILD_TESTING)
     add_executable(gege_stateflow_validator_tests ${GEGE_CPP_SOURCE}/tests/gege_stateflow_validator_tests.cpp)
+    add_executable(gege_order_window_tests ${CMAKE_CURRENT_LIST_DIR}/../scripts/test_order_window.cpp)
+    add_test(NAME gege_order_window_tests COMMAND gege_order_window_tests)
     # Torch's dependency configuration can shadow USE_CUDA after CUDA was enabled.
     if(CMAKE_CUDA_COMPILER_LOADED)
         add_executable(gege_fixed_frame_buffer_test ${GEGE_CPP_SOURCE}/tests/fixed_frame_buffer_test.cpp)

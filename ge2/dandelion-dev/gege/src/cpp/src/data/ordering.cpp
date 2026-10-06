@@ -1,5 +1,6 @@
 #include "common/datatypes.h"
 #include "data/ordering.h"
+#include "data/order_window.h"
 #include "reporting/logger.h"
 
 #include <algorithm>
@@ -7433,6 +7434,8 @@ std::string planVariantName(PlanVariant variant) {
             return "lane_matched";
         case PlanVariant::MULTI_GPU_OPTIMAL88_LANE_MATCHED:
             return "optimal88_lane_matched";
+        case PlanVariant::MULTI_GPU_ORDER_WINDOW:
+            return "order_window";
     }
     return "unknown";
 }
@@ -7976,6 +7979,43 @@ std::vector<StateflowPlan> enumerateMultiGpuStateflowPlans(const vector<torch::T
 
     std::vector<StateflowPlan> candidates;
     const LaneMatchCostConfig lane_match_cfg = lane_match_cost_config_from_env();
+
+    const auto order_window = stateflow_env_int64("GEGE_STATEFLOW_ORDER_WINDOW", nullptr, -1);
+    if (order_window >= 0) {
+        std::vector<std::vector<int64_t>> states;
+        for (const auto &state : buffer_states) states.emplace_back(tensor_to_partitions(state));
+        const auto beam_width = std::clamp<int64_t>(
+            stateflow_env_int64("GEGE_STATEFLOW_ORDER_WINDOW_BEAM", nullptr, 128), 1, 4096);
+        auto permutation = stateflow::boundedOrderPermutation(
+            states, active_devices, std::min<int64_t>(order_window, states.size()),
+            lane_match_cfg.max_admits_per_transition, static_cast<std::size_t>(beam_width));
+        if (permutation.empty()) {
+            throw GegeRuntimeException(fmt::format(
+                "Order-window search found no schedule: window={} lanes={} states={}; "
+                "no unrestricted-order fallback is permitted", order_window, active_devices, states.size()));
+        }
+        auto plan = build_multi_gpu_stateflow_plan_from_permutation(
+            buffer_states, edge_buckets_per_buffer, permutation, active_devices,
+            PlanVariant::MULTI_GPU_ORDER_WINDOW, edge_bucket_sizes, partition_row_counts, layout);
+        if (!stateflow_plan_valid(plan) ||
+            !stateflow_plan_respects_max_admits(plan, lane_match_cfg.max_admits_per_transition) ||
+            !validateStateflowPlanExactSemantics(plan)) {
+            throw GegeRuntimeException("Order-window candidate failed Stateflow validation");
+        }
+        score_stateflow_plan(plan, edge_bucket_sizes, layout);
+        int64_t total_displacement = 0;
+        int64_t max_displacement = 0;
+        for (std::size_t position = 0; position < permutation.size(); ++position) {
+            auto displacement = std::abs(permutation[position] - static_cast<int64_t>(position));
+            total_displacement += displacement;
+            max_displacement = std::max(max_displacement, displacement);
+        }
+        SPDLOG_INFO("[stateflow-order-window] window={} max_displacement={} total_displacement={} "
+                    "preserve_buckets=1 states={} lanes={} max_admits={}",
+                    order_window, max_displacement, total_displacement, states.size(), active_devices,
+                    lane_match_cfg.max_admits_per_transition);
+        return {std::move(plan)};
+    }
 
     // These validated schedules already take precedence over generic candidates.
     // Try them first so each epoch does not build and discard an expensive search.

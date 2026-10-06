@@ -1,4 +1,7 @@
 // Diagnostic-only interposition: audit storage against a global update mirror.
+#ifndef GEGE_CUDA
+#error "Compile the frame audit with the native engine's GEGE_CUDA definition."
+#endif
 #include <dlfcn.h>
 #include <map>
 #include <mutex>

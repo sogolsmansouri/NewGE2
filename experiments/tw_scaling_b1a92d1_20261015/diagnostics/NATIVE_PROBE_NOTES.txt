@@ -1,0 +1,59 @@
+Standalone native CUDA integrity probe (prepared 2026-10-15)
+
+Source: native_peer_probe.cu
+Binary: native_peer_probe
+Compile command:
+  /usr/local/cuda-12.8/bin/nvcc -std=c++17 -O2 -arch=sm_86 -o native_peer_probe native_peer_probe.cu
+Compile completed successfully. Only --help was executed by the preparation
+agent; it exits before any CUDA API call. The root agent owns GPU execution.
+No frozen training source, binary, configuration, or result was changed.
+
+Protocol:
+- Raw cudaMalloc allocations, no Torch, NumPy, ctypes, or RNG dependency.
+- Two buffers per device, each --bytes bytes, maximum 32 MiB per buffer;
+  allocated payload memory <=64 MiB per GPU (CUDA context memory additional).
+- Deterministic mixed uint32 pattern is distinct per case, never sentinel.
+- Source host-to-device initialization, device synchronization and exact
+  source readback are checked before each copy.
+- Destination sentinel initialization is synchronized and checked exactly.
+- Each copy is followed by explicit synchronization on both GPUs and exact
+  source/destination readback. Every CUDA return code is emitted as JSONL.
+- H2D/D2H, same-device D2D, and explicit CPU-staged controls run both ways.
+- Peer synchronous calls test both current devices; peer async calls test
+  both source-associated and destination-associated streams.
+- Default and DeviceToDevice copy kinds each have sync and async cases.
+- Copies mode with two repeats expects 44 cases: 12 controls + 32 cross-GPU
+  copy cases. Exit 0 means all passed, 1 means a test failed, 2 setup/usage
+  error. Use an external timeout to bound CUDA/driver hangs.
+- Peer-disabled copies are driver-selected routing controls; passing that
+  mode does NOT establish direct P2P operation or transfer performance.
+- Optional kernel-read and kernel-write modes require peer enabled. The
+  first runs a load/store copy kernel on the destination GPU; the second
+  runs it on the source GPU. Run each in a separate process because an
+  invalid peer mapping may poison a CUDA context. API failure stops the
+  remaining cases; mismatches with successful APIs allow tests to continue.
+- Timings are diagnostic wall times around copies and synchronization,
+  not a formal bandwidth benchmark or training-runtime prediction.
+
+Recommended serialized commands from this directory, after checking GPU idle:
+  timeout 60s ./native_peer_probe --peer enabled --mode copies --bytes 4194304 --repeats 2 > native_enabled_copies.jsonl 2> native_enabled_copies.stderr
+  timeout 60s ./native_peer_probe --peer disabled --mode copies --bytes 4194304 --repeats 2 > native_disabled_copies.jsonl 2> native_disabled_copies.stderr
+  timeout 30s ./native_peer_probe --peer enabled --mode kernel-read --bytes 1048576 --repeats 1 > native_kernel_read.jsonl 2> native_kernel_read.stderr
+  timeout 30s ./native_peer_probe --peer enabled --mode kernel-write --bytes 1048576 --repeats 1 > native_kernel_write.jsonl 2> native_kernel_write.stderr
+
+Prior test review:
+  /workspace/tw_scaling_threads_20261015/validation/raw_p2p/test_p2p.py
+The old ctypes cudaMemcpyPeerAsync signature matches the runtime API; its
+default ctypes integer return type is correct for cudaError_t. Source data
+is exactly representable in FP32, source and destination are synchronized
+before transfer, the raw stream is created on the selected destination,
+the stream and both devices are synchronized before readback, and source
+preservation is checked. No obvious omitted synchronization, argument-size,
+or pattern/readback artifact explains the old failures. It nevertheless
+shares Torch allocation/context setup, which the new native probe removes.
+The new source-associated stream variant also checks the alternate stream
+association instead of relying only on the old destination-stream case.
+
+Prepared artifact SHA256:
+  source c3264ec4a6c5df262d0705f0abcf551325d79113ad7486b088a853880722eb3d
+  binary 277597e388666250d4fe79b8b55573758c3b147f19817b9c9550a9808bc49139

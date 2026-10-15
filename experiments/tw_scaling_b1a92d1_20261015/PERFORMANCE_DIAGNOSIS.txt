@@ -1,0 +1,52 @@
+Completed performance diagnosis, 2026-10-15. Read-only analysis; no source changes or additional runs by this reviewer.
+
+Protocol and results
+Commit b1a92d1131e6dba37b6ce8b994caf72c033e6ad9 plus the recorded local repair; Twitter/Dot; 50,000 edges PER GPU; exactly two epochs; eight CPU threads; forced host handoffs; no checkpoint saving or accuracy evaluation.
+
+Case                         Epoch 1(s)    Epoch 2(s)
+1 GPU, cases/1gpu               209.361       208.861
+2 GPUs, retry95/case            122.283       118.523
+Matched epoch-2 scaling: 208.861 / 118.523 = 1.762198x, or 88.11% of ideal two-GPU scaling. Ideal half-time is 104.4305s; the observed gap is 14.0925s. Epoch-1 scaling is 1.712102x.
+
+The first two-GPU attempt, cases/2gpu, completed epoch 1 in 126.404s but was stopped by the controller during reset at the 90GB anon+shmem guard. It had no native runtime exception or OOM and no epoch-2 result. The accepted replacement uses the same binary, flags and training protocol with a 95GB guard. Preserve that failed attempt separately; do not mix its timers with the replacement.
+
+Matched epoch-2 region comparison (seconds)
+Region                              1 GPU      GPU 0      GPU 1
+batch_fetch                       101.314     61.917     62.970
+  edge_sample                      96.514     46.577     45.985
+    map_lookup                     72.061     33.883     33.205
+    negative_sample                14.868      7.894      8.649
+  complete transition path          4.768     15.313     16.960
+    graph/frame update              2.327     10.507     10.366
+    preload/other overhead          2.402      4.115      3.328
+    read barrier                   ~0.000      0.664      2.810
+    batch rebuild                   0.039      0.022      0.450
+    rebuild barrier                ~0.000      0.004      0.005
+forward/backward region              n/a      23.201     22.815
+GPU parameter-load region            n/a      18.359     17.091
+embedding-update region              n/a      14.688     15.497
+dense all-reduce/synchronization      n/a       0.000      0.000
+
+Transitions are the strongest measured explanation for the remaining scaling gap. Mean two-GPU transition-path time is 16.1364s per lane, versus 2.3840s for half the one-GPU transition-path time: 13.7524s extra. This is close to the 14.0925s excess above ideal half-time. It is supporting evidence, not a causal additive wall-time decomposition: lane work overlaps, background workers overlap training, and host region timers can charge queued CUDA work to a later synchronization. The single-GPU log does not provide comparable standalone compute/load/update totals, so those entries remain n/a.
+
+Sampling divides reasonably across GPUs: two-GPU edge_sample is 45.99-46.58s per lane versus 48.26s for half the one-GPU total. Batch counts are 13,389/13,173, a 1.63% spread around their mean. Dense synchronization is zero. Do not describe these host-timed sampling regions as pure CPU execution or as isolated CUDA kernel timings.
+
+Transfer and transition details from replacement epoch 2
+Graph outer-update perform_swap totals are 8.734s/8.846s per GPU. Graph prefetch-ready waits total only about 10 microseconds per GPU. Graph state publication totals 1.763s/0.882s. The repair moved multi-GPU preload startup/join after the all-lane rebuild barrier: its cost now sits in get_next_swap_overhead_ms, not swap_update_ms or graph admit_preload_start_ms. Smaller former fields alone do not demonstrate an improvement.
+
+Background optimizer-state writeback host_storage_write totals are 4.136s/4.165s per GPU, versus 0.853s/0.818s D2H staging. Embedding host writes total 2.160s/2.431s versus 0.806s/0.780s D2H. Host staging allocation totals are now at most 1.32ms per store/lane. These worker totals overlap other work and cannot be added to epoch time.
+
+Each replacement epoch executed 36 combined embedding+optimizer host handoffs totaling 37,487,000,000 bytes, zero direct-peer copies/bytes and zero descriptor mismatches. Embedding frame counters show 18 intentional visible host admissions and 18 partial-preload swaps, zero preload misses and 36 hidden publishes. Partial-preload here describes the intended mixture of two hidden admissions plus one visible host handoff at each lane transition; it is not a failed prefetch.
+
+What improved, and what did not
+The old 1bcaa5c epoch-2 timings were 193.255s on one GPU and 119.385s on two GPUs, giving 1.618754x scaling. The new two-GPU runtime is only 0.862s faster, a 0.7220% decrease. The new one-GPU runtime is 15.606s slower, an 8.0753% increase. Therefore the improved scaling ratio must not be presented as a large absolute two-GPU speedup: much of the ratio increase comes from the slower one-GPU denominator.
+
+This is not a controlled causal regression comparison. The old result used a different active gradient implementation, 48 CPU threads, and a direct-peer transport route that subsequently failed independent payload-integrity tests. Those tests found destination sentinels unchanged despite CUDA/Torch API success. The local repair rejects that route, stages the initial model through CPU, validates host payloads in a separate fixture, and orders preloads after all source writes are registered. It provides a validated transport path and a completed matched scaling result; it does not repair this machine's direct P2P path. Eight-thread CPU-copy microbenchmark gains are not evidence of equivalent full-epoch gains.
+
+Measurement limits
+Two epochs provide one warmed epoch rather than a long-run mean. GPU exclusivity remains unverified from container PID visibility. Native epoch timing excludes initialization, epoch reset and finalization. The replacement uses a different memory guard after a documented controller stop; runtime training semantics and build remain unchanged. Synthetic payload checks and runtime counters do not establish full-data accuracy equivalence. Historical ARC timing used a different batch/protocol/hardware/toolchain and is not a matched baseline.
+
+Post-comparison optimization candidate only
+Latest Dot backward scatters three independent gradient planes, writes their ordered sum, then immediately rereads and overwrites that sum in masked Adagrad. Fusing only the final ordered sum into the existing masked-Adagrad kernel could avoid 120MB of write/read traffic per full 50K-edge batch plus one launch. Keep independent index_add reductions, exact (negative + destination) + source addition order, existing mask/Adagrad arithmetic and current loss gradients. This remains an unimplemented bandwidth opportunity, not a proven cause of the one-GPU slowdown. No new unconditional host synchronization was found in this active backward path; verification branches are disabled.
+
+Comparison complete. Stop for user review. No ten-epoch runs or further training, accuracy or checkpoint work were launched by this reviewer.

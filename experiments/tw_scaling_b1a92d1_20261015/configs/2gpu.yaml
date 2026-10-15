@@ -1,0 +1,90 @@
+evaluation:
+  batch_size: 1000
+  checkpoint_dir: /workspace/tw_b1a92d1_scaling_20261015/retry95/case/model/
+  epochs_per_eval: 1000
+  negative_sampling:
+    degree_fraction: 0.5
+    filtered: false
+    local_filter_mode: DEG
+    negatives_per_positive: 1000
+    num_chunks: 1
+    superbatch_negative_plan_batches: 0
+    tiled_tournament_groups_per_tile: 64
+    tiled_tournament_scores: false
+    tournament_selection: false
+model:
+  decoder:
+    options:
+      input_dim: 100
+    type: DISTMULT
+  dense_optimizer:
+    options:
+      learning_rate: 0.1
+    type: ADAGRAD
+  encoder:
+    layers:
+    - - output_dim: 100
+        type: EMBEDDING
+  learning_task: LINK_PREDICTION
+  loss:
+    options:
+      reduction: SUM
+    type: SOFTMAX_CE
+  random_seed: 741135446461071584
+  sparse_optimizer:
+    options:
+      learning_rate: 0.1
+    type: ADAGRAD
+storage:
+  dataset:
+    dataset_dir: /workspace/tw_1bcaa5c_scaling_20261015/data/tw_p16/
+  device_ids:
+  - 0
+  - 1
+  device_type: cuda
+  edges:
+    options:
+      dtype: int
+    type: HOST_MEMORY
+  embeddings:
+    options:
+      buffer_capacity: 4
+      dtype: float
+      edge_bucket_ordering: CUSTOM
+      fine_to_coarse_ratio: 1
+      num_cache_partitions: 0
+      num_partitions: 16
+      prefetching: false
+      randomly_assign_edge_buckets: false
+    type: MEM_PARTITION_BUFFER
+  full_graph_evaluation: false
+  log_level: info
+  model_dir: /workspace/tw_b1a92d1_scaling_20261015/retry95/case/model/
+  prefetch: true
+  shuffle_input: true
+training:
+  batch_size: 50000
+  checkpoint:
+    interval: -1
+    save_best: false
+    save_state: false
+  dense_sync_batches: 1
+  epochs_per_shuffle: 1
+  logical_active_devices: 2
+  logs_per_epoch: 10
+  negative_sampling:
+    degree_fraction: 0.5
+    filtered: false
+    local_filter_mode: DEG
+    negatives_per_positive: 1000
+    num_chunks: 50
+    superbatch_negative_plan_batches: 8
+    tiled_tournament_groups_per_tile: 64
+    tiled_tournament_scores: false
+    tournament_selection: false
+  negative_sampling_method: RNS
+  negative_sampling_selected_ratio: 1.0
+  num_epochs: 2
+  resume_from_checkpoint: ''
+  resume_training: false
+  save_model: false

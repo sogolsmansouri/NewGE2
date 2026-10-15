@@ -1763,7 +1763,7 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 }
                 add_perf_sample(device_swap_rebuild_samples_ns_, device_idx, swap_rebuild_elapsed);
                 boundary_phase.stop();
-                if (start_admit_preload_after_active_edges_enabled() && graph_storage_->hasSwap(device_idx)) {
+                if (devices_.size() <= 1 && start_admit_preload_after_active_edges_enabled() && graph_storage_->hasSwap(device_idx)) {
                     graph_storage_->startAsyncAdmitPreload(device_idx);
                 }
                 if (device_idx >= 0 && static_cast<std::size_t>(device_idx) < device_current_state_index_.size() &&
@@ -1796,6 +1796,12 @@ shared_ptr<Batch> DataLoader::getNextBatch(int32_t device_idx) {
                 swap_sync_wait_ns_.fetch_add(swap_sync_elapsed);
                 if (device_idx < device_swap_sync_wait_ns_.size()) {
                     device_swap_sync_wait_ns_[device_idx] += swap_sync_elapsed;
+                }
+                if (devices_.size() > 1 && graph_storage_->hasSwap(device_idx)) {
+                    // Every lane has now committed synchronous host stores and
+                    // registered delayed writes for both embeddings and optimizer
+                    // state. Preload joins can observe all relevant producers.
+                    graph_storage_->startAsyncAdmitPreload(device_idx);
                 }
                 // auto t2 = std::chrono::high_resolution_clock::now();
                 // SPDLOG_INFO("Finished swapping subgraph for device {}", device_idx);

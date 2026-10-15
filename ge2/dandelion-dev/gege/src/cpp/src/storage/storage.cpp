@@ -1671,6 +1671,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         std::size_t source_idx = 0;
         int64_t pending_key = -1;
         torch::Tensor src_scratch;
+        bool host_fallback = false;
     };
 
     auto &published_source_scratch = peer_relay_source_scratch_tensors_[device_idx];
@@ -1864,6 +1865,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         std::vector<bool> waited_on_source_ready(buffers_.size(), false);
         std::vector<torch::Tensor> peer_copy_lifetime_holds;
         std::vector<std::pair<std::size_t, int64_t>> consumed_peer_copy_handoffs;
+        std::vector<std::pair<std::size_t, int64_t>> validated_host_handoffs;
         std::vector<RelayValidationCopy> relay_validation_copies;
 
         if (frame_cache_mapping) {
@@ -2111,6 +2113,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
 
             bool used_peer_copy = false;
+            bool forced_host_handoff = false;
             bool should_mark_scheduled_handoff_consumed = false;
             std::size_t scheduled_source_idx = 0;
             int64_t scheduled_pending_key = -1;
@@ -2145,6 +2148,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 } else if (stateflow_peer_relay_force_host_fallback_enabled()) {
                     // Debug isolation mode: keep the Stateflow peer-schedule swap path
                     // active, but route scheduled handoffs through the host-backed admit.
+                    forced_host_handoff = true;
                 } else {
                     auto *src_buffer = buffers_[scheduled_handoff->src_lane_id];
                     torch::Tensor src_scratch;
@@ -2244,9 +2248,32 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             }
 
             if (!used_peer_copy) {
+                int64_t host_validate_check_id = -1;
+                torch::Tensor host_validate_source_scratch;
                 if (should_mark_scheduled_handoff_consumed) {
                     waitForPeerRelaySourceHostHandoffReady_(scheduled_source_idx, scheduled_pending_key);
-                    markPeerRelaySourceHandoffConsumed_(scheduled_source_idx, scheduled_pending_key);
+                    if (forced_host_handoff && should_validate_stateflow_peer_relay(host_validate_check_id)) {
+                        // Host-ready follows publication and the matching source
+                        // writeback. Retain that version until the destination H2D
+                        // and payload checks complete, just as for a peer copy.
+                        auto publish_mutex = peer_relay_source_publish_mutexes_[scheduled_source_idx];
+                        std::lock_guard<std::mutex> publish_lock(*publish_mutex);
+                        const auto &scratch_rounds = peer_relay_source_scratch_rounds_[scheduled_source_idx];
+                        const auto &source_scratch_map = peer_relay_source_scratch_tensors_[scheduled_source_idx];
+                        auto scratch_it = source_scratch_map.find(partition_id);
+                        if (peer_relay_source_published_rounds_[scheduled_source_idx] != transition_round_idx ||
+                            partition_id < 0 || static_cast<std::size_t>(partition_id) >= scratch_rounds.size() ||
+                            scratch_rounds[static_cast<std::size_t>(partition_id)] != transition_round_idx ||
+                            scratch_it == source_scratch_map.end() || !scratch_it->second.defined()) {
+                            throw GegeRuntimeException(fmt::format(
+                                "Host handoff validation requires the published source snapshot for partition {} round {} source lane {}",
+                                partition_id, transition_round_idx, scheduled_source_idx));
+                        }
+                        host_validate_source_scratch = scratch_it->second;
+                        validated_host_handoffs.emplace_back(scheduled_source_idx, scheduled_pending_key);
+                    } else {
+                        markPeerRelaySourceHandoffConsumed_(scheduled_source_idx, scheduled_pending_key);
+                    }
                     should_mark_scheduled_handoff_consumed = false;
                 }
                 std::vector<int> fallback_partition_ids{partition_id};
@@ -2255,6 +2282,12 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                 load_partition_from_host(dst_partition, cpu_view);
                 torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, dst_offset, dst_offset + rows);
                 gpu_view.copy_(cpu_view, true);
+                if (host_validate_source_scratch.defined()) {
+                    relay_validation_copies.push_back(
+                        {host_validate_check_id, partition_id, static_cast<int>(scheduled_source_idx),
+                         buffer->device_.index(), dst_slot, scheduled_source_idx, scheduled_pending_key,
+                         host_validate_source_scratch, true});
+                }
                 fallback_visible_admit_parts += 1;
                 fallback_visible_admit_rows += rows;
                 if (scheduled_handoff != nullptr) {
@@ -2304,31 +2337,40 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             double src_mean_abs = src_diff.numel() > 0 ? src_diff.mean().item<double>() : 0.0;
             int64_t dst_mismatch_values = dst_diff.numel() > 0 ? dst_diff.gt(0).sum().item<int64_t>() : 0;
             int64_t src_mismatch_values = src_diff.numel() > 0 ? src_diff.gt(0).sum().item<int64_t>() : 0;
+            if (validation.host_fallback) {
+                // Unlike abs-difference > 0, direct inequality also rejects NaN.
+                dst_mismatch_values = dst_cpu.ne(expected_cpu).sum().item<int64_t>();
+                src_mismatch_values = src_cpu.ne(expected_cpu).sum().item<int64_t>();
+            }
             bool mismatch = dst_mismatch_values != 0 || src_mismatch_values != 0;
+            const char *validation_label = validation.host_fallback ? "stateflow-host-payload-validate" : "stateflow-peer-validate";
             if (mismatch) {
                 SPDLOG_ERROR(
-                    "[stateflow-peer-validate {}] partition={} src_dev={} dst_dev={} dst_slot={} file={} round={} pending_key={} dst_vs_source_max_abs={:.9g} "
+                    "[{} {}] partition={} src_dev={} dst_dev={} dst_slot={} file={} round={} pending_key={} dst_vs_source_max_abs={:.9g} "
                     "dst_vs_host_max_abs={:.9g} dst_vs_host_mean_abs={:.9g} dst_mismatch_values={} "
                     "src_vs_host_max_abs={:.9g} src_vs_host_mean_abs={:.9g} src_mismatch_values={}",
-                    validation.check_id, validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
+                    validation_label, validation.check_id, validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
                     filename_, transition_round_idx, validation.pending_key, dst_vs_source_max_abs,
                     dst_max_abs, dst_mean_abs, dst_mismatch_values, src_max_abs, src_mean_abs, src_mismatch_values);
             } else {
                 SPDLOG_INFO(
-                    "[stateflow-peer-validate {}] partition={} src_dev={} dst_dev={} dst_slot={} file={} round={} pending_key={} dst_vs_source_max_abs={:.9g} "
+                    "[{} {}] partition={} src_dev={} dst_dev={} dst_slot={} file={} round={} pending_key={} dst_vs_source_max_abs={:.9g} "
                     "dst_vs_host_max_abs={:.9g} dst_vs_host_mean_abs={:.9g} dst_mismatch_values={} "
                     "src_vs_host_max_abs={:.9g} src_vs_host_mean_abs={:.9g} src_mismatch_values={}",
-                    validation.check_id, validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
+                    validation_label, validation.check_id, validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
                     filename_, transition_round_idx, validation.pending_key, dst_vs_source_max_abs,
                     dst_max_abs, dst_mean_abs, dst_mismatch_values, src_max_abs, src_mean_abs, src_mismatch_values);
             }
             if (mismatch && stateflow_peer_relay_validate_fail_fast_enabled()) {
                 throw GegeRuntimeException(
-                    fmt::format("Stateflow peer relay validation failed for partition {} src_dev={} dst_dev={} dst_slot={} "
+                    fmt::format("Stateflow {} validation failed for partition {} src_dev={} dst_dev={} dst_slot={} "
                                 "dst_vs_host_max_abs={} src_vs_host_max_abs={}",
-                                validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
+                                validation.host_fallback ? "host handoff" : "peer relay", validation.partition_id, validation.src_dev, validation.dst_dev, validation.dst_slot,
                                 dst_max_abs, src_max_abs));
             }
+        }
+        for (const auto &handoff : validated_host_handoffs) {
+            markPeerRelaySourceHandoffConsumed_(handoff.first, handoff.second);
         }
         if (stateflow_peer_relay_wait_host_ready_enabled()) {
             for (const auto &consume : consumed_peer_copy_handoffs) {

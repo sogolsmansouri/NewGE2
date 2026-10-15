@@ -1484,7 +1484,9 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
             next_prefetch_start_ms = elapsed_graph_storage_ms(outer_phase_start, now);
             outer_phase_start = now;
         }
-        if (hasSwap(device_idx)) {
+        // Multi-device preloads start after DataLoader's all-lane rebuild
+        // barrier, once every producer has registered its host writebacks.
+        if (devices_.size() <= 1 && hasSwap(device_idx)) {
             boundary_phase.start("graph.boundary.launch_parameter_preload");
             startAsyncAdmitPreload(device_idx);
             boundary_phase.stop();
@@ -1529,7 +1531,7 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         boundary_phase.stop();
         subgraph_update_ms = elapsed_graph_storage_ms(t1, t2);
         outer_phase_start = t2;
-        if (hasSwap(device_idx) && !start_admit_preload_after_active_edges_enabled()) {
+        if (devices_.size() <= 1 && hasSwap(device_idx) && !start_admit_preload_after_active_edges_enabled()) {
             boundary_phase.start("graph.boundary.launch_parameter_preload");
             startAsyncAdmitPreload(device_idx);
             boundary_phase.stop();

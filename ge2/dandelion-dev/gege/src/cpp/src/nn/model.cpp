@@ -16,6 +16,10 @@
 
 #ifdef GEGE_CUDA
 #include <c10/cuda/CUDACachingAllocator.h>
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAStream.h>
+#include <cuda_runtime_api.h>
 #include "common/unique_map_cuda.h"
 #include <torch/csrc/cuda/nccl.h>
 #endif
@@ -437,11 +441,132 @@ void log_eval_tensor_if_non_finite(const char *stage, int batch_id, const torch:
                  log_id, stage, batch_id, invalid_values, invalid_rows, tensor_shape_string(tensor), tensor.device().str());
 }
 
+bool model_host_staging_enabled() {
+    return parse_env_flag("GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK", false);
+}
+
+// Driver capability flags and successful CUDA return codes do not prove that a
+// peer payload arrived. Check the actual transports before cloning any replica.
+void validate_model_transfer_paths(const std::vector<torch::Device> &devices, bool host_staging) {
+#ifdef GEGE_CUDA
+    torch::NoGradGuard no_grad;
+    constexpr int64_t values = 1 << 18;
+    for (const auto &source_device : devices) {
+        for (const auto &destination_device : devices) {
+            if (!source_device.is_cuda() || !destination_device.is_cuda() || source_device == destination_device) {
+                continue;
+            }
+            const char *transport = host_staging ? "host_staged" : "direct_peer";
+            try {
+                auto expected = torch::arange(values, torch::TensorOptions().dtype(torch::kInt64))
+                                    .remainder(65521).to(torch::kFloat32).div(256).add(4 + source_device.index());
+                auto source = expected.to(source_device);
+                {
+                    c10::cuda::CUDAGuard source_guard(source_device);
+                    AT_CUDA_CHECK(cudaDeviceSynchronize());
+                }
+                c10::cuda::CUDAGuard destination_guard(destination_device);
+                if (!host_staging) {
+                    int can_access = 0;
+                    AT_CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access, destination_device.index(), source_device.index()));
+                    if (!can_access) {
+                        throw GegeRuntimeException("CUDA reports peer access unavailable");
+                    }
+                    const auto status = cudaDeviceEnablePeerAccess(source_device.index(), 0);
+                    if (status == cudaErrorPeerAccessAlreadyEnabled) {
+                        static_cast<void>(cudaGetLastError());
+                    } else {
+                        AT_CUDA_CHECK(status);
+                    }
+                }
+                const int methods = host_staging ? 1 : 2;
+                for (int method = 0; method < methods; ++method) {
+                    auto destination = torch::full({values}, -987.25, source.options().device(destination_device));
+                    AT_CUDA_CHECK(cudaDeviceSynchronize());
+                    const char *method_name = host_staging ? "cpu_staging" : method == 0 ? "cudaMemcpyPeerAsync" : "torch_copy";
+                    if (host_staging) {
+                        auto staged = source.to(torch::kCPU);
+                        destination.copy_(staged);
+                    } else if (method == 0) {
+                        auto stream = c10::cuda::getStreamFromPool(false, destination_device.index());
+                        AT_CUDA_CHECK(cudaMemcpyPeerAsync(destination.data_ptr(), destination_device.index(),
+                                                         source.data_ptr(), source_device.index(),
+                                                         values * sizeof(float), stream.stream()));
+                        AT_CUDA_CHECK(cudaStreamSynchronize(stream.stream()));
+                    } else {
+                        destination.copy_(source);
+                    }
+                    AT_CUDA_CHECK(cudaDeviceSynchronize());
+                    auto actual = destination.to(torch::kCPU);
+                    auto source_after = source.to(torch::kCPU);
+                    if (!torch::equal(actual, expected) || !torch::equal(source_after, expected)) {
+                        throw GegeRuntimeException(fmt::format("{} payload mismatch ({} values)", method_name, values));
+                    }
+                    SPDLOG_INFO("[model-transfer-check] source={} destination={} method={} bytes={} exact_match=1",
+                                source_device.str(), destination_device.str(), method_name, values * sizeof(float));
+                }
+            } catch (const std::exception &error) {
+                throw GegeRuntimeException(fmt::format(
+                    "Multi-GPU {} payload validation failed from {} to {}: {}. {}",
+                    transport, source_device.str(), destination_device.str(), error.what(),
+                    host_staging
+                        ? "Host-staged transfer is unsafe; stop and inspect this machine's CUDA transport."
+                        : "Use a machine with working peer transfers or set GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK=1 for the validated host-staged Twitter/Dot path."));
+            }
+        }
+    }
+#else
+    (void)devices;
+    (void)host_staging;
+#endif
+}
+
 void copy_named_tensors_to_device(torch::OrderedDict<std::string, torch::Tensor> src, torch::OrderedDict<std::string, torch::Tensor> dst,
                                   torch::Device device) {
     torch::NoGradGuard no_grad;
     for (auto &item : src) {
-        dst[item.key()].copy_(item.value().to(device));
+        auto source = item.value();
+        if (model_host_staging_enabled() && source.is_cuda() && device.is_cuda() && source.device() != device) {
+            source = source.to(torch::kCPU);
+        }
+        dst[item.key()].copy_(source.to(device));
+    }
+}
+
+void verify_broadcast_tensors(const torch::OrderedDict<std::string, torch::Tensor> &source,
+                              const torch::OrderedDict<std::string, torch::Tensor> &destination,
+                              const char *kind, torch::Device device) {
+    if (source.size() != destination.size()) {
+        throw GegeRuntimeException(fmt::format("Model broadcast {} count mismatch on {}", kind, device.str()));
+    }
+    for (const auto &item : source) {
+        if (!destination.contains(item.key())) {
+            throw GegeRuntimeException(fmt::format("Model broadcast missing {} {} on {}", kind, item.key(), device.str()));
+        }
+        const auto &actual = destination[item.key()];
+        if (item.value().defined() != actual.defined()) {
+            throw GegeRuntimeException(fmt::format("Model broadcast undefined {} {} on {}", kind, item.key(), device.str()));
+        }
+        if (!actual.defined()) {
+            continue;
+        }
+        if (actual.device() != device || item.value().scalar_type() != actual.scalar_type() ||
+            item.value().sizes() != actual.sizes() ||
+            !torch::equal(item.value().detach().to(torch::kCPU), actual.detach().to(torch::kCPU))) {
+            throw GegeRuntimeException(fmt::format("Model broadcast {} {} failed exact payload verification on {}",
+                                                  kind, item.key(), device.str()));
+        }
+    }
+}
+
+void reject_unverified_host_mode_collective(const Model *model, const char *operation) {
+    // Empty parameter sets have no collective to execute. Single-device calls
+    // cannot use a peer transport. Reject before mutating any real multi-GPU input.
+    if (model_host_staging_enabled() && model->device_models_.size() > 1 && !model->named_parameters().is_empty()) {
+        throw GegeRuntimeException(fmt::format(
+            "{} requires a multi-GPU NCCL collective, which is not validated by GEGE_STATEFLOW_PEER_RELAY_FORCE_HOST_FALLBACK. "
+            "This host-staged mode supports the Twitter/Dot path without dense collectives; validate a collective transport before using this model.",
+            operation));
     }
 }
 
@@ -1861,6 +1986,7 @@ void Model::load(std::string directory, bool train) {
 }
 
 void Model::all_reduce_rel() {
+    reject_unverified_host_mode_collective(this, "all_reduce_rel");
     SPDLOG_INFO("all_reduce_rel");
     torch::NoGradGuard no_grad;
     int num_gpus = device_models_.size();
@@ -1881,6 +2007,7 @@ void Model::all_reduce_rel() {
 }
 
 void Model::all_reduce(const std::vector<int64_t> &grad_scales) {
+    reject_unverified_host_mode_collective(this, "all_reduce");
     torch::NoGradGuard no_grad;
     int num_gpus = device_models_.size();
     for (int i = 0; i < named_parameters().keys().size(); i++) {
@@ -2286,6 +2413,8 @@ void Model::evaluate_batch(shared_ptr<Batch> batch) {
 }
 
 void Model::broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig> model_config) {
+    const bool host_staging = model_host_staging_enabled();
+    validate_model_transfer_paths(devices, host_staging);
     bool log_startup_timing = startup_timing_enabled();
     int i = 0;
     for (auto device : devices) {
@@ -2295,7 +2424,11 @@ void Model::broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig
                 SPDLOG_INFO("[startup-timing][Model::broadcast] begin clone slot={} device={}", i, device.str());
             }
             shared_ptr<GeneralEncoder> encoder = clone_encoder_for_device(encoder_, device);
-            shared_ptr<Decoder> decoder = decoder_clone_helper(decoder_, device);
+            // Clone through CPU in host mode; Module::clone(device) otherwise
+            // performs a direct CUDA-to-CUDA copy before alignment can help.
+            shared_ptr<Decoder> decoder = host_staging && device_.is_cuda() && device.is_cuda()
+                ? decoder_clone_helper(decoder_clone_helper(decoder_, torch::Device(torch::kCPU)), device)
+                : decoder_clone_helper(decoder_, device);
             align_broadcast_model_to_device(encoder, decoder, device);
             if (log_startup_timing) {
                 SPDLOG_INFO("[startup-timing][Model::broadcast] cloned encoder/decoder slot={} device={}", i, device.str());
@@ -2304,6 +2437,13 @@ void Model::broadcast(std::vector<torch::Device> devices, shared_ptr<ModelConfig
             device_models_[i]->device_ = device;
             device_models_[i]->negative_sampling_method_ = negative_sampling_method_;
             device_models_[i]->negative_sampling_selected_ratio_ = negative_sampling_selected_ratio_;
+            verify_broadcast_tensors(named_parameters(/*recurse=*/true), device_models_[i]->named_parameters(/*recurse=*/true),
+                                     "parameter", device);
+            verify_broadcast_tensors(named_buffers(/*recurse=*/true), device_models_[i]->named_buffers(/*recurse=*/true),
+                                     "buffer", device);
+            SPDLOG_INFO("[model-broadcast-check] device={} transport={} parameters={} buffers={} exact_match=1",
+                        device.str(), host_staging ? "host_staged" : "direct_peer",
+                        named_parameters(/*recurse=*/true).size(), named_buffers(/*recurse=*/true).size());
             if (log_startup_timing) {
                 SPDLOG_INFO("[startup-timing][Model::broadcast] model wrapper created slot={} device={}", i, device.str());
             }

@@ -1,0 +1,58 @@
+{
+  "configs/1gpu.yaml": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/cases/1gpu/config.yaml",
+    "sha256": "acf91af1c3bc332c3a51ca97260be7c6a33cc85b106c456ca12f3323164da313"
+  },
+  "configs/2gpu.yaml": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/retry95/case/config.yaml",
+    "sha256": "53b0fe83f31e98b1123d1946f4866efeed0c3940550395f94c09dbdbc22eb1d9"
+  },
+  "configs/flags.json": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/retry95/case/flags.json",
+    "sha256": "95528aa2d3c512ba4338758e3b7d6aaf2c23eb321e2f02c4cdfabb111ac549cb"
+  },
+  "configs/states.txt": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/historical_recipe/states.txt",
+    "sha256": "76791fbedf7bb8ddc7b6c72ca035802d3ad71e734a75e9effb96aff7f79ae508"
+  },
+  "controllers/run_validation.py": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/run_validation.py",
+    "sha256": "518140090d0c473f6ec54a88e375d61cca6777d043230e17e769b4c089a8dfd3"
+  },
+  "controllers/run_retry95.py": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/run_retry95.py",
+    "sha256": "ff1054e982f63bdcb552e7f236c090f362cd47e998fe16be492d199d071fe5f1"
+  },
+  "controllers/run_transfer_gate.py": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/run_transfer_gate.py",
+    "sha256": "4753158e2bd770d1137f6ebcd972c995e236b1b09e366aa231cc0ba597d19e9b"
+  },
+  "controllers/build_latest.py": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/build_latest.py",
+    "sha256": "0312d5c7a74151a0fc8c6d406c7e2543a2d56d248e2a1a7d9ebb4c8a8f569918"
+  },
+  "diagnostics/native_peer_probe.cu": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/p2p_diagnosis_20261015/native_peer_probe.cu",
+    "sha256": "c3264ec4a6c5df262d0705f0abcf551325d79113ad7486b088a853880722eb3d"
+  },
+  "diagnostics/NATIVE_PROBE_NOTES.txt": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/p2p_diagnosis_20261015/NATIVE_PROBE_NOTES.txt",
+    "sha256": "2809b5480188b204e51981c637449648ca57467c84bb8062caf3a90e38bd20be"
+  },
+  "diagnostics/INDEPENDENT_NATIVE_CONCLUSION.txt": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/p2p_diagnosis_20261015/INDEPENDENT_NATIVE_CONCLUSION.txt",
+    "sha256": "a2a200ec9b408124f8a778283efb849315976d9a3684cd989980b2f99ec83a0c"
+  },
+  "diagnostics/p2p_host_audit.txt": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/p2p_host_audit.txt",
+    "sha256": "4c29c34d54d66c34388670ace46fb59ab5f766d683f98e19a2ff71ebb6265de9"
+  },
+  "comparison_review.json": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/comparison_review.json",
+    "sha256": "3422b720320775c70e1786082a7027f1b7fc8c1729d73717fafb2c5f4c9389bd"
+  },
+  "PERFORMANCE_DIAGNOSIS.txt": {
+    "original_path": "/workspace/tw_b1a92d1_scaling_20261015/PERFORMANCE_DIAGNOSIS.txt",
+    "sha256": "ebdd7dfe9c900282aa92e502cc439a7bb96885dfe50be602a84abb878e7aa71f"
+  }
+}

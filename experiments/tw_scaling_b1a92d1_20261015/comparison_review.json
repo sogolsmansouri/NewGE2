@@ -1,0 +1,57 @@
+{
+  "accuracy_evaluated": false,
+  "automatic_followup": "none; stop for review before any ten-epoch run",
+  "baseline_epoch_times_seconds": {
+    "1gpu": [
+      195.367,
+      193.255
+    ],
+    "2gpu": [
+      125.299,
+      119.385
+    ]
+  },
+  "checkpoint_saving": false,
+  "completed_utc": "2026-10-15T21:46:20.622336+00:00",
+  "cpu_threads": 8,
+  "epoch2_parallel_efficiency": 0.8810990271930342,
+  "epoch2_speedup": 1.7621980543860685,
+  "epoch_times_seconds": {
+    "1gpu": [
+      209.361,
+      208.861
+    ],
+    "2gpu": [
+      122.283,
+      118.523
+    ]
+  },
+  "limitations": [
+    "Counters describe scheduled/executed peer transfers; no per-edge execution ledger.",
+    "Two epochs provide one post-warmup timing, not a long-run mean.",
+    "Native epoch timers exclude initialization, reset, and finalization.",
+    "GPU process exclusivity is unconfirmed if host PIDs cannot be resolved.",
+    "Synthetic transfer checks do not establish full-data model accuracy.",
+    "Host fallback is intentional transport; its count is not an error.",
+    "TwoGPU partial_preload_swaps=18 and fallback_visible_admit_parts=18 reflect deliberate visible host handoffs alongside ready hidden preloads; embeddings-only frame counters differ from36combined embeddings+optimizer handoffs.",
+    "Historical baseline uses another commit and transport, so source and runtime effects cannot be separated.",
+    "TwoGPU required a fresh full two-epoch retry after90GB controller guard stopped the first attempt during reset; replacement used95GB guard with unchanged training implementation."
+  ],
+  "one_gpu_epoch2_change_vs_baseline": 0.08075340870870096,
+  "original_plan_sha256": "8c641828ed0a49b145dbe7ae7777c914e2b0559fd5d8a0543d08a4678e6648e0",
+  "parent_commit": "b1a92d1131e6dba37b6ce8b994caf72c033e6ad9",
+  "patch_manifest_sha256": "4a1555caab716f3d98c878cb22993b5bc7171a234225f6ed79b6df2bb546485c",
+  "result_paths": {
+    "1gpu": "/workspace/tw_b1a92d1_scaling_20261015/cases/1gpu/result.json",
+    "2gpu": "/workspace/tw_b1a92d1_scaling_20261015/retry95/case/result.json"
+  },
+  "result_sha256": {
+    "1gpu": "d779faaf3b50ac4ab7b5511f31a23acd863b365ccbcabda0fbcf2fa49d0e9c73",
+    "2gpu": "619a26a76fb942b49fc38bbe853cbf592c678100ca20bd3ba18f70b687e2951c"
+  },
+  "retry_plan_sha256": "541da0cc956210a4027225916c952e256671f2d8aec77d994fdc3835123fb7e7",
+  "source_changed": true,
+  "status": "completed",
+  "timing_eligible": false,
+  "two_gpu_epoch2_change_vs_baseline": -0.0072203375633455025
+}

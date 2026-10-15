@@ -1,0 +1,80 @@
+P2P HOST AUDIT — read-only inspection, 2026-10-15 UTC
+
+Finding
+The available evidence identifies translated host IOMMU domains as a strong
+specific suspect for this machine's broken PCIe P2P. Both GPU IOMMU groups report
+DMA-FQ, not identity. NVIDIA documents that bare-metal Linux PCIe P2P is not
+supported with IOMMU translation enabled and can silently corrupt device data.
+This is a supported diagnosis candidate, not a causal repair demonstration:
+no host setting was changed and no successful direct-copy retest exists.
+
+Observed locally
+- GPUs: NVIDIA RTX A6000, PCI 0000:53:00.0 and 0000:d5:00.0.
+- Driver: proprietary NVIDIA 580.159.03; running kernel 6.8.0-134-generic.
+- nvidia-smi topo -m: SYS between GPUs, NUMA 0 versus 1, no NVLink path.
+- nvidia-smi topo -p2p r and -p2p w: OK in both directions.
+- GPU 0 sysfs route:
+  /sys/devices/pci0000:4a/0000:4a:02.0/0000:4b:00.0/0000:4c:04.0/
+  0000:50:00.0/0000:51:10.0/0000:53:00.0
+- GPU 1 sysfs route:
+  /sys/devices/pci0000:c9/0000:c9:02.0/0000:ca:00.0/0000:cb:08.0/
+  0000:d3:00.0/0000:d4:00.0/0000:d5:00.0
+- GPU 0: iommu_group 4; /sys/kernel/iommu_groups/4/type = DMA-FQ;
+  iommu device dmar7. GPU 1: group 9; type = DMA-FQ; iommu device dmar3.
+  Both groups also contain their PCI bridges and other devices.
+- Linux ABI defines DMA-FQ as translated DMA with delayed/batched translation
+  invalidation, contrasting with identity mode (untranslated DMA).
+- Kernel command line:
+  BOOT_IMAGE=/vmlinuz-6.8.0-134-generic root=/dev/mapper/ubuntu--vg-ubuntu--lv ro
+  Absence of an explicit IOMMU option does NOT negate the observed DMA-FQ mode.
+- DMI reports Supermicro SYS-420GP-TNR, board X12DPG-OA6, BIOS 1.4b,
+  Intel Xeon Gold 6342. /proc/cpuinfo has no hypervisor flag. Both GPUs are
+  bound to nvidia. These observations are consistent with a container on a
+  bare-metal host; host virtualization status is not independently certified.
+- NVIDIA parameters include DmaRemapPeerMmio=1 and
+  GrdmaPciTopoCheckOverride=0. Neither setting alone establishes the cause.
+- Endpoint idle links were 2.5 GT/s x16, max 16 GT/s x16. All upstream bridge
+  links except the immediate idle endpoint-facing bridge were 16 GT/s x16.
+  An idle link-speed reading is not evidence of the speed during training.
+
+Existing payload evidence, inspected but not rerun
+- /workspace/tw_scaling_threads_20261015/validation/raw_p2p/results.json:
+  6/6 cudaMemcpyPeerAsync and 6/6 Torch cross-device copy tests failed in both
+  directions (three repeats per method/direction), each transferring 64 MiB.
+  Every destination FP32 element remained incorrect; source values stayed
+  correct. Explicit synchronization and API-success checks were present.
+  All six explicit CPU-staged controls passed exact comparison.
+- transfer_gate/expect-direct-failure/test.log:
+  native C++ startup guard rejects direct cudaMemcpyPeerAsync with all 262144
+  values mismatched on the first 1 MiB 0->1 transfer.
+- Thus this is reproducible below the training scheduler/model code. A P2P
+  support query and a successful API return do not validate delivered payload.
+
+Visibility limits
+- PCI config reads return only 64 bytes for both GPUs and all their bridges.
+  ACS registers are extended PCI capabilities and are not visible in that
+  window; no acs_cap/acs_ctrl sysfs attributes are exposed. ACS state is unknown.
+- dmesg is denied (Operation not permitted), so DMAR faults, Xid events, host
+  boot IOMMU messages and actual driver-internal DMA behavior cannot be read.
+- Different PCI roots/NUMA domains alone do not prove that P2P must fail.
+- No ACS writes, driver reloads, device unbinds, IOMMU changes, resets, new GPU
+  jobs or training were performed. Changing these shared host controls from
+  a tenant container would not be an appropriate diagnostic experiment.
+
+Action needed to establish the cause and recover direct P2P
+Host operator inspection of translated IOMMU mode and bridge ACS is required.
+A repaired/configured host or a different P2P-validated machine must first pass
+the same exact-payload direct-copy tests in both directions. Only then should
+the forced host fallback be disabled and the matched two-epoch comparison run.
+An ~100 s epoch cannot be promised solely from restoring P2P; that requires
+measuring its exposed critical-path cost versus other state-transition work.
+
+Primary references consulted
+1. NVIDIA CUDA Programming Guide, multi-GPU systems, Host IOMMU Hardware,
+   PCI Access Control Services, and VMs:
+   https://docs.nvidia.com/cuda/cuda-programming-guide/03-advanced/multi-gpu-systems.html#host-iommu-hardware-pci-access-control-services-and-vms
+2. NVIDIA NCCL GPU troubleshooting (positive topo P2P result is insufficient;
+   Linux bare-metal IOMMU and PCIe ACS diagnosis):
+   https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/troubleshooting/gpu_troubleshooting.html
+3. Linux kernel IOMMU group ABI (DMA, DMA-FQ, identity domain definitions):
+   https://github.com/torvalds/linux/blob/master/Documentation/ABI/testing/sysfs-kernel-iommu_groups

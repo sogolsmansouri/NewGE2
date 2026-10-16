@@ -6,6 +6,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <condition_variable>
+#include <exception>
+#include <map>
+#include <memory>
+#include <mutex>
 
 #include <iostream>
 #include <sstream>
@@ -54,6 +59,71 @@ bool parse_env_flag(const char *name, bool default_value) {
     }
 
     return default_value;
+}
+
+// Included in storage.cpp's anonymous namespace; no native object layout changes.
+bool early_partition_writeback_enabled() {
+    static bool enabled = parse_env_flag("GEGE_EARLY_PARTITION_WRITEBACK", false);
+    return enabled;
+}
+struct EarlyEvictionEntry {
+    int partition = -1;
+    int64_t slot = -1, frame = -1, rows = 0;
+};
+struct EarlyEvictionReceipt {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool ready = false;
+    std::exception_ptr error;
+    int64_t round = -1;
+    const void *gpu_identity = nullptr, *host_identity = nullptr, *stage_identity = nullptr;
+    const void *current_identity = nullptr, *next_identity = nullptr, *position_identity = nullptr;
+    torch::Tensor current_state, next_state;
+    std::vector<EarlyEvictionEntry> entries;
+    int64_t bytes = 0;
+};
+using EarlyEvictionKey = std::pair<MemPartitionBufferStorage *, int32_t>;
+std::mutex &early_eviction_registry_mutex() { static auto *m = new std::mutex; return *m; }
+std::map<EarlyEvictionKey, std::shared_ptr<EarlyEvictionReceipt>> &early_eviction_registry() {
+    static auto *r = new std::map<EarlyEvictionKey, std::shared_ptr<EarlyEvictionReceipt>>;
+    return *r;
+}
+std::shared_ptr<EarlyEvictionReceipt> early_eviction_lookup(MemPartitionBufferStorage *storage, int32_t lane) {
+    std::lock_guard<std::mutex> lock(early_eviction_registry_mutex());
+    auto &registry = early_eviction_registry();
+    auto found = registry.find({storage, lane});
+    return found == registry.end() ? nullptr : found->second;
+}
+void early_eviction_wait(const std::shared_ptr<EarlyEvictionReceipt> &receipt) {
+    if (!receipt) return;
+    std::unique_lock<std::mutex> lock(receipt->mutex);
+    receipt->cv.wait(lock, [&] { return receipt->ready; });
+    if (receipt->error) std::rethrow_exception(receipt->error);
+}
+void early_eviction_erase(MemPartitionBufferStorage *storage, int32_t lane,
+                          const std::shared_ptr<EarlyEvictionReceipt> &receipt) {
+    std::lock_guard<std::mutex> lock(early_eviction_registry_mutex());
+    auto &registry = early_eviction_registry();
+    auto found = registry.find({storage, lane});
+    TORCH_CHECK(found != registry.end() && found->second == receipt,
+                "Early eviction receipt was consumed twice or replaced");
+    registry.erase(found);
+}
+void early_eviction_discard(MemPartitionBufferStorage *storage, bool propagate = true) {
+    if (!early_partition_writeback_enabled()) return;
+    std::exception_ptr error;
+    for (int lane = 0; lane < 2; ++lane) {
+        auto receipt = early_eviction_lookup(storage, lane);
+        if (!receipt) continue;
+        try { early_eviction_wait(receipt); } catch (...) { if (!error) error = std::current_exception(); }
+        early_eviction_erase(storage, lane, receipt);
+    }
+    if (error && propagate) std::rethrow_exception(error);
+}
+
+
+bool peer_scratch_recycle_diagnostics_enabled() {
+    return parse_env_flag("GEGE_PEER_SCRATCH_RECYCLE_DIAGNOSTICS", false);
 }
 
 bool csr_update_enabled() {
@@ -756,7 +826,7 @@ void MemPartitionBufferStorage::resetStateflowTransitionCounts() {
             std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
             for (const auto &[partition_id, frame] : peer_relay_source_scratch_frames_[device_idx]) {
                 (void)partition_id;
-                if (frame < buffer->capacity_ || frame >= buffer->physical_frame_capacity_) {
+                if (frame < 0 || frame >= buffer->physical_frame_capacity_) {
                     continue;
                 }
                 bool frame_is_visible = false;
@@ -1172,6 +1242,7 @@ void MemPartitionBufferStorage::append(torch::Tensor values) {
 }
 
 MemPartitionBufferStorage::~MemPartitionBufferStorage() { 
+    early_eviction_discard(this, false);
 #if defined(GEGE_CUDA)
     for (auto &ready_event_handle : peer_relay_source_ready_events_) {
         if (ready_event_handle != 0) {
@@ -1257,6 +1328,7 @@ void MemPartitionBufferStorage::write() {
 }
 
 void MemPartitionBufferStorage::unload(bool perform_write) {
+    early_eviction_discard(this);
     if (loaded_) {
         for (int i = 0; i < buffers_.size(); i ++)
             buffers_[i]->unload(perform_write);
@@ -1271,6 +1343,7 @@ void MemPartitionBufferStorage::unload(bool perform_write) {
 }
 
 void MemPartitionBufferStorage::syncToHostWithoutDiskWrite() {
+    early_eviction_discard(this);
     if (!loaded_) {
         return;
     }
@@ -1298,6 +1371,7 @@ void MemPartitionBufferStorage::syncToHostWithoutDiskWrite() {
 }
 
 void MemPartitionBufferStorage::unload(bool perform_write, int32_t device_idx) {
+    early_eviction_discard(this);
     if (!loaded_) {
         return;
     }
@@ -1312,6 +1386,166 @@ void MemPartitionBufferStorage::unload(bool perform_write, int32_t device_idx) {
 
     buffers_[device_idx]->unload(false);
 }
+
+// Called only after lane zero submits its LAST sparse update in a state.
+// The adapter runs this synchronous producer in its managed background task,
+// serialized against preload preparation, and drains it before any transition.
+void MemPartitionBufferStorage::prepareEarlyEvictions(int32_t device_idx) {
+    TORCH_CHECK(early_partition_writeback_enabled(), "Early eviction API requires its explicit enable flag");
+    TORCH_CHECK(device_idx == 0 && buffers_.size() == 2 && devices_.size() == 2,
+                "Early evictions support lane zero of two independent owners only");
+#if !defined(GEGE_CUDA)
+    TORCH_CHECK(false, "Early evictions require CUDA");
+#else
+    auto *buffer = buffers_.at(device_idx);
+    TORCH_CHECK(loaded_ && buffer && buffer->loaded_ && buffer->device_.is_cuda() &&
+                peerRelayEnabled_() && stateflow_peer_schedule_active_ &&
+                stateflow_transition_counts_.size() == 2 && stateflow_peer_handoff_index_per_device_.size() == 2,
+                "Early evictions require the active two-owner peer schedule");
+    if (!buffer->buffer_state_.defined() || buffer->buffer_state_iterator_ == buffer->buffer_states_.end()) return;
+    TORCH_CHECK(buffer->frameCacheEnabled_() && buffer->buffer_tensor_gpu_view_.defined() &&
+                buffer->buffer_tensor_view_.defined() && buffer->buffer_tensor_view_.is_pinned() &&
+                data_.defined() && data_.device().is_cpu(), "Early evictions require existing pinned frame staging");
+    TORCH_CHECK(!early_eviction_lookup(this, device_idx), "Previous early eviction receipt is unconsumed");
+    const int64_t round = stateflow_transition_counts_[device_idx] + 1;
+    const auto evict_ids = buffer->getNextEvict();
+    const std::vector<uint8_t> *next_required =
+        round > 0 && static_cast<std::size_t>(round) < stateflow_global_next_required_by_round_.size()
+            ? &stateflow_global_next_required_by_round_[round] : nullptr;
+    std::unordered_set<int> outgoing;
+    for (const auto &index : stateflow_peer_handoff_index_per_device_)
+        for (const auto &[key, handoff] : index)
+            if (handoff.round_idx == round && handoff.src_lane_id == device_idx) outgoing.insert(handoff.partition_id);
+    auto receipt = std::make_shared<EarlyEvictionReceipt>();
+    receipt->round = round;
+    receipt->gpu_identity = buffer->buffer_tensor_gpu_view_.data_ptr();
+    receipt->host_identity = data_.data_ptr();
+    receipt->stage_identity = buffer->buffer_tensor_view_.data_ptr();
+    receipt->current_identity = buffer->buffer_state_.unsafeGetTensorImpl();
+    receipt->next_identity = (*buffer->buffer_state_iterator_).unsafeGetTensorImpl();
+    receipt->position_identity = buffer->pos_.defined() ? buffer->pos_.unsafeGetTensorImpl() : nullptr;
+    receipt->current_state = buffer->buffer_state_.to(torch::kCPU).to(torch::kInt64).clone();
+    receipt->next_state = (*buffer->buffer_state_iterator_).to(torch::kCPU).to(torch::kInt64).clone();
+    std::vector<int> selected;
+    for (int partition_id : evict_ids) {
+        TORCH_CHECK(partition_id >= 0 && static_cast<std::size_t>(partition_id) < buffer->partition_table_.size(),
+                    "Invalid early eviction partition");
+        // These cases are explicitly EXCLUDED from delayed stale writeback by
+        // performNextSwap. Leave already hidden writebacks to their existing path.
+        const bool forced_sync = outgoing.count(partition_id) ||
+            (next_required && static_cast<std::size_t>(partition_id) < next_required->size() && (*next_required)[partition_id]);
+        if (!forced_sync) continue;
+        auto *partition = buffer->partition_table_[partition_id];
+        TORCH_CHECK(partition->present_ && partition->buffer_idx_ >= 0, "Early eviction source is not resident");
+        const int64_t frame = buffer->logicalSlotToPhysicalFrame_(partition->buffer_idx_);
+        TORCH_CHECK(frame >= 0 && frame < buffer->physical_frame_capacity_, "Invalid early eviction physical frame");
+        receipt->entries.push_back({partition_id, partition->buffer_idx_, frame, partition->partition_size_});
+        receipt->bytes += partition->partition_size_ * buffer->buffer_tensor_gpu_view_.size(1) * buffer->buffer_tensor_gpu_view_.element_size();
+        selected.push_back(partition_id);
+    }
+    if (selected.empty()) return;
+    // A background host preload must never read these rows while we publish a
+    // newer version. Any next-state admission of an owned source must be the
+    // scheduled peer handoff, which startAsyncAdmitPreload excludes from H2D.
+    for (int peer = 0; peer < 2; ++peer) {
+        auto *other = buffers_[peer];
+        if (!other || !other->loaded_ || other->buffer_state_iterator_ == other->buffer_states_.end()) continue;
+        const auto admits = other->getNextAdmit();
+        const auto peer_round = stateflow_transition_counts_[peer] + 1;
+        TORCH_CHECK(peer_round == round, "Early eviction owners crossed transition rounds");
+        for (int partition_id : selected) {
+            if (std::find(admits.begin(), admits.end(), partition_id) == admits.end()) continue;
+            const auto key = peer_handoff_lookup_key(peer_round, partition_id);
+            const auto &index = stateflow_peer_handoff_index_per_device_[peer];
+            const auto found = index.find(key);
+            TORCH_CHECK(found != index.end() && found->second.src_lane_id == device_idx,
+                        "Early eviction would race a host-backed preload");
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(early_eviction_registry_mutex());
+        TORCH_CHECK(early_eviction_registry().emplace(EarlyEvictionKey{this, device_idx}, receipt).second,
+                    "Concurrent early eviction producer for one owner");
+    }
+    const auto start = std::chrono::steady_clock::now();
+    try {
+        // Managed preparation may have returned while a native admission
+        // worker still owns pending-writeback bookkeeping. Join BOTH owners'
+        // admission workers before touching either owner's pending vectors.
+        // This wait runs in the background producer; dense training can proceed.
+        for (auto *peer : buffers_) if (peer && peer->loaded_) peer->joinAsyncAdmitPreload_();
+        // Drain older host producers BEFORE publishing this state's newer data.
+        for (auto *peer : buffers_) if (peer && peer->loaded_) peer->flushPendingDelayedStaleWriteback_();
+        for (auto *peer : buffers_) if (peer && peer->loaded_) peer->joinAsyncEvictWritebackForPartitions_(selected);
+        torch::NoGradGuard no_grad;
+        c10::cuda::CUDAGuard device_guard(buffer->device_);
+        auto source_stream = c10::cuda::getDefaultCUDAStream(buffer->device_.index());
+        auto copy_stream = c10::cuda::getStreamFromPool(false, buffer->device_.index());
+        struct Event {
+            cudaEvent_t value = nullptr;
+            ~Event() { if (value) cudaEventDestroy(value); }
+        } source_ready;
+        try {
+            AT_CUDA_CHECK(cudaEventCreateWithFlags(&source_ready.value, cudaEventDisableTiming));
+            AT_CUDA_CHECK(cudaEventRecord(source_ready.value, source_stream.stream()));
+            AT_CUDA_CHECK(cudaStreamWaitEvent(copy_stream.stream(), source_ready.value, 0));
+            {
+                c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
+                for (const auto &entry : receipt->entries) {
+                    const int64_t offset = entry.frame * buffer->partition_size_;
+                    auto cpu = buffer->buffer_tensor_view_.narrow(0, offset, entry.rows);
+                    auto gpu = buffer->buffer_tensor_gpu_view_.narrow(0, offset, entry.rows);
+                    cpu.copy_(gpu.detach(), true);
+                }
+                AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
+            }
+        } catch (...) {
+            // Do not let error unwinding release storage while an earlier
+            // successful copy submission still reads its source frames.
+            static_cast<void>(cudaStreamSynchronize(copy_stream.stream()));
+            throw;
+        }
+        for (const auto &entry : receipt->entries) {
+            auto *partition = buffer->partition_table_[entry.partition];
+            auto cpu = buffer->buffer_tensor_view_.narrow(0, entry.frame * buffer->partition_size_, entry.rows);
+            if (!buffer->pos_.defined()) {
+                data_.narrow(0, partition->idx_offset_, entry.rows).copy_(cpu);
+            } else {
+                auto indices = buffer->pos_.slice(0, partition->idx_offset_, partition->idx_offset_ + entry.rows);
+                data_.index_put_({indices}, cpu);
+            }
+        }
+        // Do not clear dirty bits, release frames, change the partition table,
+        // signal peer host readiness, or advance the schedule here.
+        {
+            std::lock_guard<std::mutex> lock(receipt->mutex);
+            receipt->ready = true;
+        }
+        receipt->cv.notify_all();
+        std::string early_receipt_partition_ids;
+        for (const auto &entry : receipt->entries) {
+            if (!early_receipt_partition_ids.empty()) early_receipt_partition_ids += ",";
+            early_receipt_partition_ids += std::to_string(entry.partition);
+        }
+        SPDLOG_INFO("[early-partition-writeback] phase=prepare storage={} lane={} round={} parts={} bytes={} partition_ids={} ms={:.3f}",
+                    filename_, device_idx, round, receipt->entries.size(), receipt->bytes, early_receipt_partition_ids,
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+    } catch (...) {
+        {
+            std::lock_guard<std::mutex> lock(receipt->mutex);
+            receipt->error = std::current_exception();
+            receipt->ready = true;
+        }
+        receipt->cv.notify_all();
+        throw;
+    }
+#endif
+}
+extern "C" void pipege_prepare_early_evictions(MemPartitionBufferStorage *storage, int32_t lane) {
+    TORCH_CHECK(storage != nullptr, "Early eviction storage is null");
+    storage->prepareEarlyEvictions(lane);
+}
+
 
 void MemPartitionBufferStorage::publishStateflowPeerSourcesForNextRound(int32_t device_idx, std::uintptr_t swap_ready_event) {
     if (!peerRelayEnabled_()) {
@@ -1388,7 +1622,7 @@ void MemPartitionBufferStorage::publishStateflowPeerSourcesForNextRound(int32_t 
                 std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
                 for (const auto &[partition_id, frame] : published_source_scratch_frames) {
                     (void)partition_id;
-                    if (frame < buffer->capacity_ || frame >= buffer->physical_frame_capacity_) {
+                    if (frame < 0 || frame >= buffer->physical_frame_capacity_) {
                         continue;
                     }
                     bool frame_is_visible = false;
@@ -1510,6 +1744,11 @@ void MemPartitionBufferStorage::requireCoordinatedHandoffs_() const {
 }
 
 void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr_t swap_ready_event) {
+    auto early_receipt = early_partition_writeback_enabled() ? early_eviction_lookup(this, device_idx) : nullptr;
+    early_eviction_wait(early_receipt);
+    std::unordered_set<int> early_host_written;
+    int64_t early_consumed_parts = 0;
+
     if (!peerRelayEnabled_()) {
         requireCoordinatedHandoffs_();
         buffers_[device_idx]->performNextSwap(swap_ready_event);
@@ -1564,6 +1803,29 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
         if (partition_id < 0 || partition_id >= partition_count) {
             throw GegeRuntimeException(
                 fmt::format("MemPartitionBufferStorage::performNextSwap encountered invalid next-state partition {}", partition_id));
+        }
+    }
+
+    if (early_receipt) {
+        TORCH_CHECK(device_idx == 0 && early_receipt->round == transition_round_idx &&
+                    early_receipt->gpu_identity == buffer->buffer_tensor_gpu_view_.data_ptr() &&
+                    early_receipt->host_identity == data_.data_ptr() &&
+                    early_receipt->stage_identity == buffer->buffer_tensor_view_.data_ptr() &&
+                    early_receipt->current_identity == buffer->buffer_state_.unsafeGetTensorImpl() &&
+                    early_receipt->next_identity == (*buffer->buffer_state_iterator_).unsafeGetTensorImpl() &&
+                    early_receipt->position_identity == (buffer->pos_.defined() ? buffer->pos_.unsafeGetTensorImpl() : nullptr) &&
+                    torch::equal(early_receipt->current_state, previous_state) &&
+                    torch::equal(early_receipt->next_state, next_state),
+                    "Early eviction receipt does not match this exact transition/backing");
+        for (const auto &entry : early_receipt->entries) {
+            TORCH_CHECK(std::find(evict_ids.begin(), evict_ids.end(), entry.partition) != evict_ids.end(),
+                        "Early eviction receipt contains a non-evicted partition");
+            auto *partition = buffer->partition_table_.at(entry.partition);
+            TORCH_CHECK(partition->present_ && partition->buffer_idx_ == entry.slot &&
+                        partition->partition_size_ == entry.rows &&
+                        buffer->logicalSlotToPhysicalFrame_(entry.slot) == entry.frame,
+                        "Early eviction source frame or partition version changed");
+            TORCH_CHECK(early_host_written.insert(entry.partition).second, "Duplicate early eviction partition");
         }
     }
 
@@ -1705,7 +1967,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             if (frame_cache_mapping && !published_source_scratch_frames.empty()) {
                 std::lock_guard<std::mutex> frame_lock(buffer->free_physical_frames_lock_);
                 for (const auto &[partition_id, frame] : published_source_scratch_frames) {
-                    if (frame < buffer->capacity_ || frame >= buffer->physical_frame_capacity_) {
+                    if (frame < 0 || frame >= buffer->physical_frame_capacity_) {
                         continue;
                     }
                     bool frame_is_visible = false;
@@ -2027,12 +2289,14 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
             Partition *partition = buffer->partition_table_[evict_id];
             int64_t src_slot = partition->buffer_idx_;
             if (delayed_stale_logical_slots.find(src_slot) != delayed_stale_logical_slots.end()) {
+                TORCH_CHECK(!early_host_written.count(evict_id), "Early forced-sync eviction became delayed");
                 continue;
             }
             int64_t buffer_offset = buffer->logicalSlotRowOffset_(src_slot);
             torch::Tensor cpu_view = buffer->buffer_tensor_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
             torch::Tensor gpu_view = buffer->buffer_tensor_gpu_view_.slice(0, buffer_offset, buffer_offset + partition->partition_size_);
-            cpu_view.copy_(gpu_view.detach(), true);
+            if (!early_host_written.count(evict_id)) cpu_view.copy_(gpu_view.detach(), true);
+            else ++early_consumed_parts;
             host_evict_ids.emplace_back(evict_id);
         }
 
@@ -2055,7 +2319,7 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                                     filename_, transition_round_idx, partition_id, device_idx, max_abs);
                     }
                 }
-                write_partition_to_host(partition, cpu_view);
+                if (!early_host_written.count(partition_id)) write_partition_to_host(partition, cpu_view);
             }
             buffer->clearDirtyRowsForSlots_(host_evict_slots, host_evict_ids);
             std::unordered_set<int> host_written_partition_ids(host_evict_ids.begin(), host_evict_ids.end());
@@ -2067,6 +2331,19 @@ void MemPartitionBufferStorage::performNextSwap(int32_t device_idx, std::uintptr
                     static_cast<std::size_t>(device_idx),
                     peer_handoff_pending_key(transition_round_idx, handoff.partition_id, handoff.dst_lane_id));
             }
+        }
+
+        if (early_receipt) {
+            TORCH_CHECK(early_consumed_parts == static_cast<int64_t>(early_receipt->entries.size()),
+                        "Early eviction receipt was not consumed exactly once per partition");
+            early_eviction_erase(this, device_idx, early_receipt);
+            std::string early_receipt_partition_ids;
+            for (const auto &entry : early_receipt->entries) {
+                if (!early_receipt_partition_ids.empty()) early_receipt_partition_ids += ",";
+                early_receipt_partition_ids += std::to_string(entry.partition);
+            }
+            SPDLOG_INFO("[early-partition-writeback] phase=consume storage={} lane={} round={} parts={} bytes={} partition_ids={}",
+                        filename_, device_idx, transition_round_idx, early_consumed_parts, early_receipt->bytes, early_receipt_partition_ids);
         }
 
         struct ScopedCudaEvent {

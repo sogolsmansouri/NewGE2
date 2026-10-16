@@ -267,6 +267,19 @@ if(BUILD_TESTING)
     add_test(NAME gege_order_window_tests COMMAND gege_order_window_tests)
     # Torch's dependency configuration can shadow USE_CUDA after CUDA was enabled.
     if(CMAKE_CUDA_COMPILER_LOADED)
+        add_library(gege_parallel_numerics SHARED EXCLUDE_FROM_ALL
+                    ${CMAKE_CURRENT_LIST_DIR}/../scripts/check_parallel_numerics.cpp)
+        target_link_libraries(gege_parallel_numerics ${PROJECT_NAME} ${CMAKE_DL_LIBS})
+        add_executable(gege_resident_negative_domain_test
+                       ${CMAKE_CURRENT_LIST_DIR}/../scripts/test_resident_negative_domain.cpp)
+        target_link_libraries(gege_resident_negative_domain_test ${PROJECT_NAME})
+        foreach(domain_mode direct baseline replay batched superbatch pool global global_pool)
+            add_test(NAME gege_resident_negative_domain_${domain_mode}
+                     COMMAND gege_resident_negative_domain_test ${domain_mode})
+        endforeach()
+        add_executable(gege_parallel_checkpoint_resume_test EXCLUDE_FROM_ALL
+                       ${CMAKE_CURRENT_LIST_DIR}/../scripts/test_parallel_checkpoint_resume.cpp)
+        target_link_libraries(gege_parallel_checkpoint_resume_test ${PROJECT_NAME})
         add_library(gege_frame_transition_audit SHARED EXCLUDE_FROM_ALL
                     ${CMAKE_CURRENT_LIST_DIR}/../scripts/check_frame_transition_state.cpp)
         target_link_libraries(gege_frame_transition_audit ${PROJECT_NAME} ${CMAKE_DL_LIBS})

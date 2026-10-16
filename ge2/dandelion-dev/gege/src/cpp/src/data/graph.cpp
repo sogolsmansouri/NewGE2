@@ -1,5 +1,7 @@
 #include "data/graph.h"
 
+#include <algorithm>
+
 #include "common/util.h"
 #include "data/samplers/neighbor.h"
 
@@ -43,6 +45,29 @@ GegeGraph::GegeGraph(EdgeList edges) {
 
 GegeGraph::~GegeGraph() { clear(); }
 
+void GegeGraph::setNodeSamplingLayout(const torch::Tensor &slot_partitions, int64_t partition_size, int64_t total_nodes) {
+    TORCH_CHECK(partition_size > 0 && total_nodes > 0, "Invalid partition geometry for node sampling");
+    auto partitions = slot_partitions.to(torch::kCPU).to(torch::kInt64).contiguous();
+    TORCH_CHECK(partitions.dim() == 1 && partitions.numel() > 0 &&
+                    partitions.numel() * partition_size <= num_nodes_in_memory_,
+                "Invalid resident slot count for node sampling");
+    num_nodes_for_sampling_ = partitions.numel() * partition_size;
+    sampling_padding_start_ = 0;
+    sampling_padding_size_ = 0;
+    const auto *ids = partitions.data_ptr<int64_t>();
+    for (int64_t slot = 0; slot < partitions.numel(); ++slot) {
+        TORCH_CHECK(ids[slot] >= 0 && ids[slot] <= (total_nodes - 1) / partition_size,
+                    "Resident partition lies outside the node table");
+        const int64_t rows = std::min(partition_size, total_nodes - ids[slot] * partition_size);
+        if (rows < partition_size) {
+            TORCH_CHECK(sampling_padding_size_ == 0, "Short partition appears in multiple resident slots");
+            sampling_padding_start_ = slot * partition_size + rows;
+            sampling_padding_size_ = partition_size - rows;
+            num_nodes_for_sampling_ -= sampling_padding_size_;
+        }
+    }
+}
+
 Indices GegeGraph::getNodeIDs() { return node_ids_; }
 
 Indices GegeGraph::getEdges(bool incoming) {
@@ -82,6 +107,9 @@ Indices GegeGraph::getNumNeighbors(bool incoming) {
 }
 
 void GegeGraph::clear() {
+    num_nodes_for_sampling_ = -1;
+    sampling_padding_start_ = 0;
+    sampling_padding_size_ = 0;
     node_ids_ = torch::Tensor();
     src_sorted_edges_ = torch::Tensor();
     dst_sorted_edges_ = torch::Tensor();

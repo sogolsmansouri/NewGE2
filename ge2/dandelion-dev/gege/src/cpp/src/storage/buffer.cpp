@@ -240,6 +240,11 @@ bool frame_cache_defer_stale_writeback_until_preload_enabled() {
     return enabled;
 }
 
+bool transition_diagnostic_enabled() {
+    static bool enabled = parse_env_flag("GEGE_TRANSITION_DIAGNOSTIC", false);
+    return enabled;
+}
+
 bool frame_cache_serialize_admit_h2d_enabled() {
     static bool enabled = parse_env_flag("GEGE_FRAME_CACHE_SERIALIZE_ADMIT_H2D", false);
     return enabled;
@@ -2761,7 +2766,16 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
         try {
             {
                 gege::profiling::ScopedRange wait_scope("buffer.preload.wait_matching_writeback");
+                const bool diagnostic = transition_diagnostic_enabled();
+                std::chrono::steady_clock::time_point diagnostic_start;
+                if (diagnostic) diagnostic_start = std::chrono::steady_clock::now();
                 joinAsyncEvictWritebackForPartitions_(admit_ids);
+                if (diagnostic) {
+                    const double elapsed = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - diagnostic_start).count();
+                    SPDLOG_INFO("[transition-diagnostic][matching-writeback] storage={} this={} device={} admits={} wait_ms={:.6f}",
+                                basename_string(filename_), fmt::ptr(this), device_.str(), admit_ids.size(), elapsed);
+                }
             }
 
             std::vector<int> stage_admit_ids = admit_ids;
@@ -2779,8 +2793,18 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                         free_count = free_physical_frames_.size();
                     }
                     if (free_count < target_hidden_count) {
+                        const bool diagnostic = transition_diagnostic_enabled();
+                        std::chrono::steady_clock::time_point diagnostic_start;
+                        if (diagnostic) diagnostic_start = std::chrono::steady_clock::now();
                         flushPendingDelayedStaleWriteback_();
                         joinAsyncEvictWriteback_();
+                        if (diagnostic) {
+                            const double elapsed = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - diagnostic_start).count();
+                            SPDLOG_INFO("[transition-diagnostic][free-frame-drain] storage={} this={} device={} free_frames={} target_frames={} wait_ms={:.6f}",
+                                        basename_string(filename_), fmt::ptr(this), device_.str(), free_count,
+                                        target_hidden_count, elapsed);
+                        }
                     }
                 }
                 {
@@ -2855,6 +2879,9 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                     gege::profiling::ScopedRange h2d_scope("buffer.preload.h2d");
                     auto hidden_h2d_start = std::chrono::high_resolution_clock::now();
                     std::unique_lock<std::mutex> admit_h2d_lock(frame_cache_admit_h2d_mutex());
+                    const bool diagnostic = transition_diagnostic_enabled();
+                    const double diagnostic_mutex_wait_ms = diagnostic ? elapsed_ms(
+                        hidden_h2d_start, std::chrono::high_resolution_clock::now()) : 0.0;
                     c10::cuda::CUDAGuard device_guard(device_);
                     auto copy_stream = c10::cuda::getStreamFromPool(false, device_.index());
                     c10::cuda::CUDAStreamGuard stream_guard(copy_stream);
@@ -2868,6 +2895,11 @@ void MemPartitionBuffer::startAsyncAdmitPreloadForPlan_(const std::vector<int> &
                     }
                     AT_CUDA_CHECK(cudaStreamSynchronize(copy_stream.stream()));
                     interleaved_hidden_cpu_to_gpu_ms += elapsed_ms(hidden_h2d_start, std::chrono::high_resolution_clock::now());
+                    if (diagnostic) {
+                        SPDLOG_INFO("[transition-diagnostic][hidden-h2d] storage={} this={} device={} partition={} mutex_wait_ms={:.6f} mutex_and_copy_host_ms={:.6f}",
+                                    basename_string(filename_), fmt::ptr(this), device_.str(), hidden_publish.partition_id,
+                                    diagnostic_mutex_wait_ms, elapsed_ms(hidden_h2d_start, std::chrono::high_resolution_clock::now()));
+                    }
                 }
 #endif
             }
@@ -3004,7 +3036,24 @@ void MemPartitionBuffer::prepareFixedFrameBoundaryAdmissions_(const std::vector<
         return;
     }
     gege::profiling::ScopedRange boundary_scope("buffer.fixed_frames.boundary_admit");
+    const bool diagnostic = transition_diagnostic_enabled();
+    bool ready_at_entry = false;
+    bool in_flight_at_entry = false;
+    std::chrono::steady_clock::time_point diagnostic_start;
+    if (diagnostic) {
+        diagnostic_start = std::chrono::steady_clock::now();
+        std::lock_guard<std::mutex> lock(async_admit_preload_lock_);
+        ready_at_entry = async_admit_preload_valid_;
+        in_flight_at_entry = async_admit_preload_in_flight_;
+    }
     joinAsyncAdmitPreload_();
+    if (diagnostic) {
+        const double elapsed = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - diagnostic_start).count();
+        SPDLOG_INFO("[transition-diagnostic][first-preload-join] storage={} this={} device={} admits={} ready_at_entry={} in_flight_at_entry={} wait_ms={:.6f}",
+                    basename_string(filename_), fmt::ptr(this), device_.str(), admit_ids.size(),
+                    ready_at_entry, in_flight_at_entry, elapsed);
+    }
     const std::size_t target = std::min<std::size_t>(frameCacheMaxStaleBacklog_(), admit_ids.size());
     const std::size_t prepared = async_admit_preload_hidden_publishes_.size();
     if (!async_admit_preload_valid_ || target <= prepared) {

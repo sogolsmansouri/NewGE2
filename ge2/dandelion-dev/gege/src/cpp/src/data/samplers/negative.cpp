@@ -253,7 +253,7 @@ torch::Tensor sample_degree_nodes(shared_ptr<GegeGraph> graph, torch::Device dev
     int max_neighbors = incoming_degree ? graph->max_in_num_neighbors_ : graph->max_out_num_neighbors_;
     auto ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(device);
     if (max_neighbors == 0) {
-        return torch::randint(graph->num_nodes_in_memory_, {num_chunks, num_degree}, ind_opts);
+        return graph->mapNodeSamplingRanks(torch::randint(graph->getNumNodesForSampling(), {num_chunks, num_degree}, ind_opts));
     }
 
     torch::Tensor degree_weights = graph->getNumNeighbors(incoming_degree).to(device, torch::kFloat32);
@@ -331,7 +331,8 @@ ChunkNegativePlan build_chunk_negative_plan(shared_ptr<GegeGraph> graph,
     return plan;
 }
 
-MaterializedNegativeOutput materialize_negative_output(torch::Tensor edges,
+MaterializedNegativeOutput materialize_negative_output(const shared_ptr<GegeGraph> &graph,
+                                                       torch::Tensor edges,
                                                        int64_t num_nodes,
                                                        int num_chunks,
                                                        int num_negatives,
@@ -345,10 +346,14 @@ MaterializedNegativeOutput materialize_negative_output(torch::Tensor edges,
                                                        const torch::TensorOptions &ind_opts) {
     MaterializedNegativeOutput output;
     if (num_negatives == -1) {
-        output.ids = torch::arange(num_nodes, ind_opts).view({1, num_nodes});
+        output.ids = graph->mapNodeSamplingRanks(torch::arange(num_nodes, ind_opts)).view({1, num_nodes});
         return output;
     }
 
+    // Plans/caches contain compact ranks, keyed by the number of real resident
+    // rows. Map only on consumption, so moving the short partition to another
+    // logical slot cannot turn a cached uniform rank into a padded storage ID.
+    uniform_ids = graph->mapNodeSamplingRanks(uniform_ids);
     torch::Tensor deg_sample = materialize_degree_samples(edges, sample_edge_ids, sample_ids_are_edge_ids, inverse);
     if (deg_sample.defined() && uniform_ids.defined()) {
         output.ids = torch::cat({deg_sample, uniform_ids}, 1);
@@ -832,7 +837,7 @@ CorruptNodeNegativeSampler::CorruptNodeNegativeSampler(int num_chunks, int num_n
 
 std::tuple<torch::Tensor, torch::Tensor> CorruptNodeNegativeSampler::getNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges, bool inverse,
                                                                                   int32_t device_idx) {
-    int64_t num_nodes = graph->num_nodes_in_memory_;
+    int64_t num_nodes = graph->getNumNodesForSampling();
 
     int num_batch = (int)(num_negatives_ * degree_fraction_);
     int num_uni = num_negatives_ - num_batch;
@@ -842,7 +847,7 @@ std::tuple<torch::Tensor, torch::Tensor> CorruptNodeNegativeSampler::getNegative
     auto plan = build_chunk_negative_plan(graph, edges, num_nodes, num_chunks_, num_uni, num_batch, torch::Tensor(),
                                           exclude_current_chunk_degree_samples, inverse);
     auto output =
-        materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, plan.uniform_ids,
+        materialize_negative_output(graph, edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, plan.uniform_ids,
                                     plan.sample_edge_ids, plan.sample_ids_are_edge_ids, plan.chunk_exclusion_active, inverse, ind_opts);
     torch::Tensor score_filter = build_negative_filter(graph, edges, output, inverse, filtered_, local_filter_mode_);
     return std::forward_as_tuple(output.ids, score_filter);
@@ -851,7 +856,7 @@ std::tuple<torch::Tensor, torch::Tensor> CorruptNodeNegativeSampler::getNegative
 NegativeSampler::NodeCorruptResult CorruptNodeNegativeSampler::getNodeCorruptNegatives(shared_ptr<GegeGraph> graph, torch::Tensor edges,
                                                                                        bool need_src_negatives, int32_t device_idx) {
     (void)device_idx;
-    int64_t num_nodes = graph->num_nodes_in_memory_;
+    int64_t num_nodes = graph->getNumNodesForSampling();
     int num_batch = (int)(num_negatives_ * degree_fraction_);
     int num_uni = num_negatives_ - num_batch;
     torch::TensorOptions ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
@@ -863,7 +868,7 @@ NegativeSampler::NodeCorruptResult CorruptNodeNegativeSampler::getNodeCorruptNeg
         auto src_plan = build_chunk_negative_plan(graph, edges, num_nodes, num_chunks_, num_uni, num_batch, torch::Tensor(),
                                                   exclude_current_chunk_degree_samples, true);
         auto src_output =
-            materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, src_plan.uniform_ids,
+            materialize_negative_output(graph, edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, src_plan.uniform_ids,
                                         src_plan.sample_edge_ids, src_plan.sample_ids_are_edge_ids, src_plan.chunk_exclusion_active, true, ind_opts);
         src_negatives = src_output.ids;
         src_filter = build_negative_filter(graph, edges, src_output, true, filtered_, local_filter_mode_);
@@ -874,7 +879,7 @@ NegativeSampler::NodeCorruptResult CorruptNodeNegativeSampler::getNodeCorruptNeg
     auto dst_plan = build_chunk_negative_plan(graph, edges, num_nodes, num_chunks_, num_uni, num_batch, torch::Tensor(),
                                               exclude_current_chunk_degree_samples, false);
     auto dst_output =
-        materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, dst_plan.uniform_ids,
+        materialize_negative_output(graph, edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, dst_plan.uniform_ids,
                                     dst_plan.sample_edge_ids, dst_plan.sample_ids_are_edge_ids, dst_plan.chunk_exclusion_active, false, ind_opts);
     torch::Tensor dst_filter = build_negative_filter(graph, edges, dst_output, false, filtered_, local_filter_mode_);
     return std::forward_as_tuple(src_negatives, src_filter, dst_output.ids, dst_filter);
@@ -1068,7 +1073,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
     int64_t materialize_elapsed = 0;
     int64_t filter_elapsed = 0;
     NegativeFilterBreakdown filter_breakdown;
-    int64_t num_nodes = graph->num_nodes_in_memory_;
+    int64_t num_nodes = graph->getNumNodesForSampling();
     int num_batch = (int)(num_negatives_ * degree_fraction_);
     int num_uni = num_negatives_ - num_batch;
     torch::TensorOptions ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
@@ -1087,7 +1092,9 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
         }
 
         auto &cache_entry = state_negative_pool_plan_cache_[cache_id][device_idx];
-        if (cache_entry.graph_key == graph.get() && cache_entry.num_nodes == num_nodes && cache_entry.batch_size == edges.size(0) &&
+        if (cache_entry.graph_key == graph.get() && cache_entry.num_nodes == num_nodes &&
+            cache_entry.sampling_padding_start == graph->sampling_padding_start_ &&
+            cache_entry.sampling_padding_size == graph->sampling_padding_size_ && cache_entry.batch_size == edges.size(0) &&
             cache_entry.remaining_uses > 0) {
             uniform_ids = cache_entry.uniform_ids;
             sample_edge_ids = cache_entry.sample_edge_ids;
@@ -1164,6 +1171,8 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
             auto &cache_entry = state_negative_pool_plan_cache_[cache_id][device_idx];
             cache_entry.graph_key = graph.get();
             cache_entry.num_nodes = num_nodes;
+            cache_entry.sampling_padding_start = graph->sampling_padding_start_;
+            cache_entry.sampling_padding_size = graph->sampling_padding_size_;
             cache_entry.batch_size = edges.size(0);
             cache_entry.remaining_uses = state_negative_pool_refresh_batches_ - 1;
             cache_entry.chunk_exclusion_active = chunk_exclusion_active;
@@ -1174,7 +1183,7 @@ std::tuple<torch::Tensor, torch::Tensor> NegativeSamplingBase::getNegatives(shar
     }
 
     auto materialize_start = std::chrono::high_resolution_clock::now();
-    auto output = materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
+    auto output = materialize_negative_output(graph, edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
                                               sample_edge_ids, sample_ids_are_edge_ids, chunk_exclusion_active, inverse, ind_opts);
     materialize_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::high_resolution_clock::now() - materialize_start)
@@ -1234,7 +1243,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     int64_t materialize_elapsed = 0;
     int64_t filter_elapsed = 0;
     NegativeFilterBreakdown filter_breakdown;
-    int64_t num_nodes = graph->num_nodes_in_memory_;
+    int64_t num_nodes = graph->getNumNodesForSampling();
     int num_batch = (int)(num_negatives_ * degree_fraction_);
     int num_uni = num_negatives_ - num_batch;
     torch::TensorOptions ind_opts = torch::TensorOptions().dtype(torch::kInt64).device(edges.device());
@@ -1258,9 +1267,13 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
         auto &dst_cache_entry = state_negative_pool_plan_cache_[0][device_idx];
         auto &src_cache_entry = state_negative_pool_plan_cache_[1][device_idx];
         bool reuse_dst = dst_cache_entry.graph_key == graph.get() && dst_cache_entry.num_nodes == num_nodes &&
+                         dst_cache_entry.sampling_padding_start == graph->sampling_padding_start_ &&
+                         dst_cache_entry.sampling_padding_size == graph->sampling_padding_size_ &&
                          dst_cache_entry.batch_size == edges.size(0) && dst_cache_entry.remaining_uses > 0;
         bool reuse_src = !need_src_negatives ||
                          (src_cache_entry.graph_key == graph.get() && src_cache_entry.num_nodes == num_nodes &&
+                          src_cache_entry.sampling_padding_start == graph->sampling_padding_start_ &&
+                          src_cache_entry.sampling_padding_size == graph->sampling_padding_size_ &&
                           src_cache_entry.batch_size == edges.size(0) && src_cache_entry.remaining_uses > 0);
         if (reuse_dst && reuse_src) {
             uniform_ids = dst_cache_entry.uniform_ids;
@@ -1379,6 +1392,8 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
         auto &dst_cache_entry = state_negative_pool_plan_cache_[0][device_idx];
         dst_cache_entry.graph_key = graph.get();
         dst_cache_entry.num_nodes = num_nodes;
+        dst_cache_entry.sampling_padding_start = graph->sampling_padding_start_;
+        dst_cache_entry.sampling_padding_size = graph->sampling_padding_size_;
         dst_cache_entry.batch_size = edges.size(0);
         dst_cache_entry.remaining_uses = state_negative_pool_refresh_batches_ - 1;
         dst_cache_entry.chunk_exclusion_active = dst_chunk_exclusion_active;
@@ -1390,6 +1405,8 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
             auto &src_cache_entry = state_negative_pool_plan_cache_[1][device_idx];
             src_cache_entry.graph_key = graph.get();
             src_cache_entry.num_nodes = num_nodes;
+            src_cache_entry.sampling_padding_start = graph->sampling_padding_start_;
+            src_cache_entry.sampling_padding_size = graph->sampling_padding_size_;
             src_cache_entry.batch_size = edges.size(0);
             src_cache_entry.remaining_uses = state_negative_pool_refresh_batches_ - 1;
             src_cache_entry.chunk_exclusion_active = src_chunk_exclusion_active;
@@ -1403,7 +1420,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     torch::Tensor src_filter;
     if (need_src_negatives) {
         auto materialize_start = std::chrono::high_resolution_clock::now();
-        auto src_output = materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
+        auto src_output = materialize_negative_output(graph, edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
                                                       src_sample_edge_ids, src_sample_ids_are_edge_ids, src_chunk_exclusion_active, true, ind_opts);
         materialize_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    std::chrono::high_resolution_clock::now() - materialize_start)
@@ -1417,7 +1434,7 @@ NegativeSampler::NodeCorruptResult NegativeSamplingBase::getNodeCorruptNegatives
     }
 
     auto materialize_start = std::chrono::high_resolution_clock::now();
-    auto dst_output = materialize_negative_output(edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
+    auto dst_output = materialize_negative_output(graph, edges, num_nodes, num_chunks_, num_negatives_, degree_fraction_, local_filter_mode_, uniform_ids,
                                                   dst_sample_edge_ids, dst_sample_ids_are_edge_ids, dst_chunk_exclusion_active, false, ind_opts);
     materialize_elapsed += std::chrono::duration_cast<std::chrono::nanoseconds>(
                                std::chrono::high_resolution_clock::now() - materialize_start)

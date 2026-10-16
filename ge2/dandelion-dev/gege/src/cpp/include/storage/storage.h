@@ -189,6 +189,8 @@ class MemPartitionBufferStorage : public Storage {
 
     void startAsyncAdmitPreload(int32_t device_idx);
 
+    void prepareEarlyEvictions(int32_t device_idx);
+
     torch::Tensor getGlobalToLocalMap(bool get_current, int32_t device_idx = 0) { return buffers_[device_idx]->getGlobalToLocalMap(get_current); }
 
     torch::Tensor getPartitionToBufferSlotMap(int32_t device_idx = 0) { return buffers_[device_idx]->getPartitionToBufferSlotMap(); }

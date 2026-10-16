@@ -266,6 +266,8 @@ class NegativeSamplingBase : public NegativeSampler {
     struct NegativePoolPlanCacheEntry {
         const void *graph_key = nullptr;
         int64_t num_nodes = -1;
+        int64_t sampling_padding_start = 0;
+        int64_t sampling_padding_size = 0;
         int64_t batch_size = -1;
         int remaining_uses = 0;
         bool chunk_exclusion_active = false;

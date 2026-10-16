@@ -37,6 +37,14 @@ void Optimizer::save(torch::serialize::OutputArchive &output_archive) {
 
 void Optimizer::clear_grad() {
     auto param_items = param_dict_.items();
+    // ComplEx has just forward/inverse relation tensors. Clearing these
+    // handles does not justify launching a CPU thread team.
+    if (param_dict_.size() <= 2) {
+        for (auto &item : param_items) {
+            item.value().mutable_grad() = torch::Tensor();
+        }
+        return;
+    }
 #pragma omp parallel for
     for (int i = 0; i < param_dict_.size(); i++) {
         param_items[i].value().mutable_grad() = torch::Tensor();

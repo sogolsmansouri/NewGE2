@@ -38,6 +38,17 @@ class GegeGraph {
 
     ~GegeGraph();
 
+    void setNodeSamplingLayout(const torch::Tensor &slot_partitions, int64_t partition_size, int64_t total_nodes);
+
+    int64_t getNumNodesForSampling() const {
+        return num_nodes_for_sampling_ >= 0 ? num_nodes_for_sampling_ : num_nodes_in_memory_;
+    }
+
+    torch::Tensor mapNodeSamplingRanks(torch::Tensor ranks) const {
+        if (sampling_padding_size_ == 0 || !ranks.defined()) return ranks;
+        return ranks + (ranks >= sampling_padding_start_).to(ranks.scalar_type()) * sampling_padding_size_;
+    }
+
     /**
      * Get the node IDs from the graph.
      * @return Tensor of node IDs
@@ -91,6 +102,12 @@ class GegeGraph {
     void to(torch::Device device);
 
     void sortAllEdges(EdgeList additional_edges);
+
+    // Storage IDs retain their fixed partition stride. Uniform sampling uses
+    // compact ranks and skips the short partition's padding when materialized.
+    int64_t num_nodes_for_sampling_ = -1;
+    int64_t sampling_padding_start_ = 0;
+    int64_t sampling_padding_size_ = 0;
 };
 
 /**

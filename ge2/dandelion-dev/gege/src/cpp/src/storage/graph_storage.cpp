@@ -1339,6 +1339,8 @@ void GraphModelStorage::initializeInMemorySubGraph(torch::Tensor buffer_state, t
                 graph_build_ms = elapsed_graph_storage_ms(phase_start, now);
             }
         }
+        current_subgraph_state_->in_memory_subgraph_->setNodeSamplingLayout(
+            new_in_mem_partition_ids, getPartitionSize_(device_idx), getNumNodes());
         current_subgraph_state_->all_in_memory_mapped_edges_ = bucket_layout_mapped_edges;
         current_subgraph_state_->in_memory_partition_ids_ = new_in_mem_partition_ids;
         current_subgraph_state_->in_memory_edge_bucket_ids_ = in_mem_edge_bucket_ids;
@@ -1413,6 +1415,9 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
     ensureSubgraphStateVectors_(device_idx);
     int64_t outer_timing_id = -1;
     bool log_outer_timing = should_log_partition_buffer_pipeline_timing(outer_timing_id);
+    const char *transition_diagnostic = std::getenv("GEGE_TRANSITION_DIAGNOSTIC");
+    const bool diagnostic = transition_diagnostic != nullptr && std::string(transition_diagnostic) == "1";
+    log_outer_timing = log_outer_timing || diagnostic;
     auto outer_total_start = std::chrono::high_resolution_clock::now();
     auto outer_phase_start = outer_total_start;
     double prefetch_wait_ms = 0.0;
@@ -1484,7 +1489,11 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
             next_prefetch_start_ms = elapsed_graph_storage_ms(outer_phase_start, now);
             outer_phase_start = now;
         }
-        if (hasSwap(device_idx)) {
+        // Multi-device host preloads start in DataLoader after every lane has
+        // committed this transition's synchronous evictions and registered its
+        // delayed writebacks. Starting here can read another lane's stale host
+        // optimizer state before that lane reaches the rebuild barrier.
+        if (devices_.size() <= 1 && hasSwap(device_idx)) {
             boundary_phase.start("graph.boundary.launch_parameter_preload");
             startAsyncAdmitPreload(device_idx);
             boundary_phase.stop();
@@ -1529,7 +1538,8 @@ void GraphModelStorage::updateInMemorySubGraph(int32_t device_idx) {
         boundary_phase.stop();
         subgraph_update_ms = elapsed_graph_storage_ms(t1, t2);
         outer_phase_start = t2;
-        if (hasSwap(device_idx) && !start_admit_preload_after_active_edges_enabled()) {
+        // DataLoader launches multi-device preloads after the rebuild barrier.
+        if (devices_.size() <= 1 && hasSwap(device_idx) && !start_admit_preload_after_active_edges_enabled()) {
             boundary_phase.start("graph.boundary.launch_parameter_preload");
             startAsyncAdmitPreload(device_idx);
             boundary_phase.stop();
@@ -2084,6 +2094,7 @@ void GraphModelStorage::updateInMemorySubGraph_(shared_ptr<InMemorySubgraphState
         }
         worker_phase.stop();
     }
+    subgraph->in_memory_subgraph_->setNodeSamplingLayout(new_in_mem_partition_ids, getPartitionSize_(device_idx), getNumNodes());
     subgraph->all_in_memory_mapped_edges_ = bucket_layout_mapped_edges;
 
     // update state
@@ -2252,6 +2263,8 @@ void GraphModelStorage::sortAllEdges(int32_t device_idx) {
             state->all_in_memory_mapped_edges_.defined() && state->all_in_memory_mapped_edges_.numel() > 0) {
             state->in_memory_subgraph_ =
                 build_materialized_subgraph_from_mapped_edges(state->all_in_memory_mapped_edges_, getNumNodesInMemory(device_idx));
+            state->in_memory_subgraph_->setNodeSamplingLayout(
+                state->in_memory_partition_ids_, getPartitionSize_(device_idx), getNumNodes());
             in_memory_graph = state->in_memory_subgraph_;
         }
 

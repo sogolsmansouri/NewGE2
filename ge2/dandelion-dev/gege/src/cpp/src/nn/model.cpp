@@ -4,6 +4,7 @@
 #endif
 #include "common/training_contract.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
@@ -24,6 +25,7 @@
 #include "configuration/options.h"
 #include "data/samplers/negative.h"
 #include "nn/decoders/edge/decoder_methods.h"
+#include "nn/decoders/edge/four_worker_complex.h"
 #include "nn/layers/embedding/embedding.h"
 #include "nn/initialization.h"
 #include "nn/model_helpers.h"
@@ -91,6 +93,11 @@ bool fixed_buffer_manual_complex_rns_enabled() {
 }
 
 bool manual_rns_execution_allowed(const Model *model, const shared_ptr<Batch> &batch) {
+    // The worker path keeps one owner-side autograd graph and one optimizer
+    // update for the original batch. Manual backward would bypass its graph.
+    if (four_worker_complex_requested()) {
+        return false;
+    }
     if (!fixed_buffer_manual_dot_rns_enabled() && !fixed_buffer_manual_distmult_rns_enabled() &&
         !fixed_buffer_manual_complex_rns_enabled()) {
         return false;
@@ -1742,9 +1749,15 @@ Model::Model(shared_ptr<GeneralEncoder> encoder, shared_ptr<Decoder> decoder, sh
 }
 
 void Model::clear_grad() {
+    // A single optimizer cannot benefit from an OpenMP team. Keep its CUDA
+    // work on the caller's stream and avoid a team barrier on every batch.
+    if (optimizers_.size() == 1) {
+        optimizers_.front()->clear_grad();
+    } else {
 #pragma omp parallel for
-    for (int i = 0; i < optimizers_.size(); i++) {
-        optimizers_[i]->clear_grad();
+        for (int i = 0; i < optimizers_.size(); i++) {
+            optimizers_[i]->clear_grad();
+        }
     }
 
     if (negative_sampling_method_ == NegativeSamplingMethod::GAN) {
@@ -1762,6 +1775,10 @@ void Model::clear_grad_all() {
 }
 
 void Model::step() {
+    if (optimizers_.size() == 1) {
+        optimizers_.front()->step();
+        return;
+    }
 #pragma omp parallel for
     for (int i = 0; i < optimizers_.size(); i++) {
         optimizers_[i]->step();
@@ -1816,48 +1833,101 @@ void Model::save(std::string directory) {
 }
 
 void Model::load(std::string directory, bool train) {
-    string model_filename = directory + PathConstants::model_file;
-    string model_state_filename = directory + PathConstants::model_state_file;
-    string per_device_model_filename =
-            model_filename + "_" + std::to_string(device_.has_index() ? device_.index() : 0);
-
-    torch::serialize::InputArchive model_archive;
-    torch::serialize::InputArchive state_archive;
-
+    const string model_filename = directory + PathConstants::model_file;
+    const string model_state_filename = directory + PathConstants::model_state_file;
     const bool has_combined_model_file = static_cast<bool>(std::ifstream(model_filename));
-    const bool has_per_device_model_file = static_cast<bool>(std::ifstream(per_device_model_filename));
 
-    if (has_combined_model_file) {
-        model_archive.load_from(model_filename);
-    } else if (decoder_ != nullptr && has_per_device_model_file) {
-        model_archive.load_from(per_device_model_filename);
+    // Checkpointer initializes all replicas before calling load on the root.
+    // Keep those modules and their optimizer parameter aliases intact.
+    std::vector<Model *> replicas;
+    if (device_models_.empty()) {
+        replicas.push_back(this);
     } else {
-        throw std::runtime_error(
-                "Unable to find compatible model checkpoint. Expected " + model_filename +
-                " or " + per_device_model_filename);
+        for (const auto &model : device_models_) {
+            if (!model) {
+                throw std::runtime_error("Cannot load checkpoint into an uninitialized model replica");
+            }
+            replicas.push_back(model.get());
+        }
     }
 
+    std::vector<string> model_filenames;
+    size_t expected_optimizers = 0;
+    for (size_t lane = 0; lane < replicas.size(); ++lane) {
+        auto *model = replicas[lane];
+        // Native CUDA saves use device indices. CPU fixtures use lane ordinals.
+        const auto suffix = model->device_.is_cuda() && model->device_.has_index()
+                                ? static_cast<int64_t>(model->device_.index())
+                                : static_cast<int64_t>(lane);
+        const string filename = has_combined_model_file
+                                    ? model_filename
+                                    : model_filename + "_" + std::to_string(suffix);
+        if ((!has_combined_model_file && model->decoder_ == nullptr) ||
+            !static_cast<bool>(std::ifstream(filename))) {
+            throw std::runtime_error("Unable to find compatible model checkpoint for replica " +
+                                     std::to_string(lane) + ": " + filename);
+        }
+        if (has_combined_model_file && model->encoder_ == nullptr) {
+            throw std::runtime_error("Combined model checkpoint requires an initialized encoder");
+        }
+        model_filenames.push_back(filename);
+        expected_optimizers += model->optimizers_.size();
+        for (const auto &optimizer : model->optimizers_) {
+            if (!optimizer) {
+                throw std::runtime_error("Cannot load checkpoint into an uninitialized optimizer");
+            }
+        }
+    }
+
+    torch::serialize::InputArchive state_archive;
     if (train) {
-        state_archive.load_from(model_state_filename);
+        // Validate the entire flattened key set before changing any model/state.
+        // CPU staging avoids deserializing a saved replica's state on the wrong
+        // GPU; each state tensor is placed with its existing parameter below.
+        state_archive.load_from(model_state_filename, torch::Device(torch::kCPU));
+        const auto keys = state_archive.keys();
+        if (keys.size() != expected_optimizers) {
+            throw std::runtime_error("Incompatible optimizer checkpoint: expected " +
+                                     std::to_string(expected_optimizers) + " archives for " +
+                                     std::to_string(replicas.size()) + " replicas, found " +
+                                     std::to_string(keys.size()));
+        }
+        for (size_t index = 0; index < expected_optimizers; ++index) {
+            const string key = std::to_string(index);
+            if (std::find(keys.begin(), keys.end(), key) == keys.end()) {
+                throw std::runtime_error("Incompatible optimizer checkpoint: missing numeric archive key " + key);
+            }
+        }
     }
 
-    int optimizer_idx = 0;
-    for (auto key : state_archive.keys()) {
-        torch::serialize::InputArchive tmp_state_archive;
-        state_archive.read(key, tmp_state_archive);
-        // optimizers have already been created as part of initModelFromConfig
-        optimizers_[optimizer_idx++]->load(tmp_state_archive);
+    size_t optimizer_index = 0;
+    for (size_t lane = 0; lane < replicas.size(); ++lane) {
+        auto *model = replicas[lane];
+        torch::serialize::InputArchive model_archive;
+        model_archive.load_from(model_filenames[lane], model->device_);
+        if (has_combined_model_file) {
+            std::dynamic_pointer_cast<torch::nn::Module>(model->encoder_)->load(model_archive);
+        }
+        if (model->decoder_ != nullptr) {
+            std::dynamic_pointer_cast<torch::nn::Module>(model->decoder_)->load(model_archive);
+        }
+        if (train) {
+            // Match Model::save's numeric (replica, optimizer) flattening order;
+            // archive.keys() iteration order is not the optimizer order.
+            for (auto &optimizer : model->optimizers_) {
+                torch::serialize::InputArchive optimizer_archive;
+                state_archive.read(std::to_string(optimizer_index++), optimizer_archive);
+                optimizer->load(optimizer_archive);
+                for (auto &parameter_state : optimizer->state_dict_) {
+                    const auto device = optimizer->param_dict_[parameter_state.key()].device();
+                    for (auto &state : parameter_state.value()) {
+                        state.value() = state.value().to(device);
+                    }
+                }
+            }
+        }
+        log_edge_decoder_relation_stats(train ? "load_train" : "load_eval", model->decoder_);
     }
-
-    if (has_combined_model_file) {
-        std::dynamic_pointer_cast<torch::nn::Module>(encoder_)->load(model_archive);
-    }
-
-    if (decoder_ != nullptr) {
-        std::dynamic_pointer_cast<torch::nn::Module>(decoder_)->load(model_archive);
-    }
-
-    log_edge_decoder_relation_stats(train ? "load_train" : "load_eval", decoder_);
 }
 
 void Model::all_reduce_rel() {
@@ -2038,6 +2108,22 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
     torch::Tensor inv_neg_scores;
 
     auto edge_decoder = std::dynamic_pointer_cast<EdgeDecoder>(decoder_);
+    const bool use_four_workers = train && four_worker_complex_requested();
+    if (use_four_workers) {
+        auto loss = std::dynamic_pointer_cast<SoftmaxCrossEntropy>(loss_function_);
+        TORCH_CHECK(learning_task_ == LearningTask::LINK_PREDICTION &&
+                        negative_sampling_method_ == NegativeSamplingMethod::RNS &&
+                        loss && loss->reduction() == LossReduction::SUM &&
+                        !batch->resident_local_lp_direct_ && !batch->qual_embeddings_.defined(),
+                    "Four-worker ComplEx requires ordinary RNS link prediction with SUM softmax and no qualifiers");
+        TORCH_CHECK(encoder_ && encoder_->layers_.size() == 1 && encoder_->layers_[0].size() == 1,
+                    "Four-worker ComplEx requires an identity embedding encoder");
+        auto embedding = std::dynamic_pointer_cast<EmbeddingLayer>(encoder_->layers_[0][0]);
+        TORCH_CHECK(embedding && embedding->config_ && embedding->offset_ == 0 &&
+                        !embedding->config_->bias && embedding->config_->activation == ActivationFunction::NONE &&
+                        encoder_->parameters().empty(),
+                    "Four-worker ComplEx requires an identity embedding encoder");
+    }
     if (batch->resident_local_lp_direct_) {
         std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
             resident_local_forward_lp(edge_decoder, negative_sampling_method_, batch);
@@ -2055,7 +2141,12 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> Model::fo
         log_eval_tensor_if_non_finite("encoded_nodes", batch->batch_id_, encoded_nodes);
     }
 
-    if (edge_decoder->decoder_method_ == EdgeDecoderMethod::ONLY_POS) {
+    if (use_four_workers) {
+        std::tie(pos_scores, neg_scores, inv_pos_scores, inv_neg_scores) =
+            four_worker_complex_forward(edge_decoder, batch->edges_, encoded_nodes,
+                                        batch->dst_neg_indices_mapping_, batch->src_neg_indices_mapping_,
+                                        batch->batch_id_, post_decoder_gather_callback);
+    } else if (edge_decoder->decoder_method_ == EdgeDecoderMethod::ONLY_POS) {
         std::tie(pos_scores, inv_pos_scores) = only_pos_forward(edge_decoder, batch->edges_, encoded_nodes, batch->qual_embeddings_);
     } else if (edge_decoder->decoder_method_ == EdgeDecoderMethod::POS_AND_NEG) {
         throw GegeRuntimeException("Decoder method currently unsupported.");

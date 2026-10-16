@@ -1,0 +1,9 @@
+6ea78c9cf1227cf2d17b1ca8e153ff50c60c43a8ad71811be7ec3cb118160726  /workspace/build/gege_train
+b0e6344ca0867a3053cea3e000aad3bf8c0c1eae37918dab834f7d368b479b50  /workspace/build/libge2.so
+b768cac83037343365ba1eb4b880a9d87a41918a2ca7ef763da05d63005c75ac  /workspace/build/libalgorithm_policy.so
+Model name:                              AMD EPYC 9374F 32-Core Processor
+NUMA node(s):                            2
+NUMA node0 CPU(s):                       0-31,64-95
+NUMA node1 CPU(s):                       32-63,96-127
+NVIDIA L40S, 580.126.09, 350.00 W
+2.8.0+cu128

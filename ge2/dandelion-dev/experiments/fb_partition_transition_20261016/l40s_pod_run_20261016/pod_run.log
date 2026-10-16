@@ -1,0 +1,108 @@
+== running p32_b24_h6 (16 CPUs pinned, 2 epochs)
+p32_b24_h6 rc 0
+== running p24_b32_h6 (16 CPUs pinned, 2 epochs)
+p24_b32_h6 rc 0
+[
+ {
+  "case": "p32_b24_h6",
+  "epochs_s": [
+   95.323,
+   92.562
+  ],
+  "outer_update_s": {
+   "n": 174,
+   "prefetch_wait_ms": 0.0,
+   "get_swap_ids_ms": 0.01,
+   "perform_swap_ms": 1.24,
+   "subgraph_update_ms": 39.2,
+   "state_publish_ms": 0.0,
+   "next_prefetch_start_ms": 0.0,
+   "admit_preload_start_ms": 0.08,
+   "total_ms": 40.52
+  },
+  "graph_update_s": {
+   "n": 174,
+   "state_prepare_ms": 0.04,
+   "edge_materialize_ms": 19.68,
+   "remap_ms": 19.45,
+   "graph_build_ms": 0.0,
+   "total_ms": 39.17
+  },
+  "first-preload-join": {
+   "n": 348,
+   "wait_ms": 0.02
+  },
+  "matching-writeback": {
+   "n": 348,
+   "wait_ms": 0.0
+  },
+  "free-frame-drain": {
+   "n": 0
+  },
+  "hidden-h2d": {
+   "n": 916,
+   "mutex_wait_ms": 19.06,
+   "mutex_and_copy_host_ms": 59.97
+  },
+  "not_ready_at_join": 0,
+  "perf_epoch2": [
+   "[perf][epoch 2][batch_fetch] total_ms=29273.555 get_next_batch_ms=19109.926 get_next_direct_ms=10.071 get_next_swap_path_ms=19098.059 get_next_swap_overhead_ms=0.168 edge_sample_ms=10157.932 node_sample_ms=0.000 load_cpu_parameters_ms=1.926 device_prepare_ms=0.000 perform_map_ms=0.000 overhead_ms=1.528",
+   "[perf][epoch 2] swap_count=87 swap_barrier_wait_ms=0.033 swap_update_ms=19049.170 swap_rebuild_ms=48.617 swap_sync_wait_ms=0.072",
+   "[perf][epoch 2][frame_cache] swap_samples=87 visible_install_parts=0 visible_install_rows=0 hidden_publish_parts=229 hidden_publish_rows=615825072 fallback_visible_admit_parts=0 fallback_visible_admit_rows=0 preload_miss_swaps=0 partial_preload_swaps=0 delayed_stale_writeback_swaps=87 async_admit_valid_before_swap_swaps=87 async_evict_in_flight_before_swap_swaps=0 reserved_preload_frames_avg=2.63 free_frames_before_swap_avg=3.37 free_frames_after_publish_avg=3.37 stale_backlog_before_swap_max=0 stale_backlog_after_publish_max=3"
+  ],
+  "memory": [
+   "[memory-budget-peak] epoch=2 device=0 allocated_peak_bytes=22957395968 reserved_peak_bytes=23578279936 cumulative=true"
+  ]
+ },
+ {
+  "case": "p24_b32_h6",
+  "epochs_s": [
+   92.436,
+   89.855
+  ],
+  "outer_update_s": {
+   "n": 94,
+   "prefetch_wait_ms": 0.0,
+   "get_swap_ids_ms": 0.0,
+   "perform_swap_ms": 1.17,
+   "subgraph_update_ms": 28.8,
+   "state_publish_ms": 0.0,
+   "next_prefetch_start_ms": 0.0,
+   "admit_preload_start_ms": 0.04,
+   "total_ms": 30.02
+  },
+  "graph_update_s": {
+   "n": 94,
+   "state_prepare_ms": 0.01,
+   "edge_materialize_ms": 12.16,
+   "remap_ms": 16.62,
+   "graph_build_ms": 0.0,
+   "total_ms": 28.79
+  },
+  "first-preload-join": {
+   "n": 188,
+   "wait_ms": 0.01
+  },
+  "matching-writeback": {
+   "n": 188,
+   "wait_ms": 0.0
+  },
+  "free-frame-drain": {
+   "n": 0
+  },
+  "hidden-h2d": {
+   "n": 516,
+   "mutex_wait_ms": 13.99,
+   "mutex_and_copy_host_ms": 44.43
+  },
+  "not_ready_at_join": 0,
+  "perf_epoch2": [
+   "[perf][epoch 2][batch_fetch] total_ms=24811.792 get_next_batch_ms=14098.659 get_next_direct_ms=0.926 get_next_swap_path_ms=14096.050 get_next_swap_overhead_ms=0.092 edge_sample_ms=10707.768 node_sample_ms=0.000 load_cpu_parameters_ms=1.736 device_prepare_ms=0.000 perform_map_ms=0.000 overhead_ms=1.413",
+   "[perf][epoch 2] swap_count=47 swap_barrier_wait_ms=0.016 swap_update_ms=14051.732 swap_rebuild_ms=44.165 swap_sync_wait_ms=0.045",
+   "[perf][epoch 2][frame_cache] swap_samples=47 visible_install_parts=0 visible_install_rows=0 hidden_publish_parts=129 hidden_publish_rows=462541065 fallback_visible_admit_parts=0 fallback_visible_admit_rows=0 preload_miss_swaps=0 partial_preload_swaps=0 delayed_stale_writeback_swaps=47 async_admit_valid_before_swap_swaps=47 async_evict_in_flight_before_swap_swaps=0 reserved_preload_frames_avg=2.74 free_frames_before_swap_avg=3.26 free_frames_after_publish_avg=3.26 stale_backlog_before_swap_max=0 stale_backlog_after_publish_max=3"
+  ],
+  "memory": [
+   "[memory-budget-peak] epoch=2 device=0 allocated_peak_bytes=30193432576 reserved_peak_bytes=30698110976 cumulative=true"
+  ]
+ }
+]

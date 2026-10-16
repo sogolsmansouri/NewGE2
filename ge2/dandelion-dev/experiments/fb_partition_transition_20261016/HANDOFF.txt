@@ -1,0 +1,94 @@
+ARC transition instrumentation build, 2026-10-16
+
+Remote diagnostic root:
+  /mnt/beegfs/smansou2/fb_transition_diagnostic_20261016
+Unchanged native root:
+  /mnt/beegfs/smansou2/multigpu_epoch_fix_312352_20261014/native_port
+Validated c30 runtime:
+  /mnt/local/smansou2/ge2-a6000-cuda121
+  Python3.9 / Torch2.1.2+cu121 / CUDA12.1 / old C++ ABI
+If moving nodes, stage the existing torch212_runtime.tar and substitute its
+runtime lib/bin/python paths. Do not assume /mnt/local is shared between nodes.
+
+Artifacts (SHA256):
+  build/libtransition_diagnostic.so
+    c96a89261413d8a12d23c4c06a6c706855566ae92d261504e8ddaf964bd298cd
+  build/libalgorithm_policy.so
+    d8b436dbcc211a0b4bfc5653655894c56fe2a2caef4dd4ce38341f55ae2a4523
+Unchanged native artifacts freshly verified:
+  build/gege_train
+    8ae9a1bd0a2c32c22cc326a37ebf337e113b541b87a2fafa83f925993c28a2e4
+  build/libge2.so
+    b115a05d8fafacab848a32f00cd6198bcc13ae36e9d4e02ee80191bf0e4ad2d0
+
+Runtime environment (substitute D/N/R paths above):
+  LD_LIBRARY_PATH=D/build:N/build:R/lib:R/lib/python3.9/site-packages/torch/lib
+  PYTHONPATH=N/python:R/lib/python3.9/site-packages
+  GEGE_NO_BINDINGS=1
+  GEGE_DETERMINISTIC_ALGORITHMS=1 for deterministic checkpoint gates, 0 for
+    historical-policy clean timing. Both values were CPU-load validated.
+  Diagnostic LD_PRELOAD:
+    D/build/libtransition_diagnostic.so:N/build/libge2.so:D/build/libalgorithm_policy.so
+  Clean LD_PRELOAD:
+    N/build/libge2.so:D/build/libalgorithm_policy.so
+  GEGE_TRANSITION_DIAGNOSTIC=1 enables new host records and existing outer
+    graph boundary breakdown. Set normal detailed PIPELINE_TIMING separately
+    if internal graph worker/preload breakdown is also desired.
+
+The policy is a small explicit Torch2.1 port of the original algorithm_policy.cpp.
+It strictly validates deterministic=0/1 and sets ATen deterministic algorithms.
+Torch2.1 lacks the newer deterministic uninitialized-memory-fill getter/setter,
+so those calls are omitted and the compatibility difference is logged. The
+unmodified source and failed first compile are preserved. Do not additionally
+load libdiagnostic_deterministic.so, which forces deterministic=true regardless
+of the requested timing policy.
+
+The interposer compiles the exact retained ARC buffer.cpp and graph_storage.cpp
+with host timers added. It links against unchanged native libge2.so. A full
+native relink was avoided because seven original CUDA objects and spdlog.a
+remain on c25-local paths. Headers and ABI are identical to the ARC native port.
+ldd -r passed for both libraries; CPU-only LD_PRELOAD checks for policy0/1
+confirmed global symbol resolution to the diagnostic implementations of both
+first-preload-join and graph-boundary functions. CUDA remained uninitialized.
+GPU checkpoint/timing validation has NOT been performed by this build task.
+
+New records:
+  [transition-diagnostic][first-preload-join]
+    fixed-quota first join, readiness/in-flight snapshot before joining, host wait
+  [transition-diagnostic][matching-writeback]
+    preload worker's requested-partition freshness wait
+  [transition-diagnostic][free-frame-drain]
+    emitted only when whole-writeback free-frame gate is actually taken
+  [transition-diagnostic][hidden-h2d]
+    serialized-path mutex wait and combined mutex+copy host elapsed
+  [partition-buffer-pipeline][outer-update ...]
+    existing separate prefetch_wait / perform_swap / subgraph_update /
+    next_prefetch_start / admit_preload_start fields
+No CUDA synchronization, transfer, model update or state-order operations were
+added, removed or moved. Logging perturbs timings, including mutex hold time,
+so use this library for attribution and the unchanged native for clean timing.
+
+Existing memory cap verified in both source AND actual binary flag strings:
+  gege.cpp:20-39 configure_memory_budget parses GEGE_CUDA_ALLOCATOR_LIMIT_MIB,
+  calls CUDACachingAllocator::setMemoryFraction before initializeStorage,
+  and logs [memory-budget]. GEGE_CUDA_MEMORY_STATS logs cumulative peaks.
+  This limits Torch allocator memory, not all CUDA/driver allocations. Retain
+  the historical allowance (budget MiB minus512), inspect actual peak/device
+  usage, and do not claim a hard process-wide memory cap from this API alone.
+
+Lowest-risk candidate is the existing GEGE_FRAME_CACHE_SERIALIZE_ADMIT_H2D=0
+branch: gather all reserved pinned frames, queue copies, wait once before
+publishing. Freshness joins and ownership remain. Keep graph prefetch=false,
+fixed preload=3/stale=3, exact saved state file,50K batch, ComplEx and negatives.
+Gate checkpoint equality before bounded timing; no speedup is claimed yet.
+
+Comparison limits:
+This is the validated ARC Torch2.1 native port, not RunPod's lib085a/Torch2.8.
+Its C++ compile receipts omit OpenMP flags, whereas the original RunPod build
+used OpenMP. Absolute106/116-second reproduction is therefore not established.
+The original current-single subset configuration also used dynamic fixed=-1,
+OPTIMAL88=1,14.3M bitmap nodes and strict deterministic policy; use the actual
+full-sweep recipe overrides (fixed=3, supplied states,86,054,151 nodes) instead
+of silently reusing that subset environment. A partition-count sweep changes
+state/batch/negative populations; a transfer-only A/B within each fixed recipe
+is the meaningful mathematical equivalence comparison.

@@ -1,0 +1,263 @@
+{
+  "admission_histogram": {
+    "2": 14,
+    "3": 16
+  },
+  "capacity": 4,
+  "covered_pairs": 171,
+  "covering_lower_bound": 29,
+  "max_admits": 3,
+  "max_evicts": 3,
+  "optimality": {
+    "achieved_overlap": 44,
+    "cyclic_wrap_included": false,
+    "fixed_cover_order_proof": {
+      "components": [
+        {
+          "edges": [
+            [
+              0,
+              1,
+              1
+            ],
+            [
+              1,
+              27,
+              1
+            ],
+            [
+              3,
+              29,
+              1
+            ],
+            [
+              3,
+              30,
+              1
+            ],
+            [
+              25,
+              28,
+              1
+            ],
+            [
+              27,
+              28,
+              1
+            ],
+            [
+              27,
+              29,
+              1
+            ],
+            [
+              29,
+              30,
+              1
+            ]
+          ],
+          "masks_enumerated": 256,
+          "maximum_bonus": 6,
+          "selected_edges": [
+            [
+              0,
+              1,
+              1
+            ],
+            [
+              1,
+              27,
+              1
+            ],
+            [
+              3,
+              29,
+              1
+            ],
+            [
+              3,
+              30,
+              1
+            ],
+            [
+              25,
+              28,
+              1
+            ],
+            [
+              27,
+              28,
+              1
+            ]
+          ],
+          "vertices": [
+            0,
+            1,
+            3,
+            25,
+            27,
+            28,
+            29,
+            30
+          ]
+        },
+        {
+          "edges": [
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              16,
+              1
+            ],
+            [
+              7,
+              8,
+              1
+            ],
+            [
+              7,
+              16,
+              1
+            ],
+            [
+              8,
+              12,
+              1
+            ],
+            [
+              10,
+              12,
+              1
+            ]
+          ],
+          "masks_enumerated": 64,
+          "maximum_bonus": 6,
+          "selected_edges": [
+            [
+              2,
+              6,
+              1
+            ],
+            [
+              2,
+              16,
+              1
+            ],
+            [
+              7,
+              8,
+              1
+            ],
+            [
+              7,
+              16,
+              1
+            ],
+            [
+              8,
+              12,
+              1
+            ],
+            [
+              10,
+              12,
+              1
+            ]
+          ],
+          "vertices": [
+            2,
+            6,
+            7,
+            8,
+            10,
+            12,
+            16
+          ]
+        },
+        {
+          "edges": [
+            [
+              4,
+              5,
+              1
+            ]
+          ],
+          "masks_enumerated": 2,
+          "maximum_bonus": 1,
+          "selected_edges": [
+            [
+              4,
+              5,
+              1
+            ]
+          ],
+          "vertices": [
+            4,
+            5
+          ]
+        },
+        {
+          "edges": [
+            [
+              13,
+              14,
+              1
+            ]
+          ],
+          "masks_enumerated": 2,
+          "maximum_bonus": 1,
+          "selected_edges": [
+            [
+              13,
+              14,
+              1
+            ]
+          ],
+          "vertices": [
+            13,
+            14
+          ]
+        }
+      ],
+      "fragment_connection_attempts": 1,
+      "maximum_overlap_for_this_fixed_cover": 44,
+      "meaning": "An order has at most n-1 base overlap plus the selected strong-edge forest weight.",
+      "method": "exhaustive_weighted_linear_forests_of_strong_overlap_components",
+      "proof_scope": "all_path_orders_of_this_fixed_block_set"
+    },
+    "global_overlap_upper_bound": 45,
+    "imported_witness_sha256": "c5c0d0ff5ea6cdc3e40a523124108e22960b8268f3ae87d7288269bf9613d93e",
+    "maximum_overlap": null,
+    "minimum_primary_source": "https://ir.cwi.nl/pub/6869/6869D.pdf",
+    "minimum_proof_method": "published_p19_exception",
+    "minimum_proof_note": "C(19,4,2)=31; the elementary Schonheim bound is only29.",
+    "minimum_state_count": 31,
+    "overlap_gap_to_analytic_bound": 1,
+    "overlap_optimality": "not_proven_globally",
+    "overlap_scope": "this_fixed_minimum_cover_only",
+    "schedule_sha256": "0ed6bfbeecd9e30ae87645f8cfd5c571f0971bbd8829537a31e7f3e351bb771e",
+    "state_count_optimal": true,
+    "witness_source": "https://www.multipasko.pl/sprawdzanie-systemow-lotto/200-4-z-19-31-zakladow/"
+  },
+  "overlap_histogram": {
+    "1": 16,
+    "2": 14
+  },
+  "partitions": 19,
+  "required_pairs": 171,
+  "schedule_path": "/workspace/pipege_a6000/runs/fb_memory_sweep_20261013/inputs/schedules/q4/p19/states.txt",
+  "schedule_sha256": "0ed6bfbeecd9e30ae87645f8cfd5c571f0971bbd8829537a31e7f3e351bb771e",
+  "source": "minimum_cover_witness_with_exact_fixed_cover_ordering",
+  "state_count": 31,
+  "state_gap": 0,
+  "state_gap_ratio": 1.0,
+  "status": "valid",
+  "total_admissions": 76,
+  "total_overlap": 44,
+  "transition_count": 30,
+  "unique_state_count": 31
+}
